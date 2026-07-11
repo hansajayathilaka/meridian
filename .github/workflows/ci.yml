@@ -1,0 +1,72 @@
+# Meridian CI: lint (incl. invariants) -> test (incl. harnesses) -> build. Mirrors the `just` recipes.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint + invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: Repo invariants (server-no-core, no-serde-on-blob, metrics-allowlist)
+        run: |
+          bash tools/lint-server-no-core.sh
+          bash tools/lint-no-serde-on-blob.sh
+          bash tools/lint-metrics-allowlist.sh
+      - name: clippy
+        run: cargo clippy --workspace --all-targets || true   # TODO: -D warnings once code lands
+
+  test:
+    name: Test + adversarial harnesses
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --workspace
+      - name: Adversarial harnesses
+        run: |
+          bash harnesses/opacity-audit/run.sh
+          bash harnesses/mitm-sim/run.sh
+          bash harnesses/ghost-device/run.sh
+      # TODO: cargo nextest run --workspace
+      # TODO: conformance vectors (byte-identical across CLI/WASM/mobile) — docs/testing/strategy.md §1
+
+  build:
+    name: Build (release)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace --release
+
+  supply-chain:
+    name: License / advisory gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Enforces the vodozemac/no-AGPL decision (ADR 0011) once deny.toml lands.
+      - run: echo "TODO cargo-deny check (advisories + licenses; block AGPL) — ADR 0011"
+
+  docs:
+    name: Docs (mermaid + links)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "TODO mermaid-cli syntax check and relative-link checker (just check-docs)"

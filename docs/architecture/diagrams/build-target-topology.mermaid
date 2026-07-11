@@ -1,0 +1,62 @@
+flowchart TB
+  subgraph Workspace["Cargo workspace (crates/) — the shared spine"]
+    direction TB
+    PROTO["meridian-proto<br/>CBOR wire types (DOC-01)"]
+    subgraph CoreCrates["core crates"]
+      ID["identity"] --> STORE2["store"]
+      CRYPTO["crypto"] --> TRUST2["trust"]
+      SESS2["session"] --> TRANS2["transport"]
+      STREAMS2["streams"]
+      SIG2["signaling"]
+    end
+    CORE["meridian-core<br/>stable public API (DOC-04)"]
+    PROTO --> CoreCrates --> CORE
+  end
+
+  subgraph Shims["Thin per-target shims"]
+    FFI["meridian-ffi (UniFFI)"]
+    WASM["meridian-wasm (wasm-bindgen)"]
+    CLIBIN["meridian-cli"]
+  end
+  CORE --> FFI & WASM & CLIBIN
+
+  subgraph Targets["Shipped clients"]
+    T_CLI["Terminal<br/>ratatui / --json"]
+    T_WEB["Browser<br/>SvelteKit + WASM"]
+    T_DESK["Desktop<br/>Tauri v2 + shared-ui"]
+    T_AND["Android<br/>Compose + .so"]
+    T_IOS["iOS<br/>SwiftUI + xcframework"]
+  end
+  CLIBIN --> T_CLI
+  WASM --> T_WEB
+  CORE -- "in-process" --> T_DESK
+  FFI -- "bindings/kotlin" --> T_AND
+  FFI -- "bindings/swift" --> T_IOS
+
+  subgraph Server["Server side (no core dependency)"]
+    REND["meridian-rendezvous<br/>axum + sqlx"]
+    COTURN["coturn (operated)"]
+  end
+  PROTO -- "shared wire types only" --> REND
+
+  subgraph Media["Media seam (behind Transport trait)"]
+    WRTC["webrtc-rs<br/>data / ICE / SCTP / DTLS"]
+    LWRTC["libwebrtc<br/>audio 3A + codecs + capture"]
+  end
+  TRANS2 --> WRTC
+  TRANS2 -. "media only" .-> LWRTC
+  T_DESK & T_AND & T_IOS -. media .-> LWRTC
+  T_CLI & T_WEB --> WRTC
+
+  RUNNER["just + xtask + CI<br/>build · codegen · test · release<br/>(same recipes locally and in CI)"]
+  RUNNER -.-> Workspace
+  RUNNER -.-> Shims
+  RUNNER -.-> Targets
+  RUNNER -.-> Server
+
+  classDef spine fill:#e8eef7,stroke:#4a6fa5
+  classDef shim fill:#fdf3d8,stroke:#b8860b
+  classDef target fill:#eef7e8,stroke:#5a8a4a
+  class PROTO,CORE,ID,STORE2,CRYPTO,TRUST2,SESS2,TRANS2,STREAMS2,SIG2 spine
+  class FFI,WASM,CLIBIN shim
+  class T_CLI,T_WEB,T_DESK,T_AND,T_IOS target

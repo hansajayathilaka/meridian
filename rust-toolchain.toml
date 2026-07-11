@@ -1,0 +1,5 @@
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+# Targets added as clients land (see docs/architecture/stack.md §4):
+# targets = ["wasm32-unknown-unknown", "aarch64-apple-ios", "aarch64-linux-android"]

@@ -1,0 +1,21 @@
+# Meridian single-org reference stack (scaffold stub).
+# Full ops guidance: ../../docs/operations/deployment.md
+# Topology: ../../docs/operations/diagrams/deployment-topology.mermaid
+services:
+  rendezvous:
+    image: meridian-rendezvous:dev   # TODO: build from apps/rendezvous
+    # depends_on: [postgres]
+    # ports: ["443:443"]
+    # volumes: ["./config:/etc/meridian:ro"]   # TODO: config surface (deployment.md)
+    restart: unless-stopped
+
+  coturn:
+    image: coturn/coturn:latest
+    # network_mode: host          # TODO: TURN listener config (../coturn/turnserver.conf)
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    # environment: [POSTGRES_DB=meridian]   # TODO: secrets via env file, not committed
+    restart: unless-stopped
+# TODO: confirm ports, volumes, secrets, and TLS termination per deployment (not in source docs).

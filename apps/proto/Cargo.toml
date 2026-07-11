@@ -1,0 +1,11 @@
+[package]
+name = "meridian-proto"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Shared wire types (envelopes, bundles, ctrl frames). Compiled by BOTH clients and the
+# rendezvous server so they cannot drift. Canonical spec: docs/api/wire-protocol.md
+# Real deps (added when the wire format is implemented): serde, ciborium.
+[dependencies]

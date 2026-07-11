@@ -1,0 +1,12 @@
+{
+  "name": "meridian-web",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Meridian browser client (SvelteKit + WASM core) — scaffold placeholder.",
+  "type": "module",
+  "scripts": {
+    "dev": "echo 'TODO: vite dev (SvelteKit + meridian-wasm)'",
+    "build": "echo 'TODO: vite build'",
+    "lint": "echo 'TODO: eslint'"
+  }
+}

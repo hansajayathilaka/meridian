@@ -1,0 +1,12 @@
+# Allowed Prometheus metric names (docs/operations/monitoring.md). One per line.
+# The metrics-allowlist lint fails if the server registers a name not on this list.
+# NEVER add per-user message sizes, contact-graph, or content metrics here.
+meridian_connections_active
+meridian_envelopes_routed_total
+meridian_envelope_route_latency_seconds
+meridian_mailbox_depth
+meridian_mailbox_oldest_age_seconds
+meridian_prekey_pool_depth
+meridian_federation_link_up
+meridian_turn_allocations_active
+meridian_turn_bandwidth_bytes_total

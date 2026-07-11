@@ -1,0 +1,43 @@
+stateDiagram-v2
+  [*] --> Idle
+  Idle --> Dialing: send() / call() and no live session
+  Idle --> Answering: verified envelope with SDP offer arrives
+
+  state Dialing {
+    [*] --> FetchBundle
+    FetchBundle --> VerifyBundle
+    VerifyBundle --> X3DH: sigs valid under requested key
+    VerifyBundle --> FailedClosed: signature mismatch
+    X3DH --> OfferSent: envelope routed via home server
+  }
+
+  state Answering {
+    [*] --> VerifySender
+    VerifySender --> MessageRequestGate: first contact
+    VerifySender --> AnswerSent: known contact
+    MessageRequestGate --> AnswerSent: user accepts
+    MessageRequestGate --> Rejected: user declines
+  }
+
+  Dialing --> IceChecks: answer received
+  Answering --> IceChecks
+  IceChecks --> DtlsHandshake: candidate pair succeeds (direct or relay)
+  IceChecks --> FailedNoPath: all pairs fail (no TURN reachable)
+  DtlsHandshake --> FingerprintCheck
+  FingerprintCheck --> Established: negotiated fp == fp from encrypted envelope
+  FingerprintCheck --> TornDown: mismatch — fail closed
+
+  state Established {
+    [*] --> CtrlOpen
+    CtrlOpen --> CapabilityExchange
+    CapabilityExchange --> Active: streams open per registry policy
+    Active --> IceRestarting: network change detected
+    IceRestarting --> Active: new pair validated (ratchet state persists)
+  }
+
+  Established --> Closed: close() / keepalive timeout
+  Closed --> Idle: ratchet outlives session — redial is cheap
+  FailedClosed --> [*]
+  FailedNoPath --> Idle: retry with backoff
+  TornDown --> [*]
+  Rejected --> [*]

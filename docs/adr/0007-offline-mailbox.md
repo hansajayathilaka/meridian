@@ -1,0 +1,7 @@
+<!-- Source: p2p-comms-design.md §8 ADR-7. -->
+> **Nav:** [ADR index](./README.md) · [system design](../architecture/system-design.md)
+
+# ADR 0007: Offline delivery — bounded ciphertext mailbox on the home rendezvous
+
+**Status:** Proposed · **Context:** the hardest tension in the requirements: "no server holds message content" vs. users who are offline. Pure P2P (A: no offline delivery) is honest but productively unacceptable — mobile users are offline constantly. (B) sender-side queue-and-retry keeps servers empty but leaks *sender* online-time patterns, delays delivery until co-presence, and fails when the sender is a laptop that closed. (C) **recipient-side encrypted mailbox (chosen):** the home rendezvous stores sealed envelopes (ratchet-encrypted, header-encrypted, sender-signature *inside* the encryption where possible via sealed-sender-style wrapping) with strict TTL (org-configurable, default 14 days), size caps, and deletion-on-delivery. **Decision: C, disclosed loudly:** the server transiently holds *ciphertext* it cannot read, cannot attribute beyond "for K_B", and cannot retain past TTL. We judge this within the letter of requirement 1 (no *plaintext/content* visibility) and within its spirit given the alternative is a broken product; an org that disagrees can set TTL=0 and run pure-P2P delivery. **Consequences:** mailbox metadata (arrival times, sizes, count per recipient) exists at the home server → padding/batching mitigations in Phase 3; storage quotas become an ops concern.
+

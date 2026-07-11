@@ -1,0 +1,33 @@
+stateDiagram-v2
+  [*] --> New: first envelope / ID entered
+  New --> Pinned: TOFU — key pinned on first session<br/>(petname assigned locally, never from wire)
+  Pinned --> Verified: safety numbers compared out-of-band<br/>(QR scan or 60-digit match)
+
+  Pinned --> KeyChanged_Pinned: identity key or device record changed
+  Verified --> KeyChanged_Verified: identity key or device record changed
+
+  state KeyChanged_Pinned {
+    [*] --> WarnProminent
+    note right of WarnProminent
+      Prominent warning (org policy may
+      escalate to block). Wording is
+      canonical per verification-ux.md —
+      clients must not soften it.
+    end note
+  }
+
+  state KeyChanged_Verified {
+    [*] --> BlockSends
+    note right of BlockSends
+      Sends BLOCKED until re-verified.
+      This is the property that defeats
+      a fully malicious server pair.
+    end note
+  }
+
+  KeyChanged_Pinned --> Pinned: user acknowledges (re-pin)
+  KeyChanged_Verified --> Verified: re-verified via safety numbers
+  KeyChanged_Verified --> Blocked: user rejects new key
+  Pinned --> Blocked: user blocks
+  Verified --> Blocked: user blocks
+  Blocked --> [*]

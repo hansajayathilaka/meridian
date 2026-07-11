@@ -1,0 +1,46 @@
+flowchart TB
+  subgraph Shims["Platform shims (thin, per-platform)"]
+    SH1["Browser: RTCPeerConnection via wasm-bindgen<br/>IndexedDB store · WebCrypto"]
+    SH2["Desktop: webrtc-rs / libdatachannel<br/>DPAPI-Keychain store"]
+    SH3["Mobile: libwebrtc builds<br/>StrongBox / SecureEnclave"]
+    SH4["Terminal: webrtc-rs<br/>age-wrapped keyfile / PKCS#11"]
+  end
+
+  subgraph Core["meridian-core (single Rust crate family)"]
+    direction TB
+    subgraph L4["Feature layer — Stream Types (pluggable)"]
+      ST1["mrd.chat/1"]
+      ST2["mrd.file/1"]
+      ST3["mrd.call.* / mrd.screen"]
+      ST4["mrd.location/1 · mrd.sticker/1"]
+      ST5["mrd.tunnel.tcp/1 · mrd.fs/1"]
+    end
+    REG["Stream Registry + mrd.ctrl/1<br/>capability exchange · OPEN/ACCEPT/CLOSE · policy hooks"]
+    subgraph L3["Session layer"]
+      SESS["Session state machine<br/>dial · answer · ICE restart · fp binding"]
+      RAT["Crypto sessions<br/>X3DH · Double Ratchet · header enc<br/>(audited lib, never bespoke)"]
+    end
+    subgraph L2["Identity & trust"]
+      ID["meridian-identity<br/>mrd1 IDs · sign/verify · QR"]
+      TRUST["Trust store<br/>TOFU → verified · safety numbers<br/>device records"]
+    end
+    SIG["Signaling client<br/>WSS · envelopes · mailbox drain"]
+    STORE["Encrypted local store<br/>ratchet state · contacts · history"]
+  end
+
+  TRAIT1[/"Transport trait"/]
+  TRAIT2[/"SecretStore trait"/]
+
+  ST1 & ST2 & ST3 & ST4 & ST5 --> REG
+  REG --> SESS
+  SESS --> RAT
+  SESS --> TRAIT1
+  RAT --> ID
+  TRUST --> ID
+  SIG --> RAT
+  STORE --> TRAIT2
+  SH1 & SH2 & SH3 & SH4 --> TRAIT1
+  SH1 & SH2 & SH3 & SH4 --> TRAIT2
+
+  classDef trait fill:#fdf3d8,stroke:#b8860b
+  class TRAIT1,TRAIT2 trait

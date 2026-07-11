@@ -1,0 +1,36 @@
+flowchart TB
+  IK["Account identity key — Ed25519<br/>long-lived · OS keystore / secure enclave"]
+
+  DEV["Device subkeys (per device)<br/>Ed25519 sig + X25519 DH<br/>in signed, versioned device record"]
+  SPK["Signed prekey — X25519<br/>rotated ~weekly"]
+  OPK["One-time prekeys — X25519<br/>batched · depletion monitored"]
+  SN["Safety number<br/>fingerprint over both identity keys<br/>QR / 60-digit · out-of-band compare"]
+
+  IK -- signs --> DEV
+  IK -- signs --> SPK
+  IK -- signs --> OPK
+  IK -- "derives (with peer IK)" --> SN
+
+  X3DH["X3DH key agreement<br/>(hybrid PQ slot: PQXDH, versioned bundle)"]
+  RK["Root key"]
+  DR["Double Ratchet chains<br/>per peer-device pair · header encryption<br/>FS + PCS per message"]
+
+  SPK --> X3DH
+  OPK --> X3DH
+  DEV --> X3DH
+  X3DH --> RK --> DR
+
+  MEDIA["Media keys<br/>DTLS-SRTP (1:1 = E2E)<br/>fp bound to identity via encrypted SDP"]
+  STREAMK["Per-stream keys<br/>HKDF export, info = stream id<br/>fast AEAD per stream"]
+  FILEK["Per-file keys<br/>sealed under ratchet · BLAKE3 merkle"]
+
+  DR --> STREAMK
+  DR --> FILEK
+  DR -. "authenticates fp in envelope" .-> MEDIA
+
+  classDef longterm fill:#f7e8e8,stroke:#a54a4a
+  classDef session fill:#e8eef7,stroke:#4a6fa5
+  classDef stream fill:#eef7e8,stroke:#5a8a4a
+  class IK,DEV,SPK,OPK,SN longterm
+  class X3DH,RK,DR session
+  class MEDIA,STREAMK,FILEK stream

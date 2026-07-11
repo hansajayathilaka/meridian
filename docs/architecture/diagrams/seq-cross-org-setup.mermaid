@@ -1,0 +1,28 @@
+sequenceDiagram
+  autonumber
+  participant A as Alice client (org A)
+  participant RA as Rendezvous A
+  participant RB as Rendezvous B
+  participant B as Bob client (org B)
+
+  Note over A: parse mrd1:K_B@org-b →<br/>key K_B + routing hint
+  A->>RA: fetch bundle for K_B @ org-b (WSS)
+  RA->>RB: mTLS dial (DNS SRV / static map)<br/>federated prekey fetch
+  RB-->>RA: signed prekey bundle + device record
+  RA-->>A: bundle (opaque relay)
+  Note over A: VERIFY signatures under K_B<br/>mismatch ⇒ ABORT (fail closed)
+  Note over A: X3DH → root key → init Double Ratchet
+  A->>RA: Envelope₁ = Sign_K_A{ ratchet-enc{ X3DH init,<br/>SDP offer, DTLS fp, ICE cands } }
+  RA->>RB: route (opaque)
+  RB->>B: deliver (or mailbox if offline)
+  Note over B: verify K_A sig · complete X3DH ·<br/>message-request gate on first contact
+  B-->>A: answer envelope (same wrapping) + trickle ICE
+  par ICE connectivity checks
+    A->>B: direct pairs (host/srflx)
+  and
+    A->>B: relay pairs (TURN-A / TURN-B)
+  end
+  A->>B: DTLS handshake
+  Note over A,B: BOTH check negotiated DTLS fp ==<br/>fp from encrypted envelope · mismatch ⇒ teardown
+  A->>B: mrd.ctrl/1 opens · capability exchange
+  Note over A,B: session live — servers out of the data path

@@ -1,0 +1,26 @@
+sequenceDiagram
+  autonumber
+  participant A as Caller
+  participant RA as Rendezvous A
+  participant TA as TURN A
+  participant TB as TURN B
+  participant B as Callee
+
+  A->>RA: ring envelope — mrd.call.video/1 OPEN<br/>(works session-less, routed like any envelope)
+  RA->>B: deliver (via RB, omitted)
+  B-->>A: ACCEPT → SDP renegotiation adds Opus + AV1 transceivers
+  Note over A,B: ICE gathers host + srflx + relay candidates<br/>(policy relay-only would strip host/srflx before gathering)
+
+  A--xB: direct + srflx pairs FAIL (symmetric NATs both sides)
+  A->>TA: TURN allocation (ephemeral HMAC cred from RA)
+  B->>TB: TURN allocation
+  A->>TA: SRTP ciphertext
+  TA->>TB: relay leg
+  TB->>B: SRTP ciphertext
+  Note over TA,TB: relays meter flows —<br/>cannot decrypt (DTLS-SRTP is end-to-end for 1:1)
+
+  rect rgb(232, 238, 247)
+    Note over A: mid-call: Wi-Fi → LTE
+    A->>B: ICE restart within session
+    Note over A,B: call + ratchet state persist ·<br/>audio gap < 2 s target
+  end

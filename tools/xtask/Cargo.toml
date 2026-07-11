@@ -1,0 +1,10 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Dev tooling: codegen orchestration (UniFFI/wasm-bindgen), conformance-vector generation,
+# release packaging. Invoked via `cargo run -p xtask -- <cmd>` and the Justfile.
+[dependencies]

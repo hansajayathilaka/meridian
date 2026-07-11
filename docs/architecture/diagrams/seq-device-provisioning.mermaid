@@ -1,0 +1,24 @@
+sequenceDiagram
+  autonumber
+  participant OLD as Existing device (holds account key)
+  participant NEW as New device
+  participant R as Home rendezvous
+  participant P as Peer (any contact)
+
+  NEW->>NEW: generate device subkeys (Ed25519 + X25519)
+  OLD->>OLD: display provisioning QR (session bootstrap secret)
+  NEW->>OLD: scan QR → direct E2E provisioning channel<br/>(P2P — server routes opaque bootstrap envelopes only)
+  OLD->>NEW: signed delegation for NEW subkeys<br/>+ optional encrypted history sync
+  Note over OLD,NEW: account PRIVATE key never leaves OLD,<br/>never touches the server
+
+  OLD->>R: publish device record vN+1<br/>(append-only, account-signed: add NEW)
+  P->>R: fetch device record for account
+  Note over P: verify record signature under account key ·<br/>server-minted ghost entry = invalid signature = rejected
+  Note over P: legitimate change on a VERIFIED contact ⇒<br/>blocking device-change alert (detection guarantee)
+  P->>NEW: new pairwise X3DH + ratchet (fan-out now includes NEW)
+
+  rect rgb(247, 232, 232)
+    Note over OLD: revocation drill
+    OLD->>R: device record vN+2: revoke device #2
+    P--xNEW: sends stop after record propagates —<br/>revoked device decrypts nothing sent afterwards
+  end

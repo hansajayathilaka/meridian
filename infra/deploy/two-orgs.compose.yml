@@ -1,0 +1,20 @@
+# Two-org federation demo (feature 06) — scaffold stub. Brings up org-a.test + org-b.test,
+# each with rendezvous + coturn, sharing a private CA (bootstrap-ca.sh) and a static federation map.
+# Full walkthrough: docs/architecture/features/06-cross-org-federation.md
+services:
+  rendezvous-a:
+    image: meridian-rendezvous:dev   # TODO: build from apps/rendezvous
+    # environment: [MERIDIAN_DOMAIN=org-a.test]
+    # volumes: [".ca:/etc/meridian/ca:ro", "./fed-map.toml:/etc/meridian/federation_map.toml:ro"]
+    restart: unless-stopped
+  coturn-a:
+    image: coturn/coturn:latest
+    restart: unless-stopped
+  rendezvous-b:
+    image: meridian-rendezvous:dev
+    # environment: [MERIDIAN_DOMAIN=org-b.test]
+    restart: unless-stopped
+  coturn-b:
+    image: coturn/coturn:latest
+    restart: unless-stopped
+# TODO: confirm ports, static federation map contents, and TLS wiring per feature 06.

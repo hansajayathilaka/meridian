@@ -1,0 +1,40 @@
+flowchart TB
+  subgraph OrgA["Org A — self-hosted stack"]
+    RA["Rendezvous A<br/>WSS signaling · prekey store<br/>ciphertext mailbox · s2s federation"]
+    DBA[("SQLite / Postgres<br/>pubkey → prekeys, device record,<br/>mailbox blobs, fed map")]
+    TA["TURN A — coturn<br/>ephemeral HMAC creds"]
+    RA --> DBA
+    RA -. "mints TURN credentials" .-> TA
+  end
+
+  subgraph OrgB["Org B — self-hosted stack"]
+    RB["Rendezvous B"]
+    DBB[("SQLite / Postgres")]
+    TB["TURN B — coturn"]
+    RB --> DBB
+    RB -. "mints TURN credentials" .-> TB
+  end
+
+  subgraph AliceDevices["Alice — one identity, many devices"]
+    A1["Desktop (Tauri)<br/>meridian-core native"]
+    A2["Browser<br/>meridian-core WASM"]
+    A3["Terminal CLI<br/>meridian-core native"]
+  end
+
+  subgraph BobDevices["Bob"]
+    B1["Mobile (UniFFI)<br/>meridian-core native"]
+  end
+
+  A1 & A2 & A3 -- "WSS: auth, envelopes,<br/>prekey fetch (opaque blobs)" --> RA
+  B1 -- "WSS" --> RB
+  RA <-- "mTLS s2s federation<br/>(signed envelopes only)" --> RB
+
+  A1 == "E2E WebRTC: DTLS-SRTP media +<br/>SCTP data channels (ratcheted)" ==> B1
+  A1 -. "relay fallback:<br/>ciphertext only" .-> TA
+  TA -. "ciphertext" .-> TB
+  TB -. "ciphertext" .-> B1
+
+  classDef infra fill:#e8eef7,stroke:#4a6fa5,color:#1a2a44
+  classDef client fill:#eef7e8,stroke:#5a8a4a,color:#1a3a1a
+  class RA,RB,TA,TB,DBA,DBB infra
+  class A1,A2,A3,B1 client

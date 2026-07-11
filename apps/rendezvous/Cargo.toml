@@ -1,0 +1,15 @@
+[package]
+name = "meridian-rendezvous"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# NOTE: the server must NOT depend on meridian-core (only meridian-proto in the
+# real tree). See docs/adr/0008-infra-topology.md and apps/CLAUDE.md.
+[[bin]]
+name = "meridian-rendezvous"
+path = "src/main.rs"
+
+[dependencies]
+meridian-proto = { path = "../proto" }

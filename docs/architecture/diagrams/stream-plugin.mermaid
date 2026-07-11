@@ -1,0 +1,33 @@
+flowchart LR
+  subgraph Contract["The extension contract (stream-types-v1.md)"]
+    direction TB
+    DEF["A stream type is ONLY:<br/>1. registered name + version<br/>2. CBOR message schema<br/>3. channel config (reliability/ordering or RTP)<br/>4. policy descriptor (auto / prompt / org hook)"]
+  end
+
+  subgraph Registry["Stream Registry + mrd.ctrl/1"]
+    CAP["Capability exchange on session open"]
+    NEG["OPEN → policy hook → ACCEPT / REJECT"]
+    KEYS["Per-stream keys: HKDF export from ratchet,<br/>info = stream id"]
+  end
+
+  subgraph ChannelKinds["Channel bindings"]
+    RO["SCTP reliable-ordered<br/>chat · ctrl · tunnels"]
+    RU["SCTP reliable-unordered<br/>file chunks"]
+    UU["SCTP unreliable-unordered<br/>live location"]
+    RTP["RTP transceivers<br/>audio · video · screenshare"]
+  end
+
+  T1["mrd.chat/1"] --> RO
+  T2["mrd.file/1"] --> RU
+  T3["mrd.location/1 live"] --> UU
+  T4["mrd.call.* / mrd.screen"] --> RTP
+  T5["mrd.tunnel.tcp/1"] --> RO
+  T6["mrd.fs/1 (reuses file chunking)"] --> RU
+  T7["future: third-party mrd.x/1"] --> RO
+
+  DEF --> CAP --> NEG --> KEYS
+  KEYS --> RO & RU & UU
+  NEG --> RTP
+
+  GUARD["Enforcement: T09/T15 shipped with ZERO core changes<br/>(CODEOWNERS on core crate) · third-party<br/>implementability test = acceptance criterion"]
+  Contract -.-> GUARD

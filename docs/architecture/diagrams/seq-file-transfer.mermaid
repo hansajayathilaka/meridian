@@ -1,0 +1,25 @@
+sequenceDiagram
+  autonumber
+  participant S as Sender (mrd.file/1)
+  participant CTRL as mrd.ctrl/1 channel
+  participant DC as data channel (reliable, unordered)
+  participant R as Recipient
+
+  Note over S: chunk 64 KiB · build BLAKE3 merkle ·<br/>generate per-file key k_f
+  S->>CTRL: OPEN{ stream_id, type=mrd.file/1,<br/>manifest: name, size, b3 root, enc_ratchet(k_f) }
+  R-->>CTRL: ACCEPT (policy hook: auto-accept < N MB, else prompt)
+  loop chunks, backpressure via bufferedAmount watermark
+    S->>DC: AEAD_k_f(chunk_i, nonce=i) + offset
+    Note over R: write by offset ·<br/>verify merkle subtrees incrementally
+  end
+  R-->>CTRL: range ACKs (bitmap)
+
+  rect rgb(247, 232, 232)
+    Note over S,R: connection lost mid-transfer
+    S->>R: session redial (ICE restart or new session — ratchet persisted)
+    R-->>CTRL: RESUME{ missing-range bitmap }
+    S->>DC: re-send only missing ranges
+  end
+
+  Note over R: final check: assembled root == manifest b3 root
+  R-->>CTRL: CLOSE{ status=verified }

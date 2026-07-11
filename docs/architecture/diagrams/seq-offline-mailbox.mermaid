@@ -1,0 +1,28 @@
+sequenceDiagram
+  autonumber
+  participant A as Alice (org A)
+  participant RA as Rendezvous A
+  participant RB as Rendezvous B (Bob's home)
+  participant DB as Mailbox store (ciphertext only)
+  participant B as Bob (offline → online)
+
+  A->>RA: envelope for K_B (ratchet-enc, header-enc, signed)
+  RA->>RB: federated route (mTLS)
+  RB->>RB: K_B has no connected device
+  RB->>DB: store blob — TTL 14d, quota-checked,<br/>type is Vec of bytes: no-serde lint enforced
+  RB-->>A: queued receipt (via RA)
+  Note over DB: admin view (threat A7): sizes,<br/>timestamps, opaque blobs — nothing else
+
+  alt quota exceeded
+    RB-->>A: mailbox full — surfaced to SENDER
+  else TTL expiry
+    DB->>DB: purge on schedule (clock-advance tested)
+  end
+
+  B->>RB: WSS connect + identity-key auth
+  RB->>DB: drain for K_B
+  DB-->>B: envelopes (possibly out of order)
+  Note over B: dedup by envelope id ·<br/>skipped-message keys handle reordering
+  B-->>RB: per-envelope ACK
+  RB->>DB: delete on acknowledged delivery
+  Note over RB,DB: TTL=0 org config ⇒ store genuinely disabled —<br/>pure-P2P delivery mode

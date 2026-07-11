@@ -1,0 +1,8 @@
+/target
+**/node_modules
+/bindings/**/generated
+*.log
+.env
+
+# dev CA artifacts
+infra/deploy/.ca/

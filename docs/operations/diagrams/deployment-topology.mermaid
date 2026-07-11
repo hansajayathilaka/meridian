@@ -1,0 +1,40 @@
+flowchart TB
+  subgraph Airgap["Air-gapped enterprise deployment (Org A)"]
+    direction TB
+    subgraph DMZ["Service network"]
+      LB["VIP / LB (active-passive)"]
+      R1["meridian-rendezvous #1"]
+      R2["meridian-rendezvous #2 (standby)"]
+      PG[("Postgres<br/>prekeys · device records · mailbox")]
+      CT["coturn<br/>UDP + TCP + TLS-443 listeners"]
+      LB --> R1
+      LB -.-> R2
+      R1 --> PG
+      R2 -.-> PG
+    end
+    CA["Private CA<br/>client WSS certs + federation mTLS"]
+    DNS["Internal DNS<br/>SRV _meridian-fed._tcp (or static map)"]
+    MON["Prometheus + Grafana<br/>connections · envelope rates · mailbox depth ·<br/>prekey pool (alert) · fed link health"]
+    MIRROR["Artifact mirror<br/>signed client releases · offline bundle"]
+    R1 --> MON
+    CT --> MON
+    CA -.-> R1
+    CA -.-> CT
+  end
+
+  subgraph Clients["Org A clients (internal network)"]
+    C1["Desktop / CLI"]
+    C2["Android (foreground-service wake —<br/>no FCM in air-gap)"]
+    C3["Browser (served from audited internal origin)"]
+  end
+  C1 & C2 & C3 -- WSS --> LB
+  C1 & C2 & C3 -- "ICE: internal STUN/TURN only" --> CT
+  MIRROR -. "signed updates, verified offline" .-> C1
+
+  FED["Org B stack<br/>(mirror image)"]
+  R1 <-- "mTLS federation<br/>private CA or WebPKI" --> FED
+
+  classDef svc fill:#e8eef7,stroke:#4a6fa5
+  classDef sec fill:#fdf3d8,stroke:#b8860b
+  class R1,R2,PG,CT,LB svc
+  class CA,MIRROR,MON,DNS sec

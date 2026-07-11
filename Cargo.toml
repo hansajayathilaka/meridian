@@ -1,0 +1,19 @@
+# Meridian Cargo workspace — scaffold.
+# Full crate layout & dependency direction: docs/architecture/stack.md
+[workspace]
+resolver = "2"
+members = [
+  "apps/core",
+  "apps/proto",
+  "apps/cli",
+  "apps/rendezvous",
+  "tools/xtask",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.77"
+
+# Shared dependency versions are pinned here in the real tree; omitted in the scaffold.
+[workspace.dependencies]
