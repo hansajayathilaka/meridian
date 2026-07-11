@@ -1,13 +1,19 @@
-//! meridian-core — shared core facade (scaffold placeholder).
+//! meridian-core — shared core facade.
 //!
 //! Public API contract: ../../docs/api/core-api-contracts.md
 //! Module architecture:  ../../docs/architecture/diagrams/core-modules.mermaid
 //!
-//! No functional code in this scaffold. Sub-crates (identity, crypto, trust,
-//! session, transport, streams, signaling, store) are added per the roadmap
-//! (../../docs/architecture/roadmap.md), starting with feature 01.
+//! The core re-exports each sub-crate's public surface so shims (`cli`, `ffi`, `wasm`, Tauri)
+//! depend on this one crate. Sub-crates land per the roadmap
+//! (../../docs/architecture/roadmap.md); T01 wires in `identity` (+ `store`).
 
-/// Placeholder so the crate compiles. Replace with the real public surface.
+/// Self-certifying identity: `mrd1:…@domain` IDs, Ed25519 sign/verify, keystore, QR (T01).
+pub use meridian_identity as identity;
+
+/// Secret storage: the `SecretStore` trait and its OS/file/memory impls (T01).
+pub use meridian_store as store;
+
+/// Crate version — kept for build-info/diagnostics.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }

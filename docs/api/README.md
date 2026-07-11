@@ -5,6 +5,8 @@ anywhere in the repo disagrees with these files, **these files win** and the oth
 
 - [Wire protocol (v1)](./wire-protocol.md) — identity string grammar, CBOR envelope,
   WSS ops, server-to-server federation ops, `mrd.ctrl` frames, stream framing, versioning/PQ slot.
+- [Identity format (v1, frozen)](./identity-format.md) — the `mrd1:…@domain` string in full:
+  field layout, checksum, canonical hint rules, parse rejections, QR, keystore, and the PQ slot (T01).
 - [Core API contracts](./core-api-contracts.md) — the stable Rust traits (`Transport`,
   `SecretStore`, `StreamType`) and public `meridian-core` surface consumed by every client shim.
 
