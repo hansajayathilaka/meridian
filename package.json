@@ -1,0 +1,9 @@
+{
+  "name": "meridian",
+  "private": true,
+  "packageManager": "pnpm@9",
+  "scripts": {
+    "dev:web": "pnpm --filter meridian-web dev",
+    "build:web": "pnpm --filter meridian-web build"
+  }
+}

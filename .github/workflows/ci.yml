@@ -69,4 +69,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: echo "TODO mermaid-cli syntax check and relative-link checker (just check-docs)"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Install mermaid-cli
+        run: npm i -g @mermaid-js/mermaid-cli
+      - name: Validate docs (links + mermaid)
+        run: bash tools/check-docs.sh

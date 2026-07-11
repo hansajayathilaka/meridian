@@ -1,0 +1,79 @@
+{
+  "name": "Meridian",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+
+  // Higher-level toolchains as composable features (Rust is in the base image).
+  "features": {
+    // Node + npm for the web (SvelteKit) and desktop (Tauri) UIs; pnpm via corepack in post-create.
+    "ghcr.io/devcontainers/features/node:1": { "version": "lts" },
+    // Docker inside the container so `just two-orgs` and the compose stacks run self-contained.
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    // git-lfs for future vendored prebuilt binaries (e.g. libwebrtc, ADR 0014).
+    "ghcr.io/devcontainers/features/git-lfs:1": {}
+  },
+
+  "runServices": [],
+  "remoteUser": "vscode",
+
+  // Faster incremental builds: keep target/ and the cargo registry on named volumes.
+  "mounts": [
+    "source=meridian-target,target=${containerWorkspaceFolder}/target,type=volume",
+    "source=meridian-cargo-registry,target=/usr/local/cargo/registry,type=volume"
+  ],
+
+  "containerEnv": {
+    "CARGO_TERM_COLOR": "always",
+    "RUST_BACKTRACE": "1",
+    "PUPPETEER_SKIP_DOWNLOAD": "true",
+    "PUPPETEER_EXECUTABLE_PATH": "/usr/bin/chromium"
+  },
+
+  // Ports used across the stack (rendezvous, TURN, Vite, Tauri dev, Postgres).
+  "forwardPorts": [8443, 3478, 5349, 5173, 1420, 5432],
+  "portsAttributes": {
+    "8443": { "label": "rendezvous (WSS)" },
+    "3478": { "label": "TURN/STUN (udp/tcp)" },
+    "5349": { "label": "TURN/TLS" },
+    "5173": { "label": "web (Vite)" },
+    "1420": { "label": "desktop (Tauri dev)" },
+    "5432": { "label": "postgres" }
+  },
+
+  // One-time setup: toolchain targets, prebuilt dev tools, JS deps, docs tooling, lint check.
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "postStartCommand": "bash .devcontainer/post-start.sh",
+  "waitFor": "postCreateCommand",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb",
+        "fill-labs.dependi",
+        "tauri-apps.tauri-vscode",
+        "svelte.svelte-vscode",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "nefrob.vscode-just",
+        "bierner.markdown-mermaid",
+        "redhat.vscode-yaml",
+        "ms-azuretools.vscode-docker",
+        "eamodio.gitlens"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.cargo.features": "all",
+        "editor.formatOnSave": true,
+        "[rust]": { "editor.defaultFormatter": "rust-lang.rust-analyzer" },
+        "[svelte]": { "editor.defaultFormatter": "svelte.svelte-vscode" },
+        "[json][jsonc][yaml][markdown]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+        "files.watcherExclude": { "**/target/**": true, "**/node_modules/**": true },
+        "terminal.integrated.defaultProfile.linux": "zsh"
+      }
+    }
+  }
+}
