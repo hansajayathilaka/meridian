@@ -12,6 +12,11 @@ mrd1:<base32-nopad( multicodec(0xED, ed25519-pub) ‖ pubkey[32] ‖ crc32c[4] )
 ```
 Canonical form: lowercase base32, punycode-normalized hint, no trailing dot. Parsers MUST reject: bad checksum, non-canonical case, hint containing `/` or whitespace. Two IDs are the *same principal* iff key parts match, regardless of hint.
 
+The multicodec prefix is `ed25519-pub` (`0xed`) as an unsigned-varint (`0xED 0x01`); the checksum is
+CRC32C (Castagnoli) big-endian over `multicodec ‖ pubkey`. Full field layout, canonical hint rules
+(ASCII/LDH, homoglyph rejection), and the ordered list of parse rejections are specified in
+**[identity-format.md](./identity-format.md)** — the authority for this section.
+
 ## 2. Client ↔ Rendezvous (WSS)
 
 Auth handshake: server → `challenge{v, nonce[32], server_time}`; client → `auth{v, account_pub, sig = Ed25519(nonce ‖ server_domain)}`. Domain inclusion prevents cross-server challenge replay. Then CBOR frames, each `{op, id, body}` with `id` echoed in replies.

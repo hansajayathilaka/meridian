@@ -8,3 +8,7 @@ publish = false
 # Dev tooling: codegen orchestration (UniFFI/wasm-bindgen), conformance-vector generation,
 # release packaging. Invoked via `cargo run -p xtask -- <cmd>` and the Justfile.
 [dependencies]
+meridian-identity = { path = "../../apps/identity" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }

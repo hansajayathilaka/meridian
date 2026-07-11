@@ -6,6 +6,9 @@ license.workspace = true
 publish = false
 
 # Facade over identity, crypto, trust, session, transport, streams, signaling, store.
-# Public API is canonical in docs/api/core-api-contracts.md.
+# Public API is canonical in docs/api/core-api-contracts.md. Sub-crates land per the roadmap;
+# T01 wires in identity + store.
 [dependencies]
 meridian-proto = { path = "../proto" }
+meridian-identity = { path = "../identity" }
+meridian-store = { path = "../store" }

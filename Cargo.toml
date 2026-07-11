@@ -1,10 +1,12 @@
-# Meridian Cargo workspace — scaffold.
+# Meridian Cargo workspace.
 # Full crate layout & dependency direction: docs/architecture/stack.md
 [workspace]
 resolver = "2"
 members = [
   "apps/core",
   "apps/proto",
+  "apps/identity",
+  "apps/store",
   "apps/cli",
   "apps/rendezvous",
   "tools/xtask",
@@ -15,5 +17,33 @@ edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.77"
 
-# Shared dependency versions are pinned here in the real tree; omitted in the scaffold.
+# Shared dependency versions. Wire-critical crates (ed25519-dalek, data-encoding, crc32c)
+# are pinned here with a written upgrade-review requirement — a bump can change bytes on the
+# wire and MUST pass the T01 conformance vectors (test-vectors/identity-v1.json) before merge.
+# See docs/architecture/stack.md §5 "Version pinning policy".
 [workspace.dependencies]
+# Identity / signatures (wire-critical — see docs/api/identity-format.md).
+ed25519-dalek = { version = "3.0.0", features = ["zeroize"] }
+data-encoding = "2.11.0"
+crc32c = "0.6.8"
+# Key hygiene.
+zeroize = { version = "1.9.0", features = ["zeroize_derive"] }
+getrandom = "0.3"
+# Keystore backends.
+keyring-core = "1.0.0"
+age = "0.11.3"
+# QR (encode + decode round-trip for conformance).
+qrcode = "0.14.1"
+rqrr = "0.10.1"
+image = { version = "0.25.10", default-features = false }
+# Errors / (de)serialization for CLI account descriptors.
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# CLI.
+clap = { version = "4.6.1", features = ["derive"] }
+rpassword = "7.4"
+# Tests.
+proptest = "1.11.0"
+tempfile = "3"
+hex = "0.4"

@@ -5,9 +5,21 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+# Reference terminal client and T01 demo driver. Drives identity through meridian-core.
 [[bin]]
 name = "meridian"
 path = "src/main.rs"
 
 [dependencies]
 meridian-core = { path = "../core" }
+# `keyring` (the all-in-one v1 wrapper) installs a real platform credential store for `--store os`.
+keyring = "4.1.4"
+clap = { workspace = true }
+rpassword = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+age = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
