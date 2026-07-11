@@ -23,6 +23,11 @@ Resolved decisions & readiness: [docs/handoff-readiness.md](./docs/handoff-readi
 
 Scoped memory: [apps/CLAUDE.md](./apps/CLAUDE.md) · [infra/CLAUDE.md](./infra/CLAUDE.md).
 
+## Dev environment
+Use the dev container ([.devcontainer/README.md](./.devcontainer/README.md)) — Reopen in Container and
+everything (Rust, wasm target, Node/pnpm, Tauri deps, chromium+mermaid, Docker-in-Docker) is set up and
+lint-verified.
+
 ## Commands (mirror CI; see [.github/workflows/ci.yml](./.github/workflows/ci.yml))
 ```
 just setup        # install toolchains

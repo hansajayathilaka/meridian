@@ -48,4 +48,4 @@ two-orgs:
 
 # Validate docs: mermaid syntax + relative links.
 check-docs:
-    @echo "TODO: mermaid-cli syntax check + relative-link checker (wire in CI docs job)"
+    bash tools/check-docs.sh

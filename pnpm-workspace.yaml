@@ -1,0 +1,5 @@
+packages:
+  - "apps/web"
+  # future UI packages (see docs/architecture/stack.md):
+  # - "clients/*"
+  # - "shared-ui"

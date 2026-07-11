@@ -21,6 +21,16 @@ Everything starts at **[docs/INDEX.md](./docs/INDEX.md)**, which maps all design
 This repo is Claude-Code-ready. Read [CLAUDE.md](./CLAUDE.md) for the project memory, then use the
 slash commands and subagents under [.claude/](./.claude/). Begin a feature with `/new-task <feature>`.
 
+## Development environment (devcontainer)
+The fastest way in: open the repo in the dev container. It installs Rust + wasm target, Node/pnpm,
+Tauri's Linux build deps, SQLite, chromium + mermaid-cli, and Docker-in-Docker, then verifies the
+workspace and enforcement lints — no manual setup.
+
+1. Install Docker + VS Code's **Dev Containers** extension.
+2. **Reopen in Container**. When setup prints ✅, run `just build` / `just test` / `just check-docs`.
+
+Details and the opt-in heavy toolchains (Android, libwebrtc): [.devcontainer/README.md](./.devcontainer/README.md).
+
 ## Layout
 ```
 CLAUDE.md            root memory       .claude/     commands · agents · skills · settings
