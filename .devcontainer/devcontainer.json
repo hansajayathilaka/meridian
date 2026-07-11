@@ -8,7 +8,7 @@
   // Higher-level toolchains as composable features (Rust is in the base image).
   "features": {
     // Node + npm for the web (SvelteKit) and desktop (Tauri) UIs; pnpm via corepack in post-create.
-    "ghcr.io/devcontainers/features/node:1": { "version": "lts" },
+    "ghcr.io/devcontainers/features/node:2": { "version": "lts" },
     // Docker inside the container so `just two-orgs` and the compose stacks run self-contained.
     "ghcr.io/devcontainers/features/docker-in-docker:2": {},
     // git-lfs for future vendored prebuilt binaries (e.g. libwebrtc, ADR 0014).
