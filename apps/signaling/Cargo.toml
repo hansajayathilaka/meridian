@@ -1,0 +1,28 @@
+[package]
+name = "meridian-signaling"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Client-side signaling module (T02): connect + auth to a rendezvous, publish prekey bundles, and
+# fetch peer bundles WITH mandatory signature verification against the requested key. Part of
+# meridian-core (re-exported); depends on identity/store for keys and proto for wire types.
+# Public API contract: docs/api/core-api-contracts.md ("Sessions & messaging" builds on this).
+[dependencies]
+meridian-proto = { path = "../proto" }
+meridian-identity = { path = "../identity" }
+meridian-store = { path = "../store" }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+x25519-dalek = { workspace = true }
+getrandom = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+futures-util = { workspace = true }
+hex = { workspace = true }

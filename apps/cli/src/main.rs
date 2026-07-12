@@ -13,8 +13,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use meridian_core::identity::{
     self, generate_account, parse_id, pubkey_from_seed, sign, verify, FileSecretStore, KeyHandle,
-    OsSecretStore, PublicKey, SecretStore, Signature,
+    MemorySecretStore, OsSecretStore, PublicKey, SecretStore, Signature,
 };
+use meridian_core::signaling::{SignalError, SignalingClient, DEFAULT_OTK_COUNT};
 
 mod account;
 use account::{AccountDescriptor, StoreKind};
@@ -38,6 +39,27 @@ enum TopCommand {
     Id {
         #[command(subcommand)]
         cmd: IdCommand,
+    },
+    /// Register the current account with a rendezvous server and publish a prekey bundle.
+    Register {
+        /// Rendezvous WebSocket URL (e.g. `ws://127.0.0.1:8443`; `wss://` needs a TLS build/proxy).
+        #[arg(long, default_value = "ws://127.0.0.1:8443")]
+        server: String,
+        /// Admission token for invite-only servers.
+        #[arg(long)]
+        invite: Option<String>,
+    },
+    /// Fetch and verify a peer's prekey bundle by their `mrd1:…@domain` ID.
+    FetchBundle {
+        /// The peer's full ID (exact key — no prefixes).
+        id: String,
+        /// Rendezvous WebSocket URL to ask (your own server).
+        #[arg(long, default_value = "ws://127.0.0.1:8443")]
+        server: String,
+        /// TEST HOOK: ask the server to substitute a key (malicious-server demo); honored only by
+        /// a server started with `allow_test_tamper = true`.
+        #[arg(long)]
+        tamper: bool,
     },
 }
 
@@ -99,6 +121,8 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         TopCommand::Id { cmd } => run_id(cmd),
+        TopCommand::Register { server, invite } => cmd_register(&server, invite),
+        TopCommand::FetchBundle { id, server, tamper } => cmd_fetch_bundle(&id, &server, tamper),
     };
     match result {
         Ok(code) => code,
@@ -238,6 +262,116 @@ fn cmd_import(path: &Path, store: StoreArg, out: PathBuf) -> Result<ExitCode, St
     descriptor.save()?;
     println!("Imported {}", descriptor.id_string()?);
     Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// Rendezvous (T02): register + fetch-bundle
+// ---------------------------------------------------------------------------
+
+fn cmd_register(server: &str, invite: Option<String>) -> Result<ExitCode, String> {
+    let descriptor = AccountDescriptor::load()?;
+    let account_pub = account_pub_bytes(&descriptor)?;
+    let store = load_store(&descriptor)?;
+    let handle = KeyHandle::from_label(&descriptor.label);
+
+    let published = runtime()?.block_on(async {
+        let mut client =
+            SignalingClient::connect(server, store.as_ref(), &handle, account_pub, invite, 1)
+                .await
+                .map_err(|e| e.to_string())?;
+        let generated = client
+            .publish_bundle(store.as_ref(), &handle, DEFAULT_OTK_COUNT)
+            .await
+            .map_err(|e| e.to_string())?;
+        let count = generated.bundle.otk_count();
+        let _ = client.close().await;
+        Ok::<usize, String>(count)
+    })?;
+
+    println!(
+        "registered {} — published bundle with {published} one-time prekeys",
+        descriptor.id_string()?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_fetch_bundle(id: &str, server: &str, tamper: bool) -> Result<ExitCode, String> {
+    let descriptor = AccountDescriptor::load()?;
+    let account_pub = account_pub_bytes(&descriptor)?;
+    let peer = parse_id(id).map_err(|e| e.to_string())?;
+    let target = *peer.pubkey();
+    let store = load_store(&descriptor)?;
+    let handle = KeyHandle::from_label(&descriptor.label);
+
+    let outcome = runtime()?.block_on(async {
+        let mut client =
+            SignalingClient::connect(server, store.as_ref(), &handle, account_pub, None, 1).await?;
+        let bundle = client.fetch_bundle(target, tamper).await;
+        let _ = client.close().await;
+        bundle
+    });
+
+    match outcome {
+        Ok(bundle) => {
+            println!(
+                "bundle OK, signed by {}, {} OTKs",
+                peer.to_id_string(),
+                bundle.otk_count()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        // The security-critical failure: a substituted/mismatched bundle. Fail closed, non-zero.
+        Err(e @ SignalError::BundleVerification(_)) => {
+            eprintln!("FATAL: {e}");
+            Ok(ExitCode::FAILURE)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn account_pub_bytes(descriptor: &AccountDescriptor) -> Result<[u8; 32], String> {
+    let raw = hex::decode(&descriptor.pubkey).map_err(|_| "descriptor pubkey is not valid hex")?;
+    raw.as_slice()
+        .try_into()
+        .map_err(|_| "descriptor pubkey is not 32 bytes".to_string())
+}
+
+/// Open a secret store for signing the auth challenge and the ~100 published prekeys.
+///
+/// For a passphrase keyfile we unlock it **once** into an in-memory store: signing a bundle means
+/// ~100 signatures, and re-running scrypt key-derivation per signature would take minutes. The seed
+/// lives in a zeroizing in-memory store for the duration of this one command — equivalent security
+/// to per-op unlock for a software keyfile, but O(1) scrypt work instead of O(prekeys). Enclave/OS
+/// stores sign per-op (no scrypt) and are used directly.
+fn load_store(descriptor: &AccountDescriptor) -> Result<Box<dyn SecretStore>, String> {
+    match descriptor.store {
+        StoreKind::File => {
+            let keyfile = descriptor
+                .keyfile
+                .as_ref()
+                .ok_or("file-store descriptor is missing its keyfile path")?;
+            let passphrase = read_passphrase(false)?;
+            let fs = FileSecretStore::new(keyfile, passphrase);
+            let seed = fs.export_seed().map_err(|e| e.to_string())?;
+            let mem = MemorySecretStore::new();
+            mem.store(&descriptor.label, seed.as_slice())
+                .map_err(|e| e.to_string())?;
+            Ok(Box::new(mem))
+        }
+        StoreKind::Os => {
+            init_os_keystore()?;
+            Ok(Box::new(OsSecretStore::new(
+                descriptor.service.as_deref().unwrap_or(OS_KEYSTORE_SERVICE),
+            )))
+        }
+    }
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("starting async runtime: {e}"))
 }
 
 // ---------------------------------------------------------------------------

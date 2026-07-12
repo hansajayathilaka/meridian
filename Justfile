@@ -25,7 +25,8 @@ lint-invariants:
 
 # Tests: unit/integration + adversarial harnesses + (later) conformance vectors.
 test: build harnesses
-    @echo "TODO: cargo nextest run --workspace"
+    cargo test --workspace
+    @echo "TODO: migrate to cargo nextest run --workspace"
     @echo "TODO: conformance vectors — docs/testing/strategy.md §1"
 
 # Run the adversarial harnesses (stubs until their features land).

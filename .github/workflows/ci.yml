@@ -38,12 +38,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --workspace
+      - name: Unit + integration tests
+        run: cargo test --workspace
       - name: Adversarial harnesses
         run: |
           bash harnesses/opacity-audit/run.sh
           bash harnesses/mitm-sim/run.sh
           bash harnesses/ghost-device/run.sh
-      # TODO: cargo nextest run --workspace
+      # TODO: migrate to cargo nextest run --workspace
       # TODO: conformance vectors (byte-identical across CLI/WASM/mobile) — docs/testing/strategy.md §1
 
   build:

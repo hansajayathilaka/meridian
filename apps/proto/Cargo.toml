@@ -6,6 +6,12 @@ license.workspace = true
 publish = false
 
 # Shared wire types (envelopes, bundles, ctrl frames). Compiled by BOTH clients and the
-# rendezvous server so they cannot drift. Canonical spec: docs/api/wire-protocol.md
-# Real deps (added when the wire format is implemented): serde, ciborium.
+# rendezvous server so they cannot drift. Canonical spec: docs/api/wire-protocol.md and
+# docs/api/rendezvous-protocol-v1.md. Deterministic CBOR (RFC 8949) via ciborium.
 [dependencies]
+serde = { workspace = true }
+ciborium = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
