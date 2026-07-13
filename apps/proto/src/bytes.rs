@@ -76,8 +76,37 @@ macro_rules! byte_field {
     };
 }
 
+byte_field!(b16, 16);
 byte_field!(b32, 32);
 byte_field!(b64, 64);
+
+/// `#[serde(with = "opt_b32")]`: an `Option<[u8; 32]>` whose `Some` payload is a CBOR byte string.
+pub(crate) mod opt_b32 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<[u8; 32]>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(b) => s.serialize_some(&Wrap32(*b)),
+            None => s.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 32]>, D::Error> {
+        let opt: Option<Wrap32> = Option::deserialize(d)?;
+        Ok(opt.map(|w| w.0))
+    }
+
+    struct Wrap32([u8; 32]);
+    impl serde::Serialize for Wrap32 {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            super::serialize_array::<S, 32>(&self.0, s)
+        }
+    }
+    impl<'de> serde::Deserialize<'de> for Wrap32 {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            Ok(Wrap32(super::deserialize_array::<D, 32>(d)?))
+        }
+    }
+}
 
 /// `#[serde(with = "bytes_vec")]`: a variable-length `Vec<u8>` as a single CBOR byte string
 /// (not an array of integers). Used for nested frame bodies and opaque blobs.

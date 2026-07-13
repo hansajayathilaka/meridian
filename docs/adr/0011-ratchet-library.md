@@ -48,3 +48,47 @@ embeddability matter as much as cryptographic pedigree.
 - `cargo-deny` enforces the license decision in CI (no AGPL deps enter the graph).
 - The PQXDH (`ml-kem`) hybrid slot ([ADR 0003](./0003-e2ee-protocol.md)) is added around this layer,
   not inside vodozemac.
+
+<a id="supersede-2026-07"></a>
+## Superseding note (2026-07, resolved by T03) — ratchet composed in `meridian-crypto`, not vodozemac
+
+**Status:** the ratchet-library *outcome* below supersedes the "vodozemac for the Double Ratchet"
+mechanism of the Decision above. The **rationale that chose vodozemac over libsignal is unchanged**
+(Apache-2.0 vs AGPL, pure-Rust multi-target); only the integration mechanism changed once the
+`ratchet-header-enc` spike was run against real code.
+
+**Finding (spike outcome).** vodozemac 0.10's public API constructs a `Session` **only** through
+Olm's own 3DH handshake over Olm-managed Curve25519 identity + one-time keys
+(`Account::create_{outbound,inbound}_session`). It offers **no** way to seed the Double Ratchet from
+an externally-computed X3DH `root` key, does **not** interoperate with the frozen `v:1` prekey bundle
+(Ed25519 identity + separately-signed X25519 prekeys, conformance-locked in T02), and exposes
+**neither** header encryption **nor** raw message-key access. The ADR's own mitigation ("layer header
+encryption around vodozemac's message keys") is therefore not realizable through its public API, and
+adopting Olm wholesale would require breaking the frozen bundle format and moving identity keys out
+of the `SecretStore`.
+
+**Decision.** Compose the header-encrypted Double Ratchet in `meridian-crypto` from the **same
+audited RustCrypto primitives this ADR already allocates to the X3DH layer** (`x25519-dalek`,
+`hkdf`, `hmac`, `sha2`, `chacha20poly1305`) following the published Signal Double-Ratchet spec. This
+is effectively **Option C for the ratchet specifically**, chosen because Option B's ratchet is not
+reachable for our key/bundle model — not a reversal of the license-driven rejection of libsignal.
+
+**Guardrails (unchanged intent of "never bespoke").** No primitive is hand-rolled — only the
+well-specified protocol glue is assembled, exactly as the ADR already accepted for X3DH. The
+integration carries its own test vectors + FS/PCS/opacity harnesses (T03) and is a named item on the
+**Phase-1 external crypto-review gate** ([testing/strategy.md §7](../testing/strategy.md)). Wire
+details are frozen in [messaging-envelope-v1.md](../api/messaging-envelope-v1.md). `cargo-deny` still
+blocks AGPL; vodozemac remains the intended dependency if/when it exposes a seedable ratchet + header
+encryption, at which point this layer can delegate to it behind the same `meridian-crypto` API.
+
+**Multi-target check (T03, per the feature-spec risk note).** The ratchet/X3DH primitive set
+(`ed25519-dalek`, `x25519-dalek`, `hkdf`, `hmac`, `sha2`, `chacha20poly1305`, `subtle`) compiles
+clean to **aarch64** (full crate) and **wasm32** (isolated primitive probe; wasm needs only the
+standard `getrandom` `js`/`wasm_js` backend — a T11 browser-integration detail, not a ratchet-library
+problem). This is the pure-Rust, toolchain-friendly outcome the ADR chose vodozemac for; the T11 wasm
+build of `meridian-core` will additionally feature-gate `meridian-store`'s native backends (age /
+keyring), which are the remaining non-wasm pieces — tracked with T11, not here.
+
+*Follow-up:* a standalone superseding ADR (0011a) should formalize this with the `architect` subagent
+before Phase-1 GA; this note records the binding decision made at T03 so implementation was not
+blocked.

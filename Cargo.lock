@@ -722,6 +722,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
+ "rand_core 0.6.4",
  "typenum",
 ]
 
@@ -1744,6 +1745,7 @@ version = "0.0.0"
 dependencies = [
  "age",
  "clap",
+ "getrandom 0.3.4",
  "hex",
  "keyring",
  "meridian-core",
@@ -1759,10 +1761,34 @@ dependencies = [
 name = "meridian-core"
 version = "0.0.0"
 dependencies = [
+ "ciborium",
+ "meridian-crypto",
  "meridian-identity",
  "meridian-proto",
  "meridian-signaling",
  "meridian-store",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "meridian-crypto"
+version = "0.0.0"
+dependencies = [
+ "chacha20poly1305",
+ "ciborium",
+ "ed25519-dalek",
+ "getrandom 0.3.4",
+ "hkdf",
+ "hmac",
+ "meridian-identity",
+ "meridian-store",
+ "serde",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 2.0.18",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -1843,8 +1869,10 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.3.4",
  "keyring-core",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
+ "x25519-dalek",
  "zeroize",
 ]
 

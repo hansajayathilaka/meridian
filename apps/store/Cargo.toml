@@ -14,6 +14,11 @@ age = { workspace = true }
 keyring-core = { workspace = true }
 zeroize = { workspace = true }
 ed25519-dalek = { workspace = true }
+# X3DH (T03) needs Diffie–Hellman with the account key. We convert the Ed25519 seed to its
+# birationally-equivalent X25519 secret (libsodium `crypto_sign_ed25519_sk_to_curve25519`) so the
+# DH runs *through the store* and the private key never leaves it (crypto-protocols skill rule 6).
+x25519-dalek = { workspace = true }
+sha2 = { workspace = true }
 getrandom = { workspace = true }
 thiserror = { workspace = true }
 

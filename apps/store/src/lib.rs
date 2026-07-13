@@ -27,14 +27,17 @@ pub const ED25519_SEED_LEN: usize = 32;
 
 /// Which cryptographic operation to perform with a stored key.
 ///
-/// T01 only exercises [`SignOrDh::Sign`] (the account key is Ed25519, used for detached
-/// signatures over IDs and every later envelope). [`SignOrDh::Dh`] is reserved for the X25519
-/// device/prekeys introduced in T02/T13 and currently returns [`StoreError::UnsupportedOp`].
+/// [`SignOrDh::Sign`] produces detached Ed25519 signatures (IDs, prekey bundles, the T03
+/// `Sign_IK{…}` envelope). [`SignOrDh::Dh`] performs an X25519 Diffie–Hellman with the account
+/// key — needed by X3DH's `DH(IK_A, ·)` legs (T03, system-design §4.2). Because the account key is
+/// Ed25519, the store converts its seed to the birationally-equivalent X25519 secret and does the
+/// DH internally, so the private key never leaves the store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignOrDh {
     /// Ed25519 detached signature over `input`; returns 64 signature bytes.
     Sign,
-    /// X25519 Diffie–Hellman against the peer public key in `input`. Not used in T01.
+    /// X25519 Diffie–Hellman: `input` is the 32-byte peer X25519 public key; returns the 32-byte
+    /// shared secret. Uses the account seed's X25519 form (Ed25519→X25519, libsodium-compatible).
     Dh,
 }
 
@@ -96,13 +99,48 @@ pub(crate) fn ed25519_sign(seed: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
     Ok(sig.to_bytes().to_vec())
 }
 
-/// Dispatch a [`SignOrDh`] op against raw seed bytes. Central so every store applies the same
-/// rules (in particular, that `Dh` is unsupported in T01).
+/// X25519 Diffie–Hellman with the account key: convert the Ed25519 `seed` to its equivalent
+/// X25519 secret and DH against the 32-byte peer public key in `peer_pub`.
+///
+/// The conversion is libsodium's `crypto_sign_ed25519_sk_to_curve25519`: the X25519 scalar is the
+/// clamped low half of `SHA-512(seed)`. The matching public key is the Montgomery form of the
+/// Ed25519 public key (peers derive it with `VerifyingKey::to_montgomery` — see
+/// `meridian-crypto`), so `DH(a, B) == DH(b, A)` holds and X3DH interoperates.
+pub(crate) fn ed25519_seed_to_x25519_dh(seed: &[u8], peer_pub: &[u8]) -> Result<Vec<u8>> {
+    use sha2::{Digest, Sha512};
+    use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
+
+    let seed: [u8; ED25519_SEED_LEN] =
+        seed.try_into().map_err(|_| StoreError::BadSecretLength {
+            expected: ED25519_SEED_LEN,
+            got: seed.len(),
+        })?;
+    let peer: [u8; 32] = peer_pub
+        .try_into()
+        .map_err(|_| StoreError::BadSecretLength {
+            expected: 32,
+            got: peer_pub.len(),
+        })?;
+
+    // X25519 secret scalar = clamp(SHA-512(seed)[..32]). x25519-dalek re-clamps at DH time (clamp
+    // is idempotent), so the explicit clamp here only documents the libsodium construction.
+    let hash = Sha512::digest(seed);
+    let mut scalar = Zeroizing::new([0u8; 32]);
+    scalar.copy_from_slice(&hash[..32]);
+    scalar[0] &= 248;
+    scalar[31] &= 127;
+    scalar[31] |= 64;
+
+    let secret = StaticSecret::from(*scalar);
+    let shared = secret.diffie_hellman(&XPublicKey::from(peer));
+    Ok(shared.to_bytes().to_vec())
+}
+
+/// Dispatch a [`SignOrDh`] op against raw seed bytes. Central so every software store applies the
+/// same rules and conversions.
 pub(crate) fn perform_op(seed: &[u8], op: SignOrDh, input: &[u8]) -> Result<Vec<u8>> {
     match op {
         SignOrDh::Sign => ed25519_sign(seed, input),
-        SignOrDh::Dh => Err(StoreError::UnsupportedOp(
-            "X25519 DH is introduced with prekeys in T02/T13, not the T01 account key",
-        )),
+        SignOrDh::Dh => ed25519_seed_to_x25519_dh(seed, input),
     }
 }
