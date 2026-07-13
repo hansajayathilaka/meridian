@@ -158,6 +158,23 @@ async fn fetch_with_retry(
     Err(format!("{peer_label} did not publish a bundle in time"))
 }
 
+/// Route a blob, treating a `not_connected` server reply as "not delivered" rather than a fatal
+/// error: a momentarily-offline peer must not tear down the chat session (offline delivery is the
+/// T07 mailbox). Other transport/server errors still propagate.
+async fn route_tolerant(
+    client: &mut SignalingClient,
+    to: [u8; 32],
+    blob: Vec<u8>,
+) -> Result<bool, String> {
+    use meridian_core::proto::error_codes::NOT_CONNECTED;
+    use meridian_core::signaling::SignalError;
+    match client.route(to, blob).await {
+        Ok(delivered) => Ok(delivered),
+        Err(SignalError::Server(e)) if e.code == NOT_CONNECTED => Ok(false),
+        Err(e) => Err(format!("routing message: {e}")),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_text(
     client: &mut SignalingClient,
@@ -183,10 +200,7 @@ async fn send_text(
             },
         )
         .map_err(|e| format!("sealing message: {e}"))?;
-    let delivered = client
-        .route(*peer_ik, blob)
-        .await
-        .map_err(|e| format!("routing message: {e}"))?;
+    let delivered = route_tolerant(client, *peer_ik, blob).await?;
     if json {
         println!(
             "{{\"event\":\"sent\",\"id\":\"{}\",\"delivered\":{}}}",
@@ -253,10 +267,7 @@ async fn handle_inbound(
                     &ChatContent::Receipt { ack: id },
                 )
                 .map_err(|e| format!("sealing receipt: {e}"))?;
-            let _ = client
-                .route(deliver.from, receipt)
-                .await
-                .map_err(|e| format!("routing receipt: {e}"))?;
+            let _ = route_tolerant(client, deliver.from, receipt).await?;
 
             // Session is now live for a former non-initiator — flush anything they typed early.
             let queued = std::mem::take(pending);

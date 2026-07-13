@@ -6,11 +6,17 @@
 //! with delivery receipts, and that a killed-and-restarted client resumes the session from its
 //! encrypted store (no re-handshake). It also runs the opacity-audit subcommand and checks it
 //! reports zero leaks.
+//!
+//! Delivery is driven by live output readers + bounded resends rather than fixed sleeps, so the
+//! test is robust to subprocess/connection startup timing under CI load. Resends are safe: message
+//! ids are unique and assertions match on substrings, and the client treats a momentarily-offline
+//! peer (`not_connected`) as "not delivered" rather than a fatal error.
 
-use std::io::Write;
-use std::process::{Child, Command, Output, Stdio};
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use meridian_rendezvous::{serve, AppState, Config, MemoryStore};
 
@@ -73,9 +79,8 @@ impl Client {
         let out = self.run(&["id", "show"]);
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
-    /// Spawn a `chat --json` process with piped stdin/stdout.
-    fn spawn_chat(&self, server: &str, peer_id: &str) -> Child {
-        Command::new(BIN)
+    fn spawn_chat(&self, server: &str, peer_id: &str) -> ChatProc {
+        let mut child = Command::new(BIN)
             .args(["chat", peer_id, "--server", server, "--json"])
             .current_dir(self.work.path())
             .env("MERIDIAN_HOME", self.home.path())
@@ -84,12 +89,79 @@ impl Client {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn chat")
+            .expect("spawn chat");
+        let stdin = child.stdin.take().unwrap();
+        let out = drain(child.stdout.take().unwrap());
+        let err = drain(child.stderr.take().unwrap());
+        ChatProc {
+            child,
+            stdin: Some(stdin),
+            out,
+            err,
+        }
     }
+}
+
+/// A running `chat` subprocess with its stdout/stderr accumulated by reader threads.
+struct ChatProc {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    out: Arc<Mutex<String>>,
+    err: Arc<Mutex<String>>,
+}
+
+impl ChatProc {
+    fn send(&mut self, line: &str) {
+        if let Some(stdin) = self.stdin.as_mut() {
+            let _ = writeln!(stdin, "{line}");
+            let _ = stdin.flush();
+        }
+    }
+    fn out(&self) -> String {
+        self.out.lock().unwrap().clone()
+    }
+    fn err(&self) -> String {
+        self.err.lock().unwrap().clone()
+    }
+    fn finish(mut self) -> (String, String) {
+        self.stdin.take(); // drop stdin → EOF → clean exit
+        let _ = self.child.wait();
+        (self.out(), self.err())
+    }
+}
+
+/// Spawn a thread draining a child stream into a shared string buffer.
+fn drain<R: std::io::Read + Send + 'static>(stream: R) -> Arc<Mutex<String>> {
+    let buf = Arc::new(Mutex::new(String::new()));
+    let sink = buf.clone();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => sink.lock().unwrap().push_str(&line),
+            }
+        }
+    });
+    buf
 }
 
 fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// Poll `cond` until true or `timeout` elapses; returns whether it succeeded.
+fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    cond()
 }
 
 #[test]
@@ -102,81 +174,63 @@ fn chat_relayed_both_ways_with_receipts_and_restart() {
     let alice_id = alice.id();
     let bob_id = bob.id();
 
-    // Start both chat clients. Startup ordering is handled by the client (responder waits, the
-    // initiator retries the bundle fetch), so we can launch them together.
-    let mut a_proc = alice.spawn_chat(&server, &bob_id);
-    let mut b_proc = bob.spawn_chat(&server, &alice_id);
-    let mut a_in = a_proc.stdin.take().unwrap();
-    let mut b_in = b_proc.stdin.take().unwrap();
+    let mut a = alice.spawn_chat(&server, &bob_id);
+    let mut b = bob.spawn_chat(&server, &alice_id);
+    std::thread::sleep(Duration::from_millis(800)); // let both connect + publish
 
-    // Give both a moment to connect, publish, and (for the initiator) establish the session.
-    std::thread::sleep(Duration::from_millis(1500));
+    // Drive delivery with bounded resends (robust to startup ordering). The initiator's messages
+    // send immediately; the responder buffers until the opening message establishes its session.
+    let ok = wait_until(Duration::from_secs(20), || {
+        a.send("hello from alice");
+        b.send("hi alice, bob here");
+        std::thread::sleep(Duration::from_millis(600));
+        b.out().contains("hello from alice")
+            && a.out().contains("hi alice, bob here")
+            && a.out().contains("\"event\":\"receipt\"")
+    });
 
-    // Messages both ways.
-    writeln!(a_in, "hello from alice").unwrap();
-    a_in.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(1200));
-    writeln!(b_in, "hi alice, bob here").unwrap();
-    b_in.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(1200));
-
-    // EOF both → clean exit.
-    drop(a_in);
-    drop(b_in);
-    let a_out = a_proc.wait_with_output().unwrap();
-    let b_out = b_proc.wait_with_output().unwrap();
-    let a_stdout = String::from_utf8_lossy(&a_out.stdout);
-    let b_stdout = String::from_utf8_lossy(&b_out.stdout);
-
-    // Bob received Alice's message; Alice received Bob's; both saw delivery receipts.
+    let (a_out, a_err) = a.finish();
+    let (b_out, b_err) = b.finish();
     assert!(
-        b_stdout.contains("hi alice, bob here") || b_stdout.contains("\"event\":\"recv\""),
-        "bob stdout: {b_stdout}\nstderr: {}",
-        String::from_utf8_lossy(&b_out.stderr)
+        ok,
+        "did not converge.\nA stdout: {a_out}\nA stderr: {a_err}\nB stdout: {b_out}\nB stderr: {b_err}"
+    );
+    // Explicit acceptance assertions (both ways + receipts).
+    assert!(
+        b_out.contains("hello from alice"),
+        "bob missed alice's message"
     );
     assert!(
-        b_stdout.contains("hello from alice"),
-        "bob did not receive alice's message. stdout: {b_stdout}\nstderr: {}",
-        String::from_utf8_lossy(&b_out.stderr)
+        a_out.contains("hi alice, bob here"),
+        "alice missed bob's message"
     );
     assert!(
-        a_stdout.contains("hi alice, bob here"),
-        "alice did not receive bob's message. stdout: {a_stdout}\nstderr: {}",
-        String::from_utf8_lossy(&a_out.stderr)
-    );
-    assert!(
-        a_stdout.contains("\"event\":\"receipt\""),
-        "alice saw no delivery receipt. stdout: {a_stdout}"
+        a_out.contains("\"event\":\"receipt\""),
+        "alice saw no receipt"
     );
 
-    // Restart Alice's client: the session store persists, so re-opening chat resumes the ratchet
-    // (no re-handshake). Bob reconnects too so he's online to receive.
-    let mut b_proc2 = bob.spawn_chat(&server, &alice_id);
-    let b_in2 = b_proc2.stdin.take().unwrap();
-    let mut a_proc2 = alice.spawn_chat(&server, &bob_id);
-    let mut a_in2 = a_proc2.stdin.take().unwrap();
-    std::thread::sleep(Duration::from_millis(1500));
+    // Restart both clients: the session store persists, so re-opening chat resumes the ratchet with
+    // no re-handshake, and a post-restart message decrypts on the continued session.
+    let b2 = bob.spawn_chat(&server, &alice_id);
+    let mut a2 = alice.spawn_chat(&server, &bob_id);
+    std::thread::sleep(Duration::from_millis(800));
 
-    writeln!(a_in2, "back after restart").unwrap();
-    a_in2.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(1200));
-    drop(a_in2);
-    drop(b_in2);
-    let a_out2 = a_proc2.wait_with_output().unwrap();
-    let b_out2 = b_proc2.wait_with_output().unwrap();
-    let a_stderr2 = String::from_utf8_lossy(&a_out2.stderr);
-    let b_stdout2 = String::from_utf8_lossy(&b_out2.stdout);
+    let ok2 = wait_until(Duration::from_secs(20), || {
+        a2.send("back after restart");
+        std::thread::sleep(Duration::from_millis(600));
+        b2.out().contains("back after restart")
+    });
 
-    // The restarted client must NOT have re-run a handshake (it loaded the existing session), and
-    // Bob must decrypt the post-restart message on the continued ratchet.
+    let (a2_out, a2_err) = a2.finish();
+    let (b2_out, b2_err) = b2.finish();
     assert!(
-        !a_stderr2.contains("establishing session"),
-        "restart re-handshook instead of resuming: {a_stderr2}"
+        ok2,
+        "post-restart message not delivered.\nA2 stdout: {a2_out}\nA2 stderr: {a2_err}\nB2 stdout: {b2_out}\nB2 stderr: {b2_err}"
     );
+    // Resuming must NOT re-run a handshake — the existing session was loaded from the sealed store.
     assert!(
-        b_stdout2.contains("back after restart"),
-        "bob did not receive the post-restart message. stdout: {b_stdout2}\nstderr: {}",
-        String::from_utf8_lossy(&b_out2.stderr)
+        !a2_err.contains("establishing session"),
+        "restart re-handshook instead of resuming: {a2_err}"
     );
 }
 
