@@ -14,10 +14,14 @@
 mod bytes;
 
 pub mod bundle;
+pub mod chat;
+pub mod envelope;
 pub mod frame;
 pub mod msg;
 
 pub use bundle::{PrekeyBundle, BUNDLE_VERSION, MAX_ONE_TIME_PREKEYS};
+pub use chat::{ChatContent, MessageId};
+pub use envelope::{MessageEnvelope, Prekey, ENVELOPE_DOMAIN};
 pub use frame::{decode, encode, CodecError, Frame, Op};
 pub use msg::{
     error_codes, Auth, AuthOk, Bundle, Challenge, Deliver, ErrBody, Fetch, Publish, PublishOk,
@@ -83,16 +87,6 @@ impl<'de> Deserialize<'de> for OpaqueBlob {
         }
         d.deserialize_byte_buf(V)
     }
-}
-
-/// Placeholder envelope shape. The real definition (signed, header-encrypted) lands with
-/// feature 03; `payload` stays [`OpaqueBlob`] forever.
-#[derive(Clone, Debug)]
-pub struct Envelope {
-    pub eid: [u8; 16],
-    pub sender_pub: [u8; 32],
-    pub payload: OpaqueBlob,
-    pub sig: [u8; 64],
 }
 
 /// Wire-protocol major version (wire-protocol.md).

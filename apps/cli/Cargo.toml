@@ -20,7 +20,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 age = { workspace = true }
 hex = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+getrandom = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

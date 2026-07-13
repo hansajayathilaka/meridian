@@ -20,6 +20,13 @@ pub use meridian_signaling as signaling;
 /// Shared wire types (frames, bundles, opaque envelopes) — surfaced for shims that build frames.
 pub use meridian_proto as proto;
 
+/// E2EE session layer: X3DH, header-encrypted Double Ratchet, safety numbers (T03).
+pub use meridian_crypto as crypto;
+
+/// Chat session manager — signs/verifies + seals/opens `mrd.chat/1` envelopes and owns the
+/// persistable session store. Transport-agnostic (relay today, P2P/mailbox later).
+pub mod chat;
+
 /// Crate version — kept for build-info/diagnostics.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

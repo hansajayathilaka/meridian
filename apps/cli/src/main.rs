@@ -18,6 +18,8 @@ use meridian_core::identity::{
 use meridian_core::signaling::{SignalError, SignalingClient, DEFAULT_OTK_COUNT};
 
 mod account;
+mod chat;
+mod opacity;
 use account::{AccountDescriptor, StoreKind};
 
 const OS_KEYSTORE_SERVICE: &str = "meridian";
@@ -60,6 +62,35 @@ enum TopCommand {
         /// a server started with `allow_test_tamper = true`.
         #[arg(long)]
         tamper: bool,
+    },
+    /// Open an end-to-end-encrypted chat with a peer, relayed through the rendezvous (T03).
+    Chat {
+        /// The peer's full `mrd1:…@domain` ID.
+        id: String,
+        /// Rendezvous WebSocket URL.
+        #[arg(long, default_value = "ws://127.0.0.1:8443")]
+        server: String,
+        /// Headless line mode: emit/consume one JSON object per line instead of a TUI.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Demos and audits (T03: opacity audit).
+    Demo {
+        #[command(subcommand)]
+        cmd: DemoCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DemoCommand {
+    /// Run the opacity audit: scripted E2EE conversation, assert the server sees only opaque blobs.
+    OpacityAudit {
+        /// Where to write the captured "pcapish" transcript of routed bytes.
+        #[arg(default_value = "transcript.pcapish")]
+        out: PathBuf,
+        /// Number of ping-pong rounds to script.
+        #[arg(long, default_value_t = 100)]
+        rounds: usize,
     },
 }
 
@@ -123,6 +154,8 @@ fn main() -> ExitCode {
         TopCommand::Id { cmd } => run_id(cmd),
         TopCommand::Register { server, invite } => cmd_register(&server, invite),
         TopCommand::FetchBundle { id, server, tamper } => cmd_fetch_bundle(&id, &server, tamper),
+        TopCommand::Chat { id, server, json } => cmd_chat(&id, &server, json),
+        TopCommand::Demo { cmd } => run_demo(cmd),
     };
     match result {
         Ok(code) => code,
@@ -326,6 +359,50 @@ fn cmd_fetch_bundle(id: &str, server: &str, tamper: bool) -> Result<ExitCode, St
             Ok(ExitCode::FAILURE)
         }
         Err(e) => Err(e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chat (T03) + demos
+// ---------------------------------------------------------------------------
+
+fn cmd_chat(id: &str, server: &str, json: bool) -> Result<ExitCode, String> {
+    let descriptor = AccountDescriptor::load()?;
+    let account_pub = account_pub_bytes(&descriptor)?;
+    let peer = parse_id(id).map_err(|e| e.to_string())?;
+    let peer_ik = *peer.pubkey();
+    let store = load_store(&descriptor)?;
+    let handle = KeyHandle::from_label(&descriptor.label);
+
+    runtime()?.block_on(chat::run(chat::ChatArgs {
+        server: server.to_string(),
+        store: store.as_ref(),
+        handle: &handle,
+        account_pub,
+        peer_ik,
+        peer_label: peer.to_id_string(),
+        json,
+    }))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_demo(cmd: DemoCommand) -> Result<ExitCode, String> {
+    match cmd {
+        DemoCommand::OpacityAudit { out, rounds } => {
+            let report = opacity::run_audit(rounds)?;
+            std::fs::write(&out, &report.transcript)
+                .map_err(|e| format!("writing {}: {e}", out.display()))?;
+            println!(
+                "→ {} plaintext leaks; {} envelopes; sizes only observable field",
+                report.leaks, report.envelopes
+            );
+            println!(
+                "  transcript ({} bytes) written to {}",
+                report.transcript.len(),
+                out.display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 

@@ -97,3 +97,54 @@ fn bundle_structural_validation() {
     b.otk_sigs.pop(); // mismatched counts
     assert!(!b.structurally_valid());
 }
+
+#[test]
+fn chat_content_roundtrips() {
+    use meridian_proto::ChatContent;
+    let text = ChatContent::Text {
+        id: [7u8; 16],
+        body: "hello, world".into(),
+    };
+    assert_eq!(ChatContent::decode(&text.encode().unwrap()).unwrap(), text);
+
+    let receipt = ChatContent::Receipt { ack: [7u8; 16] };
+    assert_eq!(
+        ChatContent::decode(&receipt.encode().unwrap()).unwrap(),
+        receipt
+    );
+}
+
+#[test]
+fn message_envelope_roundtrips_and_binds_signing_input() {
+    use meridian_proto::{MessageEnvelope, Prekey};
+    let prekey = Prekey {
+        ek_pub: [1u8; 32],
+        used_spk: [2u8; 32],
+        used_opk: Some([3u8; 32]),
+    };
+    let env = MessageEnvelope {
+        sender_pub: [9u8; 32],
+        prekey: Some(prekey),
+        ct: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        sig: [0u8; 64],
+    };
+    // Wraps and unwraps through the opaque-blob byte form unchanged.
+    let decoded = MessageEnvelope::from_blob(&env.to_blob().unwrap()).unwrap();
+    assert_eq!(decoded, env);
+
+    // The signing input binds sender/prekey/ct: mutating the ciphertext changes it.
+    let base = env.signing_bytes();
+    let mut tampered = env.clone();
+    tampered.ct = vec![0x00];
+    assert_ne!(base, tampered.signing_bytes());
+
+    // An envelope with no prekey (steady-state message) also round-trips.
+    let steady = MessageEnvelope {
+        prekey: None,
+        ..env
+    };
+    assert_eq!(
+        MessageEnvelope::from_blob(&steady.to_blob().unwrap()).unwrap(),
+        steady
+    );
+}

@@ -12,6 +12,9 @@ anywhere in the repo disagrees with these files, **these files win** and the oth
   verification), opaque routing, config, and metrics (T02).
 - [Core API contracts](./core-api-contracts.md) — the stable Rust traits (`Transport`,
   `SecretStore`, `StreamType`) and public `meridian-core` surface consumed by every client shim.
+- [Messaging envelope (v1)](./messaging-envelope-v1.md) — the E2EE 1:1 messaging spec: X3DH, the
+  header-encrypted Double Ratchet, the signed `Sign_IK{ratchet_ct}` envelope, `mrd.chat/1`, the
+  at-rest session store, and the safety-number computation (T03).
 
 Related: [system design](../architecture/system-design.md) ·
 [data model](../architecture/data-model.md) ·

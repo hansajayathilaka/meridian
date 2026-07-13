@@ -103,8 +103,30 @@ fn wrong_passphrase_fails_closed() {
 }
 
 #[test]
-fn dh_op_unsupported_in_t01() {
+fn account_key_dh_interoperates() {
+    // The account-key X25519 DH (T03) must satisfy DH(a, mont(B)) == DH(b, mont(A)), where a/b are
+    // Ed25519 account seeds and mont(·) is the peer's Montgomery public key. This is what makes
+    // X3DH's DH(IK, ·) legs agree across the two endpoints.
+    use ed25519_dalek::SigningKey;
+
+    let seed_a = [7u8; 32];
+    let seed_b = [9u8; 32];
+    let mont = |seed: &[u8; 32]| {
+        SigningKey::from_bytes(seed)
+            .verifying_key()
+            .to_montgomery()
+            .to_bytes()
+    };
+
     let store = meridian_store::MemorySecretStore::new();
-    let handle = store.store("k", &SEED).unwrap();
-    assert!(store.use_key(&handle, SignOrDh::Dh, b"x").is_err());
+    let ha = store.store("a", &seed_a).unwrap();
+    let hb = store.store("b", &seed_b).unwrap();
+
+    let ab = store.use_key(&ha, SignOrDh::Dh, &mont(&seed_b)).unwrap();
+    let ba = store.use_key(&hb, SignOrDh::Dh, &mont(&seed_a)).unwrap();
+    assert_eq!(ab, ba, "account-key DH must be symmetric across endpoints");
+    assert_eq!(ab.len(), 32);
+
+    // A wrong-length peer key is rejected, not silently truncated.
+    assert!(store.use_key(&ha, SignOrDh::Dh, b"short").is_err());
 }

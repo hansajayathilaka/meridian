@@ -176,6 +176,12 @@ fn descriptor_path() -> Result<PathBuf, String> {
     Ok(config_dir()?.join("account.json"))
 }
 
+/// The sealed chat-session store path (ratchet state + prekey vault), next to the account
+/// descriptor. Contents are E2EE-sealed under a keystore-derived key (never plaintext).
+pub fn sessions_path() -> Result<PathBuf, String> {
+    Ok(config_dir()?.join("sessions.bin"))
+}
+
 fn absolutize(p: &Path) -> PathBuf {
     if p.is_absolute() {
         p.to_path_buf()
