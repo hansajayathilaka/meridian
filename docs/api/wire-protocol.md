@@ -19,7 +19,7 @@ CRC32C (Castagnoli) big-endian over `multicodec ‖ pubkey`. Full field layout, 
 
 ## 2. Client ↔ Rendezvous (WSS)
 
-Auth handshake: server → `challenge{v, nonce[32], server_time}`; client → `auth{v, account_pub, sig = Ed25519(nonce ‖ server_domain)}`. Domain inclusion prevents cross-server challenge replay. Then CBOR frames, each `{op, id, body}` with `id` echoed in replies.
+Auth handshake: server → `challenge{v, nonce[32], server_time}`; client → `auth{v, account_pub, sig = Ed25519(nonce ‖ server_domain)}`. Domain inclusion prevents cross-server challenge replay. Then CBOR frames, each `{op, id, body}` with `id` echoed in replies. The concrete T02 framing, error codes, config, and metrics are specified in **[rendezvous-protocol-v1.md](./rendezvous-protocol-v1.md)** — the authority for this section.
 
 | op | body | notes |
 |---|---|---|

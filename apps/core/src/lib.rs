@@ -13,6 +13,13 @@ pub use meridian_identity as identity;
 /// Secret storage: the `SecretStore` trait and its OS/file/memory impls (T01).
 pub use meridian_store as store;
 
+/// Client-side signaling: connect/auth to a rendezvous, publish/fetch prekey bundles (with
+/// mandatory verification), and route opaque envelopes (T02).
+pub use meridian_signaling as signaling;
+
+/// Shared wire types (frames, bundles, opaque envelopes) — surfaced for shims that build frames.
+pub use meridian_proto as proto;
+
 /// Crate version — kept for build-info/diagnostics.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

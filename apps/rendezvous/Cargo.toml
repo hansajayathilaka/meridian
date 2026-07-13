@@ -5,11 +5,49 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# NOTE: the server must NOT depend on meridian-core (only meridian-proto in the
-# real tree). See docs/adr/0008-infra-topology.md and apps/CLAUDE.md.
+# The always-on signaling server (T02): axum + tokio WSS, challenge-response auth, prekey bundle
+# store/fetch, opaque envelope routing, rate limits, prekey-pool metric.
+#
+# INVARIANT: the server must NOT depend on meridian-core, -identity, or -store — only on
+# meridian-proto (shared wire types) plus crypto primitives it needs to VERIFY client auth
+# signatures (ed25519-dalek). It holds no session/ratchet code and no plaintext content.
+# See docs/adr/0008-infra-topology.md, apps/CLAUDE.md, tools/lint-server-no-core.sh.
+
+[lib]
+name = "meridian_rendezvous"
+path = "src/lib.rs"
+
 [[bin]]
 name = "meridian-rendezvous"
 path = "src/main.rs"
 
+[features]
+default = []
+# Real SQLite persistence via sqlx (stack.md §3). Off by default so the MVP/tests build light and
+# run against the in-memory store; production enables it. Postgres is a later flag.
+sqlite = ["dep:sqlx"]
+
 [dependencies]
 meridian-proto = { path = "../proto" }
+# Ed25519 verification of client auth challenges (a primitive — NOT meridian-core).
+ed25519-dalek = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+getrandom = { workspace = true }
+clap = { workspace = true }
+
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"], optional = true }
+
+[dev-dependencies]
+meridian-signaling = { path = "../signaling" }
+meridian-identity = { path = "../identity" }
+meridian-store = { path = "../store" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }

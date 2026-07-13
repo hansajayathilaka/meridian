@@ -20,6 +20,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 age = { workspace = true }
 hex = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Drive the real server in-process for the register/fetch-bundle demo (T02).
+meridian-rendezvous = { path = "../rendezvous" }
+tokio = { workspace = true, features = ["rt", "macros", "net", "sync", "time", "io-util"] }

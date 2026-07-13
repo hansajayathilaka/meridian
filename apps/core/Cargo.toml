@@ -12,3 +12,4 @@ publish = false
 meridian-proto = { path = "../proto" }
 meridian-identity = { path = "../identity" }
 meridian-store = { path = "../store" }
+meridian-signaling = { path = "../signaling" }

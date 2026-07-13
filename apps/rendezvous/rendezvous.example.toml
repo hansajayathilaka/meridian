@@ -1,0 +1,15 @@
+# meridian-rendezvous example config (the §9.2 surface subset for T02).
+# Full reference: docs/api/rendezvous-protocol-v1.md §5.
+
+[server]
+domain = "chat.example"          # this server's hint-domain; folded into the auth challenge
+bind = "0.0.0.0:8443"            # WebSocket bind; TLS is terminated by the proxy/VIP (ADR-8)
+admission = "open"               # open | invite
+invite_tokens = []               # tokens accepted when admission = "invite"
+allow_test_tamper = false        # TEST HOOK — MUST be false in production
+database_url = "sqlite://rendezvous.db"   # only used when built with --features sqlite
+
+[limits]                         # anti-abuse, fixed one-minute windows
+auth_per_ip_per_min = 60
+fetch_per_account_per_min = 120
+route_per_account_per_min = 600

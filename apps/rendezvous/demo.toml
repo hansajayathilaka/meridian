@@ -1,0 +1,9 @@
+# Demo config for the T02 working-output script
+# (docs/architecture/features/02-rendezvous-mvp.md). Open admission, tamper hook ON so
+# `meridian fetch-bundle --tamper` can demonstrate the malicious-server abort. NOT for production.
+
+[server]
+domain = "localhost"
+bind = "0.0.0.0:8443"
+admission = "open"
+allow_test_tamper = true
