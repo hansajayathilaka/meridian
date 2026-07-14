@@ -203,6 +203,42 @@ pub fn run_audit(rounds: usize) -> Result<AuditReport, String> {
         alice.open(&bob_ik, &blob);
     }
 
+    // --- T04 extension: zero SDP bytes visible ------------------------------------------------
+    // The P2P substrate carries SDP offers/answers, the DTLS fingerprint, and ICE candidates inside
+    // the SAME ratchet-encrypted, signed envelopes as chat (SignalContent). A server routing these
+    // blobs must see none of it. We seal one offer + one answer with unmistakable marker strings and
+    // add those markers to the secret set the leak scan below rejects.
+    use meridian_core::proto::SignalContent;
+    let sdp_marker = b"SDP-OFFER-SECRET v=0 a=fingerprint host-candidate".to_vec();
+    let fp_marker = b"sha-256 SECRET-FINGERPRINT-DO-NOT-LEAK".to_vec();
+    let cand_marker = b"candidate:SECRET-ICE-CANDIDATE 203.0.113.7".to_vec();
+    secrets.push(sdp_marker.clone());
+    secrets.push(fp_marker.clone());
+    secrets.push(cand_marker.clone());
+    let offer = SignalContent::SdpOffer {
+        sdp: sdp_marker.clone(),
+        dtls_fp: String::from_utf8(fp_marker.clone()).unwrap(),
+        ice: vec![String::from_utf8(cand_marker.clone()).unwrap()],
+    };
+    let offer_blob = alice
+        .state
+        .seal_bytes(
+            &alice.store,
+            &alice.handle(),
+            &alice_ik,
+            &bob_ik,
+            &offer.encode().unwrap(),
+        )
+        .expect("seal offer");
+    push(&mut transcript, &mut frames, &bob_ik, &offer_blob);
+    // Bob opens it (establishing the substrate signaling path) to prove it's a real, decryptable
+    // envelope — not merely padding — while the server still saw only ciphertext.
+    let opened = bob
+        .state
+        .open_bytes(&bob.store, &bob.handle(), &bob_ik, &alice_ik, &offer_blob)
+        .expect("open offer");
+    assert_eq!(SignalContent::decode(&opened).unwrap(), offer);
+
     // --- (a) no plaintext anywhere in the server-visible bytes -------------------------------
     let mut leaks = 0;
     for secret in &secrets {

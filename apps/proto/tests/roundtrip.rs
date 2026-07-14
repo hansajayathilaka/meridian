@@ -148,3 +148,84 @@ fn message_envelope_roundtrips_and_binds_signing_input() {
         steady
     );
 }
+
+#[test]
+fn ctrl_frames_roundtrip() {
+    use meridian_proto::ctrl::{ChanCfgWire, Direction, Limits, StreamAdvert};
+    use meridian_proto::{CtrlFrame, CTRL_VERSION};
+
+    let hello = CtrlFrame::Hello {
+        v: CTRL_VERSION,
+        streams: vec![
+            StreamAdvert {
+                name: "mrd.ctrl/1".into(),
+                ver: 1,
+                dir: Direction::Bidir,
+                mandatory: true,
+            },
+            StreamAdvert {
+                name: "mrd.chat/1".into(),
+                ver: 1,
+                dir: Direction::Bidir,
+                mandatory: true,
+            },
+        ],
+        transports: vec!["webrtc".into()],
+        limits: Limits { max_frame: 65536 },
+    };
+    for frame in [
+        hello,
+        CtrlFrame::Open {
+            sid: 7,
+            ty: "mrd.chat/1".into(),
+            params: vec![1, 2, 3],
+            chan: ChanCfgWire {
+                reliable: true,
+                ordered: true,
+                max_rtx: None,
+                rtp: false,
+            },
+        },
+        CtrlFrame::Accept { sid: 7 },
+        CtrlFrame::Reject {
+            sid: 9,
+            code: "unsupported".into(),
+            reason: "unknown type".into(),
+        },
+        CtrlFrame::Close {
+            sid: 7,
+            status: "done".into(),
+        },
+        CtrlFrame::Keepalive { t: 42 },
+    ] {
+        let bytes = frame.encode().unwrap();
+        assert_eq!(CtrlFrame::decode(&bytes).unwrap(), frame);
+    }
+}
+
+#[test]
+fn signal_content_roundtrips() {
+    use meridian_proto::SignalContent;
+
+    for content in [
+        SignalContent::SdpOffer {
+            sdp: b"v=loopback\ntoken=1\n".to_vec(),
+            dtls_fp: "sha-256 AB:CD".into(),
+            ice: vec!["candidate:host 1".into()],
+        },
+        SignalContent::SdpAnswer {
+            sdp: b"v=loopback\ntoken=2\n".to_vec(),
+            dtls_fp: "sha-256 EF:01".into(),
+            ice: vec![],
+        },
+        SignalContent::IceTrickle {
+            candidates: vec!["candidate:srflx 2".into()],
+        },
+        SignalContent::Ctrl {
+            frame: vec![9, 9, 9],
+        },
+    ] {
+        let bytes = content.encode().unwrap();
+        assert_eq!(SignalContent::decode(&bytes).unwrap(), content);
+    }
+}

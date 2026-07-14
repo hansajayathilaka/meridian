@@ -8,6 +8,7 @@ members = [
   "apps/identity",
   "apps/store",
   "apps/crypto",
+  "apps/transport",
   "apps/signaling",
   "apps/cli",
   "apps/rendezvous",

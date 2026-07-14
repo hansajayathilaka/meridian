@@ -1761,14 +1761,18 @@ dependencies = [
 name = "meridian-core"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "ciborium",
+ "getrandom 0.3.4",
  "meridian-crypto",
  "meridian-identity",
  "meridian-proto",
  "meridian-signaling",
  "meridian-store",
+ "meridian-transport",
  "serde",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -1874,6 +1878,15 @@ dependencies = [
  "thiserror 2.0.18",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "meridian-transport"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

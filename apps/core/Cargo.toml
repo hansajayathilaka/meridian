@@ -13,7 +13,14 @@ meridian-proto = { path = "../proto" }
 meridian-identity = { path = "../identity" }
 meridian-store = { path = "../store" }
 meridian-crypto = { path = "../crypto" }
+meridian-transport = { path = "../transport" }
 meridian-signaling = { path = "../signaling" }
 serde = { workspace = true }
 ciborium = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
+getrandom = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

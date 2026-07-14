@@ -15,6 +15,9 @@ anywhere in the repo disagrees with these files, **these files win** and the oth
 - [Messaging envelope (v1)](./messaging-envelope-v1.md) — the E2EE 1:1 messaging spec: X3DH, the
   header-encrypted Double Ratchet, the signed `Sign_IK{ratchet_ct}` envelope, `mrd.chat/1`, the
   at-rest session store, and the safety-number computation (T03).
+- [Stream types (v1)](./stream-types-v1.md) — the extension contract: the `mrd.ctrl/1` capability
+  handshake, the `StreamType` trait + `register_stream_type`, per-stream framing, and how
+  file/call/location/tunnel types add with zero core edits (T04).
 
 Related: [system design](../architecture/system-design.md) ·
 [data model](../architecture/data-model.md) ·

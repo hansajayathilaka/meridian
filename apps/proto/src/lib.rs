@@ -15,18 +15,22 @@ mod bytes;
 
 pub mod bundle;
 pub mod chat;
+pub mod ctrl;
 pub mod envelope;
 pub mod frame;
 pub mod msg;
+pub mod signal;
 
 pub use bundle::{PrekeyBundle, BUNDLE_VERSION, MAX_ONE_TIME_PREKEYS};
 pub use chat::{ChatContent, MessageId};
+pub use ctrl::{ChanCfgWire, CtrlFrame, Direction, Limits, StreamAdvert, CTRL_VERSION};
 pub use envelope::{MessageEnvelope, Prekey, ENVELOPE_DOMAIN};
 pub use frame::{decode, encode, CodecError, Frame, Op};
 pub use msg::{
     error_codes, Auth, AuthOk, Bundle, Challenge, Deliver, ErrBody, Fetch, Publish, PublishOk,
     RouteBody, RouteOk,
 };
+pub use signal::SignalContent;
 
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
