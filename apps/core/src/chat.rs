@@ -135,9 +135,10 @@ impl ChatState {
         self.sessions.get(peer_ik).map(|s| s.safety_number(our_ik))
     }
 
-    /// Build a signed, ratchet-encrypted envelope for `content` to `peer_ik`. The session must
-    /// already exist (initiator: created via [`Session::initiate`]; responder: created on first
-    /// receive). Returns the opaque blob bytes to hand to the router.
+    /// Build a signed, ratchet-encrypted envelope for `content` to `peer_ik`. See [`seal_bytes`] for
+    /// the generic primitive; this is the `mrd.chat/1` convenience wrapper.
+    ///
+    /// [`seal_bytes`]: ChatState::seal_bytes
     pub fn seal_outbound(
         &mut self,
         store: &dyn SecretStore,
@@ -146,8 +147,26 @@ impl ChatState {
         peer_ik: &[u8; 32],
         content: &ChatContent,
     ) -> Result<Vec<u8>, ChatError> {
+        self.seal_bytes(store, handle, our_ik, peer_ik, &content.encode()?)
+    }
+
+    /// Seal an **arbitrary** ratchet plaintext into a signed [`MessageEnvelope`] blob on the session
+    /// with `peer_ik`. The same primitive carries `mrd.chat/1` payloads and the P2P substrate's
+    /// `SignalContent` (SDP/ICE/ctrl) over one ratchet — the transport-independence of §4.3: the
+    /// same envelope bytes are valid over WSS routing, the mailbox, or a data channel.
+    ///
+    /// The session must already exist (initiator: [`Session::initiate`]; responder: created on first
+    /// receive via [`open_bytes`](ChatState::open_bytes)).
+    pub fn seal_bytes(
+        &mut self,
+        store: &dyn SecretStore,
+        handle: &KeyHandle,
+        our_ik: &[u8; 32],
+        peer_ik: &[u8; 32],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ChatError> {
         let session = self.sessions.get_mut(peer_ik).ok_or(ChatError::NoSession)?;
-        let ct = session.encrypt(&content.encode()?)?;
+        let ct = session.encrypt(plaintext)?;
         let prekey = if session.needs_prekey() {
             session.prekey_material().map(to_wire_prekey)
         } else {
@@ -177,6 +196,23 @@ impl ChatState {
         from: &[u8; 32],
         blob: &[u8],
     ) -> Result<ChatContent, ChatError> {
+        let plaintext = self.open_bytes(store, handle, our_ik, from, blob)?;
+        Ok(ChatContent::decode(&plaintext)?)
+    }
+
+    /// Verify + decrypt an inbound blob to its raw ratchet plaintext, establishing a responder
+    /// session on a prekey message. The generic counterpart of [`open_inbound`](Self::open_inbound),
+    /// used by the substrate to open `SignalContent` on the same ratchet as chat. Every inbound
+    /// envelope is signature-verified under its claimed sender key **before** decryption, and the
+    /// claimed key is checked against the routing `from` (crypto-protocols rule 4).
+    pub fn open_bytes(
+        &mut self,
+        store: &dyn SecretStore,
+        handle: &KeyHandle,
+        our_ik: &[u8; 32],
+        from: &[u8; 32],
+        blob: &[u8],
+    ) -> Result<Vec<u8>, ChatError> {
         let envelope = MessageEnvelope::from_blob(blob)?;
         if &envelope.sender_pub != from {
             return Err(ChatError::SenderMismatch);
@@ -226,8 +262,7 @@ impl ChatState {
             .sessions
             .get_mut(&envelope.sender_pub)
             .ok_or(ChatError::NoSession)?;
-        let plaintext = session.decrypt(&envelope.ct)?;
-        Ok(ChatContent::decode(&plaintext)?)
+        Ok(session.decrypt(&envelope.ct)?)
     }
 
     /// Serialize and seal the whole state under a key derived from the account key in `store`.

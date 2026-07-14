@@ -23,9 +23,22 @@ pub use meridian_proto as proto;
 /// E2EE session layer: X3DH, header-encrypted Double Ratchet, safety numbers (T03).
 pub use meridian_crypto as crypto;
 
+/// The `Transport` trait + implementations (loopback; webrtc-rs behind a feature). The seam that
+/// lets one core run on five targets (T04, ADR 0014).
+pub use meridian_transport as transport;
+
 /// Chat session manager — signs/verifies + seals/opens `mrd.chat/1` envelopes and owns the
 /// persistable session store. Transport-agnostic (relay today, P2P/mailbox later).
 pub mod chat;
+
+/// The P2P **session substrate** (T04): the dial/answer state machine that carries chat over a
+/// direct WebRTC data channel with the servers out of the path, with DTLS-fingerprint binding
+/// (§4.6), the `mrd.ctrl/1` control channel, and keepalive/ICE-restart.
+pub mod session;
+
+/// The stream-type **registry** (T04): the extension point (`register_stream_type`) that lets
+/// file/call/location/tunnel stream types be added with zero core edits (§5.3, ADR contract).
+pub mod streams;
 
 /// Crate version — kept for build-info/diagnostics.
 pub fn version() -> &'static str {
