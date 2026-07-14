@@ -17,8 +17,15 @@ pub trait Transport: Send + Sync {
     fn local_description(&self, s: &SessionHandle) -> Result<Sdp>;
     async fn set_remote_description(&self, s: &SessionHandle, sdp: Sdp) -> Result<()>;
     async fn add_ice_candidate(&self, s: &SessionHandle, c: IceCandidate) -> Result<()>;
-    fn dtls_fingerprint(&self, s: &SessionHandle) -> Result<Fingerprint>; // for §4.6 binding
+    fn local_fingerprint(&self, s: &SessionHandle) -> Result<Fingerprint>; // asserted in the offer
+    fn dtls_fingerprint(&self, s: &SessionHandle) -> Result<Fingerprint>; // negotiated; §4.6 binding
     async fn ice_restart(&self, s: &SessionHandle) -> Result<()>;
+    // Data plane (T04, additive to the frozen negotiation subset above): move bytes + observe path.
+    async fn send(&self, s: &SessionHandle, ch: &ChannelId, data: &[u8]) -> Result<()>;
+    async fn recv(&self, s: &SessionHandle) -> Result<Option<(ChannelId, Vec<u8>)>>;
+    async fn local_candidates(&self, s: &SessionHandle) -> Result<Vec<IceCandidate>>;
+    async fn selected_path(&self, s: &SessionHandle) -> Result<Path>;
+    async fn close(&self, s: &SessionHandle) -> Result<()>;
 }
 
 pub trait SecretStore: Send + Sync {           // OS keystore / enclave / wrapped keyfile
@@ -60,9 +67,14 @@ pub trait StreamType {
     fn on_open(&self, sid: StreamId, params: Cbor, policy: &PolicyCtx) -> OpenDecision;
     fn on_frame(&self, sid: StreamId, frame: Bytes);
 }
-fn register_stream_type(t: Arc<dyn StreamType>);   // T09/T15/T16 use ONLY this — no core edits
-async fn open_stream(sess: &Session, ty: &str, params: Cbor) -> Result<StreamId>;
+fn register_stream_type(reg: &mut StreamRegistry, t: Arc<dyn StreamType>); // T09/T15/T16 use ONLY
+async fn open_stream(sess: &Session, ty: &str, params: Cbor) -> Result<StreamId>; // this — no core edits
 ```
+
+Implemented in T04 by [`meridian-core::streams`](../../apps/core/src/streams.rs) (`StreamType`,
+`StreamRegistry`, `register_stream_type`) and [`meridian-core::session`](../../apps/core/src/session.rs)
+(the `mrd.ctrl/1` `Hello`/`Open`/`Accept`/`Reject`/`Close` negotiation). Full extension contract:
+[stream-types-v1.md](./stream-types-v1.md).
 
 ## Stability policy
 Traits above are **semver-stable from Phase 1**. Additive stream types never change them (enforced: CODEOWNERS on the core crate, D12). Envelope/bundle *wire* changes go through the `v` bump + capability negotiation in DOC-01 §7, never a silent break.
