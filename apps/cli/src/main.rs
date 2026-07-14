@@ -20,6 +20,7 @@ use meridian_core::signaling::{SignalError, SignalingClient, DEFAULT_OTK_COUNT};
 mod account;
 mod chat;
 mod opacity;
+mod session;
 use account::{AccountDescriptor, StoreKind};
 
 const OS_KEYSTORE_SERVICE: &str = "meridian";
@@ -74,10 +75,26 @@ enum TopCommand {
         #[arg(long)]
         json: bool,
     },
+    /// P2P session substrate (T04): run the direct-connection demo (servers out of the data path).
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCommand,
+    },
     /// Demos and audits (T03: opacity audit).
     Demo {
         #[command(subcommand)]
         cmd: DemoCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionCommand {
+    /// Establish a direct P2P session between two in-process peers, drop the rendezvous, and show
+    /// chat continuing over the data channel (the T04 headline demo). Prints the `session info` line.
+    Demo {
+        /// Headless: emit one JSON status object instead of the human-readable transcript.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -155,6 +172,7 @@ fn main() -> ExitCode {
         TopCommand::Register { server, invite } => cmd_register(&server, invite),
         TopCommand::FetchBundle { id, server, tamper } => cmd_fetch_bundle(&id, &server, tamper),
         TopCommand::Chat { id, server, json } => cmd_chat(&id, &server, json),
+        TopCommand::Session { cmd } => run_session(cmd),
         TopCommand::Demo { cmd } => run_demo(cmd),
     };
     match result {
@@ -384,6 +402,15 @@ fn cmd_chat(id: &str, server: &str, json: bool) -> Result<ExitCode, String> {
         json,
     }))?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn run_session(cmd: SessionCommand) -> Result<ExitCode, String> {
+    match cmd {
+        SessionCommand::Demo { json } => {
+            runtime()?.block_on(session::run_demo(json))?;
+            Ok(ExitCode::SUCCESS)
+        }
+    }
 }
 
 fn run_demo(cmd: DemoCommand) -> Result<ExitCode, String> {
