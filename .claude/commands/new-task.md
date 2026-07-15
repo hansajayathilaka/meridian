@@ -4,7 +4,7 @@ description: Start a feature — read the relevant design docs, plan, implement,
 You are starting work on a feature for Meridian. The feature/scope is: **$ARGUMENTS**
 
 > **Naming.** `/new-task <feature>` starts a **roadmap feature** from its spec (Features 01–16). To drive
-> the **remediation plan** ([docs/architecture/implementation-plan.md](../../docs/architecture/implementation-plan.md))
+> the **remediation plan** ([docs/architecture/implementation-plan/](../../docs/architecture/implementation-plan/README.md))
 > one task at a time with model routing and subagent orchestration, use [`/next-task`](./next-task.md)
 > instead. The remediation plan must clear (Phase 5) before the roadmap feature cadence resumes here.
 

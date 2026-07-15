@@ -2,10 +2,17 @@
 description: Drive the next unblocked task from the implementation plan through the orchestrated build loop.
 ---
 Drive **one** task from the remediation plan
-([docs/architecture/implementation-plan.md](../../docs/architecture/implementation-plan.md)) end to end:
-pick the next unblocked task → plan it → build it test-first → test & verify against its Definition of
-Done → final review → go/no-go. Optional argument to pin a specific task: **$ARGUMENTS** (e.g. `T2.1`);
-if empty, select automatically.
+([docs/architecture/implementation-plan/](../../docs/architecture/implementation-plan/README.md)) end to
+end: pick the next unblocked task → plan it → build it test-first → test & verify against its Definition
+of Done → final review → go/no-go. Optional argument to pin a specific task: **$ARGUMENTS** (e.g.
+`T2.1`); if empty, select automatically.
+
+**Plan layout.** The plan is a directory: one folder per phase, one file per task. Read the plan
+[`README.md`](../../docs/architecture/implementation-plan/README.md) for the phase table and the
+findings→task map, then each `phase-<n>-*/README.md` for that phase's task table. A task ID `T<phase>.<n>`
+resolves to `phase-<phase>-<slug>/T<phase>.<n>-<slug>.md`; open **that one file** for the task's full
+context (Scope, Touches with [ADR]/[SEC] tags, Deliverables, Tests, Verification, Depends on, Status).
+Each task file names its own required pre-build review under **Pre-build review**.
 
 ## Your role (orchestrator, Opus)
 You are the **orchestrator** and you stay on Opus. You own sequencing, delegation, and the final
@@ -18,12 +25,14 @@ This loop advances **exactly one task** and then stops for review. Do not chain 
 ## The loop
 
 ### 0. Select the task
-- Read the plan and pick the **lowest-numbered task whose every "Depends on" is complete** (respect
-  `$ARGUMENTS` if given, but refuse a task whose dependencies are unmet and say why).
-- Read the task's five fields (Scope, Touches, Deliverables, Tests, Verification) and the **[ADR]/[SEC]
-  tags**. Read the docs the task cites (the relevant feature spec, ADRs, `messaging-envelope-v1.md`,
-  the [threat model](../../docs/security/threat-model.md) + [anonymity model](../../.claude/skills/anonymity-model/SKILL.md)
-  for any [SEC] task). Never invent design — if a needed detail is absent, insert `TODO: confirm` and flag it.
+- Scan the phase `README.md` task tables for the **lowest-numbered task whose Status is ☐/◐ and whose
+  every "Depends on" is ☑ done** (respect `$ARGUMENTS` if given, but refuse a task whose dependencies are
+  unmet and say why). Set its Status to ◐ in its task file.
+- Open the task file and read its fields (Scope, Touches, Deliverables, Tests, Verification, Depends on)
+  and the **[ADR]/[SEC] tags**. Read the docs the task cites (the relevant feature spec, ADRs,
+  `messaging-envelope-v1.md`, the [threat model](../../docs/security/threat-model.md) +
+  [anonymity model](../../.claude/skills/anonymity-model/SKILL.md) for any [SEC] task). Never invent
+  design — if a needed detail is absent, insert `TODO: confirm` and flag it.
 - State the selected task ID, its scope in one sentence, and its tags before proceeding.
 
 ### 1. Plan (Opus subagents — design sign-off BEFORE any code)
@@ -71,8 +80,8 @@ This loop advances **exactly one task** and then stops for review. Do not chain 
 ### 6. Go / no-go (you, Opus)
 - **Go:** every DoD item for the task is satisfied, tests are green and strict, reviewers cleared. Commit
   with a message citing the task ID and the findings it closes; run `/doc-sync` if behavior/diagrams
-  changed. Update the task's status in the plan. **Stop** — report what landed and name the next
-  unblocked task; do not auto-continue.
+  changed. Set the task file's **Status to ☑ done** (and update the row in its phase `README.md` table).
+  **Stop** — report what landed and name the next unblocked task; do not auto-continue.
 - **No-go / escalation:** if design review returned "contradicts ADR / needs new ADR", or a [SEC] finding
   changes a stated guarantee (e.g. **T0.6**, the deniability decision), **do not build** — use
   `AskUserQuestion` to put the decision to the user with enough context to answer, then record the
