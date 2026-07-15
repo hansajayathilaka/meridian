@@ -118,6 +118,80 @@ async fn fetch_is_exact_key_only() {
     }
 }
 
+// -- acceptance (T05): ephemeral, single-session TURN credentials -------------
+
+fn config_with_turn() -> Config {
+    let mut config = config_open();
+    config.turn = meridian_rendezvous::config::Turn {
+        secret: "shared-secret-abc".into(),
+        realm: "localhost".into(),
+        urls: vec![
+            "turn:turn.localhost:3478?transport=udp".into(),
+            "turn:turn.localhost:3478?transport=tcp".into(),
+            "turns:turn.localhost:443?transport=tcp".into(),
+        ],
+        ttl_secs: 120,
+    };
+    config
+}
+
+#[tokio::test]
+async fn turn_credentials_are_minted_and_verify_under_the_secret() {
+    let url = spawn(config_with_turn()).await;
+    let alice = new_acct("localhost");
+    let mut c = alice.connect(&url).await.unwrap();
+
+    let grant = c.request_turn_credentials().await.unwrap();
+    // The ladder is UDP → TCP → TLS-443, and the realm is echoed.
+    assert!(grant.urls[0].contains("transport=udp"));
+    assert!(grant.urls.last().unwrap().contains(":443"));
+    assert_eq!(grant.realm, "localhost");
+    assert_eq!(grant.ttl_secs, 120);
+    // coturn recomputes exactly this HMAC over the username to accept the allocation.
+    assert_eq!(
+        grant.credential,
+        meridian_rendezvous::turn::sign_username("shared-secret-abc", &grant.username)
+    );
+    // The username embeds a future expiry (TTL enforcement without server-side state).
+    let expiry = meridian_rendezvous::turn::username_expiry(&grant.username).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(expiry > now, "credential must expire in the future");
+}
+
+#[tokio::test]
+async fn each_turn_grant_is_single_session() {
+    let url = spawn(config_with_turn()).await;
+    let alice = new_acct("localhost");
+    let mut c = alice.connect(&url).await.unwrap();
+
+    let a = c.request_turn_credentials().await.unwrap();
+    let b = c.request_turn_credentials().await.unwrap();
+    // Distinct per-session nonces ⇒ distinct usernames+credentials: a captured credential is bound
+    // to its own short window and cannot be reused for another session (feature-05 acceptance).
+    assert_ne!(a.username, b.username);
+    assert_ne!(a.credential, b.credential);
+}
+
+#[tokio::test]
+async fn turn_unavailable_when_no_relay_configured() {
+    // A dev/air-gapped-no-relay server (empty secret) refuses minting; the client falls back to the
+    // host/STUN ladder.
+    let url = spawn(config_open()).await;
+    let alice = new_acct("localhost");
+    let mut c = alice.connect(&url).await.unwrap();
+
+    let err = c.request_turn_credentials().await.unwrap_err();
+    match err {
+        SignalError::Server(ErrBody { code, .. }) => {
+            assert_eq!(code, error_codes::TURN_UNAVAILABLE)
+        }
+        other => panic!("expected turn_unavailable, got {other:?}"),
+    }
+}
+
 // -- acceptance: auth rejects replayed challenges -----------------------------
 
 #[tokio::test]

@@ -40,6 +40,10 @@ pub mod session;
 /// file/call/location/tunnel stream types be added with zero core edits (§5.3, ADR contract).
 pub mod streams;
 
+/// Relay policy (T05, §5.4): the `direct | prefer-relay | relay-only` knob resolved across
+/// org-default / per-user / per-contact scope, and the [`meridian_transport::IceConfig`] it yields.
+pub mod relay;
+
 /// Crate version — kept for build-info/diagnostics.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

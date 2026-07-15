@@ -19,7 +19,9 @@ use meridian_core::signaling::{SignalError, SignalingClient, DEFAULT_OTK_COUNT};
 
 mod account;
 mod chat;
+mod doctor;
 mod opacity;
+mod policy;
 mod session;
 use account::{AccountDescriptor, StoreKind};
 
@@ -80,6 +82,17 @@ enum TopCommand {
         #[command(subcommand)]
         cmd: SessionCommand,
     },
+    /// Connectivity diagnostic (T05): which candidate classes work and where the path is blocked.
+    Doctor {
+        /// Headless: emit one JSON object per NAT cell instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Client configuration (T05): the relay policy knob (`direct|prefer-relay|relay-only`).
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCommand,
+    },
     /// Demos and audits (T03: opacity audit).
     Demo {
         #[command(subcommand)]
@@ -89,12 +102,40 @@ enum TopCommand {
 
 #[derive(Subcommand)]
 enum SessionCommand {
-    /// Establish a direct P2P session between two in-process peers, drop the rendezvous, and show
-    /// chat continuing over the data channel (the T04 headline demo). Prints the `session info` line.
+    /// Establish a P2P session between two in-process peers, drop the rendezvous, and show chat
+    /// continuing over the data channel (the T04 headline demo). `--nat`/`--policy` reproduce the
+    /// T05 relay-policy ladder so the `session info` line shows the selected path and *why*.
     Demo {
         /// Headless: emit one JSON status object instead of the human-readable transcript.
         #[arg(long)]
         json: bool,
+        /// Relay policy: `direct` (default), `prefer-relay`, or `relay-only`.
+        #[arg(long, default_value = "direct")]
+        policy: String,
+        /// Simulated NAT/egress cell: `full-cone` (default), `port-restricted`,
+        /// `symmetric` (=symmetric:symmetric), or `udp-blocked`.
+        #[arg(long, default_value = "full-cone")]
+        nat: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Print the effective relay policy at each scope.
+    Show,
+    /// Set the relay policy. Defaults to the per-user scope; `--org` sets the org default and
+    /// `--contact <id>` pins a single peer (per-contact overrides per-user overrides org-default).
+    Set {
+        /// The setting to change. Only `policy` is supported today.
+        key: String,
+        /// The value: `direct | prefer-relay | relay-only`.
+        value: String,
+        /// Set the org-default level instead of per-user.
+        #[arg(long)]
+        org: bool,
+        /// Pin this policy to a single contact (`mrd1:…@domain` ID or 64-hex key).
+        #[arg(long)]
+        contact: Option<String>,
     },
 }
 
@@ -173,6 +214,8 @@ fn main() -> ExitCode {
         TopCommand::FetchBundle { id, server, tamper } => cmd_fetch_bundle(&id, &server, tamper),
         TopCommand::Chat { id, server, json } => cmd_chat(&id, &server, json),
         TopCommand::Session { cmd } => run_session(cmd),
+        TopCommand::Doctor { json } => run_doctor(json),
+        TopCommand::Config { cmd } => run_config(cmd),
         TopCommand::Demo { cmd } => run_demo(cmd),
     };
     match result {
@@ -406,8 +449,54 @@ fn cmd_chat(id: &str, server: &str, json: bool) -> Result<ExitCode, String> {
 
 fn run_session(cmd: SessionCommand) -> Result<ExitCode, String> {
     match cmd {
-        SessionCommand::Demo { json } => {
-            runtime()?.block_on(session::run_demo(json))?;
+        SessionCommand::Demo { json, policy, nat } => {
+            let policy = meridian_core::relay::policy_from_str(&policy).ok_or_else(|| {
+                format!("unknown policy '{policy}' (expected direct | prefer-relay | relay-only)")
+            })?;
+            let scenario = meridian_core::transport::NatScenario::parse(&nat).ok_or_else(|| {
+                format!(
+                    "unknown nat '{nat}' (expected full-cone | port-restricted | symmetric | udp-blocked)"
+                )
+            })?;
+            runtime()?.block_on(session::run_demo(session::DemoOpts {
+                json,
+                policy,
+                scenario,
+            }))?;
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+fn run_doctor(json: bool) -> Result<ExitCode, String> {
+    runtime()?.block_on(doctor::run(json))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_config(cmd: ConfigCommand) -> Result<ExitCode, String> {
+    match cmd {
+        ConfigCommand::Show => {
+            policy::show()?;
+            Ok(ExitCode::SUCCESS)
+        }
+        ConfigCommand::Set {
+            key,
+            value,
+            org,
+            contact,
+        } => {
+            if key != "policy" {
+                return Err(format!(
+                    "unknown config key '{key}' (only 'policy' is supported)"
+                ));
+            }
+            let scope = match (org, contact) {
+                (true, _) => policy::SetScope::Org,
+                (false, Some(id)) => policy::SetScope::Contact(id),
+                (false, None) => policy::SetScope::User,
+            };
+            policy::set(&value, scope)?;
+            println!("set policy {value}");
             Ok(ExitCode::SUCCESS)
         }
     }

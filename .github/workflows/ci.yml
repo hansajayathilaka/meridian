@@ -45,6 +45,8 @@ jobs:
           bash harnesses/opacity-audit/run.sh
           bash harnesses/mitm-sim/run.sh
           bash harnesses/ghost-device/run.sh
+      - name: NAT matrix + relay policy (T05; netns rig skips without NET_ADMIN)
+        run: bash harnesses/nat-matrix/run.sh
       # TODO: migrate to cargo nextest run --workspace
       # TODO: conformance vectors (byte-identical across CLI/WASM/mobile) — docs/testing/strategy.md §1
 

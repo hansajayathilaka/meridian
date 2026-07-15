@@ -164,7 +164,7 @@ pub fn read_portable(path: &Path, passphrase: &str) -> Result<(Vec<u8>, String),
 }
 
 /// The config directory: `$MERIDIAN_HOME`, else `~/.config/meridian`.
-fn config_dir() -> Result<PathBuf, String> {
+pub fn config_dir() -> Result<PathBuf, String> {
     if let Ok(home) = std::env::var("MERIDIAN_HOME") {
         return Ok(PathBuf::from(home));
     }

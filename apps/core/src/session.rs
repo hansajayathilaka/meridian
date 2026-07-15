@@ -27,9 +27,11 @@ use meridian_identity::{KeyHandle, SecretStore};
 use meridian_proto::ctrl::ChanCfgWire;
 use meridian_proto::{ChatContent, CtrlFrame, MessageId, SignalContent, StreamAdvert};
 use meridian_transport::{
-    ChannelCfg, ChannelId, Fingerprint, IceCandidate, IceConfig, Path, Sdp, SessionHandle,
-    Transport,
+    ChannelCfg, ChannelId, Fingerprint, IceCandidate, IceConfig, IcePolicy, Path, RelayTransport,
+    Sdp, SessionHandle, Transport,
 };
+
+use crate::relay::{self, GatherClasses};
 
 use crate::chat::{ChatError, ChatState};
 use crate::streams::{CapabilityError, StreamRegistry};
@@ -138,27 +140,78 @@ pub enum Role {
     Responder,
 }
 
-/// A snapshot for `meridian session info` and the demo script.
+/// A snapshot for `meridian session info` and the demo script. Beyond the T04 fields it carries the
+/// **why**: the effective relay policy, which candidate classes were offered, and — when relayed —
+/// the relay server and transport rung, so the latency-vs-privacy trade shows as numbers (§5.4).
 #[derive(Clone, Debug)]
 pub struct SessionInfo {
     /// Logical transport (wire behavior is identical across backends): `webrtc-datachannel`.
     pub transport: &'static str,
     /// Selected candidate-pair class.
     pub path: Path,
+    /// The relay server that carried the pair, when `path == Relay`.
+    pub relay_server: Option<String>,
+    /// The relay transport rung (udp/tcp/tls-443), when `path == Relay`.
+    pub relay_transport: Option<RelayTransport>,
     /// Last measured ctrl keepalive round-trip, if any.
     pub rtt_ms: Option<f64>,
     /// Open stream labels, ctrl first.
     pub streams: Vec<String>,
+    /// The effective relay policy for this session.
+    pub policy: IcePolicy,
+    /// The candidate classes offered to the peer under `policy`.
+    pub offered: GatherClasses,
+    /// A short human explanation of why this path was chosen.
+    pub reason: String,
+}
+
+impl SessionInfo {
+    /// The `candidates offered: …` line the relay-policy demo prints — and the privacy claim it can
+    /// make. Under `relay-only` this is exactly "relay only; peer never saw our host/srflx IPs".
+    pub fn candidates_offered_line(&self) -> String {
+        let base = format!("candidates offered: {}", self.offered.describe());
+        if !self.offered.host && !self.offered.srflx {
+            format!("{base}; peer never saw our host/srflx IPs")
+        } else {
+            base
+        }
+    }
 }
 
 impl std::fmt::Display for SessionInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "transport={} path={} ", self.transport, self.path)?;
-        match self.rtt_ms {
-            Some(ms) => write!(f, "rtt={ms:.1}ms ")?,
-            None => write!(f, "rtt=? ")?,
+        write!(f, "transport={} path={}", self.transport, self.path)?;
+        if let (Some(srv), Some(xport)) = (&self.relay_server, self.relay_transport) {
+            write!(f, " ({srv}, {xport})")?;
         }
-        write!(f, "streams=[{}]", self.streams.join(", "))
+        match self.rtt_ms {
+            Some(ms) => write!(f, " rtt={ms:.1}ms")?,
+            None => write!(f, " rtt=?")?,
+        }
+        write!(f, " streams=[{}]", self.streams.join(", "))?;
+        write!(
+            f,
+            " policy={} why={}",
+            relay::policy_str(self.policy),
+            self.reason
+        )
+    }
+}
+
+/// Explain why a session landed on `path` under `policy` — honest, derivable from the two.
+fn path_reason(policy: IcePolicy, path: Path) -> String {
+    match (policy, path) {
+        (IcePolicy::RelayOnly, _) => {
+            "relay-only policy: host/srflx candidates never offered".to_string()
+        }
+        (IcePolicy::PreferRelay, Path::Relay) => {
+            "prefer-relay policy: relay pair preferred over direct".to_string()
+        }
+        (_, Path::Relay) => {
+            "no working direct/srflx pair — relayed (hostile NAT/egress)".to_string()
+        }
+        (_, Path::Direct) => "direct host pair".to_string(),
+        (_, Path::Srflx) => "server-reflexive (STUN) pair — no relay needed".to_string(),
     }
 }
 
@@ -198,6 +251,8 @@ pub struct P2pSession<T: Transport> {
     remote_fp: Fingerprint,
     keepalive_t: u64,
     last_rtt_ms: Option<f64>,
+    /// The relay policy this session gathered under (governs the `candidates offered` claim).
+    policy: IcePolicy,
 }
 
 impl<T: Transport> P2pSession<T> {
@@ -216,22 +271,32 @@ impl<T: Transport> P2pSession<T> {
         (&self.local_fp, &self.remote_fp)
     }
 
+    /// The effective relay policy this session gathered under.
+    pub fn policy(&self) -> IcePolicy {
+        self.policy
+    }
+
     /// A snapshot for the demo/diagnostics.
     pub async fn info(&self) -> SessionInfo {
-        let path = self
+        let detail = self
             .transport
-            .selected_path(&self.conn)
+            .selected_path_detail(&self.conn)
             .await
-            .unwrap_or(Path::Direct);
+            .unwrap_or_else(|_| meridian_transport::PathDetail::direct(Path::Direct));
         let mut streams: Vec<String> = vec![CTRL_LABEL.to_string()];
         if self.open_streams.contains(&CHAT_SID) {
             streams.push(CHAT_LABEL.to_string());
         }
         SessionInfo {
             transport: "webrtc-datachannel",
-            path,
+            path: detail.class,
+            relay_server: detail.relay_server,
+            relay_transport: detail.relay_transport,
             rtt_ms: self.last_rtt_ms,
             streams,
+            policy: self.policy,
+            offered: relay::gather_classes(self.policy),
+            reason: path_reason(self.policy, detail.class),
         }
     }
 
@@ -515,10 +580,7 @@ impl<T: Transport> P2pSession<T> {
     }
 }
 
-/// Dial a peer: create the peer connection, seal the SDP offer + DTLS fingerprint into an envelope,
-/// route it over `relay`, apply the answer, **cross-check the fingerprint (§4.6)**, then exchange
-/// `Hello` and open the chat stream. The crypto session with `peer_ik` must already exist (T03's
-/// X3DH); its prekey preamble rides the first envelope automatically.
+/// Dial a peer with the default (host/STUN, `direct` policy) ICE config — the T04 entry point.
 #[allow(clippy::too_many_arguments)]
 pub async fn dial<T: Transport>(
     transport: Arc<T>,
@@ -530,7 +592,40 @@ pub async fn dial<T: Transport>(
     relay: &mut dyn SignalRelay,
     registry: Arc<StreamRegistry>,
 ) -> Result<P2pSession<T>, SessionError> {
-    let conn = transport.new_session(IceConfig::default()).await?;
+    dial_with_config(
+        transport,
+        store,
+        handle,
+        our_ik,
+        peer_ik,
+        chat,
+        relay,
+        registry,
+        IceConfig::default(),
+    )
+    .await
+}
+
+/// Dial a peer under an explicit [`IceConfig`] — the T05 entry point that carries the resolved relay
+/// policy and the ephemeral TURN servers. Creates the peer connection (gathering candidates per the
+/// policy — `relay-only` strips host/srflx *before* this point), seals the SDP offer + DTLS
+/// fingerprint into an envelope, routes it over `relay`, applies the answer, **cross-checks the
+/// fingerprint (§4.6)**, then exchanges `Hello` and opens the chat stream. The crypto session with
+/// `peer_ik` must already exist (T03's X3DH).
+#[allow(clippy::too_many_arguments)]
+pub async fn dial_with_config<T: Transport>(
+    transport: Arc<T>,
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+    our_ik: [u8; 32],
+    peer_ik: [u8; 32],
+    chat: &mut ChatState,
+    relay: &mut dyn SignalRelay,
+    registry: Arc<StreamRegistry>,
+    cfg: IceConfig,
+) -> Result<P2pSession<T>, SessionError> {
+    let policy = cfg.policy;
+    let conn = transport.new_session(cfg).await?;
     let ctrl_ch = transport
         .add_data_channel(&conn, ChannelCfg::reliable_ordered(CTRL_LABEL))
         .await?;
@@ -579,14 +674,13 @@ pub async fn dial<T: Transport>(
         remote_fp,
         keepalive_t: 0,
         last_rtt_ms: None,
+        policy,
     };
     session.handshake(store, handle, chat).await?;
     Ok(session)
 }
 
-/// Answer an incoming dial: receive the offer envelope over `relay`, create the peer connection,
-/// seal the answer, cross-check the fingerprint (§4.6), then exchange `Hello`. The offer envelope is
-/// also the X3DH opening message, so this establishes the responder ratchet if not already present.
+/// Answer an incoming dial with the default ICE config — the T04 entry point.
 #[allow(clippy::too_many_arguments)]
 pub async fn answer<T: Transport>(
     transport: Arc<T>,
@@ -598,10 +692,41 @@ pub async fn answer<T: Transport>(
     relay: &mut dyn SignalRelay,
     registry: Arc<StreamRegistry>,
 ) -> Result<P2pSession<T>, SessionError> {
+    answer_with_config(
+        transport,
+        store,
+        handle,
+        our_ik,
+        peer_ik,
+        chat,
+        relay,
+        registry,
+        IceConfig::default(),
+    )
+    .await
+}
+
+/// Answer an incoming dial under an explicit [`IceConfig`] — the T05 entry point. Receives the offer
+/// envelope over `relay`, creates the peer connection (gathering per the policy), seals the answer,
+/// cross-checks the fingerprint (§4.6), then exchanges `Hello`. The offer envelope is also the X3DH
+/// opening message, so this establishes the responder ratchet if not already present.
+#[allow(clippy::too_many_arguments)]
+pub async fn answer_with_config<T: Transport>(
+    transport: Arc<T>,
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+    our_ik: [u8; 32],
+    peer_ik: [u8; 32],
+    chat: &mut ChatState,
+    relay: &mut dyn SignalRelay,
+    registry: Arc<StreamRegistry>,
+    cfg: IceConfig,
+) -> Result<P2pSession<T>, SessionError> {
+    let policy = cfg.policy;
     let (offer_sdp, asserted_fp, offer_ice) =
         recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, true).await?;
 
-    let conn = transport.new_session(IceConfig::default()).await?;
+    let conn = transport.new_session(cfg).await?;
     let ctrl_ch = transport
         .add_data_channel(&conn, ChannelCfg::reliable_ordered(CTRL_LABEL))
         .await?;
@@ -645,6 +770,7 @@ pub async fn answer<T: Transport>(
         remote_fp,
         keepalive_t: 0,
         last_rtt_ms: None,
+        policy,
     };
     session.handshake(store, handle, chat).await?;
     Ok(session)

@@ -15,6 +15,7 @@ pub mod metrics;
 pub mod ratelimit;
 pub mod state;
 pub mod store;
+pub mod turn;
 mod ws;
 
 use std::net::SocketAddr;

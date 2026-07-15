@@ -17,8 +17,8 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::types::{
-    ChannelCfg, ChannelId, Fingerprint, IceCandidate, IceConfig, IcePolicy, MediaKind, Path, Sdp,
-    SessionHandle, TrackId,
+    ChannelCfg, ChannelId, Fingerprint, IceCandidate, IceConfig, IcePolicy, IceServer, MediaKind,
+    NatScenario, Path, PathDetail, Sdp, SessionHandle, TrackId,
 };
 use crate::{Result, Transport, TransportError};
 
@@ -50,6 +50,10 @@ struct Sess {
     local_candidates: Vec<IceCandidate>,
     ice_generation: u32,
     policy: IcePolicy,
+    /// The relay servers offered (from the ephemeral TURN grant). Empty ⇒ no relay rung available.
+    ice_servers: Vec<IceServer>,
+    /// The simulated NAT/egress condition governing which pair wins.
+    scenario: NatScenario,
     mitm: bool,
     tx: mpsc::UnboundedSender<(ChannelId, Vec<u8>)>,
 }
@@ -64,14 +68,27 @@ impl LoopbackFabric {
 #[derive(Clone)]
 pub struct LoopbackTransport {
     fabric: LoopbackFabric,
+    scenario: NatScenario,
     mitm: bool,
 }
 
 impl LoopbackTransport {
-    /// An honest peer on `fabric`.
+    /// An honest peer on `fabric` on an open (full-cone) network.
     pub fn new(fabric: LoopbackFabric) -> Self {
         Self {
             fabric,
+            scenario: NatScenario::FullCone,
+            mitm: false,
+        }
+    }
+
+    /// An honest peer whose network is the given [`NatScenario`] — used by `meridian doctor` and the
+    /// relay-policy demo to reproduce the NAT matrix in-process (T05). The scenario governs which
+    /// candidate pair wins (direct/srflx/relay) and, when relayed, the transport rung.
+    pub fn with_scenario(fabric: LoopbackFabric, scenario: NatScenario) -> Self {
+        Self {
+            fabric,
+            scenario,
             mitm: false,
         }
     }
@@ -80,7 +97,11 @@ impl LoopbackTransport {
     /// that differs from the one the honest peer asserted in its encrypted envelope. Used only to
     /// prove the substrate tears the session down 100% of the time (T04 deliverable 2).
     pub fn new_mitm(fabric: LoopbackFabric) -> Self {
-        Self { fabric, mitm: true }
+        Self {
+            fabric,
+            scenario: NatScenario::FullCone,
+            mitm: true,
+        }
     }
 
     fn with_inner<R>(&self, f: impl FnOnce(&mut FabricInner) -> R) -> R {
@@ -118,6 +139,106 @@ fn parse_sdp(sdp: &Sdp) -> Result<(u64, Fingerprint)> {
     }
 }
 
+/// Extract a short relay label from a TURN url (`turn:turn-a:3478?transport=udp` ⇒ `turn-a`) so
+/// `session info` can name which relay carried the pair. Falls back to the whole url.
+fn turn_host(url: &str) -> String {
+    let after_scheme = url
+        .strip_prefix("turns:")
+        .or_else(|| url.strip_prefix("turn:"))
+        .unwrap_or(url);
+    after_scheme
+        .split([':', '?'])
+        .next()
+        .unwrap_or(after_scheme)
+        .to_string()
+}
+
+/// Synthesize the local candidate list for a session under `policy` on `scenario`. This is the
+/// load-bearing privacy behavior: `relay-only` **strips host/srflx before gathering** — they are
+/// never synthesized, so a peer can never learn our real addresses (webrtc-nat-traversal
+/// invariant 3), and UDP-blocked egress yields no srflx (STUN is unreachable). `generation` tags
+/// candidates so an ICE restart produces visibly-fresh ones.
+fn gather_candidates(
+    id: u64,
+    policy: IcePolicy,
+    scenario: NatScenario,
+    ice_servers: &[IceServer],
+    generation: u32,
+) -> Vec<IceCandidate> {
+    let gen = if generation == 0 {
+        String::new()
+    } else {
+        format!(" gen={generation}")
+    };
+    let mut out = Vec::new();
+    if policy != IcePolicy::RelayOnly {
+        out.push(IceCandidate(format!("candidate:host {id} 127.0.0.1{gen}")));
+        if scenario.srflx_reachable() {
+            out.push(IceCandidate(format!(
+                "candidate:srflx {id} 203.0.113.{}{gen}",
+                id % 251
+            )));
+        }
+    }
+    // Relay candidates come from the ephemeral TURN grant, for every policy that offers relay.
+    for srv in ice_servers {
+        if let Some(url) = srv.urls.first() {
+            out.push(IceCandidate(format!(
+                "candidate:relay {id} {}{gen}",
+                turn_host(url)
+            )));
+        }
+    }
+    out
+}
+
+/// Decide the winning candidate pair for `policy` on `scenario` given whether relay is available.
+/// Returns `None` when no pair can connect (relay required but no TURN reachable — an honest
+/// failure the diagnostics name, §10). Encodes the `direct | prefer-relay | relay-only` semantics:
+/// relay-only always relays; prefer-relay relays whenever a relay exists; direct relays only when
+/// the network blocks direct pairs.
+fn select_path(
+    policy: IcePolicy,
+    scenario: NatScenario,
+    ice_servers: &[IceServer],
+) -> Option<PathDetail> {
+    let relay_available = !ice_servers.is_empty();
+    let relay = |ice_servers: &[IceServer]| {
+        ice_servers.first().map(|s| PathDetail {
+            class: Path::Relay,
+            relay_server: s.urls.first().map(|u| turn_host(u)),
+            relay_transport: Some(scenario.relay_transport()),
+        })
+    };
+    let direct = || {
+        PathDetail::direct(match scenario {
+            NatScenario::FullCone => Path::Direct,
+            _ => Path::Srflx,
+        })
+    };
+    match policy {
+        IcePolicy::RelayOnly => relay(ice_servers),
+        IcePolicy::PreferRelay => {
+            if relay_available {
+                relay(ice_servers)
+            } else if !scenario.blocks_direct() {
+                Some(direct())
+            } else {
+                None
+            }
+        }
+        IcePolicy::Direct => {
+            if !scenario.blocks_direct() {
+                Some(direct())
+            } else if relay_available {
+                relay(ice_servers)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Transport for LoopbackTransport {
     async fn new_session(&self, cfg: IceConfig) -> Result<SessionHandle> {
@@ -126,16 +247,8 @@ impl Transport for LoopbackTransport {
             inner.next_id += 1;
             let id = inner.next_id;
             let local_fp = fingerprint_for(id);
-            // relay-only strips host/srflx candidates *before* gathering (invariant 3): none are
-            // synthesized here. Relay (TURN) candidates are T05, so a relay-only loopback session
-            // gathers nothing and would need T05 to connect — which is the honest behavior.
-            let local_candidates = match cfg.policy {
-                IcePolicy::RelayOnly => Vec::new(),
-                _ => vec![
-                    IceCandidate(format!("candidate:host {id} 127.0.0.1")),
-                    IceCandidate(format!("candidate:srflx {id} 203.0.113.{}", id % 251)),
-                ],
-            };
+            let local_candidates =
+                gather_candidates(id, cfg.policy, self.scenario, &cfg.ice_servers, 0);
             inner.sessions.insert(
                 id,
                 Sess {
@@ -147,6 +260,8 @@ impl Transport for LoopbackTransport {
                     local_candidates,
                     ice_generation: 0,
                     policy: cfg.policy,
+                    ice_servers: cfg.ice_servers,
+                    scenario: self.scenario,
                     mitm: self.mitm,
                     tx,
                 },
@@ -275,20 +390,16 @@ impl Transport for LoopbackTransport {
                 .get_mut(&s.0)
                 .ok_or(TransportError::UnknownSession)?;
             sess.ice_generation += 1;
-            let id = sess.token;
-            if sess.policy != IcePolicy::RelayOnly {
-                sess.local_candidates = vec![
-                    IceCandidate(format!(
-                        "candidate:host {id} 127.0.0.1 gen={}",
-                        sess.ice_generation
-                    )),
-                    IceCandidate(format!(
-                        "candidate:srflx {id} 198.51.100.{} gen={}",
-                        id % 251,
-                        sess.ice_generation
-                    )),
-                ];
-            }
+            // Re-gather under the same policy/scenario, keeping relay-only's strip-before-gather
+            // invariant across the restart (a Wi-Fi→LTE switch never leaks host/srflx if policy
+            // forbade them).
+            sess.local_candidates = gather_candidates(
+                sess.token,
+                sess.policy,
+                sess.scenario,
+                &sess.ice_servers,
+                sess.ice_generation,
+            );
             Ok(())
         })
     }
@@ -349,6 +460,10 @@ impl Transport for LoopbackTransport {
     }
 
     async fn selected_path(&self, s: &SessionHandle) -> Result<Path> {
+        self.selected_path_detail(s).await.map(|d| d.class)
+    }
+
+    async fn selected_path_detail(&self, s: &SessionHandle) -> Result<PathDetail> {
         self.with_inner(|inner| {
             let sess = inner
                 .sessions
@@ -357,10 +472,9 @@ impl Transport for LoopbackTransport {
             if sess.peer.is_none() {
                 return Err(TransportError::NoPath);
             }
-            Ok(match sess.policy {
-                IcePolicy::RelayOnly => Path::Relay,
-                _ => Path::Direct,
-            })
+            // No working pair (e.g. relay-only or symmetric×symmetric with no TURN reachable) is an
+            // honest failure — §10 "both peers behind symmetric NAT + no TURN reachable ⇒ fails".
+            select_path(sess.policy, sess.scenario, &sess.ice_servers).ok_or(TransportError::NoPath)
         })
     }
 
@@ -376,6 +490,7 @@ impl Transport for LoopbackTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::RelayTransport;
 
     #[tokio::test]
     async fn two_peers_exchange_bytes_and_fingerprints_agree() {
@@ -428,5 +543,128 @@ mod tests {
         // The MITM's negotiated fp does NOT equal the honest peer's real fingerprint — the exact
         // condition the substrate's §4.6 check rejects.
         assert_ne!(mitm.dtls_fingerprint(&sm).unwrap(), fingerprint_for(sh.0));
+    }
+
+    fn turn_servers() -> Vec<IceServer> {
+        vec![IceServer {
+            urls: vec![
+                "turn:turn-a:3478?transport=udp".into(),
+                "turn:turn-a:3478?transport=tcp".into(),
+                "turns:turn-a:443?transport=tcp".into(),
+            ],
+            username: Some("1700000000:nonce".into()),
+            credential: Some("hmac".into()),
+        }]
+    }
+
+    async fn connect(
+        scenario: NatScenario,
+        policy: IcePolicy,
+    ) -> (LoopbackTransport, SessionHandle) {
+        let fabric = LoopbackFabric::new();
+        let a = LoopbackTransport::with_scenario(fabric.clone(), scenario);
+        let b = LoopbackTransport::with_scenario(fabric.clone(), scenario);
+        let cfg = IceConfig {
+            stun_servers: Vec::new(),
+            ice_servers: turn_servers(),
+            policy,
+        };
+        let sa = a.new_session(cfg.clone()).await.unwrap();
+        let sb = b.new_session(cfg).await.unwrap();
+        let offer = a.local_description(&sa).unwrap();
+        let answer = b.local_description(&sb).unwrap();
+        b.set_remote_description(&sb, offer).await.unwrap();
+        a.set_remote_description(&sa, answer).await.unwrap();
+        (a, sa)
+    }
+
+    #[tokio::test]
+    async fn nat_matrix_selects_the_right_path() {
+        // full-cone ⇒ direct; port-restricted ⇒ srflx; symmetric ⇒ relay/udp; udp-blocked ⇒
+        // relay/tls-443. All four cells connect (feature-05 acceptance).
+        let (a, s) = connect(NatScenario::FullCone, IcePolicy::Direct).await;
+        assert_eq!(a.selected_path(&s).await.unwrap(), Path::Direct);
+
+        let (a, s) = connect(NatScenario::PortRestricted, IcePolicy::Direct).await;
+        assert_eq!(a.selected_path(&s).await.unwrap(), Path::Srflx);
+
+        let (a, s) = connect(NatScenario::SymmetricPair, IcePolicy::Direct).await;
+        let d = a.selected_path_detail(&s).await.unwrap();
+        assert_eq!(d.class, Path::Relay);
+        assert_eq!(d.relay_transport, Some(RelayTransport::Udp));
+        assert_eq!(d.relay_server.as_deref(), Some("turn-a"));
+
+        let (a, s) = connect(NatScenario::UdpBlocked, IcePolicy::Direct).await;
+        let d = a.selected_path_detail(&s).await.unwrap();
+        assert_eq!(d.class, Path::Relay);
+        assert_eq!(d.relay_transport, Some(RelayTransport::Tls443));
+    }
+
+    #[tokio::test]
+    async fn relay_only_strips_host_and_srflx_before_gathering() {
+        // Even on an open network, relay-only offers ONLY relay candidates — never host/srflx, so a
+        // peer capture can never contain our real addresses (invariant 3, feature-05 acceptance).
+        let fabric = LoopbackFabric::new();
+        let a = LoopbackTransport::with_scenario(fabric.clone(), NatScenario::FullCone);
+        let cfg = IceConfig {
+            stun_servers: Vec::new(),
+            ice_servers: turn_servers(),
+            policy: IcePolicy::RelayOnly,
+        };
+        let sa = a.new_session(cfg).await.unwrap();
+        let cands = a.local_candidates(&sa).await.unwrap();
+        assert!(
+            !cands.is_empty(),
+            "relay-only still offers relay candidates"
+        );
+        for c in &cands {
+            assert!(
+                c.0.contains("relay"),
+                "relay-only leaked a non-relay candidate: {}",
+                c.0
+            );
+            assert!(!c.0.contains("host") && !c.0.contains("srflx"));
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_only_survives_ice_restart_without_leaking() {
+        // A Wi-Fi→LTE switch (ICE restart) must not start offering host/srflx under relay-only.
+        let fabric = LoopbackFabric::new();
+        let a = LoopbackTransport::with_scenario(fabric.clone(), NatScenario::FullCone);
+        let cfg = IceConfig {
+            stun_servers: Vec::new(),
+            ice_servers: turn_servers(),
+            policy: IcePolicy::RelayOnly,
+        };
+        let sa = a.new_session(cfg).await.unwrap();
+        a.ice_restart(&sa).await.unwrap();
+        for c in a.local_candidates(&sa).await.unwrap() {
+            assert!(c.0.contains("relay"), "leak after restart: {}", c.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_required_but_none_reachable_is_an_honest_failure() {
+        // Symmetric×symmetric with NO turn servers cannot connect — §10 "no TURN reachable ⇒ fails".
+        let fabric = LoopbackFabric::new();
+        let a = LoopbackTransport::with_scenario(fabric.clone(), NatScenario::SymmetricPair);
+        let b = LoopbackTransport::with_scenario(fabric.clone(), NatScenario::SymmetricPair);
+        let cfg = IceConfig {
+            stun_servers: Vec::new(),
+            ice_servers: Vec::new(),
+            policy: IcePolicy::Direct,
+        };
+        let sa = a.new_session(cfg.clone()).await.unwrap();
+        let sb = b.new_session(cfg).await.unwrap();
+        let offer = a.local_description(&sa).unwrap();
+        b.set_remote_description(&sb, offer).await.unwrap();
+        a.set_remote_description(&sa, b.local_description(&sb).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            a.selected_path(&sa).await,
+            Err(TransportError::NoPath)
+        ));
     }
 }

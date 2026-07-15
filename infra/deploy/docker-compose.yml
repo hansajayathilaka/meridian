@@ -7,11 +7,27 @@ services:
     # depends_on: [postgres]
     # ports: ["443:443"]
     # volumes: ["./config:/etc/meridian:ro"]   # TODO: config surface (deployment.md)
+    # The rendezvous mints ephemeral TURN credentials; its [turn].secret MUST equal coturn's
+    # static-auth-secret below. Provision it out of band — never bake it into the image.
+    # environment:
+    #   - MERIDIAN_TURN__SECRET=${TURN_SHARED_SECRET:?set TURN_SHARED_SECRET}
+    #   - MERIDIAN_TURN__REALM=turn.chat.example
     restart: unless-stopped
 
   coturn:
     image: coturn/coturn:latest
-    # network_mode: host          # TODO: TURN listener config (../coturn/turnserver.conf)
+    # coturn and the rendezvous share ONE secret (the REST/use-auth-secret mechanism); credentials
+    # are ephemeral per-session HMAC tokens, never static per-user secrets (../coturn/turnserver.conf).
+    command: ["-c", "/etc/coturn/turnserver.conf", "--static-auth-secret=${TURN_SHARED_SECRET:?set TURN_SHARED_SECRET}"]
+    volumes:
+      - ../coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+      # - ./certs:/etc/coturn/certs:ro           # TODO: turns: TLS material (private CA air-gapped)
+    ports:
+      - "3478:3478/udp"      # TURN/UDP  (ladder rung 1)
+      - "3478:3478/tcp"      # TURN/TCP  (ladder rung 2)
+      - "443:443/tcp"        # TURN/TLS-443 (ladder rung 3 — hostile-egress last resort)
+      # - "49152-65535:49152-65535/udp"   # TODO: relay port range (host networking is simpler)
+    # network_mode: host     # TODO: often required so TURN sees real client addresses
     restart: unless-stopped
 
   postgres:

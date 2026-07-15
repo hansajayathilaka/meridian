@@ -7,7 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use meridian_identity::{sign, KeyHandle, SecretStore};
 use meridian_proto::{
     Auth, AuthOk, Bundle, Challenge, Deliver, Fetch, Frame, Op, OpaqueBlob, PrekeyBundle, Publish,
-    PublishOk, RouteBody, RouteOk,
+    PublishOk, RouteBody, RouteOk, TurnGrant, TurnReq,
 };
 use serde::Serialize;
 use tokio::net::TcpStream;
@@ -132,6 +132,23 @@ impl SignalingClient {
             .await?;
         let ok: RouteOk = reply.decode()?;
         Ok(ok.delivered)
+    }
+
+    /// Request ephemeral, single-session TURN credentials for a new P2P session (T05, §5.4). The
+    /// returned [`TurnGrant`] carries the candidate ladder (TURN/UDP → TURN/TCP → TURN/TLS-443) and
+    /// an HMAC credential the client feeds straight into its ICE config — no static TURN secret ever
+    /// touches the client (webrtc-nat-traversal invariant 4). A `turn_unavailable` error means the
+    /// org runs no relay (air-gapped / dev); the caller falls back to the host/STUN ladder.
+    pub async fn request_turn_credentials(&mut self) -> Result<TurnGrant> {
+        let reply = self
+            .request(
+                Op::TurnReq,
+                &TurnReq::default(),
+                Op::TurnGrant,
+                "turn_grant",
+            )
+            .await?;
+        Ok(reply.decode()?)
     }
 
     /// Await the next envelope delivered to this client.

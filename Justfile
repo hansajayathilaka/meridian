@@ -34,6 +34,7 @@ harnesses:
     bash harnesses/opacity-audit/run.sh
     bash harnesses/mitm-sim/run.sh
     bash harnesses/ghost-device/run.sh
+    bash harnesses/nat-matrix/run.sh
 
 # Codegen (UniFFI + wasm-bindgen) and conformance vectors.
 codegen:

@@ -105,6 +105,35 @@ pub struct Deliver {
     pub blob: OpaqueBlob,
 }
 
+/// Client → server: request ephemeral TURN credentials for a new session (T05, wire-protocol §2,
+/// system-design §5.4). The body is intentionally empty — the server mints a fresh, time-limited,
+/// per-session HMAC credential regardless of who asks; the client never sends a static TURN secret
+/// (webrtc-nat-traversal invariant 4). A future `session_hint` could bind a credential to a
+/// specific peer for finer allocation accounting; not carried in v1 (`TODO: confirm` in T14).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnReq {}
+
+/// Server → client: a freshly-minted, single-session TURN credential. `username` embeds the UNIX
+/// expiry (`<expiry>:<nonce>`) so coturn's shared-secret (`use-auth-secret`) check enforces the TTL
+/// without any server-side session state; `credential` is `base64(HMAC-SHA1(secret, username))`.
+/// The `nonce` makes every grant unique, so a captured credential is confined to its own short
+/// window (single-session in practice). `urls` is the full candidate ladder in preference order —
+/// TURN/UDP, TURN/TCP, then TURN/TLS-443 as the hostile-egress last resort (§5.4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnGrant {
+    /// ICE-server URLs in ladder order, e.g. `turn:turn.org:3478?transport=udp`,
+    /// `turn:turn.org:3478?transport=tcp`, `turns:turn.org:443?transport=tcp`.
+    pub urls: Vec<String>,
+    /// The ephemeral username `<expiry-unix>:<nonce-hex>`.
+    pub username: String,
+    /// `base64(HMAC-SHA1(shared_secret, username))` — the coturn REST-mechanism password.
+    pub credential: String,
+    /// Seconds until `username`'s embedded expiry; advisory for the client's re-mint timer.
+    pub ttl_secs: u64,
+    /// The TURN realm the credential is scoped to.
+    pub realm: String,
+}
+
 /// Server → client: a structured error reply (see [`error_codes`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrBody {
@@ -123,6 +152,10 @@ pub mod error_codes {
     pub const RATE_LIMITED: &str = "rate_limited";
     pub const BAD_BUNDLE: &str = "bad_bundle";
     pub const BAD_REQUEST: &str = "bad_request";
+    /// TURN credential minting is disabled (no shared secret configured, or air-gapped with no
+    /// relay). The client falls back to the STUN/host ladder and surfaces the blocked path via
+    /// `meridian doctor` (T05).
+    pub const TURN_UNAVAILABLE: &str = "turn_unavailable";
 }
 
 fn is_false(b: &bool) -> bool {

@@ -28,7 +28,7 @@ pub use envelope::{MessageEnvelope, Prekey, ENVELOPE_DOMAIN};
 pub use frame::{decode, encode, CodecError, Frame, Op};
 pub use msg::{
     error_codes, Auth, AuthOk, Bundle, Challenge, Deliver, ErrBody, Fetch, Publish, PublishOk,
-    RouteBody, RouteOk,
+    RouteBody, RouteOk, TurnGrant, TurnReq,
 };
 pub use signal::SignalContent;
 
