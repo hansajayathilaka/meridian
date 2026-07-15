@@ -29,6 +29,10 @@ pub enum Op {
     RouteOk,
     /// server→recipient: a delivered envelope.
     Deliver,
+    /// client→server: request ephemeral TURN credentials for a session (T05).
+    TurnReq,
+    /// server→client: a minted, single-session TURN credential.
+    TurnGrant,
     /// server→client: structured error.
     Err,
 }

@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 pub struct Metrics {
     connections_active: AtomicI64,
     envelopes_routed_total: AtomicU64,
+    turn_credentials_minted_total: AtomicU64,
 }
 
 impl Metrics {
@@ -29,6 +30,11 @@ impl Metrics {
         self.envelopes_routed_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn turn_minted(&self) {
+        self.turn_credentials_minted_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn connections_active(&self) -> i64 {
         self.connections_active.load(Ordering::Relaxed)
     }
@@ -38,6 +44,7 @@ impl Metrics {
     pub fn render(&self, prekey_pool_depth: u64) -> String {
         let conns = self.connections_active.load(Ordering::Relaxed);
         let routed = self.envelopes_routed_total.load(Ordering::Relaxed);
+        let turn_minted = self.turn_credentials_minted_total.load(Ordering::Relaxed);
         let mut out = String::new();
         metric(
             &mut out,
@@ -59,6 +66,13 @@ impl Metrics {
             "gauge",
             "One-time prekeys currently held across all accounts (depletion breaks first contact).",
             prekey_pool_depth as i64,
+        );
+        metric(
+            &mut out,
+            "meridian_turn_credentials_minted_total",
+            "counter",
+            "Ephemeral TURN credentials minted since start (relay-demand signal, §9.4).",
+            turn_minted as i64,
         );
         out
     }

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# testrig — the thin driver the feature-05 demo script invokes:
+#
+#   ./testrig up --nat symmetric:symmetric --block-udp=false
+#   ./testrig up --block-udp
+#   ./testrig down
+#
+# It wraps tools/netns-nat-matrix.sh (the network-namespace NAT matrix). Root/NET_ADMIN builds the
+# real topology; without it, the rig falls back to the deterministic in-process matrix (`meridian
+# doctor` / the loopback NAT-scenario tests), so the same command works in CI. See
+# docs/architecture/features/05-nat-traversal-relay-policy.md.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+RIG="tools/netns-nat-matrix.sh"
+NAT="symmetric:symmetric"
+BLOCK_UDP="false"
+
+sub="${1:-up}"; shift || true
+for arg in "$@"; do
+  case "$arg" in
+    --nat) : ;;                                  # value is the next positional; handled below
+    --nat=*) NAT="${arg#--nat=}" ;;
+    --block-udp) BLOCK_UDP="true" ;;
+    --block-udp=*) BLOCK_UDP="${arg#--block-udp=}" ;;
+    *) if [[ "${_want_nat:-}" == 1 ]]; then NAT="$arg"; _want_nat=0; fi ;;
+  esac
+  [[ "$arg" == "--nat" ]] && _want_nat=1 || true
+done
+
+case "$sub" in
+  up)
+    cell="$NAT"
+    [[ "$BLOCK_UDP" == "true" ]] && cell="udp-blocked"
+    exec bash "$RIG" cell "$cell"
+    ;;
+  down)
+    exec bash "$RIG" down
+    ;;
+  *)
+    echo "usage: $0 {up|down} [--nat <cell>] [--block-udp[=true|false]]" >&2
+    exit 2
+    ;;
+esac

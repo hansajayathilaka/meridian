@@ -8,6 +8,7 @@ use serde::Deserialize;
 pub struct Config {
     pub server: Server,
     pub limits: Limits,
+    pub turn: Turn,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -43,6 +44,48 @@ pub struct Limits {
     pub auth_per_ip_per_min: u32,
     pub fetch_per_account_per_min: u32,
     pub route_per_account_per_min: u32,
+    pub turn_per_account_per_min: u32,
+}
+
+/// TURN credential-minting surface (§9.2 "TURN secret + bandwidth caps"). An empty `secret`
+/// disables minting — clients then use the host/STUN ladder only (air-gapped with no relay, or a
+/// dev server). The `secret` MUST equal coturn's `static-auth-secret` and is provisioned out of
+/// band (env/file), never committed.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct Turn {
+    /// Shared HMAC secret, identical to coturn's `static-auth-secret`. Empty ⇒ minting disabled.
+    pub secret: String,
+    /// TURN realm (coturn `realm`).
+    pub realm: String,
+    /// Candidate-ladder URLs in preference order (TURN/UDP → TURN/TCP → TURN/TLS-443).
+    pub urls: Vec<String>,
+    /// Credential lifetime in seconds (short by design — single-session).
+    pub ttl_secs: u64,
+}
+
+impl Default for Turn {
+    fn default() -> Self {
+        let c = crate::turn::TurnConfig::default();
+        Self {
+            secret: c.secret,
+            realm: c.realm,
+            urls: c.urls,
+            ttl_secs: c.ttl_secs,
+        }
+    }
+}
+
+impl Turn {
+    /// Build the minting config used by [`crate::turn`].
+    pub fn to_turn_config(&self) -> crate::turn::TurnConfig {
+        crate::turn::TurnConfig {
+            secret: self.secret.clone(),
+            realm: self.realm.clone(),
+            urls: self.urls.clone(),
+            ttl_secs: self.ttl_secs,
+        }
+    }
 }
 
 impl Default for Server {
@@ -65,6 +108,7 @@ impl Default for Limits {
             auth_per_ip_per_min: 60,
             fetch_per_account_per_min: 120,
             route_per_account_per_min: 600,
+            turn_per_account_per_min: 60,
         }
     }
 }

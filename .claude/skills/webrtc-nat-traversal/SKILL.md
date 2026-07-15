@@ -37,3 +37,15 @@ pair fails: identify which candidate classes were gathered, which pairs were tri
 is blocked. `meridian doctor` is the diagnostic surface (feature 05). Symmetric×symmetric NAT ⇒ expect
 relay; UDP-blocked ⇒ expect TURN/TLS-443. Never "fix" a connectivity failure by weakening the
 fingerprint check or falling back to an unencrypted path.
+
+## Where this lives (T05 landed)
+- **Ephemeral TURN minting:** `meridian-rendezvous` `turn.rs` (HMAC-SHA1 REST creds, per-mint nonce ⇒
+  single-session) + the `TurnReq`/`TurnGrant` ops in `meridian-proto`; client:
+  `SignalingClient::request_turn_credentials`. coturn config: `infra/coturn/turnserver.conf`.
+- **Policy resolution** (`direct|prefer-relay|relay-only` across org/user/contact): `meridian-core`
+  `relay.rs`; the transport enforces it at gather time (`IcePolicy` in `meridian-transport`).
+- **Path + why:** `SessionInfo` (path, relay server/transport, offered classes, reason) and the
+  transport's `selected_path_detail`. **Diagnostic:** CLI `doctor.rs`. **Matrix:**
+  `tools/netns-nat-matrix.sh` + `tools/testrig`; deterministic coverage in `harnesses/nat-matrix`.
+- Adding relay to a session: build the `IceConfig` via `meridian_core::relay::ice_config` and dial
+  with `dial_with_config`/`answer_with_config` — do **not** hand-roll candidate stripping.

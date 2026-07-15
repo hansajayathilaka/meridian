@@ -40,6 +40,11 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 getrandom = { workspace = true }
 clap = { workspace = true }
+# TURN ephemeral-credential minting (coturn shared-secret REST mechanism). These are primitives —
+# HMAC-SHA1 + base64, NOT meridian-core (the server's "cannot" list §2.3 stays intact).
+hmac = { workspace = true }
+sha1 = { workspace = true }
+data-encoding = { workspace = true }
 
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"], optional = true }
 

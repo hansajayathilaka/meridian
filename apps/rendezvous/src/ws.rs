@@ -9,7 +9,7 @@ use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use meridian_proto::{
     error_codes, Auth, AuthOk, Bundle, Challenge, Deliver, ErrBody, Fetch, Frame, Op, Publish,
-    PublishOk, RouteBody, RouteOk,
+    PublishOk, RouteBody, RouteOk, TurnReq,
 };
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -172,6 +172,7 @@ async fn serve(
             Op::Publish => handle_publish(state, tx, account_pub, &frame).await,
             Op::Fetch => handle_fetch(state, tx, account_pub, &frame).await,
             Op::Route => handle_route(state, tx, account_pub, &frame).await,
+            Op::TurnReq => handle_turn(state, tx, account_pub, &frame).await,
             _ => send_err(tx, frame.id, error_codes::BAD_REQUEST, "unexpected op").await,
         }
     }
@@ -272,6 +273,45 @@ async fn handle_route(
         )
         .await;
     }
+}
+
+/// Mint an ephemeral, single-session TURN credential for an authenticated client (T05, §5.4). The
+/// server holds only the shared HMAC secret — no session state — so this is a pure function of the
+/// clock and a fresh nonce. Minting is refused (`turn_unavailable`) when no secret is configured
+/// (air-gapped with no relay, or a dev server): the client then falls back to the host/STUN ladder
+/// and `meridian doctor` names the blocked path.
+async fn handle_turn(
+    state: &Arc<AppState>,
+    tx: &mpsc::Sender<Message>,
+    account_pub: &[u8; 32],
+    frame: &Frame,
+) {
+    if !state.turn_limiter.check(account_pub.as_slice()) {
+        return send_err(
+            tx,
+            frame.id,
+            error_codes::RATE_LIMITED,
+            "too many turn requests",
+        )
+        .await;
+    }
+    // Body is empty in v1; decode to reject anything malformed rather than ignoring it.
+    let _req: TurnReq = match frame.decode() {
+        Ok(r) => r,
+        Err(_) => return send_err(tx, frame.id, error_codes::BAD_REQUEST, "malformed").await,
+    };
+    if !state.turn.enabled() {
+        return send_err(
+            tx,
+            frame.id,
+            error_codes::TURN_UNAVAILABLE,
+            "no relay configured",
+        )
+        .await;
+    }
+    let grant = crate::turn::mint_at(&state.turn, now_secs());
+    state.metrics.turn_minted();
+    send(tx, Op::TurnGrant, frame.id, &grant).await;
 }
 
 /// Read the next application frame, skipping ping/pong; `None` on close or error.

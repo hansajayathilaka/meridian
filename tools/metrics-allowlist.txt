@@ -10,3 +10,4 @@ meridian_prekey_pool_depth
 meridian_federation_link_up
 meridian_turn_allocations_active
 meridian_turn_bandwidth_bytes_total
+meridian_turn_credentials_minted_total

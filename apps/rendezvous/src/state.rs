@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::ratelimit::RateLimiter;
 use crate::store::Store;
+use crate::turn::TurnConfig;
 
 /// The live connections for one account key: `(conn_id, outbound sender)` per socket.
 type ConnList = Vec<(u64, mpsc::Sender<Message>)>;
@@ -81,6 +82,9 @@ pub struct AppState {
     pub auth_limiter: RateLimiter,
     pub fetch_limiter: RateLimiter,
     pub route_limiter: RateLimiter,
+    pub turn_limiter: RateLimiter,
+    /// Resolved TURN minting config (empty secret ⇒ minting disabled).
+    pub turn: TurnConfig,
     conn_seq: AtomicU64,
 }
 
@@ -93,6 +97,8 @@ impl AppState {
         let auth_limiter = RateLimiter::per_minute(config.limits.auth_per_ip_per_min);
         let fetch_limiter = RateLimiter::per_minute(config.limits.fetch_per_account_per_min);
         let route_limiter = RateLimiter::per_minute(config.limits.route_per_account_per_min);
+        let turn_limiter = RateLimiter::per_minute(config.limits.turn_per_account_per_min);
+        let turn = config.turn.to_turn_config();
         Arc::new(Self {
             config,
             store,
@@ -102,6 +108,8 @@ impl AppState {
             auth_limiter,
             fetch_limiter,
             route_limiter,
+            turn_limiter,
+            turn,
             conn_seq: AtomicU64::new(1),
         })
     }

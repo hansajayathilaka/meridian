@@ -26,8 +26,8 @@
 mod types;
 
 pub use types::{
-    ChannelCfg, ChannelId, Fingerprint, IceCandidate, IceConfig, IcePolicy, MediaKind, Path, Sdp,
-    SessionHandle, TrackId,
+    ChannelCfg, ChannelId, Fingerprint, IceCandidate, IceConfig, IcePolicy, IceServer, MediaKind,
+    NatScenario, Path, PathDetail, RelayTransport, Sdp, SessionHandle, TrackId,
 };
 
 mod loopback;
@@ -125,6 +125,15 @@ pub trait Transport: Send + Sync {
     /// The selected candidate-pair class once ICE has completed (`direct`/`relay`), for
     /// `meridian session info` and diagnostics.
     async fn selected_path(&self, s: &SessionHandle) -> Result<Path>;
+
+    /// The selected pair *with* relay detail (server + transport) for `meridian session info` and
+    /// `meridian doctor` — this is what lets the demo print `path=relay (turn-a, tls-443)` and so
+    /// surface the latency-vs-egress cost as numbers, not vibes (T05, §5.4). The default derives a
+    /// detail-less value from [`selected_path`](Transport::selected_path); real backends override it
+    /// with the winning TURN allocation's server and transport.
+    async fn selected_path_detail(&self, s: &SessionHandle) -> Result<PathDetail> {
+        Ok(PathDetail::direct(self.selected_path(s).await?))
+    }
 
     /// Tear the peer connection down.
     async fn close(&self, s: &SessionHandle) -> Result<()>;

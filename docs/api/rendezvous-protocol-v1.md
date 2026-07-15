@@ -37,11 +37,13 @@ All 32-byte keys and 64-byte signatures are encoded as **CBOR byte strings** (ma
 | `Route` | C→S | `{ to: bstr[32], blob: bstr }` | route an opaque envelope |
 | `RouteOk` | S→C | `{ delivered: bool }` | routed to a live peer |
 | `Deliver` | S→C | `{ from: bstr[32], blob: bstr }` | a delivered envelope |
+| `TurnReq` | C→S | `{}` | request ephemeral TURN credentials (T05) |
+| `TurnGrant` | S→C | `{ urls: [*tstr], username: tstr, credential: tstr, ttl_secs: uint, realm: tstr }` | a minted single-session TURN credential |
 | `Err` | S→C | `{ code: tstr, msg: tstr }` | structured error (codes below) |
 
 `PrekeyBundle = { v, account_pub: bstr[32], spk: bstr[32], spk_sig: bstr[64], otks: [*bstr[32]], otk_sigs: [*bstr[64]], device_record?: bstr }` — every `*_sig` is `Ed25519(account_pub)` over the corresponding public key. `device_record` is opaque and account-signed (T13). ≤100 one-time prekeys.
 
-**Error codes:** `auth_required`, `auth_failed`, `replay`, `admission_denied`, `not_found`, `not_connected`, `rate_limited`, `bad_bundle`, `bad_request`.
+**Error codes:** `auth_required`, `auth_failed`, `replay`, `admission_denied`, `not_found`, `not_connected`, `rate_limited`, `bad_bundle`, `bad_request`, `turn_unavailable`.
 
 ## 2. Handshake & registration
 
@@ -60,6 +62,22 @@ All 32-byte keys and 64-byte signatures are encoded as **CBOR byte strings** (ma
 
 `Route{to, blob}` delivers `blob` verbatim to every live connection for `to` as `Deliver{from, blob}`, and replies `RouteOk{delivered:true}`; an offline recipient is `not_connected` (the ciphertext mailbox is [T07](../architecture/features/07-offline-mailbox.md)). The server **never** decodes `blob` — it is `OpaqueBlob` end to end, enforced by `tools/lint-no-serde-on-blob.sh`.
 
+## 4a. TURN credentials (T05)
+
+`TurnReq{}` asks the server to mint an **ephemeral, per-session** TURN credential for the connecting client; the reply is `TurnGrant`. This is the [coturn shared-secret / REST mechanism](https://github.com/coturn/coturn/blob/master/README.turnserver) (`use-auth-secret`), so **no static TURN secret ever reaches a client** ([webrtc-nat-traversal](../../.claude/skills/webrtc-nat-traversal/SKILL.md) invariant 4, system-design §5.4):
+
+```
+username   = "<expiry-unix>:<nonce-hex>"      ; expiry = now + ttl_secs; nonce is fresh per mint
+credential = base64( HMAC-SHA1( shared_secret, username ) )
+```
+
+coturn — sharing the *same* secret (`static-auth-secret` == rendezvous `[turn].secret`) — recomputes the HMAC over the presented username and admits the allocation only while `now < expiry`. Two properties matter:
+
+- **Expiry** is embedded in the username, so the TTL is enforced by coturn with **no server-side session state** (the rendezvous stays near-stateless, ADR-8).
+- **Single-session**: a fresh random nonce per mint makes every credential unique, so a captured credential is confined to its own short window and authorizes no other session's allocation (feature-05 acceptance: *reuse rejected by coturn*).
+
+`urls` is the ladder in preference order — `turn:…?transport=udp`, `turn:…?transport=tcp`, then `turns:…:443?transport=tcp` (the hostile-egress last resort). A server with **no** relay configured (empty secret — a dev server, or air-gapped with no TURN) replies `turn_unavailable`; the client then uses the host/STUN ladder only and `meridian doctor` names the blocked path. Minting is authenticated (post-`AuthOk`) and rate-limited per account (`turn_per_account_per_min`). The mint rate is exported as the allowlisted `meridian_turn_credentials_minted_total` (§9.4). Client side: `meridian_signaling::SignalingClient::request_turn_credentials`.
+
 ## 5. Config surface (the §9.2 subset)
 
 TOML; every field has a default (see [`meridian-rendezvous` `config`](../../apps/rendezvous/src/config.rs)):
@@ -77,11 +95,22 @@ database_url = "sqlite://rendezvous.db"   # only used with the `sqlite` feature
 auth_per_ip_per_min = 60
 fetch_per_account_per_min = 120
 route_per_account_per_min = 600
+turn_per_account_per_min = 60
+
+[turn]                           # ephemeral TURN credential minting (T05, §5.4)
+secret = ""                      # == coturn static-auth-secret; EMPTY ⇒ minting disabled. Out of band.
+realm = "localhost"              # coturn realm, echoed to the client
+urls = [                         # the candidate ladder, preference order
+  "turn:127.0.0.1:3478?transport=udp",
+  "turn:127.0.0.1:3478?transport=tcp",
+  "turns:127.0.0.1:443?transport=tcp",
+]
+ttl_secs = 120                   # credential lifetime (short — single-session)
 ```
 
 ## 6. Metrics
 
-`GET /metrics` exposes **only** the allowlisted names (`tools/metrics-allowlist.txt`, §9.4): `meridian_connections_active`, `meridian_envelopes_routed_total`, `meridian_prekey_pool_depth`. `GET /healthz` is a liveness probe. Never per-user sizes, contact-graph, or content metrics.
+`GET /metrics` exposes **only** the allowlisted names (`tools/metrics-allowlist.txt`, §9.4): `meridian_connections_active`, `meridian_envelopes_routed_total`, `meridian_prekey_pool_depth`, `meridian_turn_credentials_minted_total`. `GET /healthz` is a liveness probe. Never per-user sizes, contact-graph, or content metrics.
 
 ## 7. Storage & persistence
 
