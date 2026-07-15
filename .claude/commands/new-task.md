@@ -3,6 +3,11 @@ description: Start a feature — read the relevant design docs, plan, implement,
 ---
 You are starting work on a feature for Meridian. The feature/scope is: **$ARGUMENTS**
 
+> **Naming.** `/new-task <feature>` starts a **roadmap feature** from its spec (Features 01–16). To drive
+> the **remediation plan** ([docs/architecture/implementation-plan.md](../../docs/architecture/implementation-plan.md))
+> one task at a time with model routing and subagent orchestration, use [`/next-task`](./next-task.md)
+> instead. The remediation plan must clear (Phase 5) before the roadmap feature cadence resumes here.
+
 Follow this grounded workflow. Do not skip the reading step — this repo's design is the source of truth.
 
 1. **Locate the spec.** Find the matching feature spec under [docs/architecture/features/](../../docs/architecture/features/) (features are numbered 01–16; see the [roadmap](../../docs/architecture/roadmap.md)). Read it fully, including its "working output" demo and acceptance criteria.
