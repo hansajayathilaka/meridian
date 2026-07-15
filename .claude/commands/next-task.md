@@ -1,18 +1,33 @@
 ---
 description: Drive the next unblocked task from the implementation plan through the orchestrated build loop.
 ---
-Drive **one** task from the remediation plan
+Drive **one** task from the end-to-end program
 ([docs/architecture/implementation-plan/](../../docs/architecture/implementation-plan/README.md)) end to
 end: pick the next unblocked task → plan it → build it test-first → test & verify against its Definition
 of Done → final review → go/no-go. Optional argument to pin a specific task: **$ARGUMENTS** (e.g.
-`T2.1`); if empty, select automatically.
+`T2.1`, `F06.3`, `R1.2`); if empty, select automatically.
 
-**Plan layout.** The plan is a directory: one folder per phase, one file per task. Read the plan
-[`README.md`](../../docs/architecture/implementation-plan/README.md) for the phase table and the
-findings→task map, then each `phase-<n>-*/README.md` for that phase's task table. A task ID `T<phase>.<n>`
-resolves to `phase-<phase>-<slug>/T<phase>.<n>-<slug>.md`; open **that one file** for the task's full
-context (Scope, Touches with [ADR]/[SEC] tags, Deliverables, Tests, Verification, Depends on, Status).
-Each task file names its own required pre-build review under **Pre-build review**.
+**Plan layout.** The plan is a directory organised into **milestones** (see the plan
+[`README.md`](../../docs/architecture/implementation-plan/README.md) status dashboard + milestone
+sections). There are three task kinds:
+- **Remediation** `T<phase>.<n>` (Milestone M0) — one file per task at
+  `phase-<phase>-<slug>/T<phase>.<n>-<slug>.md`.
+- **Feature** `F<NN>.<n>` (Milestones M1–M4) — a section in `feature-<NN>-<slug>/README.md`. On first
+  entry to a feature, **materialise its tasks into per-task files** (`F<NN>.<n>-<slug>.md`) from the
+  feature README's breakdown before building — same one-thing-per-file shape as M0.
+- **Review-gate** `R<n>.<m>` — produced by a review phase (`review-r<n>-<slug>/`) and fixed there.
+
+Read the relevant folder's `README.md` for the task table, then open the task (file or README section)
+for its full context: Scope, Touches with [ADR]/[SEC] tags, Deliverables, Tests, Verification, Depends
+on, Status, and the named **Pre-build review**.
+
+**Milestone gating (hard rule).** Never start a milestone's features until the **previous milestone's
+review gate is cleared** (all its `R<n>.<m>` tasks done, `just lint && just test` + that milestone's
+harnesses/vectors green). When a milestone's last feature is built, the next unblocked "task" is to
+**run that milestone's review phase** — instantiate [`review-phase-template.md`](../../docs/architecture/implementation-plan/review-phase-template.md)
+in the review folder (delegate the five-area review to `security-reviewer` + `architect` + `test-engineer`
+as R0 did), write `findings.md`, decompose findings into `R<n>.<m>` tasks, and drive those to green
+before advancing.
 
 ## Your role (orchestrator, Opus)
 You are the **orchestrator** and you stay on Opus. You own sequencing, delegation, and the final

@@ -6,6 +6,11 @@
 Every feature ships as a runnable increment — each spec under [features/](./features/) ends in a
 demo you can execute at sign-off. Trust-critical substrate comes first; convenience later.
 
+> **Execution status & sequencing:** this table is the feature *index*; the end-to-end delivery program
+> — foundation remediation, feature build order, milestones, and the review gate after each milestone —
+> lives in [implementation-plan/](./implementation-plan/README.md), which also carries the live
+> "where are we now" status dashboard.
+
 ## Feature specs (priority order)
 
 | # | Feature | Working output at sign-off | Depends on |
