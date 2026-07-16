@@ -19,7 +19,7 @@
    -------------------------------------------------------------------------
    NOTE: This is the standard Apache-2.0 notice. Replace this file with the
    full license text (https://www.apache.org/licenses/LICENSE-2.0.txt) before
-   distribution. Apache-2.0 was chosen deliberately and is why the ratchet
-   library is vodozemac, not AGPL-licensed libsignal — see
-   docs/adr/0011-ratchet-library.md.
+   distribution. Apache-2.0 was chosen deliberately and is why the crypto
+   layer is built on RustCrypto primitives, not AGPL-licensed libsignal — see
+   docs/adr/0011-ratchet-library.md and docs/adr/0015-ratchet-composition.md.
    <!-- TODO: confirm — paste full Apache-2.0 text before public release. -->

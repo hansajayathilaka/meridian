@@ -9,15 +9,20 @@ workspace builds and enforces its own invariants, and the missing agents/skills/
 
 ## A. Architectural decisions (now resolved → ADRs)
 
-### D1 — Ratchet library → **vodozemac + hand-wired X3DH** ([ADR 0011](./adr/0011-ratchet-library.md))
+### D1 — Ratchet library → **hand-wired X3DH + composed Double Ratchet, both over RustCrypto primitives**
+([ADR 0011](./adr/0011-ratchet-library.md), [ADR 0015](./adr/0015-ratchet-composition.md))
 - **Options:** libsignal-client (A) · vodozemac + thin X3DH (B) · RustCrypto assembly (C).
-- **Pros of B:** Apache-2.0 (libsignal is AGPL — copyleft across a self-hostable, redistributed
-  product); library built for embedding; clean wasm32/aarch64 builds; independently audited.
-- **Cons of B (mitigated):** X3DH wired ourselves (small, well-specified, own vectors + external review);
-  less brand-name battle-testing than libsignal (but production-proven in Matrix); header-encryption +
-  PQ slot confirmed via one time-boxed spike.
+- **Pros of B (X3DH-layer rationale, still binding):** Apache-2.0 (libsignal is AGPL — copyleft across a
+  self-hostable, redistributed product); clean wasm32/aarch64 builds; no AGPL legal review needed to
+  deploy or modify Meridian — this was the deciding factor.
+- **Cons of B (why the ratchet moved to C):** the `ratchet-header-enc` spike found vodozemac 0.10's
+  public API cannot be seeded from an externally-computed X3DH root key, cannot use the frozen `v:1`
+  bundle, and exposes neither header encryption nor raw message keys — so for the Double Ratchet
+  mechanism specifically, the decision moved from B to **C (assemble from RustCrypto primitives)**,
+  recorded in [ADR 0015](./adr/0015-ratchet-composition.md). The X3DH layer stays hand-wired over the
+  same primitive set either way, so this is a narrower change than it looks.
 - **Why this fits the end goal:** an org can deploy and modify Meridian without AGPL legal review. This
-  was the deciding factor.
+  was the deciding factor and is unchanged by the ratchet-composition shift.
 
 ### D2 — Real-time media stack → **libwebrtc for media, webrtc-rs for data** ([ADR 0014](./adr/0014-media-stack.md))
 - **Options:** pure webrtc-rs + build audio 3A (A) · all-libwebrtc (B) · hybrid split at the media
@@ -68,9 +73,11 @@ tied to D1) · `infra/deploy/bootstrap-ca.sh` + `two-orgs.compose.yml` so `just 
 - **MCP connector config** — add only when real external tools (GitHub/CI) are connected; premature now.
 
 ## F. Remaining spikes (tracked, not blocking) — run via [/spike](../.claude/commands/spike.md)
-1. `ratchet-header-enc` — confirm vodozemac exposes header encryption; else layer it in `meridian-crypto`.
+1. ~~`ratchet-header-enc`~~ — **resolved** during T03: vodozemac does not expose header encryption or a
+   seedable ratchet, so header encryption is composed directly in `meridian-crypto`
+   ([ADR 0015](./adr/0015-ratchet-composition.md)).
 2. `libwebrtc-packaging` — vendor prebuilt vs maintained `-sys` crate ([ADR 0014](./adr/0014-media-stack.md)).
-Both leave the data-plane features (03/04/09/16) unblocked.
+The data-plane features (03/04/09/16) are unblocked either way.
 
 ## G. Still `TODO: confirm` (org-specific, correctly not invented)
 Alert thresholds & on-call ([operations](./operations/monitoring.md), [runbook](./operations/runbook.md));

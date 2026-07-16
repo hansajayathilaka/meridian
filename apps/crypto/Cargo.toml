@@ -7,9 +7,10 @@ publish = false
 
 # T03: the E2EE session layer — a hand-wired X3DH prekey handshake over the frozen bundle
 # (docs/api/wire-protocol.md §7 v:1) plus a header-encrypted Double Ratchet composed from audited
-# RustCrypto primitives. See docs/adr/0011-ratchet-library.md (and its 2026-07 superseding note:
-# vodozemac's public API cannot be seeded from an externally-computed X3DH root key, so the ratchet
-# is assembled here, Option C, behind a stable API and gated on the crypto external review).
+# RustCrypto primitives. See docs/adr/0011-ratchet-library.md (X3DH layer) and
+# docs/adr/0015-ratchet-composition.md (vodozemac's public API cannot be seeded from an
+# externally-computed X3DH root key, so the ratchet is assembled here behind a stable API and
+# gated on the crypto external review).
 # Dependency direction (docs/architecture/stack.md §3): depends on `store` (DH/sign through the
 # keystore) and the RustCrypto primitives; never on `signaling`/`rendezvous`.
 [dependencies]

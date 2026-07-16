@@ -11,7 +11,9 @@ Shared vocabulary for Meridian. Terms are used consistently across design docs, 
   See [wire protocol](./api/wire-protocol.md).
 - **X3DH** — Extended Triple Diffie-Hellman; asynchronous initial key agreement against a prekey bundle.
 - **Double Ratchet** — the per-message key ratchet giving forward secrecy (FS) and post-compromise
-  security (PCS). Implemented via **vodozemac** ([ADR 0011](./adr/0011-ratchet-library.md)).
+  security (PCS). Header-encrypted, composed in `meridian-crypto` from audited RustCrypto primitives
+  ([ADR 0015](./adr/0015-ratchet-composition.md), superseding [ADR 0011](./adr/0011-ratchet-library.md)'s
+  vodozemac choice for this mechanism).
 - **FS / PCS** — Forward Secrecy (past messages safe after a key compromise) / Post-Compromise Security
   (the session self-heals after compromise ends).
 - **Safety number** — a fingerprint over both parties' identity keys, compared out-of-band to detect

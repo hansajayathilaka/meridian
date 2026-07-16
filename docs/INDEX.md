@@ -84,8 +84,10 @@ Top-level sections: [architecture](./architecture/README.md) · [adr](./adr/READ
    [anonymity-model skill](../.claude/skills/anonymity-model/SKILL.md) enforces the honest scope.
 3. **"No application server" vs. the ciphertext mailbox** — an intentional, disclosed tension, fully
    reconciled in [ADR 0007](./adr/0007-offline-mailbox.md). Not a defect.
-4. **Two open decisions remain open:** [ADR 0011](./adr/0011-ratchet-library.md) (ratchet library)
-   and libwebrtc-vs-pure-Rust media ([ADR 0006](./adr/0006-terminal-transport.md) / design §12).
+4. **Two decisions were open at reorganization time, both now resolved:** the ratchet library
+   ([ADR 0011](./adr/0011-ratchet-library.md), X3DH layer; further refined by
+   [ADR 0015](./adr/0015-ratchet-composition.md) for the Double Ratchet mechanism itself) and the
+   libwebrtc-vs-pure-Rust media question ([ADR 0014](./adr/0014-media-stack.md)).
 5. **Operational specifics absent** (alert thresholds, on-call, backup cadence) are marked
    `<!-- TODO: confirm -->` in [operations/monitoring.md](./operations/monitoring.md) and
    [operations/runbook.md](./operations/runbook.md) rather than invented.
@@ -103,7 +105,10 @@ These were created to make the scaffold Claude-Code-ready; see
 | [glossary.md](./glossary.md) | Shared vocabulary |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | Workflow + global Definition of Done |
 
-[ADR 0011](./adr/0011-ratchet-library.md) was moved from *open* to **Accepted** (vodozemac).
+[ADR 0011](./adr/0011-ratchet-library.md) was moved from *open* to **Accepted** (X3DH layer, hand-wired
+over RustCrypto primitives; the vodozemac choice for the Double Ratchet mechanism was later superseded
+by [ADR 0015](./adr/0015-ratchet-composition.md) once the `ratchet-header-enc` spike found vodozemac's
+API unusable for our key/bundle model).
 New Claude Code tooling: skills `crypto-protocols`, `webrtc-nat-traversal`, `stream-type-authoring`;
 agent `connectivity-debugger`; commands `/adr`, `/spike`. Runnable skeleton: `meridian-proto` crate,
 `tools/xtask`, three enforcement lints under `tools/`, harness stubs under `harnesses/`, and

@@ -51,8 +51,8 @@ ciborium = "0.2.2"
 # X25519 prekeys (T02 bundles; audited RustCrypto — never hand-rolled per ADR 0011 spirit).
 x25519-dalek = { version = "2.0.1", features = ["static_secrets", "zeroize"] }
 # Ratchet + X3DH primitives (T03; meridian-crypto — audited RustCrypto, ADR 0011). The Double
-# Ratchet is composed from these per docs/adr/0011-ratchet-library.md#supersede-2026-07 (vodozemac
-# cannot be seeded from an external X3DH root key — see the ADR note).
+# Ratchet is composed from these per docs/adr/0015-ratchet-composition.md (vodozemac cannot be
+# seeded from an external X3DH root key — see the ADR).
 sha2 = "0.10.8"
 sha1 = "0.10.7"
 hkdf = "0.12.4"

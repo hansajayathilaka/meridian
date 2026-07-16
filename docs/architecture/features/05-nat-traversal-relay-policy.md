@@ -33,3 +33,11 @@ All four NAT matrix cells connect (symmetric×symmetric via relay); TLS-443 fall
 
 ## Risks / notes
 This task creates the latency-vs-privacy trade surface — the demo must *show* the cost (rtt printed per path) so the org-level decision in §5.4 is made with numbers, not vibes.
+
+**Verification status (recorded honestly, F9):** the NAT test matrix and `relay-only` candidate-stripping
+guarantees above are currently validated via the `netns` simulation rig against the non-webrtc-rs
+`Transport` test double, not against real ICE/TURN negotiation over webrtc-rs. Treat this spec's
+acceptance criteria as **simulation-only until fix-task
+[1.16](../../tasks/phase-1/1.16-nat-acceptance-matrix.md)** lands the wire-level NAT/relay acceptance
+matrix and observed-candidate relay-only enforcement (which itself depends on the webrtc-rs backend from
+[1.15](../../tasks/phase-1/1.15-webrtc-backend.md)).
