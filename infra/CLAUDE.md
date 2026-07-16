@@ -1,6 +1,7 @@
 # CLAUDE.md — infra/ (deployment & operations)
 
-Scoped memory for infrastructure. Inherits the root [CLAUDE.md](../CLAUDE.md).
+Scoped memory for infrastructure. Inherits the root [CLAUDE.md](../CLAUDE.md). Work here is tracked like
+everything else via the [task tracker](../docs/tasks/README.md) and the five workflow commands.
 
 ## Contents (scaffold)
 - `deploy/` — docker-compose (small org) and Helm chart (K8s): `meridian-rendezvous` + Postgres +
