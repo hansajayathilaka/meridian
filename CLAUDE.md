@@ -54,22 +54,41 @@ just two-orgs     # local two-org federation demo stack
 - Rust: `cargo fmt` (enforced by a PostToolUse hook) + `cargo clippy` clean before done.
 
 ## Claude Code tooling ([.claude/](./.claude/))
-- **Commands:** [/new-task](./.claude/commands/new-task.md) · [/review](./.claude/commands/review.md) ·
-  [/test](./.claude/commands/test.md) · [/deploy-check](./.claude/commands/deploy-check.md) ·
-  [/doc-sync](./.claude/commands/doc-sync.md) · [/adr](./.claude/commands/adr.md) ·
-  [/spike](./.claude/commands/spike.md)
-- **Subagents:** [architect](./.claude/agents/architect.md) ·
+- **Workflow commands** (drive delivery): [/pick-next-phase](./.claude/commands/pick-next-phase.md) ·
+  [/plan-phase](./.claude/commands/plan-phase.md) · [/next-task](./.claude/commands/next-task.md) ·
+  [/start-review-phase](./.claude/commands/start-review-phase.md) ·
+  [/plan-review-phase](./.claude/commands/plan-review-phase.md)
+- **Other commands:** [/review](./.claude/commands/review.md) · [/test](./.claude/commands/test.md) ·
+  [/deploy-check](./.claude/commands/deploy-check.md) · [/doc-sync](./.claude/commands/doc-sync.md) ·
+  [/adr](./.claude/commands/adr.md) · [/spike](./.claude/commands/spike.md) ·
+  [/new-task](./.claude/commands/new-task.md) (manual escape hatch)
+- **Subagents:** [task-picker](./.claude/agents/task-picker.md) · [planner](./.claude/agents/planner.md) ·
+  [rust-dev](./.claude/agents/rust-dev.md) · [web-dev](./.claude/agents/web-dev.md) ·
+  [code-reviewer](./.claude/agents/code-reviewer.md) · [architect](./.claude/agents/architect.md) ·
   [security-reviewer](./.claude/agents/security-reviewer.md) ·
   [test-engineer](./.claude/agents/test-engineer.md) · [devops](./.claude/agents/devops.md) ·
   [connectivity-debugger](./.claude/agents/connectivity-debugger.md)
-- **Skills:** [anonymity-model](./.claude/skills/anonymity-model/SKILL.md) ·
+- **Skills:** [task-tracking](./.claude/skills/task-tracking/SKILL.md) ·
+  [anonymity-model](./.claude/skills/anonymity-model/SKILL.md) ·
   [api-contracts](./.claude/skills/api-contracts/SKILL.md) ·
   [deployment](./.claude/skills/deployment/SKILL.md) ·
   [crypto-protocols](./.claude/skills/crypto-protocols/SKILL.md) ·
   [webrtc-nat-traversal](./.claude/skills/webrtc-nat-traversal/SKILL.md) ·
   [stream-type-authoring](./.claude/skills/stream-type-authoring/SKILL.md)
 
-## Start a feature
-Run `/new-task <feature>`; it reads the matching spec in
-[docs/architecture/features/](./docs/architecture/features/) and the docs that spec references, then
-plans → implements → tests. Feature order: [docs/architecture/roadmap.md](./docs/architecture/roadmap.md).
+## How work flows (task tracking)
+All delivery is driven from the [task tracker](./docs/tasks/README.md) — one scannable activity list of
+numbered phases (`P`) and tasks (`P.N`), each task linking to its own file (goal, scope, deliverables,
+risks, tests, reviews, status). You drive it with **five commands**, and each session reads only the
+tracker plus the one task file it needs — not the whole doc tree.
+
+```
+Build phase:   /pick-next-phase → /plan-phase → /next-task ×N
+Review phase:  /start-review-phase → /plan-review-phase → /next-task ×N
+```
+
+Build and review phases alternate: after each build phase, a review phase sweeps it for bugs, gaps,
+loopholes, and on-the-fly decisions before the next build starts. Phase 0 (foundation, T01–T05) is done;
+the "issues to fix" work is Phase 1. Contract + numbering + the **Definition of Task** live in the
+[task-tracking skill](./.claude/skills/task-tracking/SKILL.md). `/new-task` remains only as a manual
+per-feature escape hatch.

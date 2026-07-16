@@ -13,6 +13,9 @@ for dp,_,fs in os.walk("."):
     if any(x in dp for x in ("/.git","/target","/node_modules","/.ca")): continue
     for fn in fs:
         if not fn.endswith(".md"): continue
+        # Skip task/phase templates: their relative links are written for the copy
+        # destination (docs/tasks/phase-N/) and contain intentional placeholders.
+        if fn.startswith("TEMPLATE"): continue
         fp=os.path.join(dp,fn)
         for m in link_re.finditer(open(fp,encoding="utf-8").read()):
             t=m.group(2).strip()

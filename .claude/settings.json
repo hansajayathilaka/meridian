@@ -10,7 +10,12 @@
       "Bash(just:*)",
       "Bash(pnpm:*)",
       "Bash(git status:*)",
-      "Bash(git diff:*)"
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(ls:*)",
+      "Bash(cat docs/tasks/*)"
     ],
     "deny": [
       "Bash(git push:*)",
@@ -22,6 +27,17 @@
     "RUST_BACKTRACE": "1"
   },
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "awk '/^## .*NOW/{f=1} f{print} f&&/^---$/{exit}' docs/tasks/README.md 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit",

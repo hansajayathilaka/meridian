@@ -29,17 +29,20 @@ demo you can execute at sign-off. Trust-critical substrate comes first; convenie
 
 ## Phasing (from the design)
 
-| D. Blockchain/ENS-style name→key registry | consensus system | good | good |
+The canonical **design** phase narrative (Phase 0–4) lives in
+[system-design.md §11](./system-design.md). In short:
 
-**Decision: C.** A gives servers key-substitution power — disqualifying under A2. B forces a DHT into v1's critical path — disqualifying for air-gapped enterprise. D imports a consensus dependency and its ops burden onto a 2–5-person team for what is, at bottom, a petname convenience; org directory attestations (§3.5) capture most of the value without it. **Consequences:** IDs are long/opaque → invest in QR + petname UX; hint staleness is a real failure mode → ID re-issue flow and (Phase 4) DHT hint-resolution fallback; server migration is user-visible but security-neutral. **Revisit** if a naming layer becomes a hard product requirement.
+| Phase | Theme | Covers features |
+|-------|-------|-----------------|
+| 0 | Substrate (risk burn-down) | 01–05 |
+| 1 | Federation & Tier-1 core | 06, 07, 08, 09, 10, 11, 12 |
+| 2 | Identity depth | 13, 15 (+ small groups, PQXDH bump, ops hardening) |
+| 3 | Scale & privacy | MLS groups, mailbox padding, sealed-sender |
+| 4 | Reach | 16 (+ QUIC, PKARR/DHT hints, group calls) |
 
-### ADR-2: Federation mechanism — server-to-server signaling over mTLS, DHT deferred
-
-**Status:** Proposed · **Options:** (A) Kademlia-style DHT for discovery + hole-punching relays; (B) **federated s2s signaling, DNS-SRV/static-map discovery (chosen)**; (C) rendezvous hashing across a shared server list; (D) gossip mesh among servers.
-
-**Trade-offs:** A maximizes decentralization but: Sybil/eclipse pressure on availability, lookup metadata broadcast to strangers, poor mobile churn behavior, and it degenerates into "a hard-to-operate static map" in air-gapped two-org deployments — the primary deployment! C requires globally consistent membership (a coordination problem federation is supposed to avoid) and reshuffles on membership change. D adds convergence complexity with no lookup benefit at realistic org counts (2–200). B matches email/Matrix operational intuition, keeps metadata bilateral (only the two involved orgs observe a cross-org contact), needs no shared state, and air-gaps trivially (static federation map + private CA). **Decision: B**, with the ID scheme deliberately transport-agnostic so a PKARR/mainline-DHT resolver can be added in Phase 4 for server-less consumer use **as an addition, not a migration**. **Consequences:** reachability of `K_B` depends on `chat.org-b` being up (mitigate: multi-hint IDs, mailbox retries); federation abuse handled bilaterally (rate limits, allowlists) rather than by global consensus.
-
-### ADR-3: E2EE messaging protocol — X3DH + Double Ratchet at the application layer
+> **Execution vs design phases:** day-to-day delivery is driven by the numbered *execution* phases in
+> the [task tracker](../tasks/README.md) (Phase 0 done, Phase 1 review, Phase 2 = T06, …), which
+> alternate build and review. Those are a delivery cadence, not the design grouping above.
 
 
 ## Parallel tracks for a small team
