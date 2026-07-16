@@ -16,9 +16,10 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** Phase 0 complete (foundation shipped).
-- **NEXT:** run **`/start-review-phase`** to open Phase 1 (review of Phase 0 → "issues to fix").
+- **NOW:** Phase 1 planned — review report (F1–F22) turned into 21 fix-tasks (1.1–1.21).
+- **NEXT:** run **`/next-task`** to implement the fix-tasks (blocking first: 1.1, 1.2, 1.3, then the rest).
 - After Phase 1 fixes land: **`/pick-next-phase`** selects Phase 2 (T06 Cross-Org Federation).
+  Blocking gate: F1, F2, F3, F10, F11 (→ 1.1, 1.2, 1.6, 1.13+1.15, 1.14+1.16) must close first.
 
 ---
 
@@ -32,8 +33,41 @@ Trust-critical substrate: identity, E2EE messaging, P2P session, NAT traversal. 
 - [x] **0.4** P2P Session Substrate (T04) — [file](./phase-0/0.4-p2p-session-substrate.md)
 - [x] **0.5** NAT Traversal & Relay Policy (T05) — [file](./phase-0/0.5-nat-traversal-relay.md)
 
-### Phase 1 — Review of Phase 0 · **not started**
-Review completed. Need to plan for this phase
+### Phase 1 — Review of Phase 0 · **in progress** · [details](./phase-1/README.md)
+Review of Phase 0 (Features 1–5). [Report](./phase-1/review-report.md) findings F1–F22 → 21 fix-tasks,
+ordered blocking-first per the Verdict (doc/ADR truth → freeze crypto → real gates → close Features 4/5 →
+design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
+
+**Group A — Doc/ADR truth restoration** (blocking)
+- [ ] **1.1** ADR 0015 — ratchet composition (F2) — [file](./phase-1/1.1-adr-0015-ratchet-composition.md)
+- [ ] **1.2** Doc-sync: purge stale "ratchet = vodozemac" (F3) — [file](./phase-1/1.2-doc-sync-vodozemac.md)
+- [ ] **1.3** Reconcile T03/T04/T05 specs + wire-deferral (F9) — [file](./phase-1/1.3-reconcile-transport-crypto-specs.md)
+- [ ] **1.4** Repair roadmap "Phasing" splice + ADR 0013 tail (F19) — [file](./phase-1/1.4-repair-roadmap-splice.md)
+
+**Group B — Freeze the crypto** (blocking / should-fix)
+- [ ] **1.5** Zeroization gaps: X3DH master secret + ratchet header keys (F5, F6) — [file](./phase-1/1.5-crypto-zeroization-gaps.md)
+- [ ] **1.6** Conformance vectors: X3DH / ratchet / envelope / safety numbers + CI (F1) — [file](./phase-1/1.6-conformance-vectors.md)
+- [ ] **1.7** SecretStore KDF op — drop signature-determinism dependency (F7) — [file](./phase-1/1.7-secretstore-kdf-op.md)
+
+**Group C — Make the gates real** (should-fix)
+- [ ] **1.8** Real CI gates: deny.toml + cargo-deny + blocking clippy (F4, F18) — [file](./phase-1/1.8-ci-blocking-gates.md)
+- [ ] **1.9** Metrics-allowlist exhaustiveness test (F14) — [file](./phase-1/1.9-metrics-exhaustiveness.md)
+- [ ] **1.10** Harden no-serde-on-blob lint (F15) — [file](./phase-1/1.10-no-serde-blob-lint.md)
+- [ ] **1.11** Re-point opacity-audit harness gate (F8) — [file](./phase-1/1.11-opacity-harness-gate.md)
+- [ ] **1.12** Rendezvous fail-closed config + feature-gate tamper hook (F16, F17) — [file](./phase-1/1.12-rendezvous-fail-closed.md)
+
+**Group D — Close Features 4/5 honestly** (blocking; honesty cheap, backend weeks)
+- [ ] **1.13** Feature 4 honesty: transport label + SDP test (F10 honesty) — [file](./phase-1/1.13-feature4-honesty.md)
+- [ ] **1.14** Feature 5 honesty: coturn user-quota + credential-reuse wording (F11 honesty) — [file](./phase-1/1.14-feature5-honesty.md)
+- [ ] **1.15** webrtc-rs `Transport` backend (F10 backend) — [file](./phase-1/1.15-webrtc-backend.md)
+- [ ] **1.16** NAT/relay wire-level acceptance matrix + observed-candidate relay-only (F11 wire, F20) — [file](./phase-1/1.16-nat-acceptance-matrix.md)
+
+**Group E — Design decisions + remaining should-fix / nit**
+- [ ] **1.17** ADR — deniability vs envelope signature (on-the-fly) — [file](./phase-1/1.17-adr-deniability-envelope-sig.md)
+- [ ] **1.18** Desync → fresh-X3DH auto-recovery decision (F13, on-the-fly) — [file](./phase-1/1.18-desync-recovery-decision.md)
+- [ ] **1.19** 5k-connection capacity test (F12) — [file](./phase-1/1.19-capacity-test-5k.md)
+- [ ] **1.20** Server-hardening bundle (F21) — [file](./phase-1/1.20-server-hardening-bundle.md)
+- [ ] **1.21** Coverage tooling or drop the % (F22) — [file](./phase-1/1.21-coverage-tooling.md)
 
 ---
 
