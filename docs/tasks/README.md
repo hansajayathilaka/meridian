@@ -16,8 +16,8 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** Phase 1 planned — review report (F1–F22) turned into 21 fix-tasks (1.1–1.21).
-- **NEXT:** run **`/next-task`** to implement the fix-tasks (blocking first: 1.1, 1.2, 1.3, then the rest).
+- **NOW:** Phase 1 fix-tasks landing — 1.1 (ADR 0015 ratchet composition) done.
+- **NEXT:** run **`/next-task`** to continue with 1.2 (doc-sync: purge stale "ratchet = vodozemac"), then 1.3, then the rest.
 - After Phase 1 fixes land: **`/pick-next-phase`** selects Phase 2 (T06 Cross-Org Federation).
   Blocking gate: F1, F2, F3, F10, F11 (→ 1.1, 1.2, 1.6, 1.13+1.15, 1.14+1.16) must close first.
 
@@ -39,7 +39,7 @@ ordered blocking-first per the Verdict (doc/ADR truth → freeze crypto → real
 design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 
 **Group A — Doc/ADR truth restoration** (blocking)
-- [ ] **1.1** ADR 0015 — ratchet composition (F2) — [file](./phase-1/1.1-adr-0015-ratchet-composition.md)
+- [x] **1.1** ADR 0015 — ratchet composition (F2) — [file](./phase-1/1.1-adr-0015-ratchet-composition.md)
 - [ ] **1.2** Doc-sync: purge stale "ratchet = vodozemac" (F3) — [file](./phase-1/1.2-doc-sync-vodozemac.md)
 - [ ] **1.3** Reconcile T03/T04/T05 specs + wire-deferral (F9) — [file](./phase-1/1.3-reconcile-transport-crypto-specs.md)
 - [ ] **1.4** Repair roadmap "Phasing" splice + ADR 0013 tail (F19) — [file](./phase-1/1.4-repair-roadmap-splice.md)
