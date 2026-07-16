@@ -9,7 +9,7 @@
 Working end-to-end-encrypted 1:1 chat between two online CLIs, with envelopes *relayed through* the rendezvous (WebRTC comes in T04). This deliberately proves the design's key property early: content security must not depend on the transport path (§4.3 point 2) — the same ratcheted envelopes will later ride data channels and the mailbox unchanged.
 
 ## Scope
-In: X3DH initiation against fetched bundles; Double Ratchet with header encryption (audited lib: libsignal-client or equivalent — **no hand-rolled ratchet**, ADR-3); `mrd.chat/1` message schema (text, delivery receipt); persistent encrypted session store (ratchet state survives restart, key from T01 `SecretStore`); envelope format: `Sign_IK{ ratchet_ct }` with sender key inside per §7.1 step 6; TUI chat mode + `--json` line mode.
+In: X3DH initiation against fetched bundles; Double Ratchet with header encryption, composed in `meridian-crypto` from audited RustCrypto primitives per [ADR 0015](../../adr/0015-ratchet-composition.md) (vodozemac's public API cannot be seeded from an externally-computed X3DH root key or a frozen `v:1` bundle — see the ADR; the composition is gated on the crypto external review, not treated as an audited-protocol-implementation substitute); `mrd.chat/1` message schema (text, delivery receipt); persistent encrypted session store (ratchet state survives restart, key from T01 `SecretStore`); envelope format: `Sign_IK{ ratchet_ct }` with sender key inside per §7.1 step 6; TUI chat mode + `--json` line mode.
 Out: P2P transport (T04), offline delivery (T07), safety-number UX (T08 — but the *fingerprint computation* lands here for T08 to consume), attachments (T09).
 
 ## Deliverables
@@ -34,3 +34,9 @@ Forward secrecy test: harness snapshots ratchet state at message N, proves messa
 
 ## Risks / notes
 Library FFI choice made here propagates to WASM/mobile (T11/T12) — validate the chosen ratchet lib compiles for wasm32 and aarch64 targets *this task*, not later.
+
+**Validation status (recorded honestly, F9):** the composed ratchet's primitives (RustCrypto crates) have
+an isolated build/primitive probe confirming wasm32 and aarch64 compatibility in principle, but there is
+no wasm32 target build wired into CI yet — that lands with fix-tasks 1.6 (conformance vectors + CI) or
+1.8 (real CI gates), whichever adds the target build first. Until then this criterion is **deferred, not
+met**; do not read this spec as claiming CI-verified wasm32/aarch64 builds.

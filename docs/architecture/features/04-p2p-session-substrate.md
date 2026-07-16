@@ -32,3 +32,11 @@ Server-down chat continuity ≥30 min with keepalives; Wi-Fi→other-interface s
 
 ## Risks / notes
 webrtc-rs SCTP behavior under loss needs early soak testing — if throughput or stability disappoints, the ADR-6 fallback (libdatachannel FFI) must be exercised *within this task*, not discovered during T09's 1 GiB transfers.
+
+**Verification status (recorded honestly, F9):** the acceptance criteria above (server-down continuity,
+ICE restart, fingerprint mismatch teardown, opacity audit) are currently validated against the
+`netns` simulation rig and the in-repo `Transport` trait's non-webrtc-rs test double, not against a
+real webrtc-rs wire session — the webrtc-rs backend itself lands in fix-task
+[1.15](../../tasks/phase-1/1.15-webrtc-backend.md). Treat this spec's acceptance criteria as
+**simulation-only until 1.15/1.16 land**; wire-level verification against the real backend is deferred
+to those tasks, not silently assumed to already hold.
