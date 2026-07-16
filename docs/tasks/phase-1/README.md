@@ -28,7 +28,7 @@ dependencies between fix-tasks are declared per task (notably 1.2→1.1, 1.15→
 - [x] **1.1** ADR 0015 — ratchet composition (F2) — [file](./1.1-adr-0015-ratchet-composition.md)
 - [x] **1.2** Doc-sync: purge stale "ratchet = vodozemac" (F3) — [file](./1.2-doc-sync-vodozemac.md)
 - [x] **1.3** Reconcile T03/T04/T05 specs with composed ratchet + wire-deferral (F9) — [file](./1.3-reconcile-transport-crypto-specs.md)
-- [ ] **1.4** Repair roadmap "Phasing" splice + ADR 0013 tail (F19) — [file](./1.4-repair-roadmap-splice.md)
+- [x] **1.4** Repair roadmap "Phasing" splice + ADR 0013 tail (F19) — [file](./1.4-repair-roadmap-splice.md)
 
 **Group B — Freeze the crypto** (blocking / should-fix)
 - [ ] **1.5** Zeroization gaps: X3DH master secret + ratchet header keys (F5, F6) — [file](./1.5-crypto-zeroization-gaps.md)

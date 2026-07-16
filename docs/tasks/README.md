@@ -17,8 +17,8 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 ## ▶ NOW / NEXT
 
 - **NOW:** Phase 1 fix-tasks landing — 1.1 (ADR 0015 ratchet composition), 1.2 (doc-sync), 1.3 (reconcile
-  T03/T04/T05 specs) done.
-- **NEXT:** run **`/next-task`** to continue with 1.4 (repair roadmap splice), then the rest.
+  T03/T04/T05 specs), 1.4 (repair roadmap splice) done. Group A complete.
+- **NEXT:** run **`/next-task`** to continue with 1.5 (crypto zeroization gaps), then the rest of Group B.
 - After Phase 1 fixes land: **`/pick-next-phase`** selects Phase 2 (T06 Cross-Org Federation).
   Blocking gate: F1, F2, F3, F10, F11 (→ 1.1, 1.2, 1.6, 1.13+1.15, 1.14+1.16) must close first.
 
@@ -43,7 +43,7 @@ design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 - [x] **1.1** ADR 0015 — ratchet composition (F2) — [file](./phase-1/1.1-adr-0015-ratchet-composition.md)
 - [x] **1.2** Doc-sync: purge stale "ratchet = vodozemac" (F3) — [file](./phase-1/1.2-doc-sync-vodozemac.md)
 - [x] **1.3** Reconcile T03/T04/T05 specs + wire-deferral (F9) — [file](./phase-1/1.3-reconcile-transport-crypto-specs.md)
-- [ ] **1.4** Repair roadmap "Phasing" splice + ADR 0013 tail (F19) — [file](./phase-1/1.4-repair-roadmap-splice.md)
+- [x] **1.4** Repair roadmap "Phasing" splice + ADR 0013 tail (F19) — [file](./phase-1/1.4-repair-roadmap-splice.md)
 
 **Group B — Freeze the crypto** (blocking / should-fix)
 - [ ] **1.5** Zeroization gaps: X3DH master secret + ratchet header keys (F5, F6) — [file](./phase-1/1.5-crypto-zeroization-gaps.md)

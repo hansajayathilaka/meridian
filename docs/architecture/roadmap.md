@@ -30,15 +30,15 @@ demo you can execute at sign-off. Trust-critical substrate comes first; convenie
 ## Phasing (from the design)
 
 The canonical **design** phase narrative (Phase 0–4) lives in
-[system-design.md §11](./system-design.md). In short:
+[system-design.md §11](./system-design.md#11-phased-roadmap). In full:
 
-| Phase | Theme | Covers features |
-|-------|-------|-----------------|
-| 0 | Substrate (risk burn-down) | 01–05 |
-| 1 | Federation & Tier-1 core | 06, 07, 08, 09, 10, 11, 12 |
-| 2 | Identity depth | 13, 15 (+ small groups, PQXDH bump, ops hardening) |
-| 3 | Scale & privacy | MLS groups, mailbox padding, sealed-sender |
-| 4 | Reach | 16 (+ QUIC, PKARR/DHT hints, group calls) |
+**Phase 0 — Substrate (the risk burn-down):** meridian-core (identity, X3DH+Double Ratchet via audited lib, ctrl channel, `mrd.chat/1`), single-org rendezvous, CLI + one desktop client, direct+TURN ICE. Exit criterion: two CLIs on hostile NATs exchange verified, ratcheted messages via one org's stack.
+**Phase 1 — Federation & Tier-1 core:** s2s mTLS federation (SRV + static map), ciphertext mailbox, `mrd.file/1`, voice/video/screenshare on 1:1 DTLS-SRTP with fingerprint-in-envelope binding, safety-number UX, browser + mobile clients. Exit: the §7.1 cross-org walkthrough works end-to-end on all five platforms.
+**Phase 2 — Identity depth:** multi-device (device records, provisioning, fan-out), pairwise small groups (hard cap ~15), location + stickers, PQXDH bundle bump, message-request/anti-spam surface, ops hardening (Helm, dashboards, `doctor`).
+**Phase 3 — Scale & privacy:** MLS groups on OpenMLS with rendezvous-as-DS commit log, mailbox padding/batching, multi-hint IDs, relay-only polish, sealed-sender-style envelope wrapping.
+**Phase 4 — Reach:** `mrd.tunnel.tcp/1` + `mrd.fs/1` (SSH/FTP tier), QUIC transport negotiation for non-browser pairs, optional PKARR/DHT hint-resolution for server-less consumer mode, group calls (SFU + SFrame over MLS keys).
+
+Sequencing rationale: everything trust-critical (identity, federation, verification) ships before anything convenient; Tier-2 waits because the stream abstraction (Phase 0) already guarantees it's additive.
 
 > **Execution vs design phases:** day-to-day delivery is driven by the numbered *execution* phases in
 > the [task tracker](../tasks/README.md) (Phase 0 done, Phase 1 review, Phase 2 = T06, …), which
