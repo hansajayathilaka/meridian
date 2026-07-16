@@ -33,13 +33,7 @@ Trust-critical substrate: identity, E2EE messaging, P2P session, NAT traversal. 
 - [x] **0.5** NAT Traversal & Relay Policy (T05) — [file](./phase-0/0.5-nat-traversal-relay.md)
 
 ### Phase 1 — Review of Phase 0 · **not started**
-Created by `/start-review-phase`. Reviews tasks 0.1–0.5; findings become fix-tasks `1.1…`.
-
-### Phase 2 — Cross-Org Federation (T06) · **not started**
-Selected by `/pick-next-phase` after Phase 1. Critical path — unblocks 07/10/14.
-
-### Phase 3 — Review of Phase 2 · **not started**
-…build → review alternating thereafter.
+Review completed. Need to plan for this phase
 
 ---
 
