@@ -11,7 +11,8 @@ Rust workspace crates (each has its own scoped `CLAUDE.md` where the rules are s
   [docs/api/core-api-contracts.md](../docs/api/core-api-contracts.md).
 - `identity/` — `meridian-identity`: `mrd1:` IDs, keys, QR (wire-critical, conformance-vectored).
 - `store/` — `meridian-store`: `SecretStore`, encrypted at rest.
-- `crypto/` — `meridian-crypto`: X3DH + Double Ratchet (vodozemac), fingerprints, at-rest. Never bespoke.
+- `crypto/` — `meridian-crypto`: X3DH + Double Ratchet (composed from RustCrypto primitives, ADR 0015),
+  fingerprints, at-rest. Never bespoke.
 - `transport/` — `meridian-transport`: `Transport` trait, WebRTC data channels, ICE/relay.
 - `signaling/` — `meridian-signaling`: session signaling frames.
 - `cli/` — `meridian-cli`: terminal client; the reference client and demo driver.

@@ -15,7 +15,9 @@ Resolved decisions & readiness: [docs/handoff-readiness.md](./docs/handoff-readi
 
 ## Stack (authoritative: [docs/architecture/stack.md](./docs/architecture/stack.md))
 - **Shared core:** Rust (`meridian-core` + sub-crates) → native + WASM. One core, five targets.
-- **Crypto:** X3DH + Double Ratchet via **vodozemac** ([ADR 0011](./docs/adr/0011-ratchet-library.md)); OpenMLS for groups (later); never bespoke.
+- **Crypto:** X3DH + header-encrypted Double Ratchet, composed in `meridian-crypto` from audited
+  RustCrypto primitives ([ADR 0011](./docs/adr/0011-ratchet-library.md),
+  [ADR 0015](./docs/adr/0015-ratchet-composition.md)); OpenMLS for groups (later); never bespoke.
 - **P2P:** webrtc-rs (data/ICE/SCTP) + libwebrtc (media) behind a `Transport` trait ([ADR 0014](./docs/adr/0014-media-stack.md)).
 - **Clients:** terminal (ratatui), browser (SvelteKit + WASM), desktop (Tauri v2), mobile (SwiftUI/Compose over UniFFI).
 - **Server:** `meridian-rendezvous` (axum + tokio + sqlx), depends only on `meridian-proto`; relay = coturn.

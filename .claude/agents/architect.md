@@ -20,9 +20,14 @@ Rules you enforce:
    (it may depend only on `meridian-proto`). See the [core-modules diagram](../../docs/architecture/diagrams/core-modules.mermaid) and [build-target topology](../../docs/architecture/diagrams/build-target-topology.mermaid).
 3. **The stream-type extension contract holds:** new stream types add via the registry only, with
    zero core-crate edits.
-4. **Open decisions stay open.** [ADR 0011 (ratchet library)](../../docs/adr/0011-ratchet-library.md)
-   and the libwebrtc-vs-pure-Rust media question are unresolved — do not let code hard-commit to one
-   side without the required spike.
+4. **Open decisions stay open until formally closed.** [ADR 0011](../../docs/adr/0011-ratchet-library.md)
+   (X3DH layer + license rationale) and [ADR 0015](../../docs/adr/0015-ratchet-composition.md) (Double
+   Ratchet composed in `meridian-crypto` from RustCrypto primitives, superseding 0011's ratchet
+   mechanism) are both Accepted — do not let stale guidance claim the ratchet library is still open.
+   [ADR 0014](../../docs/adr/0014-media-stack.md) (libwebrtc for media, webrtc-rs for data) is also
+   Accepted; the remaining open item is the *implementation* spike for libwebrtc packaging, tracked via
+   [/spike](../commands/spike.md), not an architecture decision. Do not let code hard-commit ahead of a
+   decision that is genuinely still open, and do not treat a decision as open once its ADR is Accepted.
 
 Output: a clear verdict (consistent / contradicts ADR-XXXX / needs new ADR), the reasoning, and the
 minimal path to compliance. Cite ADR numbers and doc sections.
