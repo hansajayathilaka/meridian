@@ -3,7 +3,10 @@
 
 # ADR 0011: Ratchet & key-agreement library — vodozemac + hand-wired X3DH
 
-**Status:** **Accepted** (was Proposed/open; resolved at handoff). **Supersedes** the open state of this ADR.
+**Status:** **Superseded by [0015](./0015-ratchet-composition.md)** for the Double-Ratchet mechanism
+(was Proposed/open; resolved at handoff, then partially superseded once the `ratchet-header-enc` spike
+ran against real code). The X3DH-layer decision and the AGPL-avoidance rationale below remain binding —
+see [0015](./0015-ratchet-composition.md) for what changed and why.
 
 ## Context
 Meridian needs X3DH + Double Ratchet (see [ADR 0003](./0003-e2ee-protocol.md)) via an audited
@@ -89,6 +92,6 @@ problem). This is the pure-Rust, toolchain-friendly outcome the ADR chose vodoze
 build of `meridian-core` will additionally feature-gate `meridian-store`'s native backends (age /
 keyring), which are the remaining non-wasm pieces — tracked with T11, not here.
 
-*Follow-up:* a standalone superseding ADR (0011a) should formalize this with the `architect` subagent
-before Phase-1 GA; this note records the binding decision made at T03 so implementation was not
-blocked.
+*Formalized:* this note recorded the binding decision made at T03 so implementation was not blocked.
+It is now formalized as [ADR 0015](./0015-ratchet-composition.md) (house-numbered — "0011a" was never
+correct numbering); 0015 is the canonical record going forward, this note stands as historical context.
