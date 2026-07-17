@@ -31,7 +31,7 @@ dependencies between fix-tasks are declared per task (notably 1.2→1.1, 1.15→
 - [x] **1.4** Repair roadmap "Phasing" splice + ADR 0013 tail (F19) — [file](./1.4-repair-roadmap-splice.md)
 
 **Group B — Freeze the crypto** (blocking / should-fix)
-- [ ] **1.5** Zeroization gaps: X3DH master secret + ratchet header keys (F5, F6) — [file](./1.5-crypto-zeroization-gaps.md)
+- [x] **1.5** Zeroization gaps: X3DH master secret + ratchet header keys (F5, F6) — [file](./1.5-crypto-zeroization-gaps.md)
 - [ ] **1.6** Conformance vectors: X3DH / ratchet / envelope / safety numbers + CI (F1) — [file](./1.6-conformance-vectors.md)
 - [ ] **1.7** SecretStore KDF op — drop signature-determinism dependency (F7) — [file](./1.7-secretstore-kdf-op.md)
 

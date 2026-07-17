@@ -91,7 +91,7 @@ pub fn initiate(
     let dh2 = dh(&ek_secret, &peer_ik_x); // DH(EK_A, IK_B)
     let dh3 = dh(&ek_secret, peer_spk); // DH(EK_A, SPK_B)
 
-    let mut ikm = Vec::with_capacity(32 * 5);
+    let mut ikm: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(32 * 5));
     ikm.extend_from_slice(&F);
     ikm.extend_from_slice(dh1.as_slice());
     ikm.extend_from_slice(dh2.as_slice());
@@ -129,7 +129,7 @@ pub fn respond(
     let dh2 = store_dh(store, handle, ek_a)?; // DH(EK_A, IK_B)
     let dh3 = dh(spk_secret, ek_a); // DH(EK_A, SPK_B)
 
-    let mut ikm = Vec::with_capacity(32 * 5);
+    let mut ikm: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(32 * 5));
     ikm.extend_from_slice(&F);
     ikm.extend_from_slice(dh1.as_slice());
     ikm.extend_from_slice(dh2.as_slice());
