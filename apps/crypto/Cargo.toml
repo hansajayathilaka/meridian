@@ -29,4 +29,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 meridian-identity = { path = "../identity" }
+meridian-proto = { path = "../proto" }
 ciborium = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }

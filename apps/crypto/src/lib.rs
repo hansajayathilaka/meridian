@@ -30,3 +30,17 @@ pub use error::{CryptoError, Result};
 pub use fingerprint::{display_groups, safety_number};
 pub use ratchet::{DoubleRatchet, MAX_SKIP};
 pub use session::{PrekeyMaterial, Session};
+
+/// **Test/vector-generation support only** — re-exports primitives that are otherwise
+/// `pub(crate)` so `xtask`'s `vectors` subcommand (task 1.6, review finding F1) can build
+/// byte-pinned conformance fixtures (`test-vectors/x3dh-v1.json`, `ratchet-v1.json`) from the
+/// crate's *real* derivation code instead of a parallel reimplementation that could itself drift
+/// from the spec. This is deliberately **not** part of the application-facing API — nothing in
+/// `apps/` outside `xtask`/tests should ever call it. Any further widening of this module needs
+/// security-reviewer sign-off (see the crypto-protocols skill).
+#[doc(hidden)]
+pub mod test_support {
+    pub use crate::primitives::{
+        dh, ed25519_pub_to_x25519, header_open, header_seal, kdf_ck, kdf_rk,
+    };
+}

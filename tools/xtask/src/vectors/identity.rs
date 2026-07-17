@@ -4,8 +4,6 @@
 //! WASM, mobile — must reproduce them byte-identically. The vectors are derived deterministically
 //! from fixed seeds using `meridian-identity`, so regenerating is reproducible.
 
-use std::path::PathBuf;
-
 use meridian_identity::{encode_key_part, pubkey_from_seed, to_id_string, SCHEME};
 use serde::Serialize;
 
@@ -64,7 +62,7 @@ fn valid_vector(name: &str, seed: [u8; 32], hint: &str) -> Valid {
     }
 }
 
-pub fn generate() -> Result<(), String> {
+pub fn generate_identity() -> Result<(), String> {
     let seed_zero = [0u8; 32];
     let seed_one = [1u8; 32];
     let seed_ff = [0xffu8; 32];
@@ -166,20 +164,5 @@ pub fn generate() -> Result<(), String> {
         same_principal,
     };
 
-    let path = output_path();
-    let mut json = serde_json::to_string_pretty(&fixtures).map_err(|e| e.to_string())?;
-    json.push('\n');
-    std::fs::write(&path, json).map_err(|e| format!("writing {}: {e}", path.display()))?;
-    println!("wrote {}", path.display());
-    Ok(())
-}
-
-fn output_path() -> PathBuf {
-    // CARGO_MANIFEST_DIR = <root>/tools/xtask
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("xtask lives at <root>/tools/xtask")
-        .join("test-vectors")
-        .join("identity-v1.json")
+    super::write_json(&super::vector_path("identity-v1.json"), &fixtures)
 }

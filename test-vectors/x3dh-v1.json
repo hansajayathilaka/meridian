@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "note": "X3DH conformance vectors — cross-implementation source of truth. Regenerate with `cargo run -p xtask -- vectors`. `derived.*` comes from meridian-crypto's real `x3dh::respond`; `dh_legs`/`ikm_hex` are computed independently from the same raw inputs via the crate's real X25519 primitives so a from-scratch reimplementation can check every intermediate. Construction: docs/architecture/system-design.md §4.2, apps/crypto/src/x3dh.rs.",
+  "vectors": [
+    {
+      "name": "with-opk",
+      "inputs": {
+        "responder_ik_seed_hex": "1010101010101010101010101010101010101010101010101010101010101010",
+        "responder_ik_pub_hex": "5c9c6df261c9cb840475776aaefcd944b405328fab28f9b3a95ef40490d3de84",
+        "initiator_ik_seed_hex": "2020202020202020202020202020202020202020202020202020202020202020",
+        "initiator_ik_pub_hex": "4ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a8",
+        "spk_secret_hex": "3030303030303030303030303030303030303030303030303030303030303030",
+        "spk_pub_hex": "e50c239bc204f1341664c9d9c50c6a0d0fff6fc79d9301f1e713aab2e0344b3f",
+        "opk_secret_hex": "4040404040404040404040404040404040404040404040404040404040404040",
+        "opk_pub_hex": "d7b5e81d336e578b13b8d706e82d061e3038c96bce66cdcf50d566b96ddbba10",
+        "ek_a_pub_hex": "ef38b4abd14b0a919cbe6839f6185b97d32607bee359c6c53c12cc7597867d59"
+      },
+      "ikm_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff1d6a9108f07bb162105990dfec6b252584ff7cf708f95661f0148ba308d1cd5dfc57a3fedbec3f0e2bbd50b28b02a468122a60eff420e909201d6efeea39914ca41340faa4da5fc4f0f532ab8c730139f393365e28b7ad49ed1747e3cac314238e0c1056b0b984253375798e48c339a0d129d3c69cac30aacaa5597a6933ac2d",
+      "dh_legs": {
+        "dh1_hex": "1d6a9108f07bb162105990dfec6b252584ff7cf708f95661f0148ba308d1cd5d",
+        "dh2_hex": "fc57a3fedbec3f0e2bbd50b28b02a468122a60eff420e909201d6efeea39914c",
+        "dh3_hex": "a41340faa4da5fc4f0f532ab8c730139f393365e28b7ad49ed1747e3cac31423",
+        "dh4_hex": "8e0c1056b0b984253375798e48c339a0d129d3c69cac30aacaa5597a6933ac2d"
+      },
+      "derived": {
+        "root_hex": "4daa85f719487f3a9e9ac32b32e6be9e021e1ec2c3865a9b7e14afe3f52e2385",
+        "hka_hex": "237607417435cce75eafe0858b8c27bdca77f49ab643c6785b1deed023c4ced3",
+        "nhkb_hex": "d8e469fa0544d8982caeb10cf32338252ef2a41d476195944ed645d390a5af5f",
+        "ad_hex": "4ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a85c9c6df261c9cb840475776aaefcd944b405328fab28f9b3a95ef40490d3de84"
+      }
+    },
+    {
+      "name": "without-opk",
+      "inputs": {
+        "responder_ik_seed_hex": "1010101010101010101010101010101010101010101010101010101010101010",
+        "responder_ik_pub_hex": "5c9c6df261c9cb840475776aaefcd944b405328fab28f9b3a95ef40490d3de84",
+        "initiator_ik_seed_hex": "2020202020202020202020202020202020202020202020202020202020202020",
+        "initiator_ik_pub_hex": "4ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a8",
+        "spk_secret_hex": "3030303030303030303030303030303030303030303030303030303030303030",
+        "spk_pub_hex": "e50c239bc204f1341664c9d9c50c6a0d0fff6fc79d9301f1e713aab2e0344b3f",
+        "ek_a_pub_hex": "ef38b4abd14b0a919cbe6839f6185b97d32607bee359c6c53c12cc7597867d59"
+      },
+      "ikm_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff1d6a9108f07bb162105990dfec6b252584ff7cf708f95661f0148ba308d1cd5dfc57a3fedbec3f0e2bbd50b28b02a468122a60eff420e909201d6efeea39914ca41340faa4da5fc4f0f532ab8c730139f393365e28b7ad49ed1747e3cac31423",
+      "dh_legs": {
+        "dh1_hex": "1d6a9108f07bb162105990dfec6b252584ff7cf708f95661f0148ba308d1cd5d",
+        "dh2_hex": "fc57a3fedbec3f0e2bbd50b28b02a468122a60eff420e909201d6efeea39914c",
+        "dh3_hex": "a41340faa4da5fc4f0f532ab8c730139f393365e28b7ad49ed1747e3cac31423"
+      },
+      "derived": {
+        "root_hex": "06bd2175792bf88da3b811a720dc280610bfa1a0db2e398a5adbbb931c264d4f",
+        "hka_hex": "a25eab1b7eca404c3e527bfb4d0b6143df3d63ce672db1bcead1cc8d140866f9",
+        "nhkb_hex": "bdaa9b6077c01754985af1035b4dba0c2993187e7a7c1c52fea657592ffe6b1e",
+        "ad_hex": "4ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a85c9c6df261c9cb840475776aaefcd944b405328fab28f9b3a95ef40490d3de84"
+      }
+    }
+  ]
+}
