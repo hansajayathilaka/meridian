@@ -16,9 +16,8 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** Phase 1 fix-tasks landing — 1.1 (ADR 0015 ratchet composition), 1.2 (doc-sync), 1.3 (reconcile
-  T03/T04/T05 specs), 1.4 (repair roadmap splice) done. Group A complete.
-- **NEXT:** run **`/next-task`** to continue with 1.5 (crypto zeroization gaps), then the rest of Group B.
+- **NOW:** Phase 1 fix-tasks landing — Group A (1.1-1.4) done. 1.5 (crypto zeroization gaps) done.
+- **NEXT:** run **`/next-task`** to continue with 1.6 (conformance vectors), then the rest of Group B.
 - After Phase 1 fixes land: **`/pick-next-phase`** selects Phase 2 (T06 Cross-Org Federation).
   Blocking gate: F1, F2, F3, F10, F11 (→ 1.1, 1.2, 1.6, 1.13+1.15, 1.14+1.16) must close first.
 
@@ -46,7 +45,7 @@ design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 - [x] **1.4** Repair roadmap "Phasing" splice + ADR 0013 tail (F19) — [file](./phase-1/1.4-repair-roadmap-splice.md)
 
 **Group B — Freeze the crypto** (blocking / should-fix)
-- [ ] **1.5** Zeroization gaps: X3DH master secret + ratchet header keys (F5, F6) — [file](./phase-1/1.5-crypto-zeroization-gaps.md)
+- [x] **1.5** Zeroization gaps: X3DH master secret + ratchet header keys (F5, F6) — [file](./phase-1/1.5-crypto-zeroization-gaps.md)
 - [ ] **1.6** Conformance vectors: X3DH / ratchet / envelope / safety numbers + CI (F1) — [file](./phase-1/1.6-conformance-vectors.md)
 - [ ] **1.7** SecretStore KDF op — drop signature-determinism dependency (F7) — [file](./phase-1/1.7-secretstore-kdf-op.md)
 

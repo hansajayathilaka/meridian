@@ -67,8 +67,10 @@ pub struct DoubleRatchet {
     ad: Vec<u8>,
 }
 
-impl Drop for DoubleRatchet {
-    fn drop(&mut self) {
+impl DoubleRatchet {
+    /// Zeroize every secret-bearing field in place. Shared by [`Drop::drop`] and by tests that need
+    /// to observe zeroization without relying on post-drop memory inspection.
+    fn zeroize_secrets(&mut self) {
         self.rk.zeroize();
         self.dhs_priv.zeroize();
         if let Some(mut c) = self.cks.take() {
@@ -77,9 +79,23 @@ impl Drop for DoubleRatchet {
         if let Some(mut c) = self.ckr.take() {
             c.zeroize();
         }
+        if let Some(mut hk) = self.hks.take() {
+            hk.zeroize();
+        }
+        if let Some(mut hk) = self.hkr.take() {
+            hk.zeroize();
+        }
+        self.nhks.zeroize();
+        self.nhkr.zeroize();
         for s in &mut self.skipped {
             s.mk.zeroize();
         }
+    }
+}
+
+impl Drop for DoubleRatchet {
+    fn drop(&mut self) {
+        self.zeroize_secrets();
     }
 }
 
@@ -330,4 +346,61 @@ fn unframe(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
         return None;
     }
     Some((&rest[0..eh_len], &rest[eh_len..]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F6: `zeroize_secrets` (shared with `Drop`) must clear every secret-bearing field, including
+    /// the four header-encryption keys (`hks`, `hkr`, `nhks`, `nhkr`) that were previously missed.
+    #[test]
+    fn drop_zeroizes_all_secret_fields_including_header_keys() {
+        let mut ratchet = DoubleRatchet {
+            rk: [1u8; 32],
+            dhs_priv: [2u8; 32],
+            dhs_pub: [3u8; 32],
+            dhr: Some([4u8; 32]),
+            cks: Some([5u8; 32]),
+            ckr: Some([6u8; 32]),
+            ns: 0,
+            nr: 0,
+            pn: 0,
+            hks: Some([7u8; 32]),
+            hkr: Some([8u8; 32]),
+            nhks: [9u8; 32],
+            nhkr: [10u8; 32],
+            skipped: vec![Skipped {
+                hk: [11u8; 32],
+                n: 0,
+                mk: [12u8; 32],
+            }],
+            ad: vec![13u8; 4],
+        };
+
+        // Sanity: every field we assert on below starts non-zero.
+        assert_ne!(ratchet.rk, [0u8; 32]);
+        assert_ne!(ratchet.dhs_priv, [0u8; 32]);
+        assert_eq!(ratchet.cks, Some([5u8; 32]));
+        assert_eq!(ratchet.ckr, Some([6u8; 32]));
+        assert_eq!(ratchet.hks, Some([7u8; 32]));
+        assert_eq!(ratchet.hkr, Some([8u8; 32]));
+        assert_ne!(ratchet.nhks, [0u8; 32]);
+        assert_ne!(ratchet.nhkr, [0u8; 32]);
+        assert_ne!(ratchet.skipped[0].mk, [0u8; 32]);
+
+        // Exercise the exact routine `Drop` runs, without actually dropping the struct, so the
+        // fields remain observable afterwards.
+        ratchet.zeroize_secrets();
+
+        assert_eq!(ratchet.rk, [0u8; 32]);
+        assert_eq!(ratchet.dhs_priv, [0u8; 32]);
+        assert!(ratchet.cks.is_none());
+        assert!(ratchet.ckr.is_none());
+        assert!(ratchet.hks.is_none());
+        assert!(ratchet.hkr.is_none());
+        assert_eq!(ratchet.nhks, [0u8; 32]);
+        assert_eq!(ratchet.nhkr, [0u8; 32]);
+        assert_eq!(ratchet.skipped[0].mk, [0u8; 32]);
+    }
 }
