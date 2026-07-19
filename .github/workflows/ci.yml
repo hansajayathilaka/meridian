@@ -48,7 +48,14 @@ jobs:
       - name: NAT matrix + relay policy (T05; netns rig skips without NET_ADMIN)
         run: bash harnesses/nat-matrix/run.sh
       # TODO: migrate to cargo nextest run --workspace
-      # TODO: conformance vectors (byte-identical across CLI/WASM/mobile) — docs/testing/strategy.md §1
+      - name: Conformance vectors (byte-identical across CLI/WASM/mobile) — docs/testing/strategy.md §1
+        run: |
+          cargo run -p xtask -- vectors
+          git diff --exit-code -- test-vectors/ || {
+            echo "::error::test-vectors/ drifted from the xtask generator — vectors are canonical, never hand-edited. Regenerate with 'cargo run -p xtask -- vectors' and commit the diff (a wire/derivation change needs architect + security-reviewer sign-off)." >&2
+            exit 1
+          }
+          cargo test -p meridian-crypto --test conformance
 
   build:
     name: Build (release)

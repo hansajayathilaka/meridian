@@ -5,6 +5,14 @@
 //! (crypto-protocols skill rule 1). The "assembly" is exactly the well-specified Double Ratchet /
 //! X3DH glue that [ADR 0011](../../../docs/adr/0011-ratchet-library.md) allocates to
 //! `meridian-crypto`.
+//!
+//! **Visibility note (task 1.6, review finding F1):** `dh`, `ed25519_pub_to_x25519`, `kdf_rk`,
+//! `kdf_ck`, `header_seal`, `header_open` are `pub` (not `pub(crate)`) so [`crate::test_support`]
+//! can re-export them for `xtask`'s conformance-vector generator, which needs the crate's *real*
+//! derivation code to build byte-pinned fixtures rather than a parallel reimplementation. They
+//! stay unreachable from outside the crate because [`crate`]'s `mod primitives;` is itself
+//! private; `X3DH_INFO`/`RK_INFO`/`MSG_INFO`/`hkdf`/`aead_seal`/`aead_open`/`gen_dh` are
+//! deliberately left `pub(crate)` — this widening is flagged for security-reviewer sign-off.
 
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
@@ -33,7 +41,7 @@ pub(crate) fn gen_dh() -> Result<(Zeroizing<[u8; 32]>, [u8; 32])> {
 }
 
 /// X25519 Diffie–Hellman between a local secret and a peer public key (both raw 32-byte).
-pub(crate) fn dh(secret: &[u8; 32], peer_pub: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+pub fn dh(secret: &[u8; 32], peer_pub: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     let secret = StaticSecret::from(*secret);
     let shared = secret.diffie_hellman(&XPublicKey::from(*peer_pub));
     Zeroizing::new(shared.to_bytes())
@@ -42,7 +50,7 @@ pub(crate) fn dh(secret: &[u8; 32], peer_pub: &[u8; 32]) -> Zeroizing<[u8; 32]> 
 /// Convert an Ed25519 public key to its birationally-equivalent X25519 (Montgomery) public key,
 /// so `DH(·, IK_ed)` legs of X3DH work against an account identity key. Mirrors the private-side
 /// conversion in `meridian-store` (libsodium's `crypto_sign_ed25519_pk_to_curve25519`).
-pub(crate) fn ed25519_pub_to_x25519(ed_pub: &[u8; 32]) -> Result<[u8; 32]> {
+pub fn ed25519_pub_to_x25519(ed_pub: &[u8; 32]) -> Result<[u8; 32]> {
     let vk = ed25519_dalek::VerifyingKey::from_bytes(ed_pub)
         .map_err(|_| CryptoError::BadKey("identity key is not a valid Ed25519 point"))?;
     Ok(vk.to_montgomery().to_bytes())
@@ -59,7 +67,7 @@ pub(crate) fn hkdf<const N: usize>(salt: &[u8], ikm: &[u8], info: &[u8]) -> [u8;
 
 /// Root-key KDF for the header-encryption variant: from the current root key and a fresh DH
 /// output, derive `(root', chain_key, next_header_key)` (Signal `KDF_RK_HE`).
-pub(crate) fn kdf_rk(rk: &[u8; 32], dh_out: &[u8; 32]) -> ([u8; 32], [u8; 32], [u8; 32]) {
+pub fn kdf_rk(rk: &[u8; 32], dh_out: &[u8; 32]) -> ([u8; 32], [u8; 32], [u8; 32]) {
     let okm: [u8; 96] = hkdf(rk, dh_out, RK_INFO);
     let mut root = [0u8; 32];
     let mut ck = [0u8; 32];
@@ -72,7 +80,7 @@ pub(crate) fn kdf_rk(rk: &[u8; 32], dh_out: &[u8; 32]) -> ([u8; 32], [u8; 32], [
 
 /// Symmetric chain KDF (Signal `KDF_CK`): from a chain key derive `(next_chain_key, message_key)`
 /// via HMAC-SHA256 with distinct one-byte constants.
-pub(crate) fn kdf_ck(ck: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+pub fn kdf_ck(ck: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     let mk = hmac(ck, &[0x01]);
     let next = hmac(ck, &[0x02]);
     (next, mk)
@@ -121,7 +129,7 @@ pub(crate) fn aead_open(mk: &[u8; 32], ciphertext: &[u8], aad: &[u8]) -> Result<
 /// Encrypt a ratchet header under a header key with a fresh random nonce (Signal `HENCRYPT`).
 /// Output is `nonce(24) ‖ ciphertext`; header keys are reused across a chain, so the nonce is
 /// random per header rather than derived.
-pub(crate) fn header_seal(hk: &[u8; 32], header: &[u8]) -> Result<Vec<u8>> {
+pub fn header_seal(hk: &[u8; 32], header: &[u8]) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new_from_slice(hk).map_err(|_| CryptoError::Crypto)?;
     let mut nonce = [0u8; 24];
     getrandom::fill(&mut nonce).map_err(|e| CryptoError::Rng(e.to_string()))?;
@@ -142,7 +150,7 @@ pub(crate) fn header_seal(hk: &[u8; 32], header: &[u8]) -> Result<Vec<u8>> {
 
 /// Try to decrypt an encrypted header under `hk`. Returns `None` on any failure (wrong key), which
 /// is how the receiver distinguishes the current chain from a DH-ratchet step.
-pub(crate) fn header_open(hk: &[u8; 32], enc_header: &[u8]) -> Option<Vec<u8>> {
+pub fn header_open(hk: &[u8; 32], enc_header: &[u8]) -> Option<Vec<u8>> {
     if enc_header.len() < 24 {
         return None;
     }

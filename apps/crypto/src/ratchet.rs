@@ -12,6 +12,7 @@
 //! header plaintext is `ratchet_pub(32) ‖ PN:u32-be ‖ N:u32-be`. Both are covered by AEAD.
 
 use serde::{Deserialize, Serialize};
+use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 use crate::error::{CryptoError, Result};
@@ -109,12 +110,37 @@ impl DoubleRatchet {
         hk_ba: [u8; 32],
         ad: Vec<u8>,
     ) -> Result<Self> {
-        let (dhs_priv, dhs_pub) = gen_dh()?;
+        let (dhs_priv, _dhs_pub) = gen_dh()?;
+        Ok(Self::init_initiator_with_keypair(
+            root,
+            *dhs_priv,
+            responder_ratchet_pub,
+            hk_ab,
+            hk_ba,
+            ad,
+        ))
+    }
+
+    /// **Test/vector-generation support only.** Identical to [`Self::init_initiator`] but takes
+    /// the initiator's sending secret explicitly instead of drawing a fresh one from the OS
+    /// CSPRNG, so a caller can build a byte-pinned starting state (`test-vectors/ratchet-v1.json`,
+    /// task 1.6). Production code must always go through [`Self::init_initiator`] — never call
+    /// this with an operational key. Flagged for security-reviewer sign-off.
+    #[doc(hidden)]
+    pub fn init_initiator_with_keypair(
+        root: [u8; 32],
+        dhs_priv: [u8; 32],
+        responder_ratchet_pub: [u8; 32],
+        hk_ab: [u8; 32],
+        hk_ba: [u8; 32],
+        ad: Vec<u8>,
+    ) -> Self {
+        let dhs_pub = XPublicKey::from(&StaticSecret::from(dhs_priv)).to_bytes();
         let dh_out = dh(&dhs_priv, &responder_ratchet_pub);
         let (rk, cks, nhks) = kdf_rk(&root, &dh_out);
-        Ok(Self {
+        Self {
             rk,
-            dhs_priv: *dhs_priv,
+            dhs_priv,
             dhs_pub,
             dhr: Some(responder_ratchet_pub),
             cks: Some(cks),
@@ -128,7 +154,7 @@ impl DoubleRatchet {
             nhkr: hk_ba,
             skipped: Vec::new(),
             ad,
-        })
+        }
     }
 
     /// Initialise the **responder's** ratchet (Bob). `ratchet_keypair` is Bob's signed prekey

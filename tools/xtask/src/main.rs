@@ -1,5 +1,6 @@
 //! xtask — Meridian dev tooling.
-//! Commands: `codegen` (stub), `vectors` (T01 identity conformance fixtures), `package` (stub).
+//! Commands: `codegen` (stub), `vectors` (identity/X3DH/ratchet/envelope/safety-number
+//! conformance fixtures under `test-vectors/`), `package` (stub).
 //! See docs/architecture/stack.md §4.
 
 mod vectors;

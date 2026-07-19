@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "note": "Double Ratchet (header-encrypted) conformance vectors. Regenerate with `cargo run -p xtask -- vectors`. Chain-key/message-key values (where `chain_key_pinned` is true) come from meridian-crypto's real `dh`/`kdf_rk`/`kdf_ck` (via `test_support`), fed the exact keys both `DoubleRatchet` instances in this fixture are constructed from — not a reimplementation. Steps with `chain_key_pinned: false` ride a chain seeded by a keypair the receiving side's `dh_ratchet` generated internally via the OS CSPRNG (the PCS mechanism) and so cannot be byte-pinned; only their plaintext round-trip is asserted. Header ciphertext is NEVER byte-pinned (random nonce by design) — only a functional round-trip is recorded (see `header_round_trip`); do not 'fix' either determinism boundary into a byte pin. Construction: docs/architecture/system-design.md §4.3, apps/crypto/src/ratchet.rs.",
+  "initial_state": {
+    "root_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "hk_ab_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "hk_ba_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "ad_hex": "000102030405060708090a0b0c0d0e0f",
+    "alice_dhs_priv_hex": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "alice_dhs_pub_hex": "7f115a43399180f6c05b02e1265fef92c2d91961b0cd3c6d8fa1cd001589fc0f",
+    "bob_dhs_priv_hex": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "bob_dhs_pub_hex": "b2599e860bbe532e4955cca4dbd20d3b7f6805d81bb505ddbe69276a170c4d74",
+    "alice_initial_root_hex": "989de2f24564c630be1cd96ba6433a024ff61ce226094a6cf40a90308b92e28e",
+    "alice_initial_cks_hex": "cd36c4f07519fea1473f2e4344c35fbd1f2e1b11e09ee1386724c37c1b1df7d7",
+    "alice_initial_nhks_hex": "12de96d63f30cffb269258dd70e865837d1967f6ea9615300598577e068e6812"
+  },
+  "transcript": [
+    {
+      "direction": "alice->bob",
+      "plaintext_hex": "68656c6c6f20626f62",
+      "n": 0,
+      "dh_ratchet_step": true,
+      "delivered_out_of_order": false,
+      "chain_key_pinned": true,
+      "ck_before_hex": "cd36c4f07519fea1473f2e4344c35fbd1f2e1b11e09ee1386724c37c1b1df7d7",
+      "ck_after_hex": "efcbd29328f0fee4e68bfd73dab1d98897ac5c645990a4f4f6dadde881efbd87",
+      "mk_hex": "1332e1e4421bb12edf9e14aec1cd7b1f4bf959416b89ca212ea347f42c3d9b74"
+    },
+    {
+      "direction": "alice->bob",
+      "plaintext_hex": "6d33",
+      "n": 3,
+      "dh_ratchet_step": false,
+      "delivered_out_of_order": true,
+      "chain_key_pinned": true,
+      "ck_before_hex": "5f4d6f049c25a6acdd15d5d365ca18fabbe1fb262035b20b39664016fe2a9a08",
+      "ck_after_hex": "3f1884fe6fadbc9835b990f6fb339454fc9a6fd7675d6fe8a7e52a210fda5ce2",
+      "mk_hex": "a2b5c7cc14fd3bde0555857d80e99d3845eaddf49b895a182d339e514820574b"
+    },
+    {
+      "direction": "alice->bob",
+      "plaintext_hex": "6d31",
+      "n": 1,
+      "dh_ratchet_step": false,
+      "delivered_out_of_order": true,
+      "chain_key_pinned": true,
+      "ck_before_hex": "efcbd29328f0fee4e68bfd73dab1d98897ac5c645990a4f4f6dadde881efbd87",
+      "ck_after_hex": "9c488349b110ccfdf87a7629ce11f3c7d18070df6d10c579319f8c21ca28d1c8",
+      "mk_hex": "932d636669eec40c4f7a9b77cb46e8e2b615a89651c277c4cb0854de47f1b069"
+    },
+    {
+      "direction": "alice->bob",
+      "plaintext_hex": "6d32",
+      "n": 2,
+      "dh_ratchet_step": false,
+      "delivered_out_of_order": true,
+      "chain_key_pinned": true,
+      "ck_before_hex": "9c488349b110ccfdf87a7629ce11f3c7d18070df6d10c579319f8c21ca28d1c8",
+      "ck_after_hex": "5f4d6f049c25a6acdd15d5d365ca18fabbe1fb262035b20b39664016fe2a9a08",
+      "mk_hex": "f714d3ec6e1e48f8bf339bbf112dedda01fa2bb1f26435b592498016c84e440f"
+    },
+    {
+      "direction": "bob->alice",
+      "plaintext_hex": "686920616c696365",
+      "n": 0,
+      "dh_ratchet_step": true,
+      "delivered_out_of_order": false,
+      "chain_key_pinned": false
+    }
+  ],
+  "header_round_trip": {
+    "note": "header_seal draws a random nonce, so ciphertext is never pinned. A conforming implementation must satisfy: header_open(hk, header_seal(hk, header)) == Some(header) for these fixed inputs.",
+    "hk_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "header_plaintext_hex": "b2599e860bbe532e4955cca4dbd20d3b7f6805d81bb505ddbe69276a170c4d740000000000000000"
+  }
+}

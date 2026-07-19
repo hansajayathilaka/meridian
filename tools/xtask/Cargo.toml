@@ -9,6 +9,10 @@ publish = false
 # release packaging. Invoked via `cargo run -p xtask -- <cmd>` and the Justfile.
 [dependencies]
 meridian-identity = { path = "../../apps/identity" }
+meridian-store = { path = "../../apps/store" }
+meridian-crypto = { path = "../../apps/crypto" }
+meridian-proto = { path = "../../apps/proto" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
+x25519-dalek = { workspace = true }
