@@ -130,3 +130,37 @@ fn account_key_dh_interoperates() {
     // A wrong-length peer key is rejected, not silently truncated.
     assert!(store.use_key(&ha, SignOrDh::Dh, b"short").is_err());
 }
+
+#[test]
+fn derive_key_is_stable_and_independent_of_signing() {
+    // Task 1.7 (review finding F7): `derive_key` must not depend on any signature algorithm's
+    // determinism — it is a dedicated HKDF-Expand op over the raw seed.
+    let store = meridian_store::MemorySecretStore::new();
+    let handle = store.store("acct", &SEED).unwrap();
+    let info = b"Meridian/Test/DeriveKey/v1";
+
+    // Stable/deterministic across repeated calls for the same seed + info.
+    let k1 = store.derive_key(&handle, info).unwrap();
+    let k2 = store.derive_key(&handle, info).unwrap();
+    assert_eq!(
+        k1, k2,
+        "derive_key must be deterministic for the same seed+info"
+    );
+
+    // Different info domain-separates the output.
+    let k3 = store
+        .derive_key(&handle, b"Meridian/Test/DeriveKey/v2")
+        .unwrap();
+    assert_ne!(k1, k3, "different info must yield a different key");
+
+    // The derived key is unrelated to (and independent of) the store's Ed25519 signature over the
+    // same bytes — repeated signing over `info` is still deterministic here (software Ed25519), but
+    // `derive_key` does not consult the signing path at all, so it works identically across every
+    // software store regardless of that store's signature scheme.
+    let sig = store.use_key(&handle, SignOrDh::Sign, info).unwrap();
+    assert_ne!(
+        &k1[..],
+        &sig[..32],
+        "derived key must not equal the signature bytes"
+    );
+}

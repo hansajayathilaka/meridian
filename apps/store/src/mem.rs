@@ -9,7 +9,9 @@ use std::sync::Mutex;
 
 use zeroize::Zeroizing;
 
-use crate::{perform_op, KeyHandle, Result, SecretStore, SignOrDh, StoreError};
+use crate::{
+    derive_key_from_seed, perform_op, KeyHandle, Result, SecretStore, SignOrDh, StoreError,
+};
 
 /// A process-local, filesystem-free secret store.
 #[derive(Default)]
@@ -44,5 +46,13 @@ impl SecretStore for MemorySecretStore {
 
     fn nonextractable(&self) -> bool {
         false
+    }
+
+    fn derive_key(&self, h: &KeyHandle, info: &[u8]) -> Result<[u8; 32]> {
+        let keys = self.keys.lock().expect("MemorySecretStore mutex poisoned");
+        let seed = keys
+            .get(&h.label)
+            .ok_or_else(|| StoreError::NotFound(h.label.clone()))?;
+        derive_key_from_seed(seed, info)
     }
 }

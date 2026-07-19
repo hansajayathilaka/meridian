@@ -32,6 +32,9 @@ pub trait SecretStore: Send + Sync {           // OS keystore / enclave / wrappe
     fn store(&self, label: &str, secret: &[u8]) -> Result<KeyHandle>;
     fn use_key(&self, h: &KeyHandle, op: SignOrDh, input: &[u8]) -> Result<Vec<u8>>;
     fn nonextractable(&self) -> bool;           // surfaced in diagnostics
+    // Domain-separated HKDF-Expand over the stored secret; independent of any signature
+    // algorithm's determinism (task 1.7, review finding F7) — used e.g. to seal local state at rest.
+    fn derive_key(&self, h: &KeyHandle, info: &[u8]) -> Result<[u8; 32]>;
 }
 ```
 

@@ -1,27 +1,29 @@
 //! At-rest sealing for the local session store (system-design §4.7).
 //!
 //! The session store (ratchet state) is encrypted under a key **derived from the account key held
-//! in the [`SecretStore`]**: the caller signs a fixed label through the store (the private key
-//! never leaves it), and the deterministic signature is HKDF'd into a symmetric key here. The
-//! sealed blob is XChaCha20-Poly1305 with a random nonce.
+//! in the [`SecretStore`]** via [`meridian_store::SecretStore::derive_key`] — a dedicated
+//! HKDF-Expand op over the raw stored seed, independent of any signature algorithm's determinism.
+//! The sealed blob is XChaCha20-Poly1305 with a random nonce.
 //!
-//! TODO: confirm a dedicated key-derivation op on `SecretStore` (rather than reusing a signature)
-//! when enclave-backed stores land — a deterministic Ed25519 signature is stable and secret, but a
-//! purpose-built derive op is cleaner. Tracked with the multi-device work (T13).
+//! **Resolved (task 1.7, review finding F7):** the store now exposes a dedicated `derive_key` op
+//! that does not depend on any signature algorithm's determinism, so a future HSM/enclave
+//! `SecretStore` with randomized (non-deterministic) signatures can never make previously-sealed
+//! session-store state permanently undecryptable. This is a **breaking format change** for any
+//! previously-persisted session-store blob: old blobs were sealed under
+//! `HKDF(fixed-salt, Ed25519-signature-over-label, info)`; new blobs are sealed directly under
+//! `SecretStore::derive_key`'s HKDF-Expand over the raw seed. Acceptable pre-release — there are no
+//! deployed users or production data yet — and no migration shim is provided.
+//!
+//! [`SecretStore`]: meridian_store::SecretStore
 
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 
 use crate::error::{CryptoError, Result};
-use crate::primitives::hkdf;
 
-/// Label the caller signs through the [`meridian_store::SecretStore`] to seed the store key.
-pub const STORE_KEY_LABEL: &[u8] = b"Meridian/SessionStoreKey/v1";
-
-/// Derive the 32-byte session-store key from a signature over [`STORE_KEY_LABEL`].
-pub fn derive_store_key(signature: &[u8]) -> [u8; 32] {
-    hkdf::<32>(&[0u8; 32], signature, b"Meridian/SessionStore/HKDF/v1")
-}
+/// Domain-separation info the caller passes to [`meridian_store::SecretStore::derive_key`] to seed
+/// the session-store key.
+pub const STORE_KEY_INFO: &[u8] = b"Meridian/SessionStoreKey/v1";
 
 /// Seal `plaintext` under `key`; output is `nonce(24) ‖ ciphertext`.
 pub fn seal(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {

@@ -16,8 +16,8 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** Phase 1 fix-tasks landing — Group A (1.1-1.4) done. Group B: 1.5, 1.6 done.
-- **NEXT:** run **`/next-task`** to continue with 1.7 (SecretStore KDF op), then Group C.
+- **NOW:** Phase 1 fix-tasks landing — Group A (1.1-1.4) done. Group B done (1.5, 1.6, 1.7).
+- **NEXT:** run **`/next-task`** to continue with Group C (1.8 real CI gates first).
 - After Phase 1 fixes land: **`/pick-next-phase`** selects Phase 2 (T06 Cross-Org Federation).
   Blocking gate: F1, F2, F3, F10, F11 (→ 1.1, 1.2, 1.6, 1.13+1.15, 1.14+1.16) must close first.
 
@@ -47,7 +47,7 @@ design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 **Group B — Freeze the crypto** (blocking / should-fix)
 - [x] **1.5** Zeroization gaps: X3DH master secret + ratchet header keys (F5, F6) — [file](./phase-1/1.5-crypto-zeroization-gaps.md)
 - [x] **1.6** Conformance vectors: X3DH / ratchet / envelope / safety numbers + CI (F1) — [file](./phase-1/1.6-conformance-vectors.md)
-- [ ] **1.7** SecretStore KDF op — drop signature-determinism dependency (F7) — [file](./phase-1/1.7-secretstore-kdf-op.md)
+- [x] **1.7** SecretStore KDF op — drop signature-determinism dependency (F7) — [file](./phase-1/1.7-secretstore-kdf-op.md)
 
 **Group C — Make the gates real** (should-fix)
 - [ ] **1.8** Real CI gates: deny.toml + cargo-deny + blocking clippy (F4, F18) — [file](./phase-1/1.8-ci-blocking-gates.md)
