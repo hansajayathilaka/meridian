@@ -11,7 +11,9 @@
 
 use zeroize::Zeroizing;
 
-use crate::{perform_op, KeyHandle, Result, SecretStore, SignOrDh, StoreError};
+use crate::{
+    derive_key_from_seed, perform_op, KeyHandle, Result, SecretStore, SignOrDh, StoreError,
+};
 
 fn backend_err(e: keyring_core::Error) -> StoreError {
     match e {
@@ -67,6 +69,11 @@ impl SecretStore for OsSecretStore {
         // A future enclave/StrongBox-backed store would override this to `true`. Reported honestly
         // in diagnostics rather than overclaimed (docs/security/anonymity-and-retention.md).
         false
+    }
+
+    fn derive_key(&self, h: &KeyHandle, info: &[u8]) -> Result<[u8; 32]> {
+        let seed = Zeroizing::new(self.entry(&h.label)?.get_secret().map_err(backend_err)?);
+        derive_key_from_seed(&seed, info)
     }
 }
 

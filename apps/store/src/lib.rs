@@ -7,8 +7,10 @@
 //!
 //! The [`SecretStore`] trait is the seam every platform shim implements. Signing happens *through*
 //! the store ([`SecretStore::use_key`]) so an enclave-backed impl can keep the key non-extractable;
-//! the software impls here load the seed into a [`Zeroizing`] buffer only for the length of one
-//! operation.
+//! symmetric-key derivation for callers that need a raw 32-byte key (e.g. sealing local state at
+//! rest) happens through [`SecretStore::derive_key`], an HKDF-Expand op that does not depend on any
+//! signature algorithm's determinism; the software impls here load the seed into a [`Zeroizing`]
+//! buffer only for the length of one operation.
 
 mod error;
 mod file;
@@ -80,6 +82,11 @@ pub trait SecretStore: Send + Sync {
     /// diagnostics per the API contract. The software stores here return `false` — they hold key
     /// material in process memory during an operation, honestly reported.
     fn nonextractable(&self) -> bool;
+
+    /// Derive a domain-separated 32-byte symmetric key from the stored secret via HKDF-Expand,
+    /// independent of any signature algorithm's determinism. `info` domain-separates the output so
+    /// distinct callers/purposes never collide.
+    fn derive_key(&self, h: &KeyHandle, info: &[u8]) -> Result<[u8; 32]>;
 }
 
 /// Ed25519 detached signature helper shared by the software stores.
@@ -143,4 +150,25 @@ pub(crate) fn perform_op(seed: &[u8], op: SignOrDh, input: &[u8]) -> Result<Vec<
         SignOrDh::Sign => ed25519_sign(seed, input),
         SignOrDh::Dh => ed25519_seed_to_x25519_dh(seed, input),
     }
+}
+
+/// Fixed, zero salt for the HKDF-Extract step. The seed itself supplies all the entropy; `info`
+/// domain-separates independent derivations from the same seed.
+const DERIVE_KEY_SALT: [u8; 32] = [0u8; 32];
+
+/// Derive a domain-separated 32-byte symmetric key from raw seed bytes via HKDF-Expand
+/// (HKDF-SHA256: `Extract(salt=0, ikm=seed)` then `Expand(info)`), independent of any signature
+/// algorithm's determinism. Shared by every software store's [`SecretStore::derive_key`] impl.
+pub(crate) fn derive_key_from_seed(seed: &[u8], info: &[u8]) -> Result<[u8; 32]> {
+    let seed: [u8; ED25519_SEED_LEN] =
+        seed.try_into().map_err(|_| StoreError::BadSecretLength {
+            expected: ED25519_SEED_LEN,
+            got: seed.len(),
+        })?;
+    let seed = Zeroizing::new(seed);
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(&DERIVE_KEY_SALT), seed.as_slice());
+    let mut okm = [0u8; 32];
+    hk.expand(info, &mut okm)
+        .expect("HKDF expand length is within SHA-256 bounds");
+    Ok(okm)
 }

@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 use meridian_crypto::{at_rest, PrekeyMaterial, Session};
-use meridian_identity::{sign, verify, KeyHandle, PublicKey, SecretStore, SignOrDh, Signature};
+use meridian_identity::{sign, verify, KeyHandle, PublicKey, SecretStore, Signature};
 use meridian_proto::{ChatContent, MessageEnvelope, Prekey};
 use serde::{Deserialize, Serialize};
 
@@ -301,9 +301,9 @@ impl ChatState {
 }
 
 fn store_key(store: &dyn SecretStore, handle: &KeyHandle) -> Result<[u8; 32], ChatError> {
-    // Sign the fixed label through the store (private key never leaves it); HKDF into a key.
-    let sig = store.use_key(handle, SignOrDh::Sign, at_rest::STORE_KEY_LABEL)?;
-    Ok(at_rest::derive_store_key(&sig))
+    // Derive directly through the store (private key never leaves it), independent of any
+    // signature algorithm's determinism (task 1.7, review finding F7).
+    Ok(store.derive_key(handle, at_rest::STORE_KEY_INFO)?)
 }
 
 fn to_wire_prekey(m: &PrekeyMaterial) -> Prekey {

@@ -33,7 +33,7 @@ dependencies between fix-tasks are declared per task (notably 1.2→1.1, 1.15→
 **Group B — Freeze the crypto** (blocking / should-fix)
 - [x] **1.5** Zeroization gaps: X3DH master secret + ratchet header keys (F5, F6) — [file](./1.5-crypto-zeroization-gaps.md)
 - [x] **1.6** Conformance vectors: X3DH / ratchet / envelope / safety numbers + CI (F1) — [file](./1.6-conformance-vectors.md)
-- [ ] **1.7** SecretStore KDF op — drop signature-determinism dependency (F7) — [file](./1.7-secretstore-kdf-op.md)
+- [x] **1.7** SecretStore KDF op — drop signature-determinism dependency (F7) — [file](./1.7-secretstore-kdf-op.md)
 
 **Group C — Make the gates real** (should-fix)
 - [ ] **1.8** Real CI gates: deny.toml + cargo-deny + blocking clippy (F4, F18) — [file](./1.8-ci-blocking-gates.md)

@@ -19,6 +19,7 @@ ed25519-dalek = { workspace = true }
 # DH runs *through the store* and the private key never leaves it (crypto-protocols skill rule 6).
 x25519-dalek = { workspace = true }
 sha2 = { workspace = true }
+hkdf = { workspace = true }
 getrandom = { workspace = true }
 thiserror = { workspace = true }
 

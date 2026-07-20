@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use age::secrecy::SecretString;
 use zeroize::Zeroizing;
 
-use crate::{perform_op, KeyHandle, Result, SecretStore, SignOrDh, StoreError};
+use crate::{
+    derive_key_from_seed, perform_op, KeyHandle, Result, SecretStore, SignOrDh, StoreError,
+};
 
 /// A single Ed25519 account key wrapped in one age/scrypt keyfile.
 ///
@@ -77,5 +79,10 @@ impl SecretStore for FileSecretStore {
 
     fn nonextractable(&self) -> bool {
         false
+    }
+
+    fn derive_key(&self, _h: &KeyHandle, info: &[u8]) -> Result<[u8; 32]> {
+        let seed = self.decrypt_seed()?;
+        derive_key_from_seed(&seed, info)
     }
 }
