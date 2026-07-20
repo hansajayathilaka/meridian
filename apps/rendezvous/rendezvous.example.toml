@@ -6,7 +6,9 @@ domain = "chat.example"          # this server's hint-domain; folded into the au
 bind = "0.0.0.0:8443"            # WebSocket bind; TLS is terminated by the proxy/VIP (ADR-8)
 admission = "open"               # open | invite
 invite_tokens = []               # tokens accepted when admission = "invite"
-allow_test_tamper = false        # TEST HOOK — MUST be false in production
+allow_test_tamper = false        # TEST HOOK — only takes effect when built with `--features
+                                  # test-tamper-hook` (the substitution code is compiled out
+                                  # otherwise). MUST be false in production.
 database_url = "sqlite://rendezvous.db"   # only used when built with --features sqlite
 
 [limits]                         # anti-abuse, fixed one-minute windows

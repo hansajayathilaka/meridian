@@ -78,7 +78,13 @@ async fn register_publish_and_fetch_verifies() {
 }
 
 // -- acceptance: tampered bundle fails closed --------------------------------
+//
+// Requires the `test-tamper-hook` cargo feature (F17) — the actual substitution logic is compiled
+// out entirely without it (the server would just return the untampered bundle and this assertion
+// would fail), so this test only compiles/runs when the feature is enabled:
+// `cargo test -p meridian-rendezvous --features test-tamper-hook`.
 
+#[cfg(feature = "test-tamper-hook")]
 #[tokio::test]
 async fn tampered_bundle_is_rejected() {
     let mut config = config_open();
@@ -95,6 +101,28 @@ async fn tampered_bundle_is_rejected() {
         matches!(err, SignalError::BundleVerification(_)),
         "expected hard verification failure, got {err:?}"
     );
+}
+
+// F17: without the `test-tamper-hook` feature the substitution code is compiled out entirely, so
+// even a config with `allow_test_tamper = true` and a client-sent `tamper` flag must be inert —
+// the server returns the real, untampered bundle. This is the structural counterpart to
+// `tampered_bundle_is_rejected` above (which only compiles/runs *with* the feature).
+#[cfg(not(feature = "test-tamper-hook"))]
+#[tokio::test]
+async fn tamper_flag_is_inert_without_feature() {
+    let mut config = config_open();
+    config.server.allow_test_tamper = true; // even "enabled" at the config layer...
+    let url = spawn(config).await;
+
+    let alice = new_acct("localhost");
+    let bob = new_acct("localhost");
+    register(&bob, &url).await;
+
+    let mut ac = alice.connect(&url).await.unwrap();
+    // ...requesting tamper=true still gets bob's real bundle back — the hook doesn't exist in
+    // this build at all.
+    let bundle = ac.fetch_bundle(bob.pubkey, true).await.unwrap();
+    assert_eq!(bundle.account_pub, bob.pubkey);
 }
 
 // -- acceptance: exact-key-only (anti-enumeration) ---------------------------

@@ -26,6 +26,11 @@ default = []
 # Real SQLite persistence via sqlx (stack.md §3). Off by default so the MVP/tests build light and
 # run against the in-memory store; production enables it. Postgres is a later flag.
 sqlite = ["dep:sqlx"]
+# TEST-ONLY: compiles in the bundle-tamper hook (auth::substitute_bundle + its call site in
+# ws::handle_fetch) used to drive the malicious-server demo / adversarial test harness. MUST stay
+# out of the default feature set — release binaries built with default features never contain this
+# code at all (F17). Enable explicitly with `--features test-tamper-hook` for the demo/harness.
+test-tamper-hook = []
 
 [dependencies]
 meridian-proto = { path = "../proto" }
@@ -56,3 +61,4 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "syn
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
+tempfile = { workspace = true }

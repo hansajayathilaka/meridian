@@ -25,6 +25,8 @@ getrandom = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# Drive the real server in-process for the register/fetch-bundle demo (T02).
-meridian-rendezvous = { path = "../rendezvous" }
+# Drive the real server in-process for the register/fetch-bundle demo (T02). test-tamper-hook is
+# needed so the --tamper demo path (fetch-bundle --tamper) still exercises the substituted-bundle
+# rejection; it's a dev-only feature, never enabled in the release meridian-rendezvous binary.
+meridian-rendezvous = { path = "../rendezvous", features = ["test-tamper-hook"] }
 tokio = { workspace = true, features = ["rt", "macros", "net", "sync", "time", "io-util"] }

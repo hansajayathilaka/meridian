@@ -11,15 +11,21 @@
 use clap::Parser;
 use meridian_rendezvous::{default_store, serve, AppState, Config};
 
+/// Conventional config path used only when `--config` is not supplied at all (best-effort,
+/// non-fatal if missing/unparseable — see the `None` arm of `main`'s config load below).
+const DEFAULT_CONFIG_PATH: &str = "rendezvous.toml";
+
 #[derive(Parser)]
 #[command(
     name = "meridian-rendezvous",
     about = "Meridian signaling server (T02)"
 )]
 struct Args {
-    /// Path to the TOML config (see docs/api/rendezvous-protocol-v1.md §Config).
-    #[arg(long, default_value = "rendezvous.toml")]
-    config: String,
+    /// Path to the TOML config (see docs/api/rendezvous-protocol-v1.md §Config). Defaults are used
+    /// only when this flag is entirely absent; an explicitly supplied path that fails to load is a
+    /// fatal error (fail-closed — never silently boot with weaker-than-intended settings).
+    #[arg(long)]
+    config: Option<String>,
     /// Override the bind address from config.
     #[arg(long)]
     bind: Option<String>,
@@ -29,12 +35,23 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
-    let mut config = match Config::load(&args.config) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("config: {e}; falling back to defaults");
-            Config::default()
-        }
+    let mut config = match &args.config {
+        // Explicitly supplied on the CLI: a load/parse failure is fatal — never silently boot
+        // with defaults, which could turn an invite-only/restricted config into open
+        // registration (threat-model goal 6, "never silently weaker").
+        Some(path) => match Config::load(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "config: failed to load explicitly-supplied --config {path}: {e}; refusing to boot with defaults"
+                );
+                std::process::exit(1);
+            }
+        },
+        // No --config given: best-effort load the conventional `rendezvous.toml` from the
+        // working directory, but silently fall back to defaults if it's absent or unparseable —
+        // this is the documented "no config" default-boot path, not a user-requested load.
+        None => Config::load(DEFAULT_CONFIG_PATH).unwrap_or_default(),
     };
     if let Some(bind) = args.bind {
         config.server.bind = bind;
