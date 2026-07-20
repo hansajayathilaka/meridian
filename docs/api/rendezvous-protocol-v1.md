@@ -38,7 +38,7 @@ All 32-byte keys and 64-byte signatures are encoded as **CBOR byte strings** (ma
 | `RouteOk` | S→C | `{ delivered: bool }` | routed to a live peer |
 | `Deliver` | S→C | `{ from: bstr[32], blob: bstr }` | a delivered envelope |
 | `TurnReq` | C→S | `{}` | request ephemeral TURN credentials (T05) |
-| `TurnGrant` | S→C | `{ urls: [*tstr], username: tstr, credential: tstr, ttl_secs: uint, realm: tstr }` | a minted single-session TURN credential |
+| `TurnGrant` | S→C | `{ urls: [*tstr], username: tstr, credential: tstr, ttl_secs: uint, realm: tstr }` | a minted TURN credential, distinct per request |
 | `Err` | S→C | `{ code: tstr, msg: tstr }` | structured error (codes below) |
 
 `PrekeyBundle = { v, account_pub: bstr[32], spk: bstr[32], spk_sig: bstr[64], otks: [*bstr[32]], otk_sigs: [*bstr[64]], device_record?: bstr }` — every `*_sig` is `Ed25519(account_pub)` over the corresponding public key. `device_record` is opaque and account-signed (T13). ≤100 one-time prekeys.
@@ -74,7 +74,7 @@ credential = base64( HMAC-SHA1( shared_secret, username ) )
 coturn — sharing the *same* secret (`static-auth-secret` == rendezvous `[turn].secret`) — recomputes the HMAC over the presented username and admits the allocation only while `now < expiry`. Two properties matter:
 
 - **Expiry** is embedded in the username, so the TTL is enforced by coturn with **no server-side session state** (the rendezvous stays near-stateless, ADR-8).
-- **Single-session**: a fresh random nonce per mint makes every credential unique, so a captured credential is confined to its own short window and authorizes no other session's allocation (feature-05 acceptance: *reuse rejected by coturn*).
+- **Distinct per mint**: a fresh random nonce per mint makes every credential unique, so a captured credential cannot be used to forge allocations under a *different* username. It does **not** by itself prevent reuse of that one captured credential: within its own TTL window, coturn's `user-quota` (`infra/coturn/turnserver.conf`) bounds — but does not reject outright — how many allocations it can mint before expiry (feature-05 acceptance: *distinct grants, quota-bounded reuse*; true reuse-rejection at the wire level is proven separately, task 1.16).
 
 `urls` is the ladder in preference order — `turn:…?transport=udp`, `turn:…?transport=tcp`, then `turns:…:443?transport=tcp` (the hostile-egress last resort). A server with **no** relay configured (empty secret — a dev server, or air-gapped with no TURN) replies `turn_unavailable`; the client then uses the host/STUN ladder only and `meridian doctor` names the blocked path. Minting is authenticated (post-`AuthOk`) and rate-limited per account (`turn_per_account_per_min`). The mint rate is exported as the allowlisted `meridian_turn_credentials_minted_total` (§9.4). Client side: `meridian_signaling::SignalingClient::request_turn_credentials`.
 
@@ -105,7 +105,7 @@ urls = [                         # the candidate ladder, preference order
   "turn:127.0.0.1:3478?transport=tcp",
   "turns:127.0.0.1:443?transport=tcp",
 ]
-ttl_secs = 120                   # credential lifetime (short — single-session)
+ttl_secs = 120                   # credential lifetime (short); reuse bounded by coturn user-quota
 ```
 
 ## 6. Metrics

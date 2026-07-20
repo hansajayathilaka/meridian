@@ -4,10 +4,11 @@
 #
 # T02 wires the first, load-bearing case: the substituted-bundle abort at both the library layer
 # (meridian-signaling::verify_bundle) and the CLI layer (`fetch-bundle --tamper` fails closed).
-# T04 EXTENDS it to the transport layer: SDP/ICE ride inside ratchet-encrypted envelopes, so a
-# malicious relay cannot touch the inner SDP, and the DTLS fingerprint is cross-checked against the
-# identity-bound value after the handshake — a mismatch (a MITM that terminated DTLS) tears the
-# session down 100% of the time (§4.6).
+# T04 EXTENDS it to the transport layer: SDP/ICE ride inside ratchet-encrypted envelopes, so a relay
+# seeing only ciphertext cannot read or forge the inner SDP, and the DTLS fingerprint is cross-checked
+# against the identity-bound value after the handshake — a mismatch (a MITM that terminated DTLS)
+# tears the session down 100% of the time (§4.6). An automated test actively mounting a relay-rewrite
+# attempt against a real backend is still open — tracked for 1.16.
 # T08 EXTENDS this harness with the tofu/verified trust-state matrix — do not delete these cases.
 # See docs/testing/strategy.md §3 and docs/security/threat-mitigation-matrix.md.
 set -euo pipefail
@@ -20,5 +21,7 @@ echo "[mitm-sim] OK: client aborts on a bundle signed under any other key."
 
 echo "[mitm-sim] DTLS fingerprint-binding teardown (T04 §4.6)…"
 cargo test -q -p meridian-core --test p2p_session fingerprint_mismatch_tears_down
-cargo test -q -p meridian-core --test p2p_session malicious_relay_cannot_touch_inner_sdp
-echo "[mitm-sim] OK: fingerprint mismatch tears the session down; inner SDP is untouchable."
+cargo test -q -p meridian-core --test p2p_session relay_path_connects_healthily
+echo "[mitm-sim] OK: fingerprint mismatch tears the session down; a healthy relay path still binds"
+echo "  matching fingerprints. NOTE: an active relay SDP-rewrite attack is not yet exercised here —"
+echo "  tracked for 1.16 once the real transport backend lands."

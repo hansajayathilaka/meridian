@@ -146,7 +146,7 @@ async fn fetch_is_exact_key_only() {
     }
 }
 
-// -- acceptance (T05): ephemeral, single-session TURN credentials -------------
+// -- acceptance (T05): ephemeral, distinct-per-request TURN credentials -------
 
 fn config_with_turn() -> Config {
     let mut config = config_open();
@@ -190,15 +190,18 @@ async fn turn_credentials_are_minted_and_verify_under_the_secret() {
 }
 
 #[tokio::test]
-async fn each_turn_grant_is_single_session() {
+async fn each_turn_request_mints_a_distinct_credential() {
     let url = spawn(config_with_turn()).await;
     let alice = new_acct("localhost");
     let mut c = alice.connect(&url).await.unwrap();
 
     let a = c.request_turn_credentials().await.unwrap();
     let b = c.request_turn_credentials().await.unwrap();
-    // Distinct per-session nonces ⇒ distinct usernames+credentials: a captured credential is bound
-    // to its own short window and cannot be reused for another session (feature-05 acceptance).
+    // Distinct per-request nonces ⇒ distinct usernames+credentials (feature-05 acceptance). This
+    // proves distinctness, NOT single-use enforcement: a single captured credential is still valid
+    // to mint allocations until its own embedded expiry, bounded only by coturn's `user-quota`
+    // (infra/coturn/turnserver.conf), not rejected outright. True reuse-rejection at the wire level
+    // is proven separately (task 1.16).
     assert_ne!(a.username, b.username);
     assert_ne!(a.credential, b.credential);
 }

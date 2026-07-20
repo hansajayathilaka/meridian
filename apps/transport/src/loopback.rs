@@ -241,6 +241,10 @@ fn select_path(
 
 #[async_trait::async_trait]
 impl Transport for LoopbackTransport {
+    fn name(&self) -> &'static str {
+        "loopback"
+    }
+
     async fn new_session(&self, cfg: IceConfig) -> Result<SessionHandle> {
         let (tx, rx) = mpsc::unbounded_channel();
         let id = self.with_inner(|inner| {

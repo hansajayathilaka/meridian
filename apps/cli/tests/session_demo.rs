@@ -37,9 +37,9 @@ fn session_demo_shows_server_down_continuity() {
         text.contains("[bob → alice] hi back"),
         "bob→alice missing: {text}"
     );
-    // The `session info` line lists both streams over the datachannel transport.
+    // The `session info` line lists both streams over the loopback transport.
     assert!(
-        text.contains("transport=webrtc-datachannel"),
+        text.contains("transport=loopback"),
         "missing transport line: {text}"
     );
     assert!(text.contains("mrd.ctrl/1"), "ctrl stream missing: {text}");

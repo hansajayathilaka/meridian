@@ -10,9 +10,12 @@
 //! ([`SignalContent`]), so the rendezvous only ever routes opaque blobs — it can neither read nor
 //! rewrite an offer. After the handshake the substrate cross-checks the transport's *negotiated*
 //! remote fingerprint against the one the peer *asserted* in its encrypted envelope; any mismatch
-//! tears the session down before a byte of content flows. A malicious relay that rewrites the outer
-//! routing cannot touch the inner SDP, and a MITM that terminates DTLS presents a fingerprint that
-//! fails the check. This is why we can put the servers out of the data path and still trust it.
+//! tears the session down before a byte of content flows. A relay that only sees opaque ciphertext
+//! cannot read or forge the inner SDP (that opacity is a property of the envelope encryption itself,
+//! independent of transport backend), and a MITM that terminates DTLS presents a fingerprint that
+//! fails the check. An automated test actively mounting a relay rewrite attempt against a real
+//! backend is still open (TODO: 1.16); today's suite proves the fingerprint cross-check, not that
+//! specific attack. This is why we can put the servers out of the data path and still trust it.
 //!
 //! ## Transport independence
 //! Once connected, chat and ctrl ride data channels peer-to-peer; the relay is only used for
@@ -145,7 +148,8 @@ pub enum Role {
 /// the relay server and transport rung, so the latency-vs-privacy trade shows as numbers (§5.4).
 #[derive(Clone, Debug)]
 pub struct SessionInfo {
-    /// Logical transport (wire behavior is identical across backends): `webrtc-datachannel`.
+    /// The transport actually negotiating this session (e.g. `loopback` in tests/demo today; a real
+    /// backend's own name once one lands, per T04/1.15) — not a fixed, backend-agnostic label.
     pub transport: &'static str,
     /// Selected candidate-pair class.
     pub path: Path,
@@ -288,7 +292,7 @@ impl<T: Transport> P2pSession<T> {
             streams.push(CHAT_LABEL.to_string());
         }
         SessionInfo {
-            transport: "webrtc-datachannel",
+            transport: self.transport.name(),
             path: detail.class,
             relay_server: detail.relay_server,
             relay_transport: detail.relay_transport,

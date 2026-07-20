@@ -5,7 +5,8 @@
 # Proves, per docs/architecture/features/05-nat-traversal-relay-policy.md:
 #   * all four NAT cells connect (symmetric×symmetric via relay);
 #   * TLS-443 fallback carries the UDP-blocked cell;
-#   * TURN credentials are ephemeral + single-session (reuse-distinct, expiry embedded);
+#   * TURN credentials are ephemeral + distinct per request (expiry embedded; reuse of a captured
+#     credential is quota-bounded server-side, not rejected outright);
 #   * relay-only offers ONLY relay candidates — a peer never sees our host/srflx IPs.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -17,9 +18,9 @@ cargo test -q -p meridian-transport relay_only_strips_host_and_srflx_before_gath
 echo "[nat-matrix] three-level relay-policy resolution…"
 cargo test -q -p meridian-core --test relay_policy
 
-echo "[nat-matrix] ephemeral, single-session TURN credential minting…"
+echo "[nat-matrix] ephemeral TURN credential minting, distinct per request…"
 cargo test -q -p meridian-rendezvous --test rendezvous turn_credentials_are_minted_and_verify_under_the_secret
-cargo test -q -p meridian-rendezvous --test rendezvous each_turn_grant_is_single_session
+cargo test -q -p meridian-rendezvous --test rendezvous each_turn_request_mints_a_distinct_credential
 
 echo "[nat-matrix] CLI: doctor connects all four cells; relay-only hides our IPs…"
 cargo test -q -p meridian-cli --test nat_relay
@@ -27,4 +28,4 @@ cargo test -q -p meridian-cli --test nat_relay
 echo "[nat-matrix] netns wire-level rig (skips without NET_ADMIN)…"
 bash tools/netns-nat-matrix.sh matrix
 
-echo "[nat-matrix] OK: four cells connect; TLS-443 fallback works; creds are single-session; relay-only hides IPs."
+echo "[nat-matrix] OK: four cells connect; TLS-443 fallback works; creds are distinct per request (reuse quota-bounded, not rejected outright); relay-only hides IPs."
