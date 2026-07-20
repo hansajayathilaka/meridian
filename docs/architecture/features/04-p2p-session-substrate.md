@@ -24,7 +24,7 @@ $ meridian chat mrd1:<bob>@localhost          # both peers on LAN, server runnin
 $ docker stop meridian-rendezvous             # kill the server mid-conversation
   — chat continues uninterrupted —            # ← the headline demo
 $ meridian session info
-  transport=webrtc-datachannel path=direct rtt=1.8ms streams=[mrd.ctrl/1, mrd.chat/1]
+  transport=loopback path=direct rtt=1.8ms streams=[mrd.ctrl/1, mrd.chat/1]
 ```
 
 ## Acceptance criteria

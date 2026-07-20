@@ -71,6 +71,13 @@ pub type Result<T> = std::result::Result<T, TransportError>;
 /// (webrtc-nat-traversal invariant 2).
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
+    /// A short, stable identifier for *which* backend this is (`"loopback"`, and later the real
+    /// webrtc-rs/browser backend names). Additive to the frozen core-api-contracts subset, like
+    /// [`selected_path_detail`](Transport::selected_path_detail) — every implementation states this
+    /// explicitly (no default) so callers such as `SessionInfo` never have to guess or hardcode a
+    /// backend name that may not be the one actually running.
+    fn name(&self) -> &'static str;
+
     /// Create a new peer connection and begin gathering local candidates per `cfg` (the policy in
     /// `cfg` decides whether host/srflx candidates are gathered at all — `relay-only` strips them
     /// *before* gathering so peers never learn each other's IPs, invariant 3).
