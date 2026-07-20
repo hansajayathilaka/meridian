@@ -27,7 +27,7 @@ jobs:
           bash tools/lint-no-serde-on-blob.sh
           bash tools/lint-metrics-allowlist.sh
       - name: clippy
-        run: cargo clippy --workspace --all-targets || true   # TODO: -D warnings once code lands
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: Test + adversarial harnesses
@@ -72,8 +72,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Enforces the vodozemac/no-AGPL decision (ADR 0011) once deny.toml lands.
-      - run: echo "TODO cargo-deny check (advisories + licenses; block AGPL) — ADR 0011"
+      # Enforces the vodozemac/no-AGPL decision (ADR 0011/0015) via deny.toml.
+      - name: cargo-deny (licenses, advisories, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
 
   docs:
     name: Docs (mermaid + links)

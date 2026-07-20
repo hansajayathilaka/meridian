@@ -36,7 +36,7 @@ dependencies between fix-tasks are declared per task (notably 1.2→1.1, 1.15→
 - [x] **1.7** SecretStore KDF op — drop signature-determinism dependency (F7) — [file](./1.7-secretstore-kdf-op.md)
 
 **Group C — Make the gates real** (should-fix)
-- [ ] **1.8** Real CI gates: deny.toml + cargo-deny + blocking clippy (F4, F18) — [file](./1.8-ci-blocking-gates.md)
+- [x] **1.8** Real CI gates: deny.toml + cargo-deny + blocking clippy (F4, F18) — [file](./1.8-ci-blocking-gates.md)
 - [ ] **1.9** Metrics-allowlist exhaustiveness test (F14) — [file](./1.9-metrics-exhaustiveness.md)
 - [ ] **1.10** Harden no-serde-on-blob lint (F15) — [file](./1.10-no-serde-blob-lint.md)
 - [ ] **1.11** Re-point opacity-audit harness gate (F8) — [file](./1.11-opacity-harness-gate.md)

@@ -1,0 +1,68 @@
+# cargo-deny configuration for Meridian.
+#
+# Enforces the license decision in ADR 0011 / ADR 0015: Apache-2.0 (workspace license) and other
+# permissive licenses are fine; AGPL (and other copyleft licenses) are never allowed into the
+# dependency graph. This is the concrete reason vodozemac/RustCrypto were chosen over
+# libsignal-client (AGPL-3.0) for the ratchet/X3DH layer — see docs/adr/0011-ratchet-library.md and
+# docs/adr/0015-ratchet-composition.md. Not putting AGPL/GPL/LGPL/copyleft licenses in `allow` below
+# is deliberate: any crate whose *only* license option is one of those must fail this check.
+#
+# The allow list below is the actual set of licenses present in the workspace's dependency graph
+# (verified with `cargo deny check` + `cargo deny list` against Cargo.lock as of 2026-07-20), not a
+# guessed/generic permissive list. A few crates in the graph (self_cell, r-efi, ryu, aho-corasick,
+# byteorder, etc.) are dual/triple-licensed and include a GPL-2.0/LGPL-2.1/Unlicense/BSL-1.0 option —
+# those are satisfied via their Apache-2.0/MIT alternative and do not need to be (and must not be)
+# added here.
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = false
+
+# This section is considered when running `cargo deny check bans`. Kept light/sensible per the task
+# scope (licenses + a working gate, not a strict dependency-policing regime) — 1.8 is not the place to
+# introduce a strict ban policy.
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow-workspace = true
+
+# This section is considered when running `cargo deny check advisories`. Uses the default RustSec
+# advisory database (https://github.com/rustsec/advisory-db); `cargo deny check` will fetch it at
+# check time. Vulnerabilities are denied by default (cargo-deny's own default `deny` behavior for the
+# advisories check is to fail on any unignored advisory); nothing is pre-ignored here — if a real
+# advisory ever fires, it should be triaged and either fixed (bump/patch) or added to `ignore` below
+# with a written reason, not silenced blanket.
+[advisories]
+ignore = [
+    # proc-macro-error2 is flagged "unmaintained" (not a CVE/vulnerability) as of this writing. It is
+    # a transitive build-time proc-macro dependency pulled in by `age` -> `i18n-embed-fl` (used for
+    # age keystore backend localization), several levels removed from any Meridian code; it has no
+    # runtime footprint and no safe upgrade currently exists upstream. Ignored with a documented
+    # reason rather than silently allowed — revisit when i18n-embed-fl migrates off it, or if this
+    # crate turns up in a *vulnerability* (not just unmaintained) advisory, which must not be ignored.
+    { id = "RUSTSEC-2026-0173", reason = "unmaintained (not a vulnerability); transitive build-time dep via age -> i18n-embed-fl; no safe upgrade available upstream yet" },
+]
+
+# Only the public crates.io registry is a trusted source; no private/mirrored registries or git deps
+# are expected in this workspace.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

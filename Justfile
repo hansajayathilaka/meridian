@@ -11,8 +11,7 @@ build:
 
 # Format + clippy + repo invariants.
 lint: fmt-check lint-invariants
-    @echo "TODO: cargo clippy --workspace -- -D warnings (once code lands)"
-    cargo clippy --workspace --all-targets || true
+    cargo clippy --workspace --all-targets -- -D warnings
 
 fmt-check:
     cargo fmt --all -- --check
