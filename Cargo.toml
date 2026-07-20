@@ -5,6 +5,7 @@ resolver = "2"
 members = [
   "apps/core",
   "apps/proto",
+  "apps/envelope",
   "apps/identity",
   "apps/store",
   "apps/crypto",

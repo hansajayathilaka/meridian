@@ -17,8 +17,13 @@ pub use meridian_store as store;
 /// mandatory verification), and route opaque envelopes (T02).
 pub use meridian_signaling as signaling;
 
-/// Shared wire types (frames, bundles, opaque envelopes) — surfaced for shims that build frames.
+/// Shared wire types (frames, bundles, opaque routing) — surfaced for shims that build frames.
 pub use meridian_proto as proto;
+
+/// Content-shaped, end-to-end-encrypted payload types (message envelope, chat/signal content,
+/// `mrd.ctrl/1` frames) — deliberately NOT part of `meridian-proto` so `meridian-rendezvous` has no
+/// dependency path to them (F15; see apps/envelope/src/lib.rs).
+pub use meridian_envelope as envelope;
 
 /// E2EE session layer: X3DH, header-encrypted Double Ratchet, safety numbers (T03).
 pub use meridian_crypto as crypto;

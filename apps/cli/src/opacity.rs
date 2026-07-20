@@ -12,8 +12,9 @@
 //! and writes the captured transcript out for inspection.
 
 use meridian_core::chat::ChatState;
+use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{generate_account, AccountId, KeyHandle, MemorySecretStore};
-use meridian_core::proto::{ChatContent, Frame, Op, OpaqueBlob, RouteBody};
+use meridian_core::proto::{Frame, Op, OpaqueBlob, RouteBody};
 use meridian_core::signaling::generate_bundle;
 
 /// The result of an audit run.
@@ -208,7 +209,7 @@ pub fn run_audit(rounds: usize) -> Result<AuditReport, String> {
     // the SAME ratchet-encrypted, signed envelopes as chat (SignalContent). A server routing these
     // blobs must see none of it. We seal one offer + one answer with unmistakable marker strings and
     // add those markers to the secret set the leak scan below rejects.
-    use meridian_core::proto::SignalContent;
+    use meridian_core::envelope::SignalContent;
     let sdp_marker = b"SDP-OFFER-SECRET v=0 a=fingerprint host-candidate".to_vec();
     let fp_marker = b"sha-256 SECRET-FINGERPRINT-DO-NOT-LEAK".to_vec();
     let cand_marker = b"candidate:SECRET-ICE-CANDIDATE 203.0.113.7".to_vec();

@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use meridian_crypto::test_support::{dh, header_open, header_seal, kdf_ck, kdf_rk};
 use meridian_crypto::{display_groups, safety_number, x3dh, DoubleRatchet};
-use meridian_proto::{MessageEnvelope, Prekey};
+use meridian_envelope::{MessageEnvelope, Prekey};
 use meridian_store::{MemorySecretStore, SecretStore};
 use serde_json::Value;
 

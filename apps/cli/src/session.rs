@@ -19,8 +19,8 @@
 use std::sync::Arc;
 
 use meridian_core::chat::ChatState;
+use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{generate_account, AccountId, KeyHandle, MemorySecretStore};
-use meridian_core::proto::ChatContent;
 use meridian_core::relay;
 use meridian_core::session::{
     answer_with_config, dial_with_config, MemRelay, P2pSession, SessionEvent,

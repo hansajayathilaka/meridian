@@ -24,7 +24,10 @@ pub struct Server {
     /// Valid tokens for `invite` admission.
     pub invite_tokens: Vec<String>,
     /// TEST HOOK: honor a fetch's `tamper` flag by substituting a bundle under a different key.
-    /// MUST stay false in production — it exists only to drive the malicious-server demo.
+    /// The substitution logic itself only exists — is only compiled in at all — under the
+    /// `test-tamper-hook` cargo feature (off by default; absent from release binaries entirely,
+    /// not merely gated at runtime, F17). This flag stays present (harmlessly inert) without the
+    /// feature so downstream config/test plumbing that merely sets it keeps compiling.
     pub allow_test_tamper: bool,
     /// SQLite/sqlx URL, used only with the `sqlite` feature; ignored by the in-memory default.
     pub database_url: String,

@@ -6,8 +6,12 @@
 //! be replayed onto another connection. Ed25519 verification is the server's ONE crypto primitive
 //! — it holds no session/ratchet code (ADR-8, the "cannot" list §2.3).
 
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use meridian_proto::{Auth, PrekeyBundle};
+#[cfg(feature = "test-tamper-hook")]
+use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Verifier, VerifyingKey};
+use meridian_proto::Auth;
+#[cfg(feature = "test-tamper-hook")]
+use meridian_proto::PrekeyBundle;
 
 use crate::config::Admission;
 
@@ -67,8 +71,10 @@ pub fn admission_from(
 
 /// TEST HOOK: produce a bundle that is internally valid but signed under a **different** key than
 /// the one requested — the canonical malicious-server substitution (§3.3). A correct client
-/// rejects it because `account_pub` no longer matches the key it asked for. Only reachable when
-/// `allow_test_tamper = true`.
+/// rejects it because `account_pub` no longer matches the key it asked for. Compiled in only under
+/// the `test-tamper-hook` cargo feature (off by default, absent from release binaries — F17); when
+/// enabled it's additionally gated at runtime by `allow_test_tamper = true`.
+#[cfg(feature = "test-tamper-hook")]
 pub fn substitute_bundle(original: &PrekeyBundle) -> PrekeyBundle {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).expect("OS RNG must be available");

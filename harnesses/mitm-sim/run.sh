@@ -14,7 +14,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 echo "[mitm-sim] substituted-bundle abort (library + CLI)…"
-cargo test -q -p meridian-rendezvous --test rendezvous tampered_bundle_is_rejected
+cargo test -q -p meridian-rendezvous --features test-tamper-hook --test rendezvous tampered_bundle_is_rejected
 cargo test -q -p meridian-cli --test rendezvous_demo full_rendezvous_demo
 echo "[mitm-sim] OK: client aborts on a bundle signed under any other key."
 

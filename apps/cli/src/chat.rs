@@ -2,7 +2,7 @@
 //!
 //! This is the client event loop: it publishes a fresh prekey bundle (so the peer can reach us),
 //! fetches+verifies the peer's bundle, establishes/loads the ratchet session, and then relays
-//! signed, ratchet-encrypted [`mrd.chat/1`](meridian_core::proto::ChatContent) envelopes as opaque
+//! signed, ratchet-encrypted [`mrd.chat/1`](meridian_core::envelope::ChatContent) envelopes as opaque
 //! blobs. All the crypto lives in `meridian-core`; this file is orchestration + terminal I/O.
 //!
 //! Roles are decided deterministically (the lexicographically-smaller identity key initiates) so
@@ -13,8 +13,8 @@
 //! reloaded on restart, so a killed client resumes mid-ratchet with no re-handshake.
 
 use meridian_core::chat::ChatState;
+use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{KeyHandle, SecretStore};
-use meridian_core::proto::ChatContent;
 use meridian_core::signaling::{SignalingClient, DEFAULT_OTK_COUNT};
 use tokio::sync::mpsc;
 

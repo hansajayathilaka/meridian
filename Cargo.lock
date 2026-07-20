@@ -1765,6 +1765,7 @@ dependencies = [
  "ciborium",
  "getrandom 0.3.4",
  "meridian-crypto",
+ "meridian-envelope",
  "meridian-identity",
  "meridian-proto",
  "meridian-signaling",
@@ -1786,6 +1787,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "meridian-envelope",
  "meridian-identity",
  "meridian-proto",
  "meridian-store",
@@ -1796,6 +1798,15 @@ dependencies = [
  "thiserror 2.0.18",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "meridian-envelope"
+version = "0.0.0"
+dependencies = [
+ "hex",
+ "meridian-proto",
+ "serde",
 ]
 
 [[package]]
@@ -1847,6 +1858,7 @@ dependencies = [
  "serde",
  "sha1",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
@@ -3575,6 +3587,7 @@ version = "0.0.0"
 dependencies = [
  "hex",
  "meridian-crypto",
+ "meridian-envelope",
  "meridian-identity",
  "meridian-proto",
  "meridian-store",

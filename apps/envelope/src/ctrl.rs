@@ -9,6 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use meridian_proto::{decode, encode, CodecError};
+
 /// The `mrd.ctrl/1` protocol version advertised in [`Hello`].
 pub const CTRL_VERSION: u16 = 1;
 
@@ -78,7 +80,7 @@ pub enum CtrlFrame {
         sid: u64,
         #[serde(rename = "type")]
         ty: String,
-        #[serde(with = "crate::bytes::bytes_vec")]
+        #[serde(with = "meridian_proto::bytes::bytes_vec")]
         params: Vec<u8>,
         chan: ChanCfgWire,
     },
@@ -100,12 +102,12 @@ pub enum CtrlFrame {
 
 impl CtrlFrame {
     /// Deterministic-CBOR encode (the plaintext that gets ratchet-sealed).
-    pub fn encode(&self) -> Result<Vec<u8>, crate::CodecError> {
-        crate::encode(self)
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        encode(self)
     }
 
     /// Decode a decrypted ctrl frame.
-    pub fn decode(bytes: &[u8]) -> Result<Self, crate::CodecError> {
-        crate::decode(bytes)
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        decode(bytes)
     }
 }

@@ -63,7 +63,7 @@ where
 /// helper for repeated keys/signatures in a bundle.
 macro_rules! byte_field {
     ($modname:ident, $len:expr) => {
-        pub(crate) mod $modname {
+        pub mod $modname {
             use serde::{Deserializer, Serializer};
 
             pub fn serialize<S: Serializer>(v: &[u8; $len], s: S) -> Result<S::Ok, S::Error> {
@@ -81,7 +81,7 @@ byte_field!(b32, 32);
 byte_field!(b64, 64);
 
 /// `#[serde(with = "opt_b32")]`: an `Option<[u8; 32]>` whose `Some` payload is a CBOR byte string.
-pub(crate) mod opt_b32 {
+pub mod opt_b32 {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: &Option<[u8; 32]>, s: S) -> Result<S::Ok, S::Error> {
@@ -110,7 +110,7 @@ pub(crate) mod opt_b32 {
 
 /// `#[serde(with = "bytes_vec")]`: a variable-length `Vec<u8>` as a single CBOR byte string
 /// (not an array of integers). Used for nested frame bodies and opaque blobs.
-pub(crate) mod bytes_vec {
+pub mod bytes_vec {
     use core::fmt;
 
     use serde::de::{self, Visitor};

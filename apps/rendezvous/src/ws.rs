@@ -14,7 +14,9 @@ use meridian_proto::{
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::auth::{substitute_bundle, verify_auth};
+#[cfg(feature = "test-tamper-hook")]
+use crate::auth::substitute_bundle;
+use crate::auth::verify_auth;
 use crate::state::AppState;
 
 fn now_secs() -> u64 {
@@ -227,12 +229,18 @@ async fn handle_fetch(
         Ok(None) => return send_err(tx, frame.id, error_codes::NOT_FOUND, "no bundle").await,
         Err(_) => return send_err(tx, frame.id, error_codes::BAD_REQUEST, "store failed").await,
     };
+    // TEST HOOK (F17): the bundle-tamper substitution is compiled in only under the
+    // `test-tamper-hook` cargo feature — absent from default/release builds entirely, not merely
+    // gated by config. When the feature is off, `fetch.tamper` and `allow_test_tamper` are inert.
+    #[cfg(feature = "test-tamper-hook")]
     let bundle = if fetch.tamper && state.config.server.allow_test_tamper {
-        // TEST HOOK: substitute a bundle under a different key so a correct client aborts.
+        // substitute a bundle under a different key so a correct client aborts.
         substitute_bundle(&bundle)
     } else {
         bundle
     };
+    #[cfg(not(feature = "test-tamper-hook"))]
+    let _ = fetch.tamper;
     send(tx, Op::Bundle, frame.id, &Bundle { bundle }).await;
 }
 

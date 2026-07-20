@@ -10,6 +10,7 @@ publish = false
 # T01 wires in identity + store.
 [dependencies]
 meridian-proto = { path = "../proto" }
+meridian-envelope = { path = "../envelope" }
 meridian-identity = { path = "../identity" }
 meridian-store = { path = "../store" }
 meridian-crypto = { path = "../crypto" }

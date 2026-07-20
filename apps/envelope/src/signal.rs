@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::frame::{decode, encode, CodecError};
+use meridian_proto::{decode, encode, CodecError};
 
 /// A P2P signaling payload (the ratchet plaintext). `Ctrl` wraps a `mrd.ctrl/1`
 /// [`CtrlFrame`](crate::ctrl::CtrlFrame) so channel-0 frames are ratchet-sealed like any payload
@@ -23,14 +23,14 @@ pub enum SignalContent {
     /// The dialing side's offer: the opaque SDP, the asserted DTLS fingerprint (identity-bound by
     /// the envelope signature), and any already-gathered ICE candidates.
     SdpOffer {
-        #[serde(with = "crate::bytes::bytes_vec")]
+        #[serde(with = "meridian_proto::bytes::bytes_vec")]
         sdp: Vec<u8>,
         dtls_fp: String,
         ice: Vec<String>,
     },
     /// The answering side's response, same shape.
     SdpAnswer {
-        #[serde(with = "crate::bytes::bytes_vec")]
+        #[serde(with = "meridian_proto::bytes::bytes_vec")]
         sdp: Vec<u8>,
         dtls_fp: String,
         ice: Vec<String>,
@@ -40,7 +40,7 @@ pub enum SignalContent {
     /// A ratchet-sealed `mrd.ctrl/1` frame (channel 0). Carried in-band on the ctrl data channel
     /// once the session is up.
     Ctrl {
-        #[serde(with = "crate::bytes::bytes_vec")]
+        #[serde(with = "meridian_proto::bytes::bytes_vec")]
         frame: Vec<u8>,
     },
 }

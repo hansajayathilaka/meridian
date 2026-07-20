@@ -12,6 +12,7 @@ meridian-identity = { path = "../../apps/identity" }
 meridian-store = { path = "../../apps/store" }
 meridian-crypto = { path = "../../apps/crypto" }
 meridian-proto = { path = "../../apps/proto" }
+meridian-envelope = { path = "../../apps/envelope" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }

@@ -13,8 +13,8 @@
 use std::collections::BTreeMap;
 
 use meridian_crypto::{at_rest, PrekeyMaterial, Session};
+use meridian_envelope::{ChatContent, MessageEnvelope, Prekey};
 use meridian_identity::{sign, verify, KeyHandle, PublicKey, SecretStore, Signature};
-use meridian_proto::{ChatContent, MessageEnvelope, Prekey};
 use serde::{Deserialize, Serialize};
 
 /// Errors from the chat session manager.

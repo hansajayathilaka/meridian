@@ -10,7 +10,7 @@ registry name, a channel config, a direction, and a policy hook — nothing else
 
 Implemented by [`meridian-core::streams`](../../apps/core/src/streams.rs) (the registry + `StreamType`
 trait) and driven by [`meridian-core::session`](../../apps/core/src/session.rs) (the substrate that
-runs `mrd.ctrl/1`); the wire frames live in [`meridian-proto`](../../apps/proto/src/ctrl.rs).
+runs `mrd.ctrl/1`); the wire frames live in [`meridian-envelope`](../../apps/envelope/src/ctrl.rs).
 
 ## The key property
 
