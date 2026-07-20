@@ -134,11 +134,13 @@ impl SignalingClient {
         Ok(ok.delivered)
     }
 
-    /// Request ephemeral, single-session TURN credentials for a new P2P session (T05, §5.4). The
-    /// returned [`TurnGrant`] carries the candidate ladder (TURN/UDP → TURN/TCP → TURN/TLS-443) and
-    /// an HMAC credential the client feeds straight into its ICE config — no static TURN secret ever
-    /// touches the client (webrtc-nat-traversal invariant 4). A `turn_unavailable` error means the
-    /// org runs no relay (air-gapped / dev); the caller falls back to the host/STUN ladder.
+    /// Request an ephemeral TURN credential, distinct per request, for a new P2P session (T05,
+    /// §5.4). The returned [`TurnGrant`] carries the candidate ladder (TURN/UDP → TURN/TCP →
+    /// TURN/TLS-443) and an HMAC credential the client feeds straight into its ICE config — no
+    /// static TURN secret ever touches the client (webrtc-nat-traversal invariant 4). Reuse of a
+    /// captured credential within its TTL is bounded by coturn's `user-quota`, not rejected outright.
+    /// A `turn_unavailable` error means the org runs no relay (air-gapped / dev); the caller falls
+    /// back to the host/STUN ladder.
     pub async fn request_turn_credentials(&mut self) -> Result<TurnGrant> {
         let reply = self
             .request(

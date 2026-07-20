@@ -11,8 +11,11 @@
 //!
 //! coturn recomputes the same HMAC over the presented username and accepts the allocation only
 //! while `now < expiry`. Because we mint a **fresh random nonce per request**, every credential is
-//! unique and — bounded by a short TTL — effectively single-session: a captured credential cannot
-//! be reused past its own narrow window, and it authorizes no one else's allocation.
+//! distinct — a captured credential does not let an attacker forge *other* usernames' allocations.
+//! It does **not** by itself prevent reuse of that one captured credential: within its TTL window,
+//! coturn's `user-quota` (see `infra/coturn/turnserver.conf`) bounds — but does not reject outright —
+//! how many concurrent allocations it can mint before expiry. True single-use rejection at the wire
+//! level is proven separately (see task 1.16).
 //!
 //! This module holds only the shared secret and HMAC — no session/ratchet code (the server's
 //! "cannot" list §2.3 is unbroken; HMAC-SHA1 here is a primitive, exactly like the Ed25519 verify
@@ -36,8 +39,9 @@ pub struct TurnConfig {
     pub realm: String,
     /// The candidate ladder in preference order: TURN/UDP → TURN/TCP → TURN/TLS-443 (§5.4).
     pub urls: Vec<String>,
-    /// Credential lifetime in seconds. Short by design (single-session); a call that outlives it
-    /// re-mints on ICE restart.
+    /// Credential lifetime in seconds. Short by design, and each mint is distinct, so exposure of a
+    /// captured credential is time- and quota-bounded (`user-quota` in coturn), not eliminated; a
+    /// call that outlives it re-mints on ICE restart.
     pub ttl_secs: u64,
 }
 
@@ -65,8 +69,9 @@ impl TurnConfig {
     }
 }
 
-/// A fresh 16-byte nonce, hex-encoded, from the OS CSPRNG. Uniqueness per mint is what makes a
-/// credential single-session.
+/// A fresh 16-byte nonce, hex-encoded, from the OS CSPRNG. Uniqueness per mint is what makes each
+/// credential distinct from every other request's — it does not by itself bound reuse of a single
+/// captured credential (that's coturn's `user-quota`, plus the TTL).
 fn new_nonce_hex() -> String {
     let mut nonce = [0u8; 16];
     getrandom::fill(&mut nonce).expect("OS RNG must be available");
@@ -141,11 +146,13 @@ mod tests {
     }
 
     #[test]
-    fn each_mint_is_unique_single_session() {
+    fn each_mint_produces_a_distinct_credential() {
         let a = mint_at(&cfg(), 1_000);
         let b = mint_at(&cfg(), 1_000);
-        // Same instant, same secret, yet distinct usernames+credentials: the per-mint nonce means a
-        // credential is bound to one allocation window, not reusable across sessions.
+        // Same instant, same secret, yet distinct usernames+credentials: the per-mint nonce means
+        // one request's credential never collides with another's. This does NOT by itself prevent
+        // reuse of a single captured credential across multiple allocations within its own TTL —
+        // that reuse is bounded by coturn's `user-quota`, not rejected outright.
         assert_ne!(a.username, b.username);
         assert_ne!(a.credential, b.credential);
     }

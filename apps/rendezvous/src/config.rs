@@ -63,7 +63,9 @@ pub struct Turn {
     pub realm: String,
     /// Candidate-ladder URLs in preference order (TURN/UDP → TURN/TCP → TURN/TLS-443).
     pub urls: Vec<String>,
-    /// Credential lifetime in seconds (short by design — single-session).
+    /// Credential lifetime in seconds (short by design). Each request mints a distinct credential;
+    /// reuse of one captured credential within this window is bounded by coturn's `user-quota`, not
+    /// rejected outright.
     pub ttl_secs: u64,
 }
 

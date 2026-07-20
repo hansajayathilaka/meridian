@@ -29,7 +29,7 @@ $ tcpdump on the "peer" netns confirms: no packets from our real address
 ```
 
 ## Acceptance criteria
-All four NAT matrix cells connect (symmetric×symmetric via relay); TLS-443 fallback works with UDP fully dropped; credentials expire and are single-session (reuse rejected by coturn); in `relay-only`, a packet capture at the peer contains zero of our host/srflx addresses; TURN sees only DTLS ciphertext (capture inspected in CI).
+All four NAT matrix cells connect (symmetric×symmetric via relay); TLS-443 fallback works with UDP fully dropped; credentials expire and are distinct per request (reuse of a captured credential within its TTL is bounded by coturn's `user-quota`, not rejected outright); in `relay-only`, a packet capture at the peer contains zero of our host/srflx addresses; TURN sees only DTLS ciphertext (capture inspected in CI).
 
 ## Risks / notes
 This task creates the latency-vs-privacy trade surface — the demo must *show* the cost (rtt printed per path) so the org-level decision in §5.4 is made with numbers, not vibes.

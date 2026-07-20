@@ -43,8 +43,8 @@ dependencies between fix-tasks are declared per task (notably 1.2→1.1, 1.15→
 - [x] **1.12** Rendezvous fail-closed config + feature-gate tamper hook (F16, F17) — [file](./1.12-rendezvous-fail-closed.md)
 
 **Group D — Close Features 4/5 honestly** (blocking; honesty fixes cheap, backend weeks)
-- [ ] **1.13** Feature 4 honesty: transport label + SDP test (F10 honesty) — [file](./1.13-feature4-honesty.md)
-- [ ] **1.14** Feature 5 honesty: coturn user-quota + credential-reuse wording (F11 honesty) — [file](./1.14-feature5-honesty.md)
+- [x] **1.13** Feature 4 honesty: transport label + SDP test (F10 honesty) — [file](./1.13-feature4-honesty.md)
+- [x] **1.14** Feature 5 honesty: coturn user-quota + credential-reuse wording (F11 honesty) — [file](./1.14-feature5-honesty.md)
 - [ ] **1.15** webrtc-rs `Transport` backend (F10 backend) — [file](./1.15-webrtc-backend.md)
 - [ ] **1.16** NAT/relay wire-level acceptance matrix + observed-candidate relay-only (F11 wire, F20) — [file](./1.16-nat-acceptance-matrix.md)
 

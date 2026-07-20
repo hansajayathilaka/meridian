@@ -113,12 +113,14 @@ pub struct Deliver {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnReq {}
 
-/// Server → client: a freshly-minted, single-session TURN credential. `username` embeds the UNIX
-/// expiry (`<expiry>:<nonce>`) so coturn's shared-secret (`use-auth-secret`) check enforces the TTL
-/// without any server-side session state; `credential` is `base64(HMAC-SHA1(secret, username))`.
-/// The `nonce` makes every grant unique, so a captured credential is confined to its own short
-/// window (single-session in practice). `urls` is the full candidate ladder in preference order —
-/// TURN/UDP, TURN/TCP, then TURN/TLS-443 as the hostile-egress last resort (§5.4).
+/// Server → client: a freshly-minted TURN credential, distinct from every other grant. `username`
+/// embeds the UNIX expiry (`<expiry>:<nonce>`) so coturn's shared-secret (`use-auth-secret`) check
+/// enforces the TTL without any server-side session state; `credential` is
+/// `base64(HMAC-SHA1(secret, username))`. The `nonce` makes every grant unique, so a captured
+/// credential can't be used to mint allocations under a *different* username — but reuse of that one
+/// captured credential itself, within its own TTL window, is bounded by coturn's `user-quota`, not
+/// rejected outright. `urls` is the full candidate ladder in preference order — TURN/UDP, TURN/TCP,
+/// then TURN/TLS-443 as the hostile-egress last resort (§5.4).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnGrant {
     /// ICE-server URLs in ladder order, e.g. `turn:turn.org:3478?transport=udp`,

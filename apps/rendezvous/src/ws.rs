@@ -283,11 +283,12 @@ async fn handle_route(
     }
 }
 
-/// Mint an ephemeral, single-session TURN credential for an authenticated client (T05, §5.4). The
-/// server holds only the shared HMAC secret — no session state — so this is a pure function of the
-/// clock and a fresh nonce. Minting is refused (`turn_unavailable`) when no secret is configured
-/// (air-gapped with no relay, or a dev server): the client then falls back to the host/STUN ladder
-/// and `meridian doctor` names the blocked path.
+/// Mint an ephemeral TURN credential, distinct per request, for an authenticated client (T05, §5.4).
+/// The server holds only the shared HMAC secret — no session state — so this is a pure function of
+/// the clock and a fresh nonce. Reuse of one captured credential within its TTL is bounded by
+/// coturn's `user-quota`, not rejected outright. Minting is refused (`turn_unavailable`) when no
+/// secret is configured (air-gapped with no relay, or a dev server): the client then falls back to
+/// the host/STUN ladder and `meridian doctor` names the blocked path.
 async fn handle_turn(
     state: &Arc<AppState>,
     tx: &mpsc::Sender<Message>,

@@ -17,7 +17,8 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 ## ▶ NOW / NEXT
 
 - **NOW:** Phase 1 fix-tasks landing — Group A (1.1-1.4) done. Group B done (1.5-1.7). Group C done (1.8-1.12).
-- **NEXT:** run **`/next-task`** to continue with Group D (1.13 Feature 4 honesty next).
+  Group D honesty fixes done (1.13, 1.14); backend/wire tasks (1.15, 1.16) remain.
+- **NEXT:** run **`/next-task`** to continue with Group D (1.15 webrtc-rs `Transport` backend).
 - After Phase 1 fixes land: **`/pick-next-phase`** selects Phase 2 (T06 Cross-Org Federation).
   Blocking gate: F1, F2, F3, F10, F11 (→ 1.1, 1.2, 1.6, 1.13+1.15, 1.14+1.16) must close first.
 
@@ -57,8 +58,8 @@ design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 - [x] **1.12** Rendezvous fail-closed config + feature-gate tamper hook (F16, F17) — [file](./phase-1/1.12-rendezvous-fail-closed.md)
 
 **Group D — Close Features 4/5 honestly** (blocking; honesty cheap, backend weeks)
-- [ ] **1.13** Feature 4 honesty: transport label + SDP test (F10 honesty) — [file](./phase-1/1.13-feature4-honesty.md)
-- [ ] **1.14** Feature 5 honesty: coturn user-quota + credential-reuse wording (F11 honesty) — [file](./phase-1/1.14-feature5-honesty.md)
+- [x] **1.13** Feature 4 honesty: transport label + SDP test (F10 honesty) — [file](./phase-1/1.13-feature4-honesty.md)
+- [x] **1.14** Feature 5 honesty: coturn user-quota + credential-reuse wording (F11 honesty) — [file](./phase-1/1.14-feature5-honesty.md)
 - [ ] **1.15** webrtc-rs `Transport` backend (F10 backend) — [file](./phase-1/1.15-webrtc-backend.md)
 - [ ] **1.16** NAT/relay wire-level acceptance matrix + observed-candidate relay-only (F11 wire, F20) — [file](./phase-1/1.16-nat-acceptance-matrix.md)
 

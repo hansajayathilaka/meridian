@@ -31,7 +31,8 @@ pub enum Op {
     Deliver,
     /// client→server: request ephemeral TURN credentials for a session (T05).
     TurnReq,
-    /// server→client: a minted, single-session TURN credential.
+    /// server→client: a minted TURN credential, distinct per request (reuse of one credential is
+    /// quota-bounded server-side, not rejected outright — see `TurnGrant` doc).
     TurnGrant,
     /// server→client: structured error.
     Err,

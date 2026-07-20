@@ -40,8 +40,9 @@ fingerprint check or falling back to an unencrypted path.
 
 ## Where this lives (T05 landed)
 - **Ephemeral TURN minting:** `meridian-rendezvous` `turn.rs` (HMAC-SHA1 REST creds, per-mint nonce ⇒
-  single-session) + the `TurnReq`/`TurnGrant` ops in `meridian-proto`; client:
-  `SignalingClient::request_turn_credentials`. coturn config: `infra/coturn/turnserver.conf`.
+  every grant is distinct) + the `TurnReq`/`TurnGrant` ops in `meridian-proto`; client:
+  `SignalingClient::request_turn_credentials`. coturn config: `infra/coturn/turnserver.conf` — reuse
+  of one captured credential within its TTL is bounded by `user-quota`, not rejected outright.
 - **Policy resolution** (`direct|prefer-relay|relay-only` across org/user/contact): `meridian-core`
   `relay.rs`; the transport enforces it at gather time (`IcePolicy` in `meridian-transport`).
 - **Path + why:** `SessionInfo` (path, relay server/transport, offered classes, reason) and the
