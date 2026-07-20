@@ -305,6 +305,77 @@ async fn metrics_endpoint_exposes_allowlisted_names() {
 
     let health = http_get(&host, "/healthz").await;
     assert!(health.contains("ok"));
+
+    // Exhaustiveness: every family actually rendered in the body must be on the allowlist —
+    // closing the vacuous-lint gap (F14) where a new, non-allowlisted metric family (e.g. a
+    // contact-graph counter) would otherwise pass CI silently. (Note: the allowlist also reserves
+    // names for metrics not yet implemented — e.g. mailbox/federation/TURN-allocation gauges — so
+    // this is a one-way subset check, not a bijection.)
+    let allowlist = load_metrics_allowlist();
+    let rendered = rendered_metric_families(&body);
+    let leaked: Vec<&String> = rendered.difference(&allowlist).collect();
+    assert!(
+        leaked.is_empty(),
+        "metric families rendered but not in tools/metrics-allowlist.txt: {leaked:?}\nfull body:\n{body}"
+    );
+
+    // Existing behavior: the families the server does implement today are actually rendered.
+    let currently_implemented: std::collections::HashSet<String> = [
+        "meridian_connections_active",
+        "meridian_envelopes_routed_total",
+        "meridian_prekey_pool_depth",
+        "meridian_turn_credentials_minted_total",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let missing: Vec<&String> = currently_implemented.difference(&rendered).collect();
+    assert!(
+        missing.is_empty(),
+        "expected metric families never rendered: {missing:?}\nfull body:\n{body}"
+    );
+}
+
+/// Parse `tools/metrics-allowlist.txt` into the set of allowed metric family names, skipping
+/// blank lines and `#`-prefixed comments.
+fn load_metrics_allowlist() -> std::collections::HashSet<String> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tools/metrics-allowlist.txt"
+    );
+    let text = std::fs::read_to_string(path).expect("read tools/metrics-allowlist.txt");
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Extract the set of metric **family** names actually present as sample lines in a rendered
+/// Prometheus text-exposition body. `raw` is the full HTTP response (headers + body) as returned
+/// by [`http_get`]; only the body past the blank-line separator is parsed. Skips `# HELP` /
+/// `# TYPE` comment lines, strips label sets (`{...}`), and folds histogram/summary suffixes
+/// (`_bucket`, `_sum`, `_count`) back onto their base family so multi-line families don't
+/// false-positive as extra families.
+fn rendered_metric_families(raw: &str) -> std::collections::HashSet<String> {
+    let body = raw.split_once("\r\n\r\n").map_or(raw, |(_, body)| body);
+    let mut families = std::collections::HashSet::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Sample line: "<name>{labels} value" or "<name> value".
+        let name_and_labels = line.split_whitespace().next().unwrap_or("");
+        let name = name_and_labels.split('{').next().unwrap_or(name_and_labels);
+        let family = name
+            .strip_suffix("_bucket")
+            .or_else(|| name.strip_suffix("_sum"))
+            .or_else(|| name.strip_suffix("_count"))
+            .unwrap_or(name);
+        families.insert(family.to_string());
+    }
+    families
 }
 
 // -- rate limiting -----------------------------------------------------------

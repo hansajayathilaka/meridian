@@ -37,7 +37,7 @@ dependencies between fix-tasks are declared per task (notably 1.2→1.1, 1.15→
 
 **Group C — Make the gates real** (should-fix)
 - [x] **1.8** Real CI gates: deny.toml + cargo-deny + blocking clippy (F4, F18) — [file](./1.8-ci-blocking-gates.md)
-- [~] **1.9** Metrics-allowlist exhaustiveness test (F14) — [file](./1.9-metrics-exhaustiveness.md)
+- [x] **1.9** Metrics-allowlist exhaustiveness test (F14) — [file](./1.9-metrics-exhaustiveness.md)
 - [ ] **1.10** Harden no-serde-on-blob lint (F15) — [file](./1.10-no-serde-blob-lint.md)
 - [x] **1.11** Re-point opacity-audit harness gate (F8) — [file](./1.11-opacity-harness-gate.md)
 - [ ] **1.12** Rendezvous fail-closed config + feature-gate tamper hook (F16, F17) — [file](./1.12-rendezvous-fail-closed.md)
