@@ -16,8 +16,8 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** Phase 1 fix-tasks landing — Group A (1.1-1.4) done. Group B done (1.5-1.7). Group C: 1.8 done.
-- **NEXT:** run **`/next-task`** to continue with Group C (1.9 metrics-allowlist exhaustiveness next).
+- **NOW:** Phase 1 fix-tasks landing — Group A (1.1-1.4) done. Group B done (1.5-1.7). Group C done (1.8-1.12).
+- **NEXT:** run **`/next-task`** to continue with Group D (1.13 Feature 4 honesty next).
 - After Phase 1 fixes land: **`/pick-next-phase`** selects Phase 2 (T06 Cross-Org Federation).
   Blocking gate: F1, F2, F3, F10, F11 (→ 1.1, 1.2, 1.6, 1.13+1.15, 1.14+1.16) must close first.
 
