@@ -28,6 +28,10 @@ lint-invariants:
 # Tests: unit/integration + adversarial harnesses + (later) conformance vectors.
 test: build harnesses
     cargo test --workspace
+    # Real webrtc-rs transport backend (1.15): real ICE/SCTP/DTLS on localhost, opt-in feature so
+    # default builds/CI-without-this-step stay pure-Rust and network-free.
+    cargo test -p meridian-transport --features webrtc
+    cargo test -p meridian-core --features webrtc
     @echo "TODO: migrate to cargo nextest run --workspace"
     @echo "TODO: conformance vectors — docs/testing/strategy.md §1"
 

@@ -4,15 +4,21 @@
 //! deployment — instead of the in-process simulation [`crate::LoopbackTransport`] provides.
 //!
 //! ## Negotiated (pre-arranged) data channels
-//! The substrate only ever opens exactly two data channels per session — `mrd.ctrl/1` and
-//! `mrd.chat/1` (`apps/core/src/session.rs`); additional stream types (T09/T15/T16) multiplex over
-//! `mrd.ctrl/1` at the ctrl-protocol layer and never call [`Transport::add_data_channel`] again. If
-//! both peers called `create_data_channel(label)` in-band (the WebRTC default), each side would end
-//! up with *two* channels per label — the one it created locally, and a second one delivered via
-//! `on_data_channel` for the peer's independent call with the same label. We sidestep that by using
-//! WebRTC's **negotiated** mode: both sides derive the *same* SCTP stream id from the channel label
-//! via [`stream_id_for_label`] (pure function, no coordination needed) and create the channel with
-//! `negotiated: Some(id)`, so there is exactly one logical channel per label, symmetrically.
+//! Today the substrate only ever opens exactly two data channels per session — `mrd.ctrl/1` and
+//! `mrd.chat/1` — at dial/answer time (`apps/core/src/session.rs` `dial_with_config`/
+//! `answer_with_config`); `open_stream` for additional stream types multiplexes over `mrd.ctrl/1` at
+//! the ctrl-protocol layer instead of calling [`Transport::add_data_channel`] again. That is the
+//! *current* T04 session-layer behavior, not a permanent constraint: system-design §5.3 and
+//! `stream-types-v1.md` describe a future where an accepted stream opens its *own* new SCTP data
+//! channel labeled with the stream id (T09/T15/T16). If both peers called `create_data_channel(label)`
+//! in-band (the WebRTC default), each side would end up with *two* channels per label — the one it
+//! created locally, and a second one delivered via `on_data_channel` for the peer's independent call
+//! with the same label. We sidestep that by using WebRTC's **negotiated** mode: both sides derive the
+//! *same* SCTP stream id from the channel label via [`stream_id_for_label`] (pure function, no
+//! coordination needed) and create the channel with `negotiated: Some(id)`, so there is exactly one
+//! logical channel per label, symmetrically — a scheme that extends to per-stream channels without
+//! change (`add_data_channel` rejects a label whose derived id collides with a different label
+//! already on the session, rather than silently cross-wiring two streams).
 //!
 //! ## Offer/answer without a role hint
 //! [`Transport::local_description`] and [`Transport::local_fingerprint`] are synchronous per the
@@ -39,16 +45,30 @@
 //!
 //! ## Fingerprint binding without blocking
 //! [`Transport::local_fingerprint`]/[`Transport::dtls_fingerprint`] are also synchronous, so they
-//! cannot await the real DTLS handshake. We read the `a=fingerprint:` line directly out of the
-//! cached local/remote SDP text instead of the live negotiated certificate. This is not a weaker
-//! check: WebRTC's own DTLS stack refuses to complete a handshake whose peer certificate does not
-//! match the `a=fingerprint` the far side declared in its SDP, so "the fingerprint in the SDP we
-//! applied" and "the fingerprint of the certificate actually used" are the same value whenever the
-//! connection succeeds at all — and the SDP itself never left the ratchet-encrypted envelope, so a
-//! routing-only relay cannot forge it. The substrate's §4.6 cross-check (comparing this value against
-//! the identity-signed `dtls_fp` asserted alongside the SDP) is unaffected.
+//! cannot await the real DTLS handshake — `dtls_fingerprint` returns as soon as
+//! `set_remote_description` has been called, not once `RTCPeerConnectionState::Connected` fires. We
+//! read the `a=fingerprint:` line directly out of the cached local/remote SDP text instead of the
+//! live negotiated certificate. Against a **routing-only** adversary (the rendezvous, or anyone on
+//! the signaling path) this loses nothing: the SDP itself never left the ratchet-encrypted envelope,
+//! so it cannot be forged, and WebRTC's own DTLS stack refuses to complete a handshake whose peer
+//! certificate does not match the `a=fingerprint` the far side declared — so "the fingerprint in the
+//! SDP we applied" and "the fingerprint of the certificate actually used" are the same value whenever
+//! the connection succeeds at all. The substrate's §4.6 cross-check (comparing this value against the
+//! identity-signed `dtls_fp` asserted alongside the SDP) still catches an internally inconsistent
+//! envelope. What this does **not** do is prove the handshake *actually completed*: against a
+//! network-level adversary who intercepts the peer-to-peer UDP path itself (not the signaling
+//! relay) and presents a forged certificate, `verify_fingerprint` still reports a match (both sides
+//! compare the same honest, envelope-protected SDP value) while the real DTLS handshake fails
+//! underneath — the session then hangs on the first real `send`/`recv` rather than tearing down with
+//! an explicit `FingerprintMismatch`. That's a denial-of-service exposure, not a confidentiality or
+//! integrity one (no plaintext or wrong-peer content is ever accepted); gating `dtls_fingerprint` on
+//! `RTCPeerConnectionState::Connected` would close it but needs an async call site the current
+//! dial/answer call order (`apps/core/src/session.rs`) doesn't offer between `set_remote_description`
+//! and `verify_fingerprint` without risking a runtime deadlock (see `selected_path_detail`'s bounded
+//! `Notify` wait for the pattern this would need, and why it can't reuse it here) — reviewed and
+//! accepted for this task's scope; a real fix belongs in the session layer, not this transport.
 //!
-//! ## ICE restart is a no-op on the wire today (known gap)
+//! ## ICE restart does not (yet) fulfill the resumability promise (known gap)
 //! [`Transport::ice_restart`] does **not** invoke webrtc-rs's real ICE-agent restart
 //! (`create_offer` with `ice_restart: true`). Verified empirically while building this backend: on
 //! an already-connected `RTCPeerConnection`, that call rotates the local ICE ufrag/pwd and
@@ -58,9 +78,17 @@
 //! signaling path to carry a restart offer to the peer (it calls this on one side with no envelope
 //! round trip, mirroring `LoopbackTransport::ice_restart`'s already-local-only contract), so
 //! invoking the real primitive here would violate the trait's explicit "keep the session alive"
-//! promise rather than fulfill it. Until a ctrl-channel renegotiation message exists (flagged for
-//! architect review against ADR 0006/0014 — see 1.15 risk note), this only resets local
-//! candidate-gathering bookkeeping; the already-open data channels are left completely untouched.
+//! promise rather than fulfill it — this only resets local candidate-gathering bookkeeping, leaving
+//! the already-open data channels completely untouched.
+//!
+//! Be precise about what that buys and doesn't: it proves a call to `ice_restart` never *breaks* an
+//! already-working connection (the gated tests below exercise exactly that). It does **not** yet
+//! fulfill system-design §5.2/§7.3's "resumable... ICE restarts on network change" promise or
+//! feature-04's acceptance criterion — if the local address genuinely changes (Wi-Fi→LTE), nothing
+//! here gathers or exchanges the new candidates the peer would need to find the new path, so
+//! connectivity will *not* actually resume. Closing that gap needs a ctrl-channel renegotiation
+//! message (ADR 0006/0014-relevant; flagged for architect review, tracked as a successor to
+//! 1.15/1.16 — network-roaming support should not ship claiming this works until it lands).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -142,6 +170,10 @@ struct Session {
     /// in here (see module docs).
     remote_sdp: Mutex<Option<String>>,
     channels: Mutex<HashMap<ChannelId, ChanState>>,
+    /// Negotiated SCTP stream id -> the label that claimed it, so a hash collision between two
+    /// *different* labels (see [`stream_id_for_label`]) fails loudly instead of silently
+    /// cross-wiring two streams onto the same channel.
+    negotiated_ids: Mutex<HashMap<u16, String>>,
     inbox_tx: mpsc::UnboundedSender<(ChannelId, Vec<u8>)>,
     inbox_rx: AsyncMutex<mpsc::UnboundedReceiver<(ChannelId, Vec<u8>)>>,
     local_candidates: Mutex<Vec<String>>,
@@ -202,12 +234,7 @@ impl WebRtcTransport {
         let cached = sess.pending_offer.lock().unwrap().clone();
         let sdp_text = match cached {
             Some(t) => t,
-            None => sess
-                .pc
-                .create_offer(None)
-                .await
-                .map_err(backend_err)?
-                .sdp,
+            None => sess.pc.create_offer(None).await.map_err(backend_err)?.sdp,
         };
         let desc = RTCSessionDescription::offer(sdp_text.clone()).map_err(backend_err)?;
         sess.pc
@@ -268,6 +295,7 @@ impl Transport for WebRtcTransport {
             committed_local_sdp: Mutex::new(None),
             remote_sdp: Mutex::new(None),
             channels: Mutex::new(HashMap::new()),
+            negotiated_ids: Mutex::new(HashMap::new()),
             inbox_tx: tx,
             inbox_rx: AsyncMutex::new(rx),
             local_candidates: Mutex::new(Vec::new()),
@@ -317,10 +345,26 @@ impl Transport for WebRtcTransport {
         let sess = self.get_session(s)?;
         let cid = ChannelId(self.next_channel_id.fetch_add(1, Ordering::SeqCst) + 1);
 
+        let negotiated_id = stream_id_for_label(&cfg.label);
+        {
+            let mut ids = sess.negotiated_ids.lock().unwrap();
+            if let Some(existing_label) = ids.get(&negotiated_id) {
+                if existing_label != &cfg.label {
+                    return Err(TransportError::Backend(format!(
+                        "negotiated stream id {negotiated_id} collides between labels \
+                         {existing_label:?} and {:?}",
+                        cfg.label
+                    )));
+                }
+            } else {
+                ids.insert(negotiated_id, cfg.label.clone());
+            }
+        }
+
         let init = RTCDataChannelInit {
             ordered: Some(cfg.ordered),
             max_retransmits: cfg.max_retransmits,
-            negotiated: Some(stream_id_for_label(&cfg.label)),
+            negotiated: Some(negotiated_id),
             ..Default::default()
         };
         let dc = sess
@@ -329,7 +373,9 @@ impl Transport for WebRtcTransport {
             .await
             .map_err(backend_err)?;
 
-        let ready_flag = Arc::new(AtomicBool::new(dc.ready_state() == RTCDataChannelState::Open));
+        let ready_flag = Arc::new(AtomicBool::new(
+            dc.ready_state() == RTCDataChannelState::Open,
+        ));
         let ready_notify = Arc::new(Notify::new());
         {
             let ready_flag = ready_flag.clone();
@@ -463,8 +509,7 @@ impl Transport for WebRtcTransport {
 
     fn local_fingerprint(&self, s: &SessionHandle) -> Result<Fingerprint> {
         let sdp = self.local_description(s)?;
-        let text =
-            std::str::from_utf8(&sdp.0).map_err(|_| TransportError::BadRemoteDescription)?;
+        let text = std::str::from_utf8(&sdp.0).map_err(|_| TransportError::BadRemoteDescription)?;
         parse_fingerprint(text).ok_or_else(|| {
             TransportError::Backend("local SDP carried no a=fingerprint line".into())
         })
@@ -499,7 +544,11 @@ impl Transport for WebRtcTransport {
         let (dc, ready_flag, ready_notify) = {
             let map = sess.channels.lock().unwrap();
             let cs = map.get(ch).ok_or(TransportError::UnknownChannel)?;
-            (cs.dc.clone(), cs.ready_flag.clone(), cs.ready_notify.clone())
+            (
+                cs.dc.clone(),
+                cs.ready_flag.clone(),
+                cs.ready_notify.clone(),
+            )
         };
         if !ready_flag.load(Ordering::SeqCst) {
             let notified = ready_notify.notified();
@@ -558,6 +607,12 @@ impl Transport for WebRtcTransport {
                 CandidateType::Relay => Path::Relay,
                 CandidateType::Unspecified => Path::Direct,
             };
+            // webrtc-rs's own stats collector hardcodes `relay_protocol: "udp"` for every relay
+            // candidate today (webrtc-ice's `agent_stats.rs`, not derived from the real TURN
+            // allocation's transport) — there is no live udp/tcp/tls-443 signal to read here yet.
+            // Reporting `Udp` unconditionally matches upstream's own (limited) truth rather than
+            // inventing a distinction webrtc-rs doesn't expose; real relay-transport classification
+            // for the production backend is 1.16's "observed-candidate relay-only classification".
             let (relay_server, relay_transport) = if class == Path::Relay {
                 (Some(local.ip.clone()), Some(RelayTransport::Udp))
             } else {

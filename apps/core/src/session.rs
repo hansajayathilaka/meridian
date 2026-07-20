@@ -630,6 +630,32 @@ pub async fn dial_with_config<T: Transport>(
 ) -> Result<P2pSession<T>, SessionError> {
     let policy = cfg.policy;
     let conn = transport.new_session(cfg).await?;
+    // Every path below is fallible after the session exists; close it on any of them rather than
+    // leaking a live peer connection (real backends hold real ICE agents/UDP sockets — a malicious
+    // or malformed peer that keeps failing this handshake must not be able to leak one per attempt).
+    let result = dial_established(
+        &transport, conn, policy, store, handle, our_ik, peer_ik, chat, relay, registry,
+    )
+    .await;
+    if result.is_err() {
+        let _ = transport.close(&conn).await;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dial_established<T: Transport>(
+    transport: &Arc<T>,
+    conn: SessionHandle,
+    policy: IcePolicy,
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+    our_ik: [u8; 32],
+    peer_ik: [u8; 32],
+    chat: &mut ChatState,
+    relay: &mut dyn SignalRelay,
+    registry: Arc<StreamRegistry>,
+) -> Result<P2pSession<T>, SessionError> {
     let ctrl_ch = transport
         .add_data_channel(&conn, ChannelCfg::reliable_ordered(CTRL_LABEL))
         .await?;
@@ -640,7 +666,7 @@ pub async fn dial_with_config<T: Transport>(
     // Seal SDP offer + our fingerprint + candidates inside a signed, ratchet-encrypted envelope.
     let offer = transport.local_description(&conn)?;
     let local_fp = transport.local_fingerprint(&conn)?;
-    let ice = candidate_strings(&transport, &conn).await?;
+    let ice = candidate_strings(transport, &conn).await?;
     let offer_content = SignalContent::SdpOffer {
         sdp: offer.0,
         dtls_fp: local_fp.0.clone(),
@@ -659,10 +685,17 @@ pub async fn dial_with_config<T: Transport>(
         transport.add_ice_candidate(&conn, IceCandidate(c)).await?;
     }
 
-    let remote_fp = verify_fingerprint(&transport, &conn, &asserted_fp).await?;
+    let remote_fp = verify_fingerprint(transport, &conn, &asserted_fp).await?;
+
+    // Wait (bounded by the transport's own connect timeout) for a real path before the ctrl
+    // handshake below, which blocks on an unbounded `recv()`. A real backend's connection can
+    // legitimately fail to converge (blocked UDP, unreachable peer, no relay reachable); without
+    // this, that failure mode hangs `dial`/`answer` forever instead of erroring out cleanly. A
+    // no-op for `LoopbackTransport`, which never blocks here.
+    transport.selected_path(&conn).await?;
 
     let mut session = P2pSession {
-        transport,
+        transport: transport.clone(),
         conn,
         role: Role::Initiator,
         our_ik,
@@ -731,6 +764,46 @@ pub async fn answer_with_config<T: Transport>(
         recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, true).await?;
 
     let conn = transport.new_session(cfg).await?;
+    // See `dial_with_config`'s comment: close the session on any failure below rather than
+    // leaking a live peer connection.
+    let result = answer_established(
+        &transport,
+        conn,
+        policy,
+        offer_sdp,
+        offer_ice,
+        asserted_fp,
+        store,
+        handle,
+        our_ik,
+        peer_ik,
+        chat,
+        relay,
+        registry,
+    )
+    .await;
+    if result.is_err() {
+        let _ = transport.close(&conn).await;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn answer_established<T: Transport>(
+    transport: &Arc<T>,
+    conn: SessionHandle,
+    policy: IcePolicy,
+    offer_sdp: Vec<u8>,
+    offer_ice: Vec<String>,
+    asserted_fp: String,
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+    our_ik: [u8; 32],
+    peer_ik: [u8; 32],
+    chat: &mut ChatState,
+    relay: &mut dyn SignalRelay,
+    registry: Arc<StreamRegistry>,
+) -> Result<P2pSession<T>, SessionError> {
     let ctrl_ch = transport
         .add_data_channel(&conn, ChannelCfg::reliable_ordered(CTRL_LABEL))
         .await?;
@@ -746,7 +819,7 @@ pub async fn answer_with_config<T: Transport>(
 
     let answer_sdp = transport.local_description(&conn)?;
     let local_fp = transport.local_fingerprint(&conn)?;
-    let ice = candidate_strings(&transport, &conn).await?;
+    let ice = candidate_strings(transport, &conn).await?;
     let answer_content = SignalContent::SdpAnswer {
         sdp: answer_sdp.0,
         dtls_fp: local_fp.0.clone(),
@@ -755,10 +828,14 @@ pub async fn answer_with_config<T: Transport>(
     let blob = chat.seal_bytes(store, handle, &our_ik, &peer_ik, &answer_content.encode()?)?;
     relay.send(&peer_ik, blob).await?;
 
-    let remote_fp = verify_fingerprint(&transport, &conn, &asserted_fp).await?;
+    let remote_fp = verify_fingerprint(transport, &conn, &asserted_fp).await?;
+
+    // See `dial_established`'s comment: fail fast (bounded) rather than hang forever on the
+    // unbounded `recv()` inside the handshake below if the real connection never converges.
+    transport.selected_path(&conn).await?;
 
     let mut session = P2pSession {
-        transport,
+        transport: transport.clone(),
         conn,
         role: Role::Responder,
         our_ik,

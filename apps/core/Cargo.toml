@@ -23,5 +23,12 @@ async-trait = { workspace = true }
 getrandom = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 
+[features]
+default = []
+# Forwards to meridian-transport/webrtc so `meridian_core::transport::WebRtcTransport` is available
+# (real ICE/SCTP/DTLS backend, 1.15). Off by default for the same reason as the underlying crate:
+# heavy dependency tree, needs real UDP/ICE.
+webrtc = ["meridian-transport/webrtc"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

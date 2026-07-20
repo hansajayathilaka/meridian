@@ -43,6 +43,10 @@ jobs:
         run: cargo build --workspace
       - name: Unit + integration tests
         run: cargo test --workspace
+      - name: Real webrtc-rs transport backend (1.15; real ICE/SCTP/DTLS on localhost, no NET_ADMIN needed)
+        run: |
+          cargo test -p meridian-transport --features webrtc
+          cargo test -p meridian-core --features webrtc
       - name: Adversarial harnesses
         run: |
           bash harnesses/opacity-audit/run.sh

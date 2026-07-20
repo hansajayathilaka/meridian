@@ -105,6 +105,69 @@ async fn selected_path_is_direct_on_localhost() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tampered_remote_fingerprint_never_connects() {
+    // Corrupt the last hex digit of the offer's declared DTLS fingerprint before the answerer
+    // applies it — modelling a peer (or a compromised sender) whose SDP disagrees with the
+    // certificate it will actually present. Real WebRTC enforces certificate-matches-SDP binding
+    // inside the DTLS handshake itself: the handshake must never complete, so the module docs'
+    // central safety claim ("WebRTC's own DTLS stack refuses to complete a handshake whose peer
+    // certificate does not match the SDP-declared fingerprint") is exercised here, not just
+    // asserted in a comment.
+    let ta = Arc::new(WebRtcTransport::new());
+    let tb = Arc::new(WebRtcTransport::new());
+
+    let sa = ta.new_session(IceConfig::default()).await.unwrap();
+    let sb = tb.new_session(IceConfig::default()).await.unwrap();
+    ta.add_data_channel(&sa, ChannelCfg::reliable_ordered("mrd.ctrl/1"))
+        .await
+        .unwrap();
+    tb.add_data_channel(&sb, ChannelCfg::reliable_ordered("mrd.ctrl/1"))
+        .await
+        .unwrap();
+
+    let offer = ta.local_description(&sa).unwrap();
+    let mut sdp_bytes = offer.0;
+    let marker = b"a=fingerprint:";
+    let start = sdp_bytes
+        .windows(marker.len())
+        .position(|w| w == marker)
+        .expect("offer carries a fingerprint line");
+    let line_end = sdp_bytes[start..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|p| start + p)
+        .unwrap_or(sdp_bytes.len());
+    let last = if sdp_bytes[line_end - 1] == b'\r' {
+        line_end - 2
+    } else {
+        line_end - 1
+    };
+    sdp_bytes[last] = if sdp_bytes[last] == b'0' { b'1' } else { b'0' };
+
+    tb.set_remote_description(&sb, meridian_transport::Sdp(sdp_bytes))
+        .await
+        .unwrap();
+    for c in ta.local_candidates(&sa).await.unwrap() {
+        tb.add_ice_candidate(&sb, c).await.unwrap();
+    }
+    let answer = tb.local_description(&sb).unwrap();
+    ta.set_remote_description(&sa, answer).await.unwrap();
+    for c in tb.local_candidates(&sb).await.unwrap() {
+        ta.add_ice_candidate(&sa, c).await.unwrap();
+    }
+
+    // `tb` is the one who received the tampered claim about `ta`'s certificate — its DTLS
+    // transport is the one that must refuse the handshake (validating "does the peer's real cert
+    // match what they declared in their SDP" is inherently a property the *receiver* of that SDP
+    // checks, not the declarer). Connectivity must never converge on tb's side: either the
+    // transport's own bounded wait reports `NoPath`, or the outer timeout fires first.
+    if let Ok(Ok(path)) = tokio::time::timeout(Duration::from_secs(20), tb.selected_path(&sb)).await
+    {
+        panic!("connected over a tampered fingerprint! path={path:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ice_restart_keeps_the_live_channel_flowing() {
     let (ta, sa, tb, sb) = connect_pair().await;
     let ca = ta

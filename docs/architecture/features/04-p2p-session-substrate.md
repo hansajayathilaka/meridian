@@ -33,10 +33,18 @@ Server-down chat continuity ≥30 min with keepalives; Wi-Fi→other-interface s
 ## Risks / notes
 webrtc-rs SCTP behavior under loss needs early soak testing — if throughput or stability disappoints, the ADR-6 fallback (libdatachannel FFI) must be exercised *within this task*, not discovered during T09's 1 GiB transfers.
 
-**Verification status (recorded honestly, F9):** the acceptance criteria above (server-down continuity,
-ICE restart, fingerprint mismatch teardown, opacity audit) are currently validated against the
-`netns` simulation rig and the in-repo `Transport` trait's non-webrtc-rs test double, not against a
-real webrtc-rs wire session — the webrtc-rs backend itself lands in fix-task
-[1.15](../../tasks/phase-1/1.15-webrtc-backend.md). Treat this spec's acceptance criteria as
-**simulation-only until 1.15/1.16 land**; wire-level verification against the real backend is deferred
-to those tasks, not silently assumed to already hold.
+**Verification status (recorded honestly, F9 — updated as of 1.15):** a real webrtc-rs `Transport`
+backend (`WebRtcTransport`, real ICE/SCTP/DTLS) now exists behind the `webrtc` feature
+([1.15](../../tasks/phase-1/1.15-webrtc-backend.md)), gated into CI (`cargo test -p meridian-transport
+-p meridian-core --features webrtc`, opt-in so default builds stay pure-Rust/network-free). Server-down
+chat continuity, capability exchange rejecting unknown mandatory types, and DTLS-fingerprint binding
+(a peer whose SDP-declared fingerprint doesn't match its real certificate can never complete the
+handshake at all — `apps/transport/tests/webrtc_backend.rs::tampered_remote_fingerprint_never_connects`)
+are now proven against the real backend, not only the `netns` simulation rig / `LoopbackTransport` test
+double. **Still simulation-only / deferred:** the ICE-restart acceptance line below ("Wi-Fi→other-interface
+switch recovers via ICE restart <5 s") — 1.15 found that webrtc-rs's real ICE-agent restart breaks an
+already-connected peer connection with no peer-side signaling to recover it, so `ice_restart()` is
+currently a documented no-op on the wire; this criterion is **not met against a real network change**
+and needs a session-layer renegotiation path before it can be (flagged for architect review, tracked as
+a 1.15/1.16 successor). The netns/tcpdump wire-level NAT matrix and observed-candidate relay-only
+classification are 1.16's job.
