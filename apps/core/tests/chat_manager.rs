@@ -3,8 +3,8 @@
 //! No network: the "relay" is just handing blob bytes between two [`ChatState`]s.
 
 use meridian_core::chat::ChatState;
+use meridian_envelope::{ChatContent, MessageEnvelope};
 use meridian_identity::{generate_account, AccountId, MemorySecretStore};
-use meridian_proto::{ChatContent, MessageEnvelope};
 use meridian_signaling::{generate_bundle, GeneratedBundle};
 
 struct Party {

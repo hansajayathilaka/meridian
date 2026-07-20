@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::frame::{decode, encode, CodecError};
+use meridian_proto::{decode, encode, CodecError};
 
 /// A chat message identifier — a random 128-bit value the sender mints, echoed by receipts.
 pub type MessageId = [u8; 16];
@@ -18,13 +18,13 @@ pub type MessageId = [u8; 16];
 pub enum ChatContent {
     /// A text message with its sender-minted id (so the peer can acknowledge it).
     Text {
-        #[serde(with = "crate::bytes::b16")]
+        #[serde(with = "meridian_proto::bytes::b16")]
         id: MessageId,
         body: String,
     },
     /// A delivery receipt acknowledging a previously received [`ChatContent::Text`] by id.
     Receipt {
-        #[serde(with = "crate::bytes::b16")]
+        #[serde(with = "meridian_proto::bytes::b16")]
         ack: MessageId,
     },
 }

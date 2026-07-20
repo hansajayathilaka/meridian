@@ -10,27 +10,25 @@
 //! payload *contents*. Payloads are carried as [`OpaqueBlob`] — a byte newtype that (de)serializes
 //! as a single CBOR byte string, never as structured data. The CI lint
 //! `tools/lint-no-serde-on-blob.sh` checks this.
+//!
+//! Content-shaped types (the message envelope, chat/signal content, `mrd.ctrl/1` frames) live in
+//! the separate `meridian-envelope` crate (`apps/envelope`), NOT here — deliberately, so
+//! `meridian-rendezvous` (which depends on this crate) has no dependency path, direct or
+//! transitive, to any type a server could be tempted to (de)serialize as structured content. See
+//! `apps/envelope/src/lib.rs` and `docs/security/anonymity-and-retention.md` "must never" #1.
 
-mod bytes;
+pub mod bytes;
 
 pub mod bundle;
-pub mod chat;
-pub mod ctrl;
-pub mod envelope;
 pub mod frame;
 pub mod msg;
-pub mod signal;
 
 pub use bundle::{PrekeyBundle, BUNDLE_VERSION, MAX_ONE_TIME_PREKEYS};
-pub use chat::{ChatContent, MessageId};
-pub use ctrl::{ChanCfgWire, CtrlFrame, Direction, Limits, StreamAdvert, CTRL_VERSION};
-pub use envelope::{MessageEnvelope, Prekey, ENVELOPE_DOMAIN};
 pub use frame::{decode, encode, CodecError, Frame, Op};
 pub use msg::{
     error_codes, Auth, AuthOk, Bundle, Challenge, Deliver, ErrBody, Fetch, Publish, PublishOk,
     RouteBody, RouteOk, TurnGrant, TurnReq,
 };
-pub use signal::SignalContent;
 
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

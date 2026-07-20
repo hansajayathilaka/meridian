@@ -20,6 +20,9 @@ fmt-check:
 lint-invariants:
     bash tools/lint-server-no-core.sh
     bash tools/lint-no-serde-on-blob.sh
+    # Guards the guard: proves check-3 above still trips on the F15 bypass patterns (module-
+    # qualified type paths, multi-line `let x: T = ... .decode()`) rather than silently regressing.
+    bash tools/lint-no-serde-on-blob.sh --selftest
     bash tools/lint-metrics-allowlist.sh
 
 # Tests: unit/integration + adversarial harnesses + (later) conformance vectors.

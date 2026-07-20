@@ -3,7 +3,7 @@
 //! Deterministic CBOR (`MessageEnvelope::to_blob`/`from_blob`, apps/proto/src/envelope.rs) over
 //! fixed field values — no randomness anywhere in this path, so every byte is pinned exactly.
 
-use meridian_proto::{MessageEnvelope, Prekey};
+use meridian_envelope::{MessageEnvelope, Prekey};
 use serde::Serialize;
 
 #[derive(Serialize)]

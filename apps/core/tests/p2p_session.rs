@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use meridian_core::chat::ChatState;
+use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{generate_account, AccountId, KeyHandle, MemorySecretStore};
-use meridian_core::proto::ChatContent;
 use meridian_core::session::{answer, dial, MemRelay, P2pSession, SessionError, SessionEvent};
 use meridian_core::signaling::generate_bundle;
 use meridian_core::streams::{register_stream_type, StreamRegistry, StreamType};
@@ -292,8 +292,8 @@ async fn unknown_mandatory_capability_rejected_gracefully() {
         fn channel_cfg(&self) -> ChannelCfg {
             ChannelCfg::reliable_ordered("mrd.exotic/9")
         }
-        fn direction(&self) -> meridian_core::proto::Direction {
-            meridian_core::proto::Direction::Bidir
+        fn direction(&self) -> meridian_core::envelope::Direction {
+            meridian_core::envelope::Direction::Bidir
         }
         fn mandatory(&self) -> bool {
             true
@@ -405,8 +405,8 @@ async fn additional_stream_type_opens_via_registry() {
         fn channel_cfg(&self) -> ChannelCfg {
             ChannelCfg::reliable_ordered("mrd.echo/1")
         }
-        fn direction(&self) -> meridian_core::proto::Direction {
-            meridian_core::proto::Direction::Bidir
+        fn direction(&self) -> meridian_core::envelope::Direction {
+            meridian_core::envelope::Direction::Bidir
         }
         // optional (mandatory defaults to false)
     }

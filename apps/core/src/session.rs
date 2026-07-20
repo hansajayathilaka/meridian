@@ -17,15 +17,15 @@
 //! ## Transport independence
 //! Once connected, chat and ctrl ride data channels peer-to-peer; the relay is only used for
 //! signaling and can vanish mid-conversation without interrupting the session (the headline demo).
-//! The same [`MessageEnvelope`](meridian_proto::MessageEnvelope) bytes are valid over the relay or a
+//! The same [`MessageEnvelope`](meridian_envelope::MessageEnvelope) bytes are valid over the relay or a
 //! data channel (§4.3), so re-homing chat is a change of carrier, not of format.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+use meridian_envelope::ctrl::ChanCfgWire;
+use meridian_envelope::{ChatContent, CtrlFrame, MessageId, SignalContent, StreamAdvert};
 use meridian_identity::{KeyHandle, SecretStore};
-use meridian_proto::ctrl::ChanCfgWire;
-use meridian_proto::{ChatContent, CtrlFrame, MessageId, SignalContent, StreamAdvert};
 use meridian_transport::{
     ChannelCfg, ChannelId, Fingerprint, IceCandidate, IceConfig, IcePolicy, Path, RelayTransport,
     Sdp, SessionHandle, Transport,

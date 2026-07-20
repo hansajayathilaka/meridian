@@ -11,8 +11,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use meridian_proto::ctrl::{Direction, Limits, StreamAdvert};
-use meridian_proto::{CtrlFrame, CTRL_VERSION};
+use meridian_envelope::ctrl::{Direction, Limits, StreamAdvert};
+use meridian_envelope::{CtrlFrame, CTRL_VERSION};
 use meridian_transport::ChannelCfg;
 
 /// A stream identifier assigned at OPEN time (the data channel label suffix / ctrl `sid`).

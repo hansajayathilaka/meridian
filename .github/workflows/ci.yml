@@ -25,6 +25,9 @@ jobs:
         run: |
           bash tools/lint-server-no-core.sh
           bash tools/lint-no-serde-on-blob.sh
+          # Guards the guard: fails CI if a future edit to the lint silently regresses its
+          # module-qualified-path / multi-line bypass coverage (F15).
+          bash tools/lint-no-serde-on-blob.sh --selftest
           bash tools/lint-metrics-allowlist.sh
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings

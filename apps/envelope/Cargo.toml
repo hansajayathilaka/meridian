@@ -1,0 +1,24 @@
+[package]
+name = "meridian-envelope"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Content-shaped, END-TO-END-ENCRYPTED payload types: the message envelope (X3DH preamble + ratchet
+# ciphertext), chat/signal content, and the `mrd.ctrl/1` session-control frames they carry. These
+# are the plaintexts that ride *inside* an OpaqueBlob — never structured data a server sees.
+#
+# INVARIANT (F15 / docs/security/anonymity-and-retention.md "must never" #1): this crate exists
+# SEPARATELY from meridian-proto specifically so `meridian-rendezvous` cannot import these types —
+# not even transitively, not even via a Cargo feature (a feature split was tried and rejected: Cargo
+# unifies features across `cargo build --workspace`, which defeats it; a separate crate that
+# `apps/rendezvous/Cargo.toml` never lists as a dependency, direct or dev, is compiler-enforced
+# under every build command instead). apps/rendezvous must NEVER add a dependency on this crate.
+# See apps/proto/CLAUDE.md and tools/lint-no-serde-on-blob.sh (defense-in-depth grep lint).
+[dependencies]
+meridian-proto = { path = "../proto" }
+serde = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }

@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::frame::{decode, encode, CodecError};
+use meridian_proto::{decode, encode, CodecError};
 
 /// Domain-separation tag folded into the envelope signature. A change is a wire break.
 pub const ENVELOPE_DOMAIN: &[u8] = b"mrd.env/1";
@@ -22,11 +22,11 @@ pub const ENVELOPE_DOMAIN: &[u8] = b"mrd.env/1";
 /// key and which of the responder's prekeys were consumed (so it can find the matching secrets).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Prekey {
-    #[serde(with = "crate::bytes::b32")]
+    #[serde(with = "meridian_proto::bytes::b32")]
     pub ek_pub: [u8; 32],
-    #[serde(with = "crate::bytes::b32")]
+    #[serde(with = "meridian_proto::bytes::b32")]
     pub used_spk: [u8; 32],
-    #[serde(with = "crate::bytes::opt_b32")]
+    #[serde(with = "meridian_proto::bytes::opt_b32")]
     pub used_opk: Option<[u8; 32]>,
 }
 
@@ -34,13 +34,13 @@ pub struct Prekey {
 /// the recipient endpoint.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageEnvelope {
-    #[serde(with = "crate::bytes::b32")]
+    #[serde(with = "meridian_proto::bytes::b32")]
     pub sender_pub: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prekey: Option<Prekey>,
-    #[serde(with = "crate::bytes::bytes_vec")]
+    #[serde(with = "meridian_proto::bytes::bytes_vec")]
     pub ct: Vec<u8>,
-    #[serde(with = "crate::bytes::b64")]
+    #[serde(with = "meridian_proto::bytes::b64")]
     pub sig: [u8; 64],
 }
 
