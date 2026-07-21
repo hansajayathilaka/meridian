@@ -21,7 +21,7 @@ use meridian_rendezvous::{serve, AppState, Config, MemoryStore};
 
 const BIN: &str = env!("CARGO_BIN_EXE_meridian");
 
-fn spawn_server() -> String {
+fn spawn_server_with_config(config: Config) -> String {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -30,7 +30,7 @@ fn spawn_server() -> String {
             .unwrap();
         rt.block_on(async move {
             let store = std::sync::Arc::new(MemoryStore::new());
-            let state = AppState::new(Config::default(), store);
+            let state = AppState::new(config, store);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             tx.send(addr).unwrap();
@@ -38,6 +38,29 @@ fn spawn_server() -> String {
         });
     });
     format!("ws://{}", rx.recv().unwrap())
+}
+
+fn spawn_server() -> String {
+    spawn_server_with_config(Config::default())
+}
+
+/// A real `[turn]` secret configured (mirrors `apps/rendezvous/tests/rendezvous.rs`'s
+/// `config_with_turn`) — `request_turn_credentials` mints a real HMAC grant without needing a live
+/// coturn (minting is pure HMAC computation server-side; nothing validates the grant against a
+/// running relay), so this proves the CLI's successful-grant path end to end.
+fn spawn_server_with_turn() -> String {
+    let mut config = Config::default();
+    config.turn = meridian_rendezvous::config::Turn {
+        secret: "shared-secret-abc".into(),
+        realm: "localhost".into(),
+        urls: vec![
+            "turn:turn.localhost:3478?transport=udp".into(),
+            "turn:turn.localhost:3478?transport=tcp".into(),
+            "turns:turn.localhost:443?transport=tcp".into(),
+        ],
+        ttl_secs: 120,
+    };
+    spawn_server_with_config(config)
 }
 
 struct Client {
@@ -169,10 +192,16 @@ fn stderr(o: &Output) -> String {
 }
 
 #[test]
-fn refuses_to_connect_when_the_configured_policy_for_the_peer_is_not_direct() {
-    // No real TURN relay exists yet (that's 1.25/1.27) — `session connect` must fail closed
-    // rather than silently connecting `direct` when the user configured e.g. `relay-only` for
-    // this contact, which would hand host/srflx candidates to the peer with no warning.
+fn refuses_to_connect_when_the_configured_policy_for_the_peer_is_not_direct_and_turn_is_unavailable(
+) {
+    // A real rendezvous is now up (task 1.25's TURN wiring), but with `Config::default()`'s empty
+    // `[turn].secret` — the same "dev/air-gapped, no relay configured" shape as
+    // `turn_unavailable_when_no_relay_configured` in `apps/rendezvous/tests/rendezvous.rs`. Under
+    // `direct` this would degrade to a host/srflx-only attempt, but the whole point of `relay-only`
+    // is relay availability, so `session connect` must still fail closed rather than silently
+    // connecting without one — that would hand host/srflx candidates to the peer with no warning.
+    let server = spawn_server();
+
     let alice = Client::new();
     let bob = Client::new();
     alice.new_account("alice.key");
@@ -189,24 +218,23 @@ fn refuses_to_connect_when_the_configured_policy_for_the_peer_is_not_direct() {
     ]);
     assert!(set.status.success(), "config set: {}", stderr(&set));
 
-    // No server needs to be running — the policy check happens before any network connection.
     let out = alice.run(&[
         "session",
         "connect",
         &bob_id,
         "--server",
-        "ws://127.0.0.1:1",
+        &server,
         "--transport",
         "webrtc",
     ]);
     assert!(
         !out.status.success(),
-        "expected session connect to refuse a non-direct policy"
+        "expected session connect to refuse a non-direct policy with no TURN relay configured"
     );
     let err = stderr(&out);
     assert!(
-        err.contains("only supports the direct policy"),
-        "stderr should explain the policy refusal: {err}"
+        err.contains("turn_unavailable") && err.contains("relay"),
+        "stderr should explain the TURN-unavailable policy refusal: {err}"
     );
 }
 
@@ -266,5 +294,46 @@ fn two_processes_establish_a_real_p2p_session_over_the_rendezvous() {
     assert!(
         roles == "truefalse" || roles == "falsetrue",
         "expected exactly one initiator: alice_out={a_out} bob_out={b_out}"
+    );
+}
+
+#[test]
+fn two_processes_establish_a_real_p2p_session_when_a_turn_grant_is_minted() {
+    // A real `[turn]` secret is configured on the rendezvous (unlike `spawn_server`'s default),
+    // so `request_turn_credentials` succeeds and `session connect` threads a real (if practically
+    // unreachable — no coturn is actually running) `IceServer` into the ICE config under the
+    // default `direct` policy. This proves the successful-grant → `IceServer` conversion doesn't
+    // break the existing localhost happy path: host candidates still win even with a TURN server
+    // offered alongside them.
+    let server = spawn_server_with_turn();
+
+    let alice = Client::new();
+    let bob = Client::new();
+    alice.new_account("alice.key");
+    bob.new_account("bob.key");
+    let alice_id = alice.id();
+    let bob_id = bob.id();
+
+    let a = alice.spawn_connect(&server, &bob_id);
+    let b = bob.spawn_connect(&server, &alice_id);
+
+    let (a_ok, a_out, a_err) = a.wait(Duration::from_secs(30));
+    let (b_ok, b_out, b_err) = b.wait(Duration::from_secs(30));
+
+    assert!(
+        a_ok,
+        "alice's session connect failed.\nstdout: {a_out}\nstderr: {a_err}"
+    );
+    assert!(
+        b_ok,
+        "bob's session connect failed.\nstdout: {b_out}\nstderr: {b_err}"
+    );
+    assert!(
+        a_out.contains("\"event\":\"p2p_connect\"") && a_out.contains("\"established\":true"),
+        "alice did not report an established session: {a_out}"
+    );
+    assert!(
+        b_out.contains("\"event\":\"p2p_connect\"") && b_out.contains("\"established\":true"),
+        "bob did not report an established session: {b_out}"
     );
 }
