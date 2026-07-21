@@ -457,7 +457,10 @@ turn_reachability_probe() {
   fi
 
   echo "[nat-matrix] driving turnutils_uclient ($mode) from ns-alice against coturn 203.0.113.30…"
-  local uclient_args=(-t -u "$username" -w "$credential" 203.0.113.30)
+  # -y: client-to-client connections, so uclient allocates and exercises a relay without needing
+  # a separate peer process. -t switches the client<->coturn transport to TCP for the udp-blocked
+  # cell's TCP-reachability check; UDP is the default transport otherwise.
+  local uclient_args=(-y -u "$username" -w "$credential" 203.0.113.30)
   if [[ "$mode" == "tcp" ]]; then
     uclient_args=(-t -y -u "$username" -w "$credential" 203.0.113.30)
   fi
