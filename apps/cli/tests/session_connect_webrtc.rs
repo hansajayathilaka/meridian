@@ -169,6 +169,48 @@ fn stderr(o: &Output) -> String {
 }
 
 #[test]
+fn refuses_to_connect_when_the_configured_policy_for_the_peer_is_not_direct() {
+    // No real TURN relay exists yet (that's 1.25/1.27) — `session connect` must fail closed
+    // rather than silently connecting `direct` when the user configured e.g. `relay-only` for
+    // this contact, which would hand host/srflx candidates to the peer with no warning.
+    let alice = Client::new();
+    let bob = Client::new();
+    alice.new_account("alice.key");
+    bob.new_account("bob.key");
+    let bob_id = bob.id();
+
+    let set = alice.run(&[
+        "config",
+        "set",
+        "policy",
+        "relay-only",
+        "--contact",
+        &bob_id,
+    ]);
+    assert!(set.status.success(), "config set: {}", stderr(&set));
+
+    // No server needs to be running — the policy check happens before any network connection.
+    let out = alice.run(&[
+        "session",
+        "connect",
+        &bob_id,
+        "--server",
+        "ws://127.0.0.1:1",
+        "--transport",
+        "webrtc",
+    ]);
+    assert!(
+        !out.status.success(),
+        "expected session connect to refuse a non-direct policy"
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("only supports the direct policy"),
+        "stderr should explain the policy refusal: {err}"
+    );
+}
+
+#[test]
 fn two_processes_establish_a_real_p2p_session_over_the_rendezvous() {
     let server = spawn_server();
 

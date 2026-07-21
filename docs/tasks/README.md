@@ -32,8 +32,10 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   assertions + CI wiring — the task that actually closes F11's wire-level half, depends on 1.26). A fifth
   item flagged during the split (an active relay-rewrite adversarial test against the rendezvous) is
   tracked separately as **1.28**, not part of F11's closure. All four of 1.24-1.27 are pending.
-- **NEXT:** run **`/next-task`** to continue with Group D — **1.24** and **1.25** are both unblocked and
-  independent of each other (can run in parallel); 1.26 needs both, 1.27 needs 1.26.
+- **NEXT:** run **`/next-task`** to continue with Group D — **1.24** done (`session connect` CLI +
+  real-signaling `SignalRelay`, plus a `WebRtcTransport::close()` race fix found while testing it).
+  **1.25** is next (netns topology + coturn/rendezvous orchestration, depends on 1.14 only); 1.26 needs
+  both 1.24 and 1.25, 1.27 needs 1.26.
 - After Phase 1 fixes land: **`/pick-next-phase`** selects Phase 2 (T06 Cross-Org Federation).
   Blocking gate: F1, F2, F3, F10, F11 (→ 1.1, 1.2, 1.6, 1.13+1.15, 1.14+1.22+1.24+1.25+1.26+1.27) must
   close first.
@@ -80,7 +82,7 @@ design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 - [x] **1.16** Observed-candidate relay-only enforcement (F20) — [file](./phase-1/1.16-nat-acceptance-matrix.md)
 - [x] **1.22** `meridian` CLI: `--transport webrtc` wiring (F11 wire, prerequisite; split from 1.16) — [file](./phase-1/1.22-webrtc-cli-transport.md)
 - [x] **1.23** ~~NAT/relay wire-level acceptance matrix~~ — split before implementation into 1.24-1.27 (see file) — [file](./phase-1/1.23-netns-nat-matrix.md)
-- [~] **1.24** Real-signaling `SignalRelay` + `session connect` CLI (F11 wire, prerequisite; split from 1.23; depends on 1.22) — [file](./phase-1/1.24-real-signaling-p2p-cli.md)
+- [x] **1.24** Real-signaling `SignalRelay` + `session connect` CLI (F11 wire, prerequisite; split from 1.23; depends on 1.22) — [file](./phase-1/1.24-real-signaling-p2p-cli.md)
 - [ ] **1.25** netns topology + NAT-flavor emulation + coturn/rendezvous orchestration (F11 wire; split from 1.23; depends on 1.14) — [file](./phase-1/1.25-netns-topology-coturn.md)
 - [ ] **1.26** Drive real peers across the topology + capture pcaps (F11 wire; split from 1.23; depends on 1.24, 1.25) — [file](./phase-1/1.26-netns-drive-and-capture.md)
 - [ ] **1.27** pcap-analysis assertions + CI/harness wiring — closes F11 wire-level (split from 1.23; depends on 1.26) — [file](./phase-1/1.27-pcap-assertions-ci.md)

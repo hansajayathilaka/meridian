@@ -9,6 +9,11 @@
 //! of the data path" property, now proven over a real socket rather than in-process channels.
 //!
 //! `--transport loopback` is rejected outright: there is no cross-process loopback mode.
+//!
+//! No real TURN relay exists yet (coturn orchestration is 1.25/1.27, not this task), so a
+//! configured relay policy other than `direct` for this peer is also rejected outright rather than
+//! silently connecting `direct` regardless — a silent downgrade would hand host/srflx candidates to
+//! the peer with no warning, defeating the whole point of `config set policy relay-only`.
 
 use meridian_core::identity::{KeyHandle, SecretStore};
 
@@ -77,6 +82,21 @@ async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
         transport: _,
         json,
     } = args;
+
+    // `session connect` has no real TURN relay to offer yet (coturn orchestration is 1.25/1.27,
+    // not this task) — resolve the configured policy for this peer and fail closed rather than
+    // silently connecting `direct` regardless of what the user configured (e.g. `relay-only` for
+    // this contact): a silent downgrade would expose host/srflx candidates to the peer with no
+    // warning, exactly the IP-hiding guarantee `config set policy relay-only` exists to give.
+    let resolved_policy = crate::policy::load()?.resolve(&peer_ik);
+    if resolved_policy != IcePolicy::Direct {
+        return Err(format!(
+            "session connect only supports the direct policy today (no real TURN relay yet — \
+             coturn integration lands in 1.25/1.27); the configured policy for {peer_label} is \
+             {}, so refusing to silently connect direct instead",
+            meridian_core::relay::policy_str(resolved_policy)
+        ));
+    }
 
     let mut chat = ChatState::default();
 
