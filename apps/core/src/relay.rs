@@ -136,8 +136,10 @@ impl GatherClasses {
 /// The candidate classes a policy *intends* to gather. `relay-only` never offers host/srflx
 /// (invariant 3) — but this is the policy's promise, not a measurement. [`observed_classes`] is
 /// the corresponding measurement of what a transport actually produced (F20); prefer it wherever a
-/// live session is available. This function stays useful before a session exists (e.g. `doctor`'s
-/// static preview of what a policy *would* gather).
+/// live session is available — `session info`/`doctor`'s "candidates offered" line does, via
+/// `SessionInfo::offered`, not this function. Kept for a genuine before-a-session-exists use (e.g.
+/// a settings UI previewing what a policy *would* gather before the user connects); today that's
+/// hypothetical, so the only real caller is this module's own tests.
 pub fn gather_classes(policy: IcePolicy) -> GatherClasses {
     match policy {
         IcePolicy::RelayOnly => GatherClasses {
