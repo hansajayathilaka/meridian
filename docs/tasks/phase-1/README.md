@@ -21,8 +21,8 @@ design decisions + remaining should-fix/nit.
 The Phase 0 build is complete; its review report is written. Fix-tasks are unblocked now. Internal
 dependencies between fix-tasks are declared per task (notably 1.2→1.1, 1.15→1.13/1.3, 1.16→1.15/1.14,
 1.22→1.15, 1.24→1.22, 1.25→1.14, 1.26→1.24/1.25, 1.27→1.26). 1.23 was split before implementation into
-1.24-1.27 (see [1.23](./1.23-netns-nat-matrix.md)'s Status); 1.24 and 1.25 are independent of each other
-and can proceed in parallel.
+1.24-1.27 (see [1.23](./1.23-netns-nat-matrix.md)'s Status); 1.24 and 1.25 were independent of each other
+and proceeded in parallel — both are now done. 1.26 (needs both) is next.
 
 ## Tasks (todo)
 <!-- Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
@@ -53,7 +53,7 @@ and can proceed in parallel.
 - [x] **1.22** `meridian` CLI: `--transport webrtc` wiring (F11 wire, prerequisite; split from 1.16) — [file](./1.22-webrtc-cli-transport.md)
 - [x] **1.23** ~~NAT/relay wire-level acceptance matrix~~ — split before implementation into 1.24-1.27 (see file) — [file](./1.23-netns-nat-matrix.md)
 - [x] **1.24** Real-signaling `SignalRelay` + `session connect` CLI (F11 wire, prerequisite; split from 1.23; depends on 1.22) — [file](./1.24-real-signaling-p2p-cli.md)
-- [~] **1.25** netns topology + NAT-flavor emulation + coturn/rendezvous orchestration (F11 wire; split from 1.23; depends on 1.14) — [file](./1.25-netns-topology-coturn.md)
+- [x] **1.25** netns topology + NAT-flavor emulation + coturn/rendezvous orchestration (F11 wire; split from 1.23; depends on 1.14) — [file](./1.25-netns-topology-coturn.md)
 - [ ] **1.26** Drive real peers across the topology + capture pcaps (F11 wire; split from 1.23; depends on 1.24, 1.25) — [file](./1.26-netns-drive-and-capture.md)
 - [ ] **1.27** pcap-analysis assertions + CI/harness wiring — closes F11 wire-level (split from 1.23; depends on 1.26) — [file](./1.27-pcap-assertions-ci.md)
 
