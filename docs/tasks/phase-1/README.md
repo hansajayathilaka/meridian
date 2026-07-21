@@ -54,7 +54,7 @@ and proceeded in parallel — both are now done. 1.26 (needs both) is next.
 - [x] **1.23** ~~NAT/relay wire-level acceptance matrix~~ — split before implementation into 1.24-1.27 (see file) — [file](./1.23-netns-nat-matrix.md)
 - [x] **1.24** Real-signaling `SignalRelay` + `session connect` CLI (F11 wire, prerequisite; split from 1.23; depends on 1.22) — [file](./1.24-real-signaling-p2p-cli.md)
 - [x] **1.25** netns topology + NAT-flavor emulation + coturn/rendezvous orchestration (F11 wire; split from 1.23; depends on 1.14) — [file](./1.25-netns-topology-coturn.md)
-- [ ] **1.26** Drive real peers across the topology + capture pcaps (F11 wire; split from 1.23; depends on 1.24, 1.25) — [file](./1.26-netns-drive-and-capture.md)
+- [~] **1.26** Drive real peers across the topology + capture pcaps (F11 wire; split from 1.23; depends on 1.24, 1.25) — [file](./1.26-netns-drive-and-capture.md)
 - [ ] **1.27** pcap-analysis assertions + CI/harness wiring — closes F11 wire-level (split from 1.23; depends on 1.26) — [file](./1.27-pcap-assertions-ci.md)
 
 **Group E — Design decisions + remaining should-fix / nit**
