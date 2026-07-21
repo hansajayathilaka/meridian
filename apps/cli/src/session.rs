@@ -234,7 +234,7 @@ pub async fn run_demo(opts: DemoOpts) -> Result<Vec<String>, String> {
                     "--transport webrtc only supports --policy direct today: the demo's TURN \
                      servers are fabricated for LoopbackTransport's simulation and a real \
                      WebRtcTransport would try to actually reach them; real TURN support lands in \
-                     1.23"
+                     1.25/1.27"
                         .to_string(),
                 );
             }

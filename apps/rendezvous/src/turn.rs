@@ -15,7 +15,8 @@
 //! It does **not** by itself prevent reuse of that one captured credential: within its TTL window,
 //! coturn's `user-quota` (see `infra/coturn/turnserver.conf`) bounds — but does not reject outright —
 //! how many concurrent allocations it can mint before expiry. True single-use rejection at the wire
-//! level is proven separately (see task 1.23, split from what was originally 1.16).
+//! level is proven separately (see task 1.25/1.27, the real-coturn netns matrix, split from what
+//! was originally 1.16 via 1.23).
 //!
 //! This module holds only the shared secret and HMAC — no session/ratchet code (the server's
 //! "cannot" list §2.3 is unbroken; HMAC-SHA1 here is a primitive, exactly like the Ed25519 verify

@@ -43,6 +43,8 @@ webrtc-rs backend from [1.15](../../tasks/phase-1/1.15-webrtc-backend.md). The N
 still validated only via the `netns` simulation rig against the non-webrtc-rs `Transport` test double,
 not against real ICE/TURN negotiation or an actual packet capture — treat the four-cell matrix and the
 "packet capture confirms zero of our address" acceptance criterion as **simulation-only** until
-[1.23](../../tasks/phase-1/1.23-netns-nat-matrix.md) lands the wire-level netns/tcpdump matrix (which
-depends on [1.22](../../tasks/phase-1/1.22-webrtc-cli-transport.md)'s CLI transport wiring and 1.14's
-coturn quota).
+[1.27](../../tasks/phase-1/1.27-pcap-assertions-ci.md) lands the wire-level netns/tcpdump matrix's
+pcap assertions (the chain: [1.24](../../tasks/phase-1/1.24-real-signaling-p2p-cli.md) real-signaling
+CLI + [1.25](../../tasks/phase-1/1.25-netns-topology-coturn.md) netns/coturn topology →
+[1.26](../../tasks/phase-1/1.26-netns-drive-and-capture.md) drive+capture → 1.27 assertions; depends on
+[1.22](../../tasks/phase-1/1.22-webrtc-cli-transport.md)'s CLI transport wiring and 1.14's coturn quota).

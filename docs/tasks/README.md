@@ -22,12 +22,21 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   classification are documented, scoped-out gaps, see the task file); observed-candidate relay-only
   enforcement done (1.16 — F20 closed; the netns/tcpdump wire-level matrix that was 1.16's other
   deliverable turned out to need its own CLI transport wiring first, so it split into **1.22** (CLI
-  `--transport webrtc`) and **1.23** (the matrix itself, depends on 1.22); **1.22** now done (`--transport
-  <loopback|webrtc>` on `meridian session demo`, gated `webrtc` cargo feature on `meridian-cli`) — 1.23
-  pending.
-- **NEXT:** run **`/next-task`** to continue with Group D (1.23 NAT/relay wire-level acceptance matrix).
+  `--transport webrtc`) and **1.23** (the matrix itself); **1.22** done (`--transport <loopback|webrtc>`
+  on `meridian session demo`, gated `webrtc` cargo feature on `meridian-cli`, PR #25). **1.23** was then
+  itself split *before* implementation — its "drive two real peers using 1.22's flag" premise assumed
+  cross-process signaling that doesn't exist yet (`session demo` runs both peers in one process) — into
+  **1.24** (real-signaling `SignalRelay` + `session connect` CLI, depends on 1.22), **1.25** (netns
+  topology + NAT-flavor emulation + coturn/rendezvous orchestration, depends on 1.14, parallel to 1.24),
+  **1.26** (drive real peers + capture pcaps, depends on 1.24+1.25), and **1.27** (pcap-analysis
+  assertions + CI wiring — the task that actually closes F11's wire-level half, depends on 1.26). A fifth
+  item flagged during the split (an active relay-rewrite adversarial test against the rendezvous) is
+  tracked separately as **1.28**, not part of F11's closure. All four of 1.24-1.27 are pending.
+- **NEXT:** run **`/next-task`** to continue with Group D — **1.24** and **1.25** are both unblocked and
+  independent of each other (can run in parallel); 1.26 needs both, 1.27 needs 1.26.
 - After Phase 1 fixes land: **`/pick-next-phase`** selects Phase 2 (T06 Cross-Org Federation).
-  Blocking gate: F1, F2, F3, F10, F11 (→ 1.1, 1.2, 1.6, 1.13+1.15, 1.14+1.22+1.23) must close first.
+  Blocking gate: F1, F2, F3, F10, F11 (→ 1.1, 1.2, 1.6, 1.13+1.15, 1.14+1.22+1.24+1.25+1.26+1.27) must
+  close first.
 
 ---
 
@@ -70,7 +79,11 @@ design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 - [x] **1.15** webrtc-rs `Transport` backend (F10 backend) — [file](./phase-1/1.15-webrtc-backend.md)
 - [x] **1.16** Observed-candidate relay-only enforcement (F20) — [file](./phase-1/1.16-nat-acceptance-matrix.md)
 - [x] **1.22** `meridian` CLI: `--transport webrtc` wiring (F11 wire, prerequisite; split from 1.16) — [file](./phase-1/1.22-webrtc-cli-transport.md)
-- [ ] **1.23** NAT/relay wire-level acceptance matrix (F11 wire; split from 1.16, depends on 1.22) — [file](./phase-1/1.23-netns-nat-matrix.md)
+- [x] **1.23** ~~NAT/relay wire-level acceptance matrix~~ — split before implementation into 1.24-1.27 (see file) — [file](./phase-1/1.23-netns-nat-matrix.md)
+- [ ] **1.24** Real-signaling `SignalRelay` + `session connect` CLI (F11 wire, prerequisite; split from 1.23; depends on 1.22) — [file](./phase-1/1.24-real-signaling-p2p-cli.md)
+- [ ] **1.25** netns topology + NAT-flavor emulation + coturn/rendezvous orchestration (F11 wire; split from 1.23; depends on 1.14) — [file](./phase-1/1.25-netns-topology-coturn.md)
+- [ ] **1.26** Drive real peers across the topology + capture pcaps (F11 wire; split from 1.23; depends on 1.24, 1.25) — [file](./phase-1/1.26-netns-drive-and-capture.md)
+- [ ] **1.27** pcap-analysis assertions + CI/harness wiring — closes F11 wire-level (split from 1.23; depends on 1.26) — [file](./phase-1/1.27-pcap-assertions-ci.md)
 
 **Group E — Design decisions + remaining should-fix / nit**
 - [ ] **1.17** ADR — deniability vs envelope signature (on-the-fly) — [file](./phase-1/1.17-adr-deniability-envelope-sig.md)
@@ -78,6 +91,7 @@ design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 - [ ] **1.19** 5k-connection capacity test (F12) — [file](./phase-1/1.19-capacity-test-5k.md)
 - [ ] **1.20** Server-hardening bundle (F21) — [file](./phase-1/1.20-server-hardening-bundle.md)
 - [ ] **1.21** Coverage tooling or drop the % (F22) — [file](./phase-1/1.21-coverage-tooling.md)
+- [ ] **1.28** Active relay-rewrite adversarial test (on-the-fly, flagged during 1.23's split; not part of F11's closure) — [file](./phase-1/1.28-active-relay-rewrite-test.md)
 
 ---
 

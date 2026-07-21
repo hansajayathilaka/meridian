@@ -87,9 +87,9 @@
 //! feature-04's acceptance criterion — if the local address genuinely changes (Wi-Fi→LTE), nothing
 //! here gathers or exchanges the new candidates the peer would need to find the new path, so
 //! connectivity will *not* actually resume. Closing that gap needs a ctrl-channel renegotiation
-//! message (ADR 0006/0014-relevant; flagged for architect review — 1.16/1.22/1.23 do not touch
-//! this gap, so it remains a not-yet-numbered successor to 1.15; network-roaming support should
-//! not ship claiming this works until it lands).
+//! message (ADR 0006/0014-relevant; flagged for architect review — 1.16/1.22/1.24-1.27 do not
+//! touch this gap, so it remains a not-yet-numbered successor to 1.15; network-roaming support
+//! should not ship claiming this works until it lands).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -616,7 +616,7 @@ impl Transport for WebRtcTransport {
             // rung* (udp/tcp/tls-443), a different gap from candidate *class* (host/srflx/relay) —
             // 1.16 closed the latter (`meridian_core::relay::observed_classes`/
             // `enforce_relay_only`); this rung-classification gap is still open and has no assigned
-            // task yet, though 1.23's real packet captures are the most likely place it gets solved.
+            // task yet, though 1.27's real packet captures are the most likely place it gets solved.
             let (relay_server, relay_transport) = if class == Path::Relay {
                 (Some(local.ip.clone()), Some(RelayTransport::Udp))
             } else {

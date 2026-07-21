@@ -201,7 +201,8 @@ async fn each_turn_request_mints_a_distinct_credential() {
     // proves distinctness, NOT single-use enforcement: a single captured credential is still valid
     // to mint allocations until its own embedded expiry, bounded only by coturn's `user-quota`
     // (infra/coturn/turnserver.conf), not rejected outright. True reuse-rejection at the wire level
-    // is proven separately (task 1.23, split from what was originally 1.16).
+    // is proven separately (task 1.25/1.27, the real-coturn netns matrix, split from what was
+    // originally 1.16 via 1.23).
     assert_ne!(a.username, b.username);
     assert_ne!(a.credential, b.credential);
 }
