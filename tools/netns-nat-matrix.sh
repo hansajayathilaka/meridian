@@ -245,10 +245,33 @@ gen_secret() {
   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
 }
 
+# The secret is shared state between coturn (static-auth-secret) and rendezvous ([turn].secret),
+# but the two are started independently and idempotently by `ensure_topology` (each individually
+# skipped if already running) — so if only ONE of them dies and gets restarted on its own (e.g.
+# coturn crashes but rendezvous is still the same live process from an earlier start), a naive
+# `gen_secret` call in `start_coturn` would mint a FRESH secret that no longer matches whatever
+# rendezvous already has baked into its running config, silently breaking every credential minted
+# from then on. Persisting to `$d/turn.secret` on first generation and always reading it back if it
+# already exists means any component that (re)starts on its own recovers the SAME secret the other
+# side is already using, rather than diverging.
+get_or_create_secret() {
+  local d
+  d="$(rig_dir)"
+  if [[ -f "$d/turn.secret" ]]; then
+    cat "$d/turn.secret"
+    return
+  fi
+  local s
+  s="$(gen_secret)"
+  printf '%s' "$s" > "$d/turn.secret"
+  chmod 600 "$d/turn.secret"
+  echo "$s"
+}
+
 start_coturn() {
   local d
   d="$(rig_dir)"
-  TURN_SECRET="$(gen_secret)"
+  TURN_SECRET="$(get_or_create_secret)"
   local conf="$d/turnserver.conf"
   local pidfile="$d/turnserver.pid"
   local logfile="$d/turnserver.log"
@@ -301,11 +324,9 @@ EOF
     exit 1
   fi
   echo "$pid" > "$d/turnserver.tracked-pid"
-  # Persist (0600, rig-scratch-only, never committed) so a standalone `cell` invocation in a fresh
-  # bash process (coturn already running from a prior `matrix`/`cell` call) can still recover the
-  # secret for the reachability probe below without regenerating/restarting coturn.
-  printf '%s' "$TURN_SECRET" > "$d/turn.secret"
-  chmod 600 "$d/turn.secret"
+  # (get_or_create_secret already persisted $d/turn.secret above, 0600, rig-scratch-only, never
+  # committed — a standalone `cell` invocation in a fresh bash process, or a solo coturn restart,
+  # reads the same value back rather than diverging from what rendezvous already has.)
   echo "[nat-matrix] coturn running: pid=$pid realm=$TURN_REALM secret=<redacted>"
 }
 
@@ -328,6 +349,12 @@ start_rendezvous() {
   local conf="$d/rendezvous.toml"
   local pidfile="$d/rendezvous.pid"
   local logfile="$d/rendezvous.log"
+
+  # Always source the shared secret via get_or_create_secret (not the bare $TURN_SECRET global)
+  # so this converges to whatever coturn already has even if start_rendezvous ends up called
+  # without start_coturn having just run first in this same process (e.g. rendezvous alone dies
+  # and ensure_topology restarts only it, with coturn already up from earlier).
+  TURN_SECRET="$(get_or_create_secret)"
 
   if [[ ! -x "$RDZV_BIN" ]]; then
     echo "meridian-rendezvous binary not found at $RDZV_BIN — run 'cargo build -p meridian-rendezvous' first." >&2
