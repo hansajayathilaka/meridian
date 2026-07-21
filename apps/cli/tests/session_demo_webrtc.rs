@@ -96,7 +96,7 @@ fn session_demo_webrtc_rejects_nat_simulation() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("NAT simulation") || stderr.contains("nat"),
+        stderr.contains("has no NAT simulation"),
         "stderr should explain why --nat is rejected under --transport webrtc: {stderr}"
     );
 }
@@ -122,7 +122,7 @@ fn session_demo_webrtc_rejects_relay_only_policy() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("TURN") || stderr.contains("policy"),
+        stderr.contains("only supports --policy direct"),
         "stderr should explain why --policy relay-only is rejected under --transport webrtc: {stderr}"
     );
 }
