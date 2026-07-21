@@ -80,21 +80,17 @@ async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
 
     let mut chat = ChatState::default();
 
-    eprintln!("[DIAG cli] connecting to rendezvous");
     let mut client = SignalingClient::connect(&server, store, handle, account_pub, None, 1)
         .await
         .map_err(|e| format!("connecting to {server}: {e}"))?;
-    eprintln!("[DIAG cli] connected");
 
     // Publish a fresh bundle so the peer can reach us (needed regardless of role: the initiator
     // fetches it to X3DH against; the responder needs its own spk/otk secrets in the vault so the
     // offer's prekey message can establish the responder ratchet session).
-    eprintln!("[DIAG cli] publishing bundle");
     let generated = client
         .publish_bundle(store, handle, DEFAULT_OTK_COUNT)
         .await
         .map_err(|e| format!("publishing bundle: {e}"))?;
-    eprintln!("[DIAG cli] published bundle");
     let otks: Vec<([u8; 32], [u8; 32])> = generated
         .bundle
         .otks
@@ -108,7 +104,6 @@ async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
     // Roles are decided by key order so two peers both running `session connect` settle on exactly
     // one dialer without racing (mirrors chat.rs).
     let initiator = account_pub.as_slice() <= peer_ik.as_slice();
-    eprintln!("[DIAG cli] initiator={initiator}");
     if initiator {
         let peer_bundle = fetch_with_retry(&mut client, peer_ik, &peer_label).await?;
         chat.start_initiator_session(
@@ -127,7 +122,6 @@ async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
     // Localhost, direct policy: real ICE/STUN discovers the host pair without any TURN relay.
     let cfg = relay::ice_config(IcePolicy::Direct, Vec::new(), Vec::new());
 
-    eprintln!("[DIAG cli] entering dial/answer");
     let mut session = {
         let mut adapter = RendezvousRelay::new(&mut client);
         if initiator {
@@ -161,7 +155,6 @@ async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
         }
     };
 
-    eprintln!("[DIAG cli] dial/answer returned, session established");
     // T04's "servers out of the data path" property — now proven over a real socket: the
     // rendezvous connection is no longer needed once the P2P session is up.
     let _ = client.close().await;

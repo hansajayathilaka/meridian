@@ -147,10 +147,7 @@ impl ConnectProc {
 }
 
 /// Spawn a thread draining a child stream into a shared string buffer.
-fn drain<R: std::io::Read + Send + 'static>(stream: R) -> Arc<Mutex<String>>
-where
-    R: 'static,
-{
+fn drain<R: std::io::Read + Send + 'static>(stream: R) -> Arc<Mutex<String>> {
     let buf = Arc::new(Mutex::new(String::new()));
     let sink = buf.clone();
     std::thread::spawn(move || {
@@ -202,10 +199,12 @@ fn two_processes_establish_a_real_p2p_session_over_the_rendezvous() {
 
     let combined = format!("{a_out}\n{b_out}");
 
-    // The real WebRtcTransport backend was used, not a simulation.
+    // The real WebRtcTransport backend was used, not a simulation. Both sides run with
+    // `--json`, so the headline event's `"transport":"..."` field is what actually gets
+    // printed (the plain-text `transport=...` `Display` line only appears without `--json`).
     assert!(
-        combined.contains("transport=webrtc-datachannel"),
-        "expected transport=webrtc-datachannel in combined output: {combined}"
+        combined.contains("\"transport\":\"webrtc-datachannel\""),
+        "expected a \"transport\":\"webrtc-datachannel\" field in combined output: {combined}"
     );
     // Both sides established the session ("p2p_connect" is the --json headline event).
     assert!(
