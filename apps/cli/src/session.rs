@@ -27,11 +27,11 @@ use meridian_core::session::{
 };
 use meridian_core::signaling::generate_bundle;
 use meridian_core::streams::StreamRegistry;
+#[cfg(feature = "webrtc")]
+use meridian_core::transport::WebRtcTransport;
 use meridian_core::transport::{
     IcePolicy, IceServer, LoopbackFabric, LoopbackTransport, NatScenario, Transport,
 };
-#[cfg(feature = "webrtc")]
-use meridian_core::transport::WebRtcTransport;
 
 use crate::TransportArg;
 
@@ -246,9 +246,11 @@ pub async fn run_demo(opts: DemoOpts) -> Result<Vec<String>, String> {
             }
             #[cfg(not(feature = "webrtc"))]
             {
-                Err("meridian-cli was built without the `webrtc` feature; rebuild with \
+                Err(
+                    "meridian-cli was built without the `webrtc` feature; rebuild with \
                      `--features webrtc` to use `--transport webrtc`"
-                    .to_string())
+                        .to_string(),
+                )
             }
         }
     }

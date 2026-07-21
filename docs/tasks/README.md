@@ -22,9 +22,10 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   classification are documented, scoped-out gaps, see the task file); observed-candidate relay-only
   enforcement done (1.16 — F20 closed; the netns/tcpdump wire-level matrix that was 1.16's other
   deliverable turned out to need its own CLI transport wiring first, so it split into **1.22** (CLI
-  `--transport webrtc`) and **1.23** (the matrix itself, depends on 1.22) — both pending.
-- **NEXT:** run **`/next-task`** to continue with Group D (1.22 CLI transport wiring, then 1.23 NAT/relay
-  wire-level acceptance matrix).
+  `--transport webrtc`) and **1.23** (the matrix itself, depends on 1.22); **1.22** now done (`--transport
+  <loopback|webrtc>` on `meridian session demo`, gated `webrtc` cargo feature on `meridian-cli`) — 1.23
+  pending.
+- **NEXT:** run **`/next-task`** to continue with Group D (1.23 NAT/relay wire-level acceptance matrix).
 - After Phase 1 fixes land: **`/pick-next-phase`** selects Phase 2 (T06 Cross-Org Federation).
   Blocking gate: F1, F2, F3, F10, F11 (→ 1.1, 1.2, 1.6, 1.13+1.15, 1.14+1.22+1.23) must close first.
 
@@ -68,7 +69,7 @@ design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 - [x] **1.14** Feature 5 honesty: coturn user-quota + credential-reuse wording (F11 honesty) — [file](./phase-1/1.14-feature5-honesty.md)
 - [x] **1.15** webrtc-rs `Transport` backend (F10 backend) — [file](./phase-1/1.15-webrtc-backend.md)
 - [x] **1.16** Observed-candidate relay-only enforcement (F20) — [file](./phase-1/1.16-nat-acceptance-matrix.md)
-- [~] **1.22** `meridian` CLI: `--transport webrtc` wiring (F11 wire, prerequisite; split from 1.16) — [file](./phase-1/1.22-webrtc-cli-transport.md)
+- [x] **1.22** `meridian` CLI: `--transport webrtc` wiring (F11 wire, prerequisite; split from 1.16) — [file](./phase-1/1.22-webrtc-cli-transport.md)
 - [ ] **1.23** NAT/relay wire-level acceptance matrix (F11 wire; split from 1.16, depends on 1.22) — [file](./phase-1/1.23-netns-nat-matrix.md)
 
 **Group E — Design decisions + remaining should-fix / nit**
