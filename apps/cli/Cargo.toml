@@ -10,6 +10,13 @@ publish = false
 name = "meridian"
 path = "src/main.rs"
 
+[features]
+default = []
+# Forwards to meridian-core/webrtc so `--transport webrtc` can construct a real WebRtcTransport
+# (1.15's real ICE/SCTP/DTLS backend) instead of the deterministic LoopbackTransport. Off by default
+# for the same reason as the underlying crates: heavy dependency tree, needs real UDP/ICE.
+webrtc = ["meridian-core/webrtc"]
+
 [dependencies]
 meridian-core = { path = "../core" }
 # `keyring` (the all-in-one v1 wrapper) installs a real platform credential store for `--store os`.

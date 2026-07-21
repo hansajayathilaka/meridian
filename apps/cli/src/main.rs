@@ -116,7 +116,22 @@ enum SessionCommand {
         /// `symmetric` (=symmetric:symmetric), or `udp-blocked`.
         #[arg(long, default_value = "full-cone")]
         nat: String,
+        /// Data-path backend: `loopback` (default, deterministic in-process simulation) or `webrtc`
+        /// (real ICE/SCTP/DTLS on localhost, requires building with `--features webrtc`).
+        #[arg(long, value_enum, default_value_t = TransportArg::Loopback)]
+        transport: TransportArg,
     },
+}
+
+/// Which `Transport` backend `session demo` builds. See `session.rs` module docs for why `webrtc`
+/// rejects non-default `--nat`/`--policy` (there is no NAT simulation, and the demo's fabricated TURN
+/// servers only mean anything to `LoopbackTransport`'s simulation).
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+pub(crate) enum TransportArg {
+    /// Deterministic in-process simulation (default).
+    Loopback,
+    /// Real ICE/SCTP/DTLS backend (`meridian-transport`'s `WebRtcTransport`, feature-gated).
+    Webrtc,
 }
 
 #[derive(Subcommand)]
@@ -449,7 +464,12 @@ fn cmd_chat(id: &str, server: &str, json: bool) -> Result<ExitCode, String> {
 
 fn run_session(cmd: SessionCommand) -> Result<ExitCode, String> {
     match cmd {
-        SessionCommand::Demo { json, policy, nat } => {
+        SessionCommand::Demo {
+            json,
+            policy,
+            nat,
+            transport,
+        } => {
             let policy = meridian_core::relay::policy_from_str(&policy).ok_or_else(|| {
                 format!("unknown policy '{policy}' (expected direct | prefer-relay | relay-only)")
             })?;
@@ -462,6 +482,7 @@ fn run_session(cmd: SessionCommand) -> Result<ExitCode, String> {
                 json,
                 policy,
                 scenario,
+                transport,
             }))?;
             Ok(ExitCode::SUCCESS)
         }
