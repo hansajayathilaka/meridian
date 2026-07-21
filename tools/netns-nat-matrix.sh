@@ -489,25 +489,25 @@ s.sendto(b"probe2", ("203.0.113.30", 15202))
 # from within ns-alice (genuinely behind the NAT under test); independently verify the returned
 # `credential` is exactly base64(HMAC-SHA1(secret, username)) (the coturn REST-secret algorithm,
 # per apps/rendezvous/src/turn.rs); then drive turnutils_uclient from ns-alice against coturn in
-# ns-turn and assert it gets a real relay allocation for that exact username.
+# ns-turn and assert it gets a real relay allocation for that exact username, using the literal
+# minted (username, credential) pair via `-u <user> -w <credential>` — exactly the two values a
+# real Meridian client would receive from the TurnGrant and hand to its ICE agent. No raw coturn
+# secret is used for authentication anywhere in this probe.
 #
-# DEVIATION #1 (flagged for connectivity-debugger review): turnutils_uclient's explicit
-# precomputed-credential mode (`-u <user> -w <password>`) reliably fails to authenticate against
-# this coturn 4.6.1 build in this sandbox — it retries the ALLOCATE indefinitely and gives up with
-# "Cannot complete Allocation", and coturn logs "check_stun_auth: Cannot find credentials of user
-# <...>" for every retry (confirmed NOT a benign first-request log line: identical repeated failure
-# with a byte-verified-correct credential). Independently confirmed via `python3 hmac` that our
-# `credential` is bit-for-bit the HMAC-SHA1 coturn expects, and that `turnutils_uclient -u <same
-# username> -W <same secret>` (the tool's OWN REST-secret client mode, which recomputes the
-# identical password from the shared secret) succeeds immediately against the SAME coturn instance
-# for the SAME username. This strongly points at a turnutils_uclient `-w` client-mode quirk/bug
-# (e.g. a differing password-algorithm/realm-learning code path), not a defect in Meridian's
-# credential minting — but is flagged here rather than silently worked around, since NAT/coturn
-# wire-level correctness calls are exactly what devops was told to defer to connectivity-debugger
-# on. We therefore drive the reachability check with `-W` (using the rig's own coturn secret, which
-# this script already legitimately holds to write both turnserver.conf and rendezvous.toml — this
-# is ops rig tooling, not a Meridian client, so the "ephemeral creds in clients" invariant is
-# unaffected) while still asserting the real TurnGrant's `credential` field is correct.
+# DEVIATION #1 RESOLVED (was flagged for connectivity-debugger review; re-tested and closed): an
+# earlier iteration of this script reported `-u <user> -w <precomputed-password>` reliably failing
+# ("Cannot find credentials of user") against this same coturn 4.6.1 build, and worked around it by
+# driving the probe with `-W <secret>` (coturn's own REST-secret client mode) instead, while
+# independently verifying the TurnGrant's credential byte-for-byte. connectivity-debugger re-ran
+# `-u`/`-w` with freshly-minted real credentials directly against this rig (repeatedly, across all
+# four NAT flavors, after accumulated coturn state from a full matrix run) and it succeeded every
+# time — the originally reported failure did not reproduce. Root cause of the original report is
+# unconfirmed (most likely a stale coturn process from an earlier partial run still using an old
+# secret while a freshly-written `turn.secret` was used to compute the `-w` password — a state
+# mismatch, not an algorithm or tool bug), but since it does not reproduce, the probe now drives
+# authentication with the literal minted credential rather than the ops secret, which is a strictly
+# more faithful check (identical to what a real client presents) and removes the need for this
+# rig tooling to hand its own coturn secret to the test client at all.
 #
 # DEVIATION #2 (also flagged): turnutils_uclient's `-y` (client-to-client) mode — the obvious choice
 # for a peerless smoke check — empirically drives 4-5 concurrent ALLOCATEs under the hood before it
@@ -570,16 +570,16 @@ print(base64.b64encode(mac).decode())
 
   echo "[nat-matrix] driving turnutils_uclient ($mode) from ns-alice against coturn 203.0.113.30…"
   # -e/-r: a single real peer (turnutils_peer in ns-net) so this is one ALLOCATE, not `-y`'s 4-5
-  # (DEVIATION #2 above). -c: skip the extra RTCP-style companion allocation. -W: coturn's own
-  # REST-secret client mode (DEVIATION #1 above) — recomputes the identical password we just
-  # verified matches the real TurnGrant's credential, for the EXACT username minted by the real
-  # rendezvous flow. -t switches the client<->coturn transport to TCP for the udp-blocked cell's
-  # TCP-reachability check; UDP is the default transport otherwise. -n 2: a couple of relayed data
-  # messages is enough to prove the allocation actually relays traffic, not just that ALLOCATE
-  # returned success.
-  local uclient_args=(-e 203.0.113.1 -r "$TEST_PEER_PORT" -c -n 2 -u "$username" -W "$TURN_SECRET" 203.0.113.30)
+  # (DEVIATION #2 above). -c: skip the extra RTCP-style companion allocation. -u/-w: the literal
+  # minted (username, credential) pair from the real TurnReq/TurnGrant flow above (verified above to
+  # match coturn's own REST-secret HMAC) — exactly what a real client presents, no raw ops secret
+  # involved (see DEVIATION #1 RESOLVED above). -t switches the client<->coturn transport to TCP for
+  # the udp-blocked cell's TCP-reachability check; UDP is the default transport otherwise. -n 2: a
+  # couple of relayed data messages is enough to prove the allocation actually relays traffic, not
+  # just that ALLOCATE returned success.
+  local uclient_args=(-e 203.0.113.1 -r "$TEST_PEER_PORT" -c -n 2 -u "$username" -w "$credential" 203.0.113.30)
   if [[ "$mode" == "tcp" ]]; then
-    uclient_args=(-t -e 203.0.113.1 -r "$TEST_PEER_PORT" -c -n 2 -u "$username" -W "$TURN_SECRET" 203.0.113.30)
+    uclient_args=(-t -e 203.0.113.1 -r "$TEST_PEER_PORT" -c -n 2 -u "$username" -w "$credential" 203.0.113.30)
   fi
   # "Received relay addr" is logged only once coturn has actually granted a relay allocation —
   # the specific proof this probe needs. The data phase afterward (actual relayed messages) may or
@@ -609,21 +609,27 @@ assert_udp_turn_blocked() {
     exit 1
   fi
   echo "[nat-matrix] minting a TURN credential (for the negative UDP-blocked assertion)…"
-  local grant_out username
+  local grant_out username credential
   grant_out="$(ip netns exec ns-alice "$REPO_ROOT/$FETCH_TURN_BIN" ws://203.0.113.1:8443)"
   username="$(echo "$grant_out" | sed -n 's/^username=//p')"
-  if [[ -z "$username" ]]; then
-    echo "[nat-matrix] FAIL: did not get a username from fetch_turn_credentials" >&2
+  credential="$(echo "$grant_out" | sed -n 's/^credential=//p')"
+  if [[ -z "$username" || -z "$credential" ]]; then
+    echo "[nat-matrix] FAIL: did not get username/credential from fetch_turn_credentials" >&2
     exit 1
   fi
   local uclient_log
   uclient_log="$(rig_dir)/uclient-udp-blocked-negative.log"
-  # Same shape as turn_reachability_probe's UDP path, but over the now-udp-blocked NAT: this should
-  # NOT reach coturn at all (natA/natB drop the UDP egress before it ever leaves the LAN), so no
-  # "Received relay addr" should ever appear. A short timeout is enough — a working UDP path
-  # answers within milliseconds in this rig, so 6s is generous, not a race.
+  # Same shape as turn_reachability_probe's UDP path (same real minted username/credential, no raw
+  # secret), but over the now-udp-blocked NAT: this should NOT reach coturn at all (natA/natB drop
+  # the UDP egress before it ever leaves the LAN), so no "Received relay addr" should ever appear.
+  # NOTE on the 6s bound: unlike the positive probes (which return in well under a second — "Total
+  # connect time is 0" — once genuinely reachable), a *blocked* attempt never gets a response, so
+  # this always consumes the full 6s before `timeout` kills it — that cost is fixed, not "usually
+  # faster." 6s is still a safe bound (>>10x the observed positive-path latency in this rig, so no
+  # risk of mistaking a slow-but-working path for a blocked one) without being large enough to make
+  # the suite noticeably slower.
   timeout 6 ip netns exec ns-alice turnutils_uclient -v -e 203.0.113.1 -r "$TEST_PEER_PORT" -c -n 2 \
-    -u "$username" -W "$TURN_SECRET" 203.0.113.30 > "$uclient_log" 2>&1 || true
+    -u "$username" -w "$credential" 203.0.113.30 > "$uclient_log" 2>&1 || true
   if grep -q "Received relay addr" "$uclient_log"; then
     echo "[nat-matrix] FAIL: expected UDP TURN allocation to be BLOCKED by udp-blocked's iptables" >&2
     echo "             rule, but it succeeded anyway:" >&2
