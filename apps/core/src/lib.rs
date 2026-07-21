@@ -41,6 +41,10 @@ pub mod chat;
 /// (§4.6), the `mrd.ctrl/1` control channel, and keepalive/ICE-restart.
 pub mod session;
 
+/// A [`session::SignalRelay`] adapter over the real rendezvous [`signaling::SignalingClient`]
+/// (1.24) — the counterpart to [`session::MemRelay`] for cross-process P2P session establishment.
+pub mod signal_relay;
+
 /// The stream-type **registry** (T04): the extension point (`register_stream_type`) that lets
 /// file/call/location/tunnel stream types be added with zero core edits (§5.3, ADR contract).
 pub mod streams;
