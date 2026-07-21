@@ -10,10 +10,15 @@
 //!
 //! `--transport loopback` is rejected outright: there is no cross-process loopback mode.
 //!
-//! No real TURN relay exists yet (coturn orchestration is 1.25/1.27, not this task), so a
-//! configured relay policy other than `direct` for this peer is also rejected outright rather than
-//! silently connecting `direct` regardless — a silent downgrade would hand host/srflx candidates to
-//! the peer with no warning, defeating the whole point of `config set policy relay-only`.
+//! Real TURN is wired for real (task 1.25's coturn + `meridian-rendezvous` ephemeral-credential
+//! minting): before dialing, this always asks the still-open signaling connection for a fresh
+//! [`meridian_core::proto::TurnGrant`] via `request_turn_credentials`. A successful grant feeds a
+//! real `IceServer` into the ICE config under the peer's *resolved* policy
+//! (`direct`/`prefer-relay`/`relay-only` all actually work now); a `turn_unavailable` mint failure
+//! only degrades to a host/srflx-only attempt under `direct` — `prefer-relay`/`relay-only` still
+//! fail closed rather than silently connecting without relay, which would hand host/srflx
+//! candidates to the peer despite the user having asked for those to stay hidden (defeating the
+//! whole point of `config set policy relay-only`).
 
 use meridian_core::identity::{KeyHandle, SecretStore};
 
@@ -65,12 +70,13 @@ async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
 
     use meridian_core::chat::ChatState;
     use meridian_core::envelope::ChatContent;
+    use meridian_core::proto::error_codes;
     use meridian_core::relay;
     use meridian_core::session::{answer_with_config, dial_with_config, SessionEvent};
     use meridian_core::signal_relay::RendezvousRelay;
-    use meridian_core::signaling::{SignalingClient, DEFAULT_OTK_COUNT};
+    use meridian_core::signaling::{SignalError, SignalingClient, DEFAULT_OTK_COUNT};
     use meridian_core::streams::StreamRegistry;
-    use meridian_core::transport::{IcePolicy, WebRtcTransport};
+    use meridian_core::transport::{IcePolicy, IceServer, WebRtcTransport};
 
     let ConnectArgs {
         server,
@@ -83,26 +89,49 @@ async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
         json,
     } = args;
 
-    // `session connect` has no real TURN relay to offer yet (coturn orchestration is 1.25/1.27,
-    // not this task) — resolve the configured policy for this peer and fail closed rather than
-    // silently connecting `direct` regardless of what the user configured (e.g. `relay-only` for
-    // this contact): a silent downgrade would expose host/srflx candidates to the peer with no
-    // warning, exactly the IP-hiding guarantee `config set policy relay-only` exists to give.
+    // Resolve the configured relay policy for this peer up front — it decides both what a TURN
+    // mint failure means below and what policy the ICE config ultimately gathers under.
     let resolved_policy = crate::policy::load()?.resolve(&peer_ik);
-    if resolved_policy != IcePolicy::Direct {
-        return Err(format!(
-            "session connect only supports the direct policy today (no real TURN relay yet — \
-             coturn integration lands in 1.25/1.27); the configured policy for {peer_label} is \
-             {}, so refusing to silently connect direct instead",
-            meridian_core::relay::policy_str(resolved_policy)
-        ));
-    }
 
     let mut chat = ChatState::default();
 
     let mut client = SignalingClient::connect(&server, store, handle, account_pub, None, 1)
         .await
         .map_err(|e| format!("connecting to {server}: {e}"))?;
+
+    // Always attempt to mint a real ephemeral TURN credential while the signaling connection is
+    // still open (T05, §5.4) — this is the real bug fix over 1.24: that version hardcoded an empty
+    // `ice_servers` list regardless of policy, so any cell that genuinely needs relay (symmetric
+    // NAT, UDP-blocked egress) could never connect even under the default `direct` policy, which
+    // gathers host+srflx+relay and prefers whichever is fastest.
+    let ice_servers: Vec<IceServer> = match client.request_turn_credentials().await {
+        Ok(grant) => vec![IceServer {
+            urls: grant.urls,
+            username: Some(grant.username),
+            credential: Some(grant.credential),
+        }],
+        // No relay is configured on this org's rendezvous (dev/air-gapped). `direct` degrades to a
+        // host/srflx-only attempt, same as before any relay existed. `prefer-relay`/`relay-only`
+        // still fail closed — the whole point of those policies is relay availability, so silently
+        // proceeding without one would expose host/srflx candidates the user explicitly asked to
+        // keep hidden.
+        Err(SignalError::Server(e)) if e.code == error_codes::TURN_UNAVAILABLE => {
+            if resolved_policy != IcePolicy::Direct {
+                return Err(format!(
+                    "no TURN relay is configured on {server} (turn_unavailable), but the \
+                     configured policy for {peer_label} is {} — refusing to silently connect \
+                     without relay, which would expose host/srflx candidates to the peer",
+                    meridian_core::relay::policy_str(resolved_policy)
+                ));
+            }
+            Vec::new()
+        }
+        // Any other failure while requesting TURN credentials (auth, transport, codec, …) is
+        // unexpected — fail loud rather than silently proceeding without relay under any policy.
+        Err(e) => {
+            return Err(format!("requesting TURN credentials from {server}: {e}"));
+        }
+    };
 
     // Publish a fresh bundle so the peer can reach us (needed regardless of role: the initiator
     // fetches it to X3DH against; the responder needs its own spk/otk secrets in the vault so the
@@ -139,8 +168,10 @@ async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
 
     let transport = Arc::new(WebRtcTransport::new());
     let registry = Arc::new(StreamRegistry::with_builtins());
-    // Localhost, direct policy: real ICE/STUN discovers the host pair without any TURN relay.
-    let cfg = relay::ice_config(IcePolicy::Direct, Vec::new(), Vec::new());
+    // The resolved policy plus whatever TURN servers were minted above — `dial_with_config`/
+    // `answer_with_config`/`WebRtcTransport` already handle gathering and relay fallback for
+    // whichever candidate classes this allows (T05's ladder), nothing else changes here.
+    let cfg = relay::ice_config(resolved_policy, ice_servers, Vec::new());
 
     let mut session = {
         let mut adapter = RendezvousRelay::new(&mut client);
