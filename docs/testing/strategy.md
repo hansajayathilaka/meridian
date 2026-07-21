@@ -15,7 +15,10 @@ A proxy/harness (T03, extended by T04/T06/T07) captures every byte each server c
 - `meridian-mitm-sim` (T08): malicious rendezvous substitutes keys/bundles against `tofu` and `verified` states → matrix must show 0 silent successes.
 - Ghost-device harness (T13): forged record (bad sig → reject) and key-theft variant (→ blocking alert on verified contacts).
 - FS/PCS harness (T03): snapshot ratchet at N, prove <N undecryptable; simulate state theft, prove self-heal within one round-trip.
-- Fingerprint-mismatch (T04): forced DTLS fp mismatch tears down 100%.
+- Fingerprint-mismatch (T04): forced DTLS fp mismatch tears down 100% (`LoopbackTransport::new_mitm`,
+  backend-agnostic session-layer check). Real-backend counterpart (1.15): a peer whose SDP-declared
+  fingerprint doesn't match its actual DTLS certificate can never complete the handshake at all —
+  `apps/transport/tests/webrtc_backend.rs::tampered_remote_fingerprint_never_connects`.
 
 ## 4. Network realism (NAT matrix)
 netns-based rig (T04/T05) — no cloud dependency — covering full-cone / port-restricted / symmetric×symmetric / UDP-blocked, plus loss+latency profiles (1% / 80 ms) for the file (T09) and call (T10) soak tests. Mid-session failover (direct→relay, Wi-Fi→LTE) is a scripted case, not a manual check.

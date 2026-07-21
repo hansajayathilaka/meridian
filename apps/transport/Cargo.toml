@@ -14,13 +14,18 @@ publish = false
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 thiserror = { workspace = true }
+# webrtc-rs itself + the `Bytes` type its data-channel API speaks. Both optional, pulled in only by
+# the `webrtc` feature below.
+webrtc = { version = "0.17", optional = true }
+bytes = { version = "1", optional = true }
 
 [features]
 default = []
-# The production data-plane backend (webrtc-rs). Off by default: it is a heavy dependency tree and
-# needs real UDP/ICE, so it is exercised by the netns rig and desktop/CLI builds, not unit CI.
+# The production data-plane backend (webrtc-rs): real ICE/SCTP/DTLS data channels behind
+# `WebRtcTransport`. Off by default: it is a heavy dependency tree and needs real UDP/ICE, so it is
+# exercised explicitly (`--features webrtc`) by the netns rig and desktop/CLI builds, not unit CI.
 # See docs/adr/0014-media-stack.md and the `/spike libwebrtc-packaging` note.
-webrtc = []
+webrtc = ["dep:webrtc", "dep:bytes"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

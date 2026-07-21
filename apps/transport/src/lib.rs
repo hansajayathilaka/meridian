@@ -33,6 +33,11 @@ pub use types::{
 mod loopback;
 pub use loopback::{LoopbackFabric, LoopbackTransport};
 
+#[cfg(feature = "webrtc")]
+mod webrtc_backend;
+#[cfg(feature = "webrtc")]
+pub use webrtc_backend::WebRtcTransport;
+
 /// Errors surfaced by a [`Transport`]. The substrate maps these onto session teardown; none of them
 /// ever weaken the fingerprint check or fall back to an unencrypted path (webrtc-nat-traversal
 /// invariant).
