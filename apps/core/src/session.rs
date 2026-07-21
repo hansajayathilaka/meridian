@@ -668,6 +668,7 @@ async fn dial_established<T: Transport>(
     relay: &mut dyn SignalRelay,
     registry: Arc<StreamRegistry>,
 ) -> Result<P2pSession<T>, SessionError> {
+    eprintln!("[DIAG dial] adding data channels");
     let ctrl_ch = transport
         .add_data_channel(&conn, ChannelCfg::reliable_ordered(CTRL_LABEL))
         .await?;
@@ -675,6 +676,7 @@ async fn dial_established<T: Transport>(
         .add_data_channel(&conn, ChannelCfg::reliable_ordered(CHAT_LABEL))
         .await?;
 
+    eprintln!("[DIAG dial] local_description");
     // Seal SDP offer + our fingerprint + candidates inside a signed, ratchet-encrypted envelope.
     let offer = transport.local_description(&conn)?;
     let local_fp = transport.local_fingerprint(&conn)?;
@@ -689,11 +691,14 @@ async fn dial_established<T: Transport>(
         ice,
     };
     let blob = chat.seal_bytes(store, handle, &our_ik, &peer_ik, &offer_content.encode()?)?;
+    eprintln!("[DIAG dial] sending offer via relay.send");
     relay.send(&peer_ik, blob).await?;
+    eprintln!("[DIAG dial] offer sent, awaiting answer");
 
     // Await the answer.
     let (answer_sdp, asserted_fp, answer_ice) =
         recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, false).await?;
+    eprintln!("[DIAG dial] got answer, set_remote_description");
     transport
         .set_remote_description(&conn, Sdp(answer_sdp))
         .await?;
@@ -701,7 +706,9 @@ async fn dial_established<T: Transport>(
         transport.add_ice_candidate(&conn, IceCandidate(c)).await?;
     }
 
+    eprintln!("[DIAG dial] verify_fingerprint");
     let remote_fp = verify_fingerprint(transport, &conn, &asserted_fp).await?;
+    eprintln!("[DIAG dial] fingerprint ok, awaiting selected_path");
 
     // Wait (bounded by the transport's own connect timeout) for a real path before the ctrl
     // handshake below, which blocks on an unbounded `recv()`. A real backend's connection can
@@ -709,6 +716,7 @@ async fn dial_established<T: Transport>(
     // this, that failure mode hangs `dial`/`answer` forever instead of erroring out cleanly. A
     // no-op for `LoopbackTransport`, which never blocks here.
     transport.selected_path(&conn).await?;
+    eprintln!("[DIAG dial] selected_path ok, starting handshake");
 
     let mut session = P2pSession {
         transport: transport.clone(),
@@ -730,7 +738,9 @@ async fn dial_established<T: Transport>(
         policy,
         offered,
     };
+    eprintln!("[DIAG dial] handshake starting");
     session.handshake(store, handle, chat).await?;
+    eprintln!("[DIAG dial] handshake complete");
     Ok(session)
 }
 
@@ -777,8 +787,10 @@ pub async fn answer_with_config<T: Transport>(
     cfg: IceConfig,
 ) -> Result<P2pSession<T>, SessionError> {
     let policy = cfg.policy;
+    eprintln!("[DIAG answer] awaiting offer");
     let (offer_sdp, asserted_fp, offer_ice) =
         recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, true).await?;
+    eprintln!("[DIAG answer] got offer");
 
     let conn = transport.new_session(cfg).await?;
     // See `dial_with_config`'s comment: close the session on any failure below rather than
@@ -821,15 +833,18 @@ async fn answer_established<T: Transport>(
     relay: &mut dyn SignalRelay,
     registry: Arc<StreamRegistry>,
 ) -> Result<P2pSession<T>, SessionError> {
+    eprintln!("[DIAG answer] adding data channels");
     let ctrl_ch = transport
         .add_data_channel(&conn, ChannelCfg::reliable_ordered(CTRL_LABEL))
         .await?;
     let chat_ch = transport
         .add_data_channel(&conn, ChannelCfg::reliable_ordered(CHAT_LABEL))
         .await?;
+    eprintln!("[DIAG answer] set_remote_description(offer)");
     transport
         .set_remote_description(&conn, Sdp(offer_sdp))
         .await?;
+    eprintln!("[DIAG answer] set_remote_description done");
     for c in offer_ice {
         transport.add_ice_candidate(&conn, IceCandidate(c)).await?;
     }
@@ -846,13 +861,17 @@ async fn answer_established<T: Transport>(
         ice,
     };
     let blob = chat.seal_bytes(store, handle, &our_ik, &peer_ik, &answer_content.encode()?)?;
+    eprintln!("[DIAG answer] sending answer via relay.send");
     relay.send(&peer_ik, blob).await?;
+    eprintln!("[DIAG answer] answer sent");
 
     let remote_fp = verify_fingerprint(transport, &conn, &asserted_fp).await?;
+    eprintln!("[DIAG answer] fingerprint ok, awaiting selected_path");
 
     // See `dial_established`'s comment: fail fast (bounded) rather than hang forever on the
     // unbounded `recv()` inside the handshake below if the real connection never converges.
     transport.selected_path(&conn).await?;
+    eprintln!("[DIAG answer] selected_path ok, starting handshake");
 
     let mut session = P2pSession {
         transport: transport.clone(),
@@ -874,7 +893,9 @@ async fn answer_established<T: Transport>(
         policy,
         offered,
     };
+    eprintln!("[DIAG answer] handshake starting");
     session.handshake(store, handle, chat).await?;
+    eprintln!("[DIAG answer] handshake complete");
     Ok(session)
 }
 
@@ -913,9 +934,11 @@ impl<T: Transport> P2pSession<T> {
 
         let mut got_hello = false;
         while !(got_hello && self.open_streams.contains(&CHAT_SID)) {
+            eprintln!("[DIAG handshake] awaiting transport.recv()");
             let Some((cid, blob)) = self.transport.recv(&self.conn).await? else {
                 return Err(SessionError::SignalingEnded);
             };
+            eprintln!("[DIAG handshake] got a frame from transport.recv()");
             // During the handshake, only ctrl frames are expected; a stray chat frame would arrive
             // before its stream is open, so treat everything as ctrl here.
             let _ = cid;
@@ -998,8 +1021,14 @@ async fn recv_sdp(
     want_offer: bool,
 ) -> Result<(Vec<u8>, String, Vec<String>), SessionError> {
     loop {
+        eprintln!("[DIAG recv_sdp] waiting on relay.recv()");
         let (from, blob) = relay.recv().await?;
+        eprintln!(
+            "[DIAG recv_sdp] got a blob from someone, len={}",
+            blob.len()
+        );
         if &from != peer_ik {
+            eprintln!("[DIAG recv_sdp] not our peer; ignoring");
             continue; // not our peer; ignore
         }
         let plaintext = chat.open_bytes(store, handle, our_ik, peer_ik, &blob)?;
