@@ -87,8 +87,9 @@
 //! feature-04's acceptance criterion — if the local address genuinely changes (Wi-Fi→LTE), nothing
 //! here gathers or exchanges the new candidates the peer would need to find the new path, so
 //! connectivity will *not* actually resume. Closing that gap needs a ctrl-channel renegotiation
-//! message (ADR 0006/0014-relevant; flagged for architect review, tracked as a successor to
-//! 1.15/1.16 — network-roaming support should not ship claiming this works until it lands).
+//! message (ADR 0006/0014-relevant; flagged for architect review — 1.16/1.22/1.23 do not touch
+//! this gap, so it remains a not-yet-numbered successor to 1.15; network-roaming support should
+//! not ship claiming this works until it lands).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -611,8 +612,11 @@ impl Transport for WebRtcTransport {
             // candidate today (webrtc-ice's `agent_stats.rs`, not derived from the real TURN
             // allocation's transport) — there is no live udp/tcp/tls-443 signal to read here yet.
             // Reporting `Udp` unconditionally matches upstream's own (limited) truth rather than
-            // inventing a distinction webrtc-rs doesn't expose; real relay-transport classification
-            // for the production backend is 1.16's "observed-candidate relay-only classification".
+            // inventing a distinction webrtc-rs doesn't expose. NOTE: this is the relay *transport
+            // rung* (udp/tcp/tls-443), a different gap from candidate *class* (host/srflx/relay) —
+            // 1.16 closed the latter (`meridian_core::relay::observed_classes`/
+            // `enforce_relay_only`); this rung-classification gap is still open and has no assigned
+            // task yet, though 1.23's real packet captures are the most likely place it gets solved.
             let (relay_server, relay_transport) = if class == Path::Relay {
                 (Some(local.ip.clone()), Some(RelayTransport::Udp))
             } else {
