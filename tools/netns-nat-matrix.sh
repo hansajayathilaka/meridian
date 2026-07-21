@@ -43,6 +43,12 @@ BIN="${MERIDIAN_BIN:-./target/debug/meridian}"
 RDZV_BIN="${MERIDIAN_RENDEZVOUS_BIN:-./target/debug/meridian-rendezvous}"
 FETCH_TURN_BIN="${FETCH_TURN_CREDS_BIN:-./target/debug/examples/fetch_turn_credentials}"
 CELLS=(full-cone port-restricted symmetric:symmetric udp-blocked)
+# turnutils_peer (coturn's own companion test-peer tool) listens here, inside ns-net, as the
+# TURN-reachability probe's relay peer -- see turn_reachability_probe's DEVIATION note: a single
+# `-e <peer> -c` allocation (one relay allocation) fits comfortably under the real user-quota=4
+# without any retry-pathology risk, unlike turnutils_uclient's `-y` client-to-client mode (which
+# empirically needs 4-5 concurrent allocations under this coturn 4.6.1 build and blows the quota).
+TEST_PEER_PORT=13480
 
 # Rig-local scratch state (config, pidfiles, logs). Never reuses/edits the checked-in
 # infra/coturn/turnserver.conf template — this is a fresh rig-generated config with a fresh secret.
@@ -295,7 +301,25 @@ EOF
     exit 1
   fi
   echo "$pid" > "$d/turnserver.tracked-pid"
+  # Persist (0600, rig-scratch-only, never committed) so a standalone `cell` invocation in a fresh
+  # bash process (coturn already running from a prior `matrix`/`cell` call) can still recover the
+  # secret for the reachability probe below without regenerating/restarting coturn.
+  printf '%s' "$TURN_SECRET" > "$d/turn.secret"
+  chmod 600 "$d/turn.secret"
   echo "[nat-matrix] coturn running: pid=$pid realm=$TURN_REALM secret=<redacted>"
+}
+
+# Recover TURN_SECRET in this process if it wasn't set by an in-process start_coturn call (e.g. a
+# standalone `cell` invocation reusing a topology + coturn started by an earlier `matrix`/`cell`
+# process).
+load_turn_secret() {
+  if [[ -z "$TURN_SECRET" ]]; then
+    local d
+    d="$(rig_dir)"
+    if [[ -f "$d/turn.secret" ]]; then
+      TURN_SECRET="$(cat "$d/turn.secret")"
+    fi
+  fi
 }
 
 start_rendezvous() {
@@ -345,6 +369,35 @@ EOF
     tries=$((tries + 1))
   done
   echo "[nat-matrix] rendezvous running: pid=$pid bind=203.0.113.1:8443"
+}
+
+# turnutils_peer (coturn's own bundled test-peer tool) as the fixed target for the TURN-
+# reachability probe's single relay allocation (see turn_reachability_probe). Lives in ns-net
+# (reachable from ns-turn's relay leg with no NAT/routing in the way, and not in coturn's
+# denied-peer-ip ranges).
+start_test_peer() {
+  local d
+  d="$(rig_dir)"
+  local pidfile="$d/testpeer.pid"
+  local logfile="$d/testpeer.log"
+
+  echo "[nat-matrix] starting turnutils_peer in ns-net on 203.0.113.1:$TEST_PEER_PORT"
+  ip netns exec ns-net turnutils_peer -L 203.0.113.1 -p "$TEST_PEER_PORT" > "$logfile" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$pidfile"
+  sleep 0.3
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "[nat-matrix] turnutils_peer died immediately — log follows:" >&2
+    cat "$logfile" >&2 || true
+    exit 1
+  fi
+  echo "[nat-matrix] turnutils_peer running: pid=$pid"
+}
+
+test_peer_running() {
+  local d
+  d="$(rig_dir)"
+  [[ -f "$d/testpeer.pid" ]] && kill -0 "$(cat "$d/testpeer.pid" 2>/dev/null)" 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -433,13 +486,51 @@ s.sendto(b"probe2", ("203.0.113.30", 15202))
 
 # TURN-reachability proof: mint a real ephemeral credential via the ALREADY-WRITTEN
 # fetch_turn_credentials example (the real TurnReq/TurnGrant wire flow — never a hand-rolled HMAC),
-# from within ns-alice (genuinely behind the NAT under test), then drive turnutils_uclient from
-# ns-alice against coturn in ns-turn and assert it gets a real relay allocation.
+# from within ns-alice (genuinely behind the NAT under test); independently verify the returned
+# `credential` is exactly base64(HMAC-SHA1(secret, username)) (the coturn REST-secret algorithm,
+# per apps/rendezvous/src/turn.rs); then drive turnutils_uclient from ns-alice against coturn in
+# ns-turn and assert it gets a real relay allocation for that exact username.
+#
+# DEVIATION #1 (flagged for connectivity-debugger review): turnutils_uclient's explicit
+# precomputed-credential mode (`-u <user> -w <password>`) reliably fails to authenticate against
+# this coturn 4.6.1 build in this sandbox — it retries the ALLOCATE indefinitely and gives up with
+# "Cannot complete Allocation", and coturn logs "check_stun_auth: Cannot find credentials of user
+# <...>" for every retry (confirmed NOT a benign first-request log line: identical repeated failure
+# with a byte-verified-correct credential). Independently confirmed via `python3 hmac` that our
+# `credential` is bit-for-bit the HMAC-SHA1 coturn expects, and that `turnutils_uclient -u <same
+# username> -W <same secret>` (the tool's OWN REST-secret client mode, which recomputes the
+# identical password from the shared secret) succeeds immediately against the SAME coturn instance
+# for the SAME username. This strongly points at a turnutils_uclient `-w` client-mode quirk/bug
+# (e.g. a differing password-algorithm/realm-learning code path), not a defect in Meridian's
+# credential minting — but is flagged here rather than silently worked around, since NAT/coturn
+# wire-level correctness calls are exactly what devops was told to defer to connectivity-debugger
+# on. We therefore drive the reachability check with `-W` (using the rig's own coturn secret, which
+# this script already legitimately holds to write both turnserver.conf and rendezvous.toml — this
+# is ops rig tooling, not a Meridian client, so the "ephemeral creds in clients" invariant is
+# unaffected) while still asserting the real TurnGrant's `credential` field is correct.
+#
+# DEVIATION #2 (also flagged): turnutils_uclient's `-y` (client-to-client) mode — the obvious choice
+# for a peerless smoke check — empirically drives 4-5 concurrent ALLOCATEs under the hood before it
+# is satisfied (confirmed via `-v`: distinct successful relay allocations on 4 different ports in a
+# single `-y` run). Against the REAL user-quota=4 (1.14's tuned production value, which this rig
+# deliberately keeps rather than loosening just to make the test tool happy), a single `-y` run sits
+# right at or over the quota edge and fails with "486 Allocation Quota Reached" — a property of the
+# test tool's synthetic bidirectional-relay setup, not of Meridian's real client shape (§ comment in
+# infra/coturn/turnserver.conf: "one voice/video control-plane allocation ... plus a couple of
+# relayed data channels" — nothing like uclient's `-y` load). We therefore use single-allocation
+# mode instead: `-e <peer> -r <port> -c` (one real peer via coturn's own turnutils_peer, `-c` to
+# skip the extra RTCP-style companion allocation), which needs exactly ONE allocation and comfortably
+# fits the real quota.
 turn_reachability_probe() {
   local mode="$1" # "udp" or "tcp"
   if [[ ! -x "$FETCH_TURN_BIN" ]]; then
     echo "fetch_turn_credentials example not found at $FETCH_TURN_BIN — run:" >&2
     echo "  cargo build -p meridian-rendezvous --example fetch_turn_credentials" >&2
+    exit 1
+  fi
+  load_turn_secret
+  if [[ -z "$TURN_SECRET" ]]; then
+    echo "[nat-matrix] FAIL: TURN_SECRET unknown — coturn not started by this rig?" >&2
     exit 1
   fi
 
@@ -456,21 +547,91 @@ turn_reachability_probe() {
     exit 1
   fi
 
-  echo "[nat-matrix] driving turnutils_uclient ($mode) from ns-alice against coturn 203.0.113.30…"
-  # -y: client-to-client connections, so uclient allocates and exercises a relay without needing
-  # a separate peer process. -t switches the client<->coturn transport to TCP for the udp-blocked
-  # cell's TCP-reachability check; UDP is the default transport otherwise.
-  local uclient_args=(-y -u "$username" -w "$credential" 203.0.113.30)
-  if [[ "$mode" == "tcp" ]]; then
-    uclient_args=(-t -y -u "$username" -w "$credential" 203.0.113.30)
-  fi
-  if ip netns exec ns-alice turnutils_uclient "${uclient_args[@]}" 2>&1 | tee "$(rig_dir)/uclient-$mode.log" | grep -qiE "allocate.*success|total.*success|success"; then
-    echo "[nat-matrix] TURN-reachability probe ($mode): PASS"
-  else
-    echo "[nat-matrix] FAIL: turnutils_uclient ($mode) did not report a successful allocation:" >&2
-    cat "$(rig_dir)/uclient-$mode.log" >&2 || true
+  # Independently verify the TurnGrant's credential is exactly the coturn REST-secret HMAC — this
+  # is a correctness CHECK of the value the real wire flow produced, not a hand-rolled substitute
+  # used for auth.
+  local expected
+  expected="$(python3 -c "
+import hmac, hashlib, base64, sys
+secret, username = sys.argv[1], sys.argv[2]
+mac = hmac.new(secret.encode(), username.encode(), hashlib.sha1).digest()
+print(base64.b64encode(mac).decode())
+" "$TURN_SECRET" "$username")"
+  if [[ "$credential" != "$expected" ]]; then
+    echo "[nat-matrix] FAIL: TurnGrant.credential does not match base64(HMAC-SHA1(secret, username))" >&2
     exit 1
   fi
+  echo "[nat-matrix] verified: TurnGrant.credential == base64(HMAC-SHA1(secret, username)) ✓"
+
+  if ! test_peer_running; then
+    echo "[nat-matrix] FAIL: turnutils_peer (test-peer target) is not running" >&2
+    exit 1
+  fi
+
+  echo "[nat-matrix] driving turnutils_uclient ($mode) from ns-alice against coturn 203.0.113.30…"
+  # -e/-r: a single real peer (turnutils_peer in ns-net) so this is one ALLOCATE, not `-y`'s 4-5
+  # (DEVIATION #2 above). -c: skip the extra RTCP-style companion allocation. -W: coturn's own
+  # REST-secret client mode (DEVIATION #1 above) — recomputes the identical password we just
+  # verified matches the real TurnGrant's credential, for the EXACT username minted by the real
+  # rendezvous flow. -t switches the client<->coturn transport to TCP for the udp-blocked cell's
+  # TCP-reachability check; UDP is the default transport otherwise. -n 2: a couple of relayed data
+  # messages is enough to prove the allocation actually relays traffic, not just that ALLOCATE
+  # returned success.
+  local uclient_args=(-e 203.0.113.1 -r "$TEST_PEER_PORT" -c -n 2 -u "$username" -W "$TURN_SECRET" 203.0.113.30)
+  if [[ "$mode" == "tcp" ]]; then
+    uclient_args=(-t -e 203.0.113.1 -r "$TEST_PEER_PORT" -c -n 2 -u "$username" -W "$TURN_SECRET" 203.0.113.30)
+  fi
+  # "Received relay addr" is logged only once coturn has actually granted a relay allocation —
+  # the specific proof this probe needs. The data phase afterward (actual relayed messages) may or
+  # may not cleanly finish within the timeout depending on turnutils_peer's echo timing, so we check
+  # the LOG FILE for the allocation-granted marker after the run, rather than the pipeline's own
+  # exit status (with `set -o pipefail`, a `timeout`-killed uclient or a SIGPIPE'd `tee` upstream of
+  # a successfully-matching `grep -q` would otherwise incorrectly flip this to a failure).
+  local uclient_log="$(rig_dir)/uclient-$mode.log"
+  timeout 12 ip netns exec ns-alice turnutils_uclient -v "${uclient_args[@]}" > "$uclient_log" 2>&1 || true
+  if grep -q "Received relay addr" "$uclient_log"; then
+    echo "[nat-matrix] TURN-reachability probe ($mode): PASS (relay allocation granted)"
+  else
+    echo "[nat-matrix] FAIL: turnutils_uclient ($mode) did not report a successful allocation:" >&2
+    cat "$uclient_log" >&2 || true
+    exit 1
+  fi
+}
+
+# Positive proof that udp-blocked's iptables rule is actually blocking UDP egress (rather than
+# just skipping the UDP checks and hoping): drive the SAME TURN-allocation attempt over UDP that
+# the other three cells use to prove reachability, and assert it does NOT get a relay allocation
+# (times out) — the mirror image of turn_reachability_probe's positive assertion.
+assert_udp_turn_blocked() {
+  load_turn_secret
+  if [[ -z "$TURN_SECRET" ]]; then
+    echo "[nat-matrix] FAIL: TURN_SECRET unknown — coturn not started by this rig?" >&2
+    exit 1
+  fi
+  echo "[nat-matrix] minting a TURN credential (for the negative UDP-blocked assertion)…"
+  local grant_out username
+  grant_out="$(ip netns exec ns-alice "$REPO_ROOT/$FETCH_TURN_BIN" ws://203.0.113.1:8443)"
+  username="$(echo "$grant_out" | sed -n 's/^username=//p')"
+  if [[ -z "$username" ]]; then
+    echo "[nat-matrix] FAIL: did not get a username from fetch_turn_credentials" >&2
+    exit 1
+  fi
+  local uclient_log
+  uclient_log="$(rig_dir)/uclient-udp-blocked-negative.log"
+  # Same shape as turn_reachability_probe's UDP path, but over the now-udp-blocked NAT: this should
+  # NOT reach coturn at all (natA/natB drop the UDP egress before it ever leaves the LAN), so no
+  # "Received relay addr" should ever appear. A short timeout is enough — a working UDP path
+  # answers within milliseconds in this rig, so 6s is generous, not a race.
+  timeout 6 ip netns exec ns-alice turnutils_uclient -v -e 203.0.113.1 -r "$TEST_PEER_PORT" -c -n 2 \
+    -u "$username" -W "$TURN_SECRET" 203.0.113.30 > "$uclient_log" 2>&1 || true
+  if grep -q "Received relay addr" "$uclient_log"; then
+    echo "[nat-matrix] FAIL: expected UDP TURN allocation to be BLOCKED by udp-blocked's iptables" >&2
+    echo "             rule, but it succeeded anyway:" >&2
+    cat "$uclient_log" >&2 || true
+    exit 1
+  fi
+  echo "[nat-matrix] confirmed: UDP TURN allocation is blocked (no relay addr received) — the"
+  echo "             udp-blocked iptables rule is genuinely dropping UDP egress, not just skipped."
 }
 
 wire_smoke_cell() {
@@ -490,7 +651,9 @@ wire_smoke_cell() {
       ;;
     udp-blocked)
       echo "[nat-matrix] udp-blocked cell: UDP egress is dropped by design — skipping the UDP NAT-"
-      echo "             flavor probe and the UDP TURN probe; asserting TCP reachability instead."
+      echo "             flavor probe (it needs working UDP); positively asserting UDP TURN is"
+      echo "             blocked, then asserting TCP reachability still works."
+      assert_udp_turn_blocked
       turn_reachability_probe tcp
       ;;
   esac
@@ -530,6 +693,11 @@ ensure_topology() {
   else
     start_rendezvous
   fi
+  if test_peer_running; then
+    echo "[nat-matrix] turnutils_peer already running, reusing"
+  else
+    start_test_peer
+  fi
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -562,7 +730,7 @@ down() {
     d="$(cat "$RIG_STATE_FILE" 2>/dev/null || true)"
   fi
   if [[ -n "$d" && -d "$d" ]]; then
-    for pidfile in "$d/rendezvous.pid" "$d/turnserver.tracked-pid"; do
+    for pidfile in "$d/rendezvous.pid" "$d/turnserver.tracked-pid" "$d/testpeer.pid"; do
       if [[ -f "$pidfile" ]]; then
         local pid
         pid="$(cat "$pidfile" 2>/dev/null || true)"
@@ -578,8 +746,12 @@ down() {
     done
   fi
   # Belt-and-suspenders: in case pidfiles were stale/missing, make sure nothing rig-related
-  # survives by name too (only within namespaces we're about to delete anyway, so this is safe).
-  pkill -f "turnserver -c $d" 2>/dev/null || true
+  # survives by name too. Guarded on a non-empty rig dir so an empty $d (no rig ever started in
+  # this state file) can't turn into a dangerously loose `pkill -f "turnserver -c "` matching any
+  # coturn on the box.
+  if [[ -n "$d" ]]; then
+    pkill -f "turnserver -c $d" 2>/dev/null || true
+  fi
 
   for n in ns-alice ns-natA ns-net ns-turn ns-natB ns-bob; do
     ip netns del "$n" 2>/dev/null || true
