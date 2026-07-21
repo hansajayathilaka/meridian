@@ -23,6 +23,7 @@ mod doctor;
 mod opacity;
 mod policy;
 mod session;
+mod session_connect;
 use account::{AccountDescriptor, StoreKind};
 
 const OS_KEYSTORE_SERVICE: &str = "meridian";
@@ -116,7 +117,41 @@ enum SessionCommand {
         /// `symmetric` (=symmetric:symmetric), or `udp-blocked`.
         #[arg(long, default_value = "full-cone")]
         nat: String,
+        /// Data-path backend: `loopback` (default, deterministic in-process simulation) or `webrtc`
+        /// (real ICE/SCTP/DTLS on localhost, requires building with `--features webrtc`).
+        #[arg(long, value_enum, default_value_t = TransportArg::Loopback)]
+        transport: TransportArg,
     },
+    /// Establish a real P2P session with a peer over the real rendezvous (1.24) — the
+    /// cross-process counterpart to `session demo`'s single-process simulation. Publishes a
+    /// bundle, decides initiator/responder by key order, dials/answers over `--transport`, drops
+    /// the signaling connection once connected, exchanges one chat message each way, and prints
+    /// `session info`.
+    Connect {
+        /// The peer's full `mrd1:…@domain` ID.
+        id: String,
+        /// Rendezvous WebSocket URL.
+        #[arg(long, default_value = "ws://127.0.0.1:8443")]
+        server: String,
+        /// Data-path backend. `loopback` is rejected (no cross-process loopback mode) — pass
+        /// `webrtc` (requires building with `--features webrtc`).
+        #[arg(long, value_enum, default_value_t = TransportArg::Webrtc)]
+        transport: TransportArg,
+        /// Headless: emit one JSON status object instead of the human-readable transcript.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Which `Transport` backend `session demo` builds. See `session.rs` module docs for why `webrtc`
+/// rejects non-default `--nat`/`--policy` (there is no NAT simulation, and the demo's fabricated TURN
+/// servers only mean anything to `LoopbackTransport`'s simulation).
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+pub(crate) enum TransportArg {
+    /// Deterministic in-process simulation (default).
+    Loopback,
+    /// Real ICE/SCTP/DTLS backend (`meridian-transport`'s `WebRtcTransport`, feature-gated).
+    Webrtc,
 }
 
 #[derive(Subcommand)]
@@ -449,7 +484,12 @@ fn cmd_chat(id: &str, server: &str, json: bool) -> Result<ExitCode, String> {
 
 fn run_session(cmd: SessionCommand) -> Result<ExitCode, String> {
     match cmd {
-        SessionCommand::Demo { json, policy, nat } => {
+        SessionCommand::Demo {
+            json,
+            policy,
+            nat,
+            transport,
+        } => {
             let policy = meridian_core::relay::policy_from_str(&policy).ok_or_else(|| {
                 format!("unknown policy '{policy}' (expected direct | prefer-relay | relay-only)")
             })?;
@@ -462,6 +502,32 @@ fn run_session(cmd: SessionCommand) -> Result<ExitCode, String> {
                 json,
                 policy,
                 scenario,
+                transport,
+            }))?;
+            Ok(ExitCode::SUCCESS)
+        }
+        SessionCommand::Connect {
+            id,
+            server,
+            transport,
+            json,
+        } => {
+            let descriptor = AccountDescriptor::load()?;
+            let account_pub = account_pub_bytes(&descriptor)?;
+            let peer = parse_id(&id).map_err(|e| e.to_string())?;
+            let peer_ik = *peer.pubkey();
+            let store = load_store(&descriptor)?;
+            let handle = KeyHandle::from_label(&descriptor.label);
+
+            runtime()?.block_on(session_connect::run(session_connect::ConnectArgs {
+                server,
+                store: store.as_ref(),
+                handle: &handle,
+                account_pub,
+                peer_ik,
+                peer_label: peer.to_id_string(),
+                transport,
+                json,
             }))?;
             Ok(ExitCode::SUCCESS)
         }

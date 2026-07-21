@@ -63,3 +63,23 @@ fn session_demo_json_mode() {
         "unexpected json: {text}"
     );
 }
+
+// Only meaningful on a plain build: with the `webrtc` feature compiled in, `--transport webrtc`
+// is expected to succeed (see `session_demo_webrtc.rs`), so this guard can't hold under that build.
+#[cfg(not(feature = "webrtc"))]
+#[test]
+fn session_demo_rejects_webrtc_transport_without_the_feature() {
+    let out = Command::new(BIN)
+        .args(["session", "demo", "--transport", "webrtc"])
+        .output()
+        .expect("run meridian session demo --transport webrtc");
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit for --transport webrtc on a non-feature build"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("built without the `webrtc` feature"),
+        "stderr should explain the feature is missing: {stderr}"
+    );
+}

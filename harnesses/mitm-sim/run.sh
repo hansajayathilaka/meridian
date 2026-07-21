@@ -8,7 +8,7 @@
 # seeing only ciphertext cannot read or forge the inner SDP, and the DTLS fingerprint is cross-checked
 # against the identity-bound value after the handshake — a mismatch (a MITM that terminated DTLS)
 # tears the session down 100% of the time (§4.6). An automated test actively mounting a relay-rewrite
-# attempt against a real backend is still open — tracked for 1.16.
+# attempt against a real backend is still open — tracked for 1.28.
 # T08 EXTENDS this harness with the tofu/verified trust-state matrix — do not delete these cases.
 # See docs/testing/strategy.md §3 and docs/security/threat-mitigation-matrix.md.
 set -euo pipefail
@@ -24,4 +24,4 @@ cargo test -q -p meridian-core --test p2p_session fingerprint_mismatch_tears_dow
 cargo test -q -p meridian-core --test p2p_session relay_path_connects_healthily
 echo "[mitm-sim] OK: fingerprint mismatch tears the session down; a healthy relay path still binds"
 echo "  matching fingerprints. NOTE: an active relay SDP-rewrite attack is not yet exercised here —"
-echo "  tracked for 1.16 once the real transport backend lands."
+echo "  tracked for 1.28 once the real transport backend lands."

@@ -87,9 +87,9 @@
 //! feature-04's acceptance criterion — if the local address genuinely changes (Wi-Fi→LTE), nothing
 //! here gathers or exchanges the new candidates the peer would need to find the new path, so
 //! connectivity will *not* actually resume. Closing that gap needs a ctrl-channel renegotiation
-//! message (ADR 0006/0014-relevant; flagged for architect review — 1.16/1.22/1.23 do not touch
-//! this gap, so it remains a not-yet-numbered successor to 1.15; network-roaming support should
-//! not ship claiming this works until it lands).
+//! message (ADR 0006/0014-relevant; flagged for architect review — 1.16/1.22/1.24-1.27 do not
+//! touch this gap, so it remains a not-yet-numbered successor to 1.15; network-roaming support
+//! should not ship claiming this works until it lands).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -124,6 +124,16 @@ use crate::{Result, Transport, TransportError};
 /// How long we'll wait for real ICE gathering / connectivity / a data channel to open before
 /// treating it as a backend failure. Generous for loopback-in-a-container CI, still bounded.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long [`close`](WebRtcTransport::close) will wait for each data channel's `buffered_amount`
+/// to drain to zero before tearing the peer connection down. `send()` (below) only guarantees the
+/// bytes were handed to the SCTP association's outgoing queue, not that they left the process —
+/// unlike `LoopbackTransport::send`, which delivers straight into the peer's inbox before
+/// returning, so a same-process caller's `close()` can never race a delivery already in flight.
+/// Bounded (rather than unbounded) so a peer that vanished mid-send can't hang teardown forever;
+/// short, because in practice this only ever needs to cover "let the runtime poll the SCTP
+/// flush task once", not a real network RTT.
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn backend_err(e: impl std::fmt::Display) -> TransportError {
     TransportError::Backend(e.to_string())
@@ -616,7 +626,7 @@ impl Transport for WebRtcTransport {
             // rung* (udp/tcp/tls-443), a different gap from candidate *class* (host/srflx/relay) —
             // 1.16 closed the latter (`meridian_core::relay::observed_classes`/
             // `enforce_relay_only`); this rung-classification gap is still open and has no assigned
-            // task yet, though 1.23's real packet captures are the most likely place it gets solved.
+            // task yet, though 1.27's real packet captures are the most likely place it gets solved.
             let (relay_server, relay_transport) = if class == Path::Relay {
                 (Some(local.ip.clone()), Some(RelayTransport::Udp))
             } else {
@@ -634,6 +644,27 @@ impl Transport for WebRtcTransport {
     async fn close(&self, s: &SessionHandle) -> Result<()> {
         let removed = self.sessions.lock().unwrap().remove(&s.0);
         if let Some(sess) = removed {
+            // Drain each data channel's outstanding `send()`s before tearing the association
+            // down. Without this, a message queued just before `close()` (e.g. the responder's
+            // final chat reply in `apps/cli`'s `session connect`) can be silently dropped:
+            // `RTCDataChannel::send` returning only means the bytes were accepted into the SCTP
+            // association's outgoing buffer, not that they were actually written to the wire —
+            // and `pc.close()` tears down the ICE/DTLS/SCTP stack (and the underlying UDP socket)
+            // immediately, with no flush of its own. Bounded by `CLOSE_DRAIN_TIMEOUT` so a peer
+            // that is gone (nothing will ever drain the buffer) can't hang teardown forever.
+            let dcs: Vec<Arc<RTCDataChannel>> = sess
+                .channels
+                .lock()
+                .unwrap()
+                .values()
+                .map(|c| c.dc.clone())
+                .collect();
+            let deadline = tokio::time::Instant::now() + CLOSE_DRAIN_TIMEOUT;
+            for dc in dcs {
+                while dc.buffered_amount().await > 0 && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
             let _ = sess.pc.close().await;
         }
         Ok(())

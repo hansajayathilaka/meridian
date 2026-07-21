@@ -8,7 +8,7 @@
 //!   * **fingerprint mismatch tears down 100%** of the time (§4.6), forced at the DTLS layer;
 //!   * the inner SDP rides opaque inside the encrypted envelope, so a relay touching only the
 //!     *outer* routing cannot read or forge it (an active relay-rewrite attack against a real
-//!     backend is not yet exercised here — tracked for 1.23, split from what was originally 1.16);
+//!     backend is not yet exercised here — tracked for 1.28, flagged during 1.23's split);
 //!   * **capability exchange rejects unknown mandatory stream types gracefully**;
 //!   * **ICE restart** on a network change keeps the session and ratchet alive (<5 s, invariant 5).
 
@@ -254,7 +254,7 @@ async fn fingerprint_mismatch_tears_down() {
     }
 }
 
-// TODO(1.23, split from what was originally 1.16): replace with an active relay-rewrite attack
+// TODO(1.28, flagged during 1.23's split): replace with an active relay-rewrite attack
 // test once the real transport backend lands.
 #[tokio::test]
 async fn relay_path_connects_healthily() {
@@ -262,7 +262,7 @@ async fn relay_path_connects_healthily() {
     // mount an active relay-rewrite attack — it only proves a healthy connect over the loopback
     // transport yields matching, bound fingerprints. The real active-relay-rewrite attack (a
     // malicious relay actively substituting routing metadata or attempting to rewrite the inner
-    // SDP) needs a real transport backend and is tracked for 1.23.
+    // SDP) needs a real transport backend and is tracked for 1.28.
     let mut alice = Peer::new("chat.a");
     let mut bob = Peer::new("chat.b");
     establish_ratchet(&mut alice, &mut bob);

@@ -14,8 +14,8 @@
 //! cannot read or forge the inner SDP (that opacity is a property of the envelope encryption itself,
 //! independent of transport backend), and a MITM that terminates DTLS presents a fingerprint that
 //! fails the check. An automated test actively mounting a relay rewrite attempt against a real
-//! backend is still open (TODO: 1.23, split from what was originally 1.16); today's suite proves
-//! the fingerprint cross-check, not that specific attack. This is why we can put the servers out
+//! backend is still open (TODO: 1.28, flagged during 1.23's split into 1.24-1.27); today's suite
+//! proves the fingerprint cross-check, not that specific attack. This is why we can put the servers out
 //! of the data path and still trust it.
 //!
 //! ## Transport independence

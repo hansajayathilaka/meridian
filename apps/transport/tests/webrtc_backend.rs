@@ -168,6 +168,35 @@ async fn tampered_remote_fingerprint_never_connects() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_immediately_before_close_is_still_delivered() {
+    // Regression test for the race `close()` used to have: `send()` only guarantees the bytes
+    // were handed to the SCTP association's outgoing buffer, not that they left the process —
+    // closing the peer connection right after a send, with no flush, could silently drop it
+    // (found via `apps/cli`'s `session connect`, where the responder's final reply raced its own
+    // `close()`). `close()` now drains each channel's `buffered_amount()` before tearing down.
+    let (ta, sa, tb, sb) = connect_pair().await;
+    let ca = ta
+        .add_data_channel(&sa, ChannelCfg::reliable_ordered("mrd.chat/1"))
+        .await
+        .unwrap();
+    tb.add_data_channel(&sb, ChannelCfg::reliable_ordered("mrd.chat/1"))
+        .await
+        .unwrap();
+
+    ta.send(&sa, &ca, b"final message before close")
+        .await
+        .unwrap();
+    ta.close(&sa).await.unwrap();
+
+    let (_cid, data) = tokio::time::timeout(Duration::from_secs(5), tb.recv(&sb))
+        .await
+        .expect("recv timed out — the pre-close send was dropped")
+        .unwrap()
+        .expect("channel closed with no message delivered");
+    assert_eq!(data, b"final message before close");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ice_restart_keeps_the_live_channel_flowing() {
     let (ta, sa, tb, sb) = connect_pair().await;
     let ca = ta

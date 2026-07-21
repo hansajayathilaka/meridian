@@ -27,9 +27,13 @@ use meridian_core::session::{
 };
 use meridian_core::signaling::generate_bundle;
 use meridian_core::streams::StreamRegistry;
+#[cfg(feature = "webrtc")]
+use meridian_core::transport::WebRtcTransport;
 use meridian_core::transport::{
-    IcePolicy, IceServer, LoopbackFabric, LoopbackTransport, NatScenario,
+    IcePolicy, IceServer, LoopbackFabric, LoopbackTransport, NatScenario, Transport,
 };
+
+use crate::TransportArg;
 
 pub(crate) struct DemoPeer {
     pub store: MemorySecretStore,
@@ -71,22 +75,17 @@ pub(crate) fn demo_ice_servers() -> Vec<IceServer> {
     }]
 }
 
-/// Establish a live P2P session between two fresh peers over `scenario`, under `policy`, with the
-/// given TURN servers. Returns both live sessions plus the peers (whose stores/handles the caller
-/// needs to pump chat). Shared by the demo and `meridian doctor`.
-pub(crate) async fn connect(
-    scenario: NatScenario,
+/// Establish a live P2P session between two fresh peers over an already-built transport pair, under
+/// `policy`, with the given TURN servers. Returns both live sessions plus the peers (whose
+/// stores/handles the caller needs to pump chat). Does everything `connect`/`connect_webrtc` need
+/// *except* building the transports themselves — the X3DH/bundle setup and dial/answer plumbing is
+/// identical regardless of which `Transport` backend is in play.
+async fn establish<T: Transport>(
+    ta: Arc<T>,
+    tb: Arc<T>,
     policy: IcePolicy,
     ice_servers: Vec<IceServer>,
-) -> Result<
-    (
-        P2pSession<LoopbackTransport>,
-        P2pSession<LoopbackTransport>,
-        DemoPeer,
-        DemoPeer,
-    ),
-    String,
-> {
+) -> Result<(P2pSession<T>, P2pSession<T>, DemoPeer, DemoPeer), String> {
     let mut alice = DemoPeer::new("chat.a");
     let mut bob = DemoPeer::new("chat.b");
     let (alice_ik, bob_ik) = (alice.ik(), bob.ik());
@@ -116,10 +115,6 @@ pub(crate) async fn connect(
         )
         .map_err(|e| e.to_string())?;
 
-    // Both peers live on the same simulated network (`scenario`); each gathers under `policy`.
-    let fabric = LoopbackFabric::new();
-    let ta = Arc::new(LoopbackTransport::with_scenario(fabric.clone(), scenario));
-    let tb = Arc::new(LoopbackTransport::with_scenario(fabric.clone(), scenario));
     let (mut relay_a, mut relay_b) = MemRelay::pair(alice_ik, bob_ik);
 
     let cfg_a = relay::ice_config(policy, ice_servers.clone(), Vec::new());
@@ -131,7 +126,7 @@ pub(crate) async fn connect(
         let bchat = &mut bob.chat;
         tokio::join!(
             dial_with_config(
-                ta.clone(),
+                ta,
                 &alice.store,
                 &ahandle,
                 alice_ik,
@@ -142,7 +137,7 @@ pub(crate) async fn connect(
                 cfg_a,
             ),
             answer_with_config(
-                tb.clone(),
+                tb,
                 &bob.store,
                 &bhandle,
                 bob_ik,
@@ -160,18 +155,117 @@ pub(crate) async fn connect(
     Ok((asess, bsess, alice, bob))
 }
 
+/// Establish a live P2P session between two fresh peers over `scenario`, under `policy`, with the
+/// given TURN servers, using the deterministic `LoopbackTransport`. Shared by the demo and
+/// `meridian doctor`.
+pub(crate) async fn connect(
+    scenario: NatScenario,
+    policy: IcePolicy,
+    ice_servers: Vec<IceServer>,
+) -> Result<
+    (
+        P2pSession<LoopbackTransport>,
+        P2pSession<LoopbackTransport>,
+        DemoPeer,
+        DemoPeer,
+    ),
+    String,
+> {
+    // Both peers live on the same simulated network (`scenario`); each gathers under `policy`.
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(LoopbackTransport::with_scenario(fabric.clone(), scenario));
+    let tb = Arc::new(LoopbackTransport::with_scenario(fabric.clone(), scenario));
+    establish(ta, tb, policy, ice_servers).await
+}
+
+/// Establish a live P2P session between two fresh peers over the real `WebRtcTransport` backend
+/// (real ICE/SCTP/DTLS on localhost, 1.15). There is no NAT simulation for a real transport — callers
+/// must not pass a non-default `scenario`; `run_demo` enforces this before calling in.
+#[cfg(feature = "webrtc")]
+pub(crate) async fn connect_webrtc(
+    policy: IcePolicy,
+    ice_servers: Vec<IceServer>,
+) -> Result<
+    (
+        P2pSession<WebRtcTransport>,
+        P2pSession<WebRtcTransport>,
+        DemoPeer,
+        DemoPeer,
+    ),
+    String,
+> {
+    let ta = Arc::new(WebRtcTransport::new());
+    let tb = Arc::new(WebRtcTransport::new());
+    establish(ta, tb, policy, ice_servers).await
+}
+
 /// Options for the relay-policy demo.
 pub(crate) struct DemoOpts {
     pub json: bool,
     pub policy: IcePolicy,
     pub scenario: NatScenario,
+    pub transport: TransportArg,
 }
 
 /// Run the in-process P2P demo, returning the printed lines (also returned so the acceptance test
-/// can assert on them).
+/// can assert on them). Dispatches on `opts.transport`: `Loopback` uses the deterministic simulation
+/// (and honors `--nat`/`--policy`); `Webrtc` uses the real backend behind the `webrtc` cargo feature,
+/// and — because there is no NAT simulation for a real transport and the demo's fabricated TURN
+/// servers only mean anything to `LoopbackTransport`'s simulation — rejects a non-default `--nat` or a
+/// non-`direct` `--policy` up front rather than silently ignoring them or hanging trying to reach a
+/// fake TURN host.
 pub async fn run_demo(opts: DemoOpts) -> Result<Vec<String>, String> {
-    let (mut asess, mut bsess, alice, bob) =
-        connect(opts.scenario, opts.policy, demo_ice_servers()).await?;
+    match opts.transport {
+        TransportArg::Loopback => {
+            let (asess, bsess, alice, bob) =
+                connect(opts.scenario, opts.policy, demo_ice_servers()).await?;
+            run_demo_generic(asess, bsess, alice, bob, &opts).await
+        }
+        TransportArg::Webrtc => {
+            if opts.scenario != NatScenario::default() {
+                return Err(format!(
+                    "--transport webrtc has no NAT simulation (--nat {} is meaningless for a real \
+                     transport); drop --nat or use --transport loopback",
+                    opts.scenario.label()
+                ));
+            }
+            if opts.policy != IcePolicy::Direct {
+                return Err(
+                    "--transport webrtc only supports --policy direct today: the demo's TURN \
+                     servers are fabricated for LoopbackTransport's simulation and a real \
+                     WebRtcTransport would try to actually reach them; real TURN support lands in \
+                     1.25/1.27"
+                        .to_string(),
+                );
+            }
+            #[cfg(feature = "webrtc")]
+            {
+                let (asess, bsess, alice, bob) =
+                    connect_webrtc(opts.policy, demo_ice_servers()).await?;
+                run_demo_generic(asess, bsess, alice, bob, &opts).await
+            }
+            #[cfg(not(feature = "webrtc"))]
+            {
+                Err(
+                    "meridian-cli was built without the `webrtc` feature; rebuild with \
+                     `--features webrtc` to use `--transport webrtc`"
+                        .to_string(),
+                )
+            }
+        }
+    }
+}
+
+/// The printed-output logic shared by every `Transport` backend: identical for `LoopbackTransport`
+/// and `WebRtcTransport`, including the `transport=...` line (via `SessionInfo`'s `Display`), so the
+/// same acceptance assertions hold regardless of which backend produced the session.
+async fn run_demo_generic<T: Transport>(
+    mut asess: P2pSession<T>,
+    mut bsess: P2pSession<T>,
+    alice: DemoPeer,
+    bob: DemoPeer,
+    opts: &DemoOpts,
+) -> Result<Vec<String>, String> {
     let (ahandle, bhandle) = (alice.handle(), bob.handle());
     let mut alice = alice;
     let mut bob = bob;
