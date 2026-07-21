@@ -19,7 +19,8 @@ design decisions + remaining should-fix/nit.
 
 ## Dependency check
 The Phase 0 build is complete; its review report is written. Fix-tasks are unblocked now. Internal
-dependencies between fix-tasks are declared per task (notably 1.2→1.1, 1.15→1.13/1.3, 1.16→1.15/1.14).
+dependencies between fix-tasks are declared per task (notably 1.2→1.1, 1.15→1.13/1.3, 1.16→1.15/1.14,
+1.22→1.15, 1.23→1.22/1.14).
 
 ## Tasks (todo)
 <!-- Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
@@ -46,7 +47,9 @@ dependencies between fix-tasks are declared per task (notably 1.2→1.1, 1.15→
 - [x] **1.13** Feature 4 honesty: transport label + SDP test (F10 honesty) — [file](./1.13-feature4-honesty.md)
 - [x] **1.14** Feature 5 honesty: coturn user-quota + credential-reuse wording (F11 honesty) — [file](./1.14-feature5-honesty.md)
 - [x] **1.15** webrtc-rs `Transport` backend (F10 backend) — [file](./1.15-webrtc-backend.md)
-- [ ] **1.16** NAT/relay wire-level acceptance matrix + observed-candidate relay-only (F11 wire, F20) — [file](./1.16-nat-acceptance-matrix.md)
+- [x] **1.16** Observed-candidate relay-only enforcement (F20) — [file](./1.16-nat-acceptance-matrix.md)
+- [ ] **1.22** `meridian` CLI: `--transport webrtc` wiring (F11 wire, prerequisite; split from 1.16) — [file](./1.22-webrtc-cli-transport.md)
+- [ ] **1.23** NAT/relay wire-level acceptance matrix (F11 wire; split from 1.16, depends on 1.22) — [file](./1.23-netns-nat-matrix.md)
 
 **Group E — Design decisions + remaining should-fix / nit**
 - [ ] **1.17** ADR — deniability vs envelope signature (on-the-fly) — [file](./1.17-adr-deniability-envelope-sig.md)
@@ -57,8 +60,9 @@ dependencies between fix-tasks are declared per task (notably 1.2→1.1, 1.15→
 
 ## Exit criteria
 All fix-tasks `[x]`, tree green (`just build` + `cargo clippy -D warnings` clean), docs synced. Blocking
-findings F1, F2, F3, F10, F11 closed — for F10/F11 this means 1.13–1.16 landed (backend 1.15 is the
-one task that may span multiple PRs). Then `/pick-next-phase` selects Phase 2 (T06 federation).
+findings F1, F2, F3, F10, F11 closed — for F10/F11 this means 1.13–1.16 and 1.22–1.23 landed (backend
+1.15 and the netns/tcpdump matrix 1.23 are the tasks that may span multiple PRs). Then `/pick-next-phase`
+selects Phase 2 (T06 federation).
 
 ## Finding → fix-task map
 | F | Sev | Task | F | Sev | Task |
@@ -73,7 +77,7 @@ one task that may span multiple PRs). Then `/pick-next-phase` selects Phase 2 (T
 | F8 | should-fix | 1.11 | F19 | should-fix | 1.4 |
 | F9 | should-fix | 1.3 | F20 | nit | 1.16 |
 | F10 | blocking | 1.13 + 1.15 | F21 | nit | 1.20 |
-| F11 | blocking | 1.14 + 1.16 | F22 | nit | 1.21 |
+| F11 | blocking | 1.14 + 1.22 + 1.23 | F22 | nit | 1.21 |
 
 On-the-fly decisions: ratchet composition → 1.1 (ADR 0015); deniability vs envelope signature → 1.17
 (ADR); desync auto-recovery → 1.18. **No action** (already recorded as deferred): threat-model goal 2

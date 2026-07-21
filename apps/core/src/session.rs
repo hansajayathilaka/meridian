@@ -14,8 +14,9 @@
 //! cannot read or forge the inner SDP (that opacity is a property of the envelope encryption itself,
 //! independent of transport backend), and a MITM that terminates DTLS presents a fingerprint that
 //! fails the check. An automated test actively mounting a relay rewrite attempt against a real
-//! backend is still open (TODO: 1.16); today's suite proves the fingerprint cross-check, not that
-//! specific attack. This is why we can put the servers out of the data path and still trust it.
+//! backend is still open (TODO: 1.23, split from what was originally 1.16); today's suite proves
+//! the fingerprint cross-check, not that specific attack. This is why we can put the servers out
+//! of the data path and still trust it.
 //!
 //! ## Transport independence
 //! Once connected, chat and ctrl ride data channels peer-to-peer; the relay is only used for
@@ -82,6 +83,12 @@ pub enum SessionError {
     /// The relay closed before signaling completed.
     #[error("signaling ended before the session was established")]
     SignalingEnded,
+    /// Under `relay-only`, a host/srflx (or unrecognized) candidate was actually gathered — the
+    /// observation-based counterpart to the policy label (F20). Fail closed: the dial/answer
+    /// aborts before this candidate is ever sent to the peer, rather than trusting the transport's
+    /// construction alone to have honored the policy.
+    #[error("relay-only violated: observed non-relay candidate ({candidate})")]
+    RelayOnlyViolation { candidate: String },
 }
 
 /// A signaling carrier for the offer/answer/ICE exchange — the rendezvous relay in production, an
@@ -163,7 +170,8 @@ pub struct SessionInfo {
     pub streams: Vec<String>,
     /// The effective relay policy for this session.
     pub policy: IcePolicy,
-    /// The candidate classes offered to the peer under `policy`.
+    /// The candidate classes **actually gathered and offered** to the peer — observed from the
+    /// real candidate lines the transport produced (F20), not merely implied by `policy`.
     pub offered: GatherClasses,
     /// A short human explanation of why this path was chosen.
     pub reason: String,
@@ -257,6 +265,10 @@ pub struct P2pSession<T: Transport> {
     last_rtt_ms: Option<f64>,
     /// The relay policy this session gathered under (governs the `candidates offered` claim).
     policy: IcePolicy,
+    /// The candidate classes **actually observed** in our own gathered candidates (F20) — measured
+    /// once, from the exact lines sent to the peer in the offer/answer, not re-derived from
+    /// `policy` on every call.
+    offered: GatherClasses,
 }
 
 impl<T: Transport> P2pSession<T> {
@@ -299,7 +311,7 @@ impl<T: Transport> P2pSession<T> {
             rtt_ms: self.last_rtt_ms,
             streams,
             policy: self.policy,
-            offered: relay::gather_classes(self.policy),
+            offered: self.offered,
             reason: path_reason(self.policy, detail.class),
         }
     }
@@ -667,6 +679,10 @@ async fn dial_established<T: Transport>(
     let offer = transport.local_description(&conn)?;
     let local_fp = transport.local_fingerprint(&conn)?;
     let ice = candidate_strings(transport, &conn).await?;
+    // F20: abort here, before the offer is sealed and sent, if relay-only actually gathered
+    // anything but relay candidates — never trust the policy label alone.
+    enforce_relay_only(policy, &ice)?;
+    let offered = relay::observed_classes(&ice);
     let offer_content = SignalContent::SdpOffer {
         sdp: offer.0,
         dtls_fp: local_fp.0.clone(),
@@ -712,6 +728,7 @@ async fn dial_established<T: Transport>(
         keepalive_t: 0,
         last_rtt_ms: None,
         policy,
+        offered,
     };
     session.handshake(store, handle, chat).await?;
     Ok(session)
@@ -820,6 +837,9 @@ async fn answer_established<T: Transport>(
     let answer_sdp = transport.local_description(&conn)?;
     let local_fp = transport.local_fingerprint(&conn)?;
     let ice = candidate_strings(transport, &conn).await?;
+    // F20: same fail-closed check as the dialer — abort before the answer is sealed and sent.
+    enforce_relay_only(policy, &ice)?;
+    let offered = relay::observed_classes(&ice);
     let answer_content = SignalContent::SdpAnswer {
         sdp: answer_sdp.0,
         dtls_fp: local_fp.0.clone(),
@@ -852,6 +872,7 @@ async fn answer_established<T: Transport>(
         keepalive_t: 0,
         last_rtt_ms: None,
         policy,
+        offered,
     };
     session.handshake(store, handle, chat).await?;
     Ok(session)
@@ -945,6 +966,27 @@ async fn candidate_strings<T: Transport>(
         .collect())
 }
 
+/// F20: enforce `relay-only` from **observed** gathered candidates, not the policy label alone.
+/// `LoopbackTransport` and the webrtc-rs backend's `RTCIceTransportPolicy::Relay` are both built to
+/// strip host/srflx before gathering under this policy — but this is the actual proof point of the
+/// IP-hiding guarantee, checked against what a transport really produced rather than assumed from
+/// its construction. Fail-closed: any non-relay (or unrecognized — see
+/// [`relay::candidate_class`]) candidate aborts *before* the offer/answer carrying it is sealed and
+/// sent to the peer, so a transport bug can never leak an address instead of merely being logged.
+fn enforce_relay_only(policy: IcePolicy, candidates: &[String]) -> Result<(), SessionError> {
+    if policy != IcePolicy::RelayOnly {
+        return Ok(());
+    }
+    for c in candidates {
+        if relay::candidate_class(c) != Some(relay::CandidateClass::Relay) {
+            return Err(SessionError::RelayOnlyViolation {
+                candidate: c.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Receive one signaling envelope and decode it as an SDP offer (`want_offer`) or answer.
 async fn recv_sdp(
     relay: &mut dyn SignalRelay,
@@ -994,4 +1036,56 @@ async fn verify_fingerprint<T: Transport>(
         });
     }
     Ok(negotiated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // F20: the fail-closed abort itself, independent of any transport — a real transport is built
+    // never to leak host/srflx under relay-only, so exercising the abort end-to-end would mean
+    // deliberately misbuilding one; testing the pure decision function directly is the honest way
+    // to prove "aborts on any non-relay candidate" without faking a backend bug.
+
+    #[test]
+    fn relay_only_passes_when_every_candidate_is_relay() {
+        let candidates = vec![
+            "candidate:relay 1 turn.example.org".to_string(),
+            "candidate:4 1 udp 25108223 198.51.100.7 3478 typ relay".to_string(),
+        ];
+        assert!(enforce_relay_only(IcePolicy::RelayOnly, &candidates).is_ok());
+    }
+
+    #[test]
+    fn relay_only_aborts_on_a_leaked_host_candidate() {
+        let candidates = vec![
+            "candidate:relay 1 turn.example.org".to_string(),
+            "candidate:host 2 127.0.0.1".to_string(),
+        ];
+        let err = enforce_relay_only(IcePolicy::RelayOnly, &candidates).unwrap_err();
+        assert!(matches!(err, SessionError::RelayOnlyViolation { .. }));
+    }
+
+    #[test]
+    fn relay_only_aborts_on_a_leaked_srflx_candidate() {
+        let candidates =
+            vec!["candidate:1 1 udp 999 203.0.113.9 51269 typ srflx raddr 0.0.0.0".to_string()];
+        assert!(enforce_relay_only(IcePolicy::RelayOnly, &candidates).is_err());
+    }
+
+    #[test]
+    fn relay_only_aborts_on_an_unparseable_candidate_worst_case() {
+        // A malformed/unrecognized line must never silently pass as "clean" under relay-only.
+        let candidates = vec!["not-a-candidate-line".to_string()];
+        assert!(enforce_relay_only(IcePolicy::RelayOnly, &candidates).is_err());
+    }
+
+    #[test]
+    fn non_relay_only_policies_are_never_checked() {
+        // direct/prefer-relay intentionally gather host/srflx; enforcement only applies under
+        // relay-only.
+        let candidates = vec!["candidate:host 1 127.0.0.1".to_string()];
+        assert!(enforce_relay_only(IcePolicy::Direct, &candidates).is_ok());
+        assert!(enforce_relay_only(IcePolicy::PreferRelay, &candidates).is_ok());
+    }
 }

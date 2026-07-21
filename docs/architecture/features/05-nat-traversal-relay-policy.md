@@ -34,10 +34,15 @@ All four NAT matrix cells connect (symmetric×symmetric via relay); TLS-443 fall
 ## Risks / notes
 This task creates the latency-vs-privacy trade surface — the demo must *show* the cost (rtt printed per path) so the org-level decision in §5.4 is made with numbers, not vibes.
 
-**Verification status (recorded honestly, F9):** the NAT test matrix and `relay-only` candidate-stripping
-guarantees above are currently validated via the `netns` simulation rig against the non-webrtc-rs
-`Transport` test double, not against real ICE/TURN negotiation over webrtc-rs. Treat this spec's
-acceptance criteria as **simulation-only until fix-task
-[1.16](../../tasks/phase-1/1.16-nat-acceptance-matrix.md)** lands the wire-level NAT/relay acceptance
-matrix and observed-candidate relay-only enforcement (which itself depends on the webrtc-rs backend from
-[1.15](../../tasks/phase-1/1.15-webrtc-backend.md)).
+**Verification status (recorded honestly, F9 — updated as of 1.16):** `relay-only` candidate-stripping is
+now enforced from **observed** gathered candidates, not just derived from policy —
+[1.16](../../tasks/phase-1/1.16-nat-acceptance-matrix.md) added a fail-closed check
+(`apps/core/src/session.rs::enforce_relay_only`) that aborts the dial/answer before any offer/answer
+carrying a host/srflx candidate is sent to the peer, against both `LoopbackTransport` and the real
+webrtc-rs backend from [1.15](../../tasks/phase-1/1.15-webrtc-backend.md). The NAT test matrix above is
+still validated only via the `netns` simulation rig against the non-webrtc-rs `Transport` test double,
+not against real ICE/TURN negotiation or an actual packet capture — treat the four-cell matrix and the
+"packet capture confirms zero of our address" acceptance criterion as **simulation-only** until
+[1.23](../../tasks/phase-1/1.23-netns-nat-matrix.md) lands the wire-level netns/tcpdump matrix (which
+depends on [1.22](../../tasks/phase-1/1.22-webrtc-cli-transport.md)'s CLI transport wiring and 1.14's
+coturn quota).

@@ -8,7 +8,7 @@
 //!   * **fingerprint mismatch tears down 100%** of the time (§4.6), forced at the DTLS layer;
 //!   * the inner SDP rides opaque inside the encrypted envelope, so a relay touching only the
 //!     *outer* routing cannot read or forge it (an active relay-rewrite attack against a real
-//!     backend is not yet exercised here — tracked for 1.16);
+//!     backend is not yet exercised here — tracked for 1.23, split from what was originally 1.16);
 //!   * **capability exchange rejects unknown mandatory stream types gracefully**;
 //!   * **ICE restart** on a network change keeps the session and ratchet alive (<5 s, invariant 5).
 
@@ -17,10 +17,16 @@ use std::sync::Arc;
 use meridian_core::chat::ChatState;
 use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{generate_account, AccountId, KeyHandle, MemorySecretStore};
-use meridian_core::session::{answer, dial, MemRelay, P2pSession, SessionError, SessionEvent};
+use meridian_core::relay;
+use meridian_core::session::{
+    answer, answer_with_config, dial, dial_with_config, MemRelay, P2pSession, SessionError,
+    SessionEvent,
+};
 use meridian_core::signaling::generate_bundle;
 use meridian_core::streams::{register_stream_type, StreamRegistry, StreamType};
-use meridian_core::transport::{ChannelCfg, LoopbackFabric, LoopbackTransport};
+use meridian_core::transport::{
+    ChannelCfg, IcePolicy, IceServer, LoopbackFabric, LoopbackTransport,
+};
 
 struct Peer {
     store: MemorySecretStore,
@@ -246,15 +252,15 @@ async fn fingerprint_mismatch_tears_down() {
     }
 }
 
-// TODO(1.16): replace with an active relay-rewrite attack test once the real transport backend
-// lands.
+// TODO(1.23, split from what was originally 1.16): replace with an active relay-rewrite attack
+// test once the real transport backend lands.
 #[tokio::test]
 async fn relay_path_connects_healthily() {
     // NOTE: despite the surrounding commentary about SDP/fingerprint opacity, this test does not
     // mount an active relay-rewrite attack — it only proves a healthy connect over the loopback
     // transport yields matching, bound fingerprints. The real active-relay-rewrite attack (a
     // malicious relay actively substituting routing metadata or attempting to rewrite the inner
-    // SDP) needs a real transport backend and is tracked for 1.16.
+    // SDP) needs a real transport backend and is tracked for 1.23.
     let mut alice = Peer::new("chat.a");
     let mut bob = Peer::new("chat.b");
     establish_ratchet(&mut alice, &mut bob);
@@ -517,5 +523,85 @@ async fn open_unregistered_stream_type_is_rejected() {
     {
         Err(SessionError::StreamRejected { code, .. }) => assert_eq!(code, "unsupported"),
         other => panic!("expected local unsupported rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn relay_only_session_reports_observed_not_assumed_candidates() {
+    // F20: `session info`'s `candidates offered` claim must come from what was actually gathered,
+    // not merely from the policy label — this drives a real relay-only dial/answer end-to-end
+    // (through `dial_with_config`/`answer_with_config`, exactly as the CLI demo does) and checks
+    // the *observed* classification, not `relay::gather_classes(policy)` recomputed after the fact.
+    let mut alice = Peer::new("chat.a");
+    let mut bob = Peer::new("chat.b");
+    establish_ratchet(&mut alice, &mut bob);
+
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(LoopbackTransport::new(fabric.clone()));
+    let tb = Arc::new(LoopbackTransport::new(fabric.clone()));
+
+    let ice_servers = vec![IceServer {
+        urls: vec!["turn:turn-a:3478?transport=udp".into()],
+        username: Some("1700000000:demo".into()),
+        credential: Some("demo-hmac".into()),
+    }];
+    let cfg_a = relay::ice_config(IcePolicy::RelayOnly, ice_servers.clone(), Vec::new());
+    let cfg_b = relay::ice_config(IcePolicy::RelayOnly, ice_servers, Vec::new());
+
+    let (mut relay_a, mut relay_b) = MemRelay::pair(alice.ik(), bob.ik());
+    let (alice_ik, bob_ik) = (alice.ik(), bob.ik());
+    let (ahandle, bhandle) = (alice.handle(), bob.handle());
+    let (ra, rb) = {
+        let achat = &mut alice.chat;
+        let bchat = &mut bob.chat;
+        tokio::join!(
+            dial_with_config(
+                ta,
+                &alice.store,
+                &ahandle,
+                alice_ik,
+                bob_ik,
+                achat,
+                &mut relay_a,
+                Arc::new(StreamRegistry::with_builtins()),
+                cfg_a,
+            ),
+            answer_with_config(
+                tb,
+                &bob.store,
+                &bhandle,
+                bob_ik,
+                alice_ik,
+                bchat,
+                &mut relay_b,
+                Arc::new(StreamRegistry::with_builtins()),
+                cfg_b,
+            ),
+        )
+    };
+    let asess =
+        ra.expect("relay-only dial should succeed: LoopbackTransport never leaks host/srflx");
+    let bsess = rb.expect("relay-only answer should succeed");
+
+    for sess in [&asess, &bsess] {
+        let info = sess.info().await;
+        assert!(
+            !info.offered.host,
+            "relay-only must never observe a host candidate"
+        );
+        assert!(
+            !info.offered.srflx,
+            "relay-only must never observe a srflx candidate"
+        );
+        assert!(
+            info.offered.relay,
+            "relay-only must observe relay candidates"
+        );
+        assert!(
+            info.candidates_offered_line()
+                .contains("peer never saw our host/srflx IPs"),
+            "line: {}",
+            info.candidates_offered_line()
+        );
     }
 }

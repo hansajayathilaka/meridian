@@ -133,7 +133,11 @@ impl GatherClasses {
     }
 }
 
-/// The candidate classes a policy gathers. `relay-only` never offers host/srflx (invariant 3).
+/// The candidate classes a policy *intends* to gather. `relay-only` never offers host/srflx
+/// (invariant 3) — but this is the policy's promise, not a measurement. [`observed_classes`] is
+/// the corresponding measurement of what a transport actually produced (F20); prefer it wherever a
+/// live session is available. This function stays useful before a session exists (e.g. `doctor`'s
+/// static preview of what a policy *would* gather).
 pub fn gather_classes(policy: IcePolicy) -> GatherClasses {
     match policy {
         IcePolicy::RelayOnly => GatherClasses {
@@ -150,6 +154,69 @@ pub fn gather_classes(policy: IcePolicy) -> GatherClasses {
     }
 }
 
+/// The class of one *actually gathered* ICE candidate line (F20) — the observation-based
+/// counterpart to the policy's mere intent. Recognizes both the standard ICE-SDP form
+/// (`candidate:<foundation> <component> <proto> <priority> <addr> <port> typ <type> ...`, as
+/// produced by a real backend) and `LoopbackTransport`'s shorthand (`candidate:<type> ...`, the
+/// type immediately after the `candidate:` prefix instead of a separate `typ` field), so the same
+/// classifier works against both the simulated and the real transport. Peer-reflexive (`prflx`) is
+/// folded into `Srflx`: both reveal a real, routable address to the far side, which is exactly what
+/// `relay-only` must never do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateClass {
+    Host,
+    Srflx,
+    Relay,
+}
+
+fn classify_token(tok: &str) -> Option<CandidateClass> {
+    match tok {
+        "host" => Some(CandidateClass::Host),
+        "srflx" | "prflx" => Some(CandidateClass::Srflx),
+        "relay" => Some(CandidateClass::Relay),
+        _ => None,
+    }
+}
+
+/// Classify a raw candidate line. `None` means the line didn't parse as either recognized format —
+/// callers enforcing the relay-only invariant must treat that as worst-case, not as "relay", since
+/// silently accepting an unrecognized line would defeat the whole point of observing reality instead
+/// of trusting intent.
+pub fn candidate_class(line: &str) -> Option<CandidateClass> {
+    let mut tokens = line.split_whitespace();
+    while let Some(tok) = tokens.next() {
+        if tok == "typ" {
+            return classify_token(tokens.next()?);
+        }
+    }
+    let first = line.strip_prefix("candidate:")?.split_whitespace().next()?;
+    classify_token(first)
+}
+
+/// The candidate classes **actually gathered**, from the raw lines a transport produced — the
+/// measurement backing the `candidates offered:` line in `session info`/`doctor` once a session
+/// exists (F20). An unparseable line is folded into both `host` and `srflx` (worst case) so a
+/// malformed or unexpected candidate format can never silently read as clean.
+pub fn observed_classes(candidates: &[String]) -> GatherClasses {
+    let mut classes = GatherClasses {
+        host: false,
+        srflx: false,
+        relay: false,
+    };
+    for c in candidates {
+        match candidate_class(c) {
+            Some(CandidateClass::Host) => classes.host = true,
+            Some(CandidateClass::Srflx) => classes.srflx = true,
+            Some(CandidateClass::Relay) => classes.relay = true,
+            None => {
+                classes.host = true;
+                classes.srflx = true;
+            }
+        }
+    }
+    classes
+}
+
 /// Build the [`IceConfig`] for a session: the resolved policy plus the ephemeral TURN servers minted
 /// by the rendezvous (and optional STUN). The transport enforces the policy at gather time.
 pub fn ice_config(
@@ -161,5 +228,78 @@ pub fn ice_config(
         stun_servers,
         ice_servers,
         policy,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_standard_ice_sdp_form() {
+        // The form a real backend (webrtc-rs) produces.
+        assert_eq!(
+            candidate_class("candidate:1 1 udp 2122260223 192.168.1.5 51268 typ host generation 0"),
+            Some(CandidateClass::Host)
+        );
+        assert_eq!(
+            candidate_class("candidate:2 1 udp 1686052607 203.0.113.9 51269 typ srflx raddr 192.168.1.5 rport 51268"),
+            Some(CandidateClass::Srflx)
+        );
+        assert_eq!(
+            candidate_class("candidate:3 1 udp 41886047 203.0.113.9 3478 typ prflx"),
+            Some(CandidateClass::Srflx)
+        );
+        assert_eq!(
+            candidate_class(
+                "candidate:4 1 udp 25108223 198.51.100.7 3478 typ relay raddr 0.0.0.0 rport 0"
+            ),
+            Some(CandidateClass::Relay)
+        );
+    }
+
+    #[test]
+    fn classifies_loopback_shorthand_form() {
+        // `LoopbackTransport`'s own format: type right after `candidate:`, no `typ` token.
+        assert_eq!(
+            candidate_class("candidate:host 7 127.0.0.1"),
+            Some(CandidateClass::Host)
+        );
+        assert_eq!(
+            candidate_class("candidate:srflx 7 203.0.113.7"),
+            Some(CandidateClass::Srflx)
+        );
+        assert_eq!(
+            candidate_class("candidate:relay 7 turn.example.org gen=1"),
+            Some(CandidateClass::Relay)
+        );
+    }
+
+    #[test]
+    fn unrecognized_line_classifies_as_none() {
+        assert_eq!(candidate_class("not a candidate at all"), None);
+        assert_eq!(candidate_class(""), None);
+    }
+
+    #[test]
+    fn observed_classes_folds_unparseable_lines_into_worst_case() {
+        let g = observed_classes(&["garbage".to_string()]);
+        assert!(g.host && g.srflx && !g.relay);
+    }
+
+    #[test]
+    fn observed_classes_matches_the_actual_lines() {
+        let g = observed_classes(&[
+            "candidate:relay 1 turn.example.org".to_string(),
+            "candidate:relay 2 turn.example.org".to_string(),
+        ]);
+        assert_eq!(
+            g,
+            GatherClasses {
+                host: false,
+                srflx: false,
+                relay: true
+            }
+        );
     }
 }
