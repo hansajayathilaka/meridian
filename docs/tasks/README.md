@@ -31,17 +31,27 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   **1.26** (drive real peers + capture pcaps, depends on 1.24+1.25), and **1.27** (pcap-analysis
   assertions + CI wiring — the task that actually closes F11's wire-level half, depends on 1.26). A fifth
   item flagged during the split (an active relay-rewrite adversarial test against the rendezvous) is
-  tracked separately as **1.28**, not part of F11's closure. **1.24** and **1.25** are both done; 1.26 and
-  1.27 are pending.
-- **NEXT:** run **`/next-task`** to continue with Group D — **1.24** done (`session connect` CLI +
-  real-signaling `SignalRelay`, plus a `WebRtcTransport::close()` race fix found while testing it). **1.25**
-  done (real six-namespace topology, per-cell NAT-flavor iptables, real coturn + rendezvous, generic
-  wire-level smoke checks — `apps/rendezvous/examples/fetch_turn_credentials.rs` mints credentials through
-  the real `TurnReq`/`TurnGrant` flow; a shared-secret restart race found during review is fixed). **1.26**
-  (drive real peers + capture pcaps, needs both 1.24 and 1.25) is next; 1.27 needs 1.26.
+  tracked separately as **1.28**, not part of F11's closure. **1.24** and **1.25** are both done. **1.26**
+  was run against the real rig: its own harness (topology-driving, per-cell relay policy, tcpdump
+  bracketing, predictable pcap naming, path/transport/role summaries) all work correctly, but its
+  "all four cells connect" deliverable surfaced two real connectivity bugs the harness was designed to
+  catch — an ICE candidate-pair-nomination stall under `direct`/`prefer-relay` (root-caused: permanently-
+  unreachable host/srflx pairs never reach a terminal `Failed` state, so the agent never falls through to
+  the relay pair that works fine on its own) and a TURN-over-TCP client gap under `relay-only` +
+  `udp-blocked` (root-caused: the pinned `webrtc-ice` 0.17.1 has zero client-side TURN/TCP support at all,
+  confirmed by reading its source). Per architect review these are carved out — not silently folded in or
+  dropped — as **1.29** (nomination stall) and **1.30** (TURN/TCP gap); **1.26 stays blocked** on both
+  until a re-run confirms all four cells actually connect. 1.27 needs 1.26.
+- **NEXT:** run **`/next-task`** to continue with Group D — **1.29** (try tightening
+  `SettingEngine::set_ice_timeouts` in `webrtc_backend.rs` first per architect review, before reaching for
+  a session-level policy-retry fallback that would need a design-doc update) and **1.30** (check for a
+  semver-compatible `webrtc-ice` bump with TURN/TCP support; if none exists, document the real-backend
+  limitation honestly in Feature 5's spec) are both unblocked now (their only dependency, 1.26, has run and
+  found them) and can proceed in parallel. **1.26** flips to done once both land and a re-run confirms all
+  four cells connect; **1.27** needs 1.26 done.
 - After Phase 1 fixes land: **`/pick-next-phase`** selects Phase 2 (T06 Cross-Org Federation).
-  Blocking gate: F1, F2, F3, F10, F11 (→ 1.1, 1.2, 1.6, 1.13+1.15, 1.14+1.22+1.24+1.25+1.26+1.27) must
-  close first.
+  Blocking gate: F1, F2, F3, F10, F11 (→ 1.1, 1.2, 1.6, 1.13+1.15, 1.14+1.22+1.24+1.25+1.26+1.27+1.29+1.30)
+  must close first.
 
 ---
 
@@ -87,8 +97,10 @@ design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 - [x] **1.23** ~~NAT/relay wire-level acceptance matrix~~ — split before implementation into 1.24-1.27 (see file) — [file](./phase-1/1.23-netns-nat-matrix.md)
 - [x] **1.24** Real-signaling `SignalRelay` + `session connect` CLI (F11 wire, prerequisite; split from 1.23; depends on 1.22) — [file](./phase-1/1.24-real-signaling-p2p-cli.md)
 - [x] **1.25** netns topology + NAT-flavor emulation + coturn/rendezvous orchestration (F11 wire; split from 1.23; depends on 1.14) — [file](./phase-1/1.25-netns-topology-coturn.md)
-- [~] **1.26** Drive real peers across the topology + capture pcaps (F11 wire; split from 1.23; depends on 1.24, 1.25) — [file](./phase-1/1.26-netns-drive-and-capture.md)
+- [!] **1.26** Drive real peers across the topology + capture pcaps (F11 wire; split from 1.23; depends on 1.24, 1.25) — blocked on 1.29, 1.30 — [file](./phase-1/1.26-netns-drive-and-capture.md)
 - [ ] **1.27** pcap-analysis assertions + CI/harness wiring — closes F11 wire-level (split from 1.23; depends on 1.26) — [file](./phase-1/1.27-pcap-assertions-ci.md)
+- [ ] **1.29** ICE candidate-pair nomination stall under direct/prefer-relay (F11 wire; carved out of 1.26) — [file](./phase-1/1.29-ice-nomination-relay-fallback.md)
+- [ ] **1.30** TURN-over-TCP client gap under relay-only + udp-blocked (F11 wire; carved out of 1.26) — [file](./phase-1/1.30-turn-tcp-dependency-gap.md)
 
 **Group E — Design decisions + remaining should-fix / nit**
 - [ ] **1.17** ADR — deniability vs envelope signature (on-the-fly) — [file](./phase-1/1.17-adr-deniability-envelope-sig.md)
