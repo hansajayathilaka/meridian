@@ -87,7 +87,7 @@
 //! feature-04's acceptance criterion — if the local address genuinely changes (Wi-Fi→LTE), nothing
 //! here gathers or exchanges the new candidates the peer would need to find the new path, so
 //! connectivity will *not* actually resume. Closing that gap needs a ctrl-channel renegotiation
-//! message (ADR 0006/0014-relevant; flagged for architect review — 1.16/1.22/1.24-1.27 do not
+//! message (ADR 0006/0014-relevant; flagged for architect review; 1.16/1.22/1.24-1.27 do not
 //! touch this gap, so it remains a not-yet-numbered successor to 1.15; network-roaming support
 //! should not ship claiming this works until it lands).
 
@@ -100,6 +100,7 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
 
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::{APIBuilder, API};
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
@@ -125,6 +126,20 @@ use crate::{Result, Transport, TransportError};
 /// treating it as a backend failure. Generous for loopback-in-a-container CI, still bounded.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Bounds the *entire* `local_candidates` flow — committing the local SDP (which, for the dialer,
+/// is what actually kicks off ICE/TURN gathering) plus the wait for gathering to finish — not just
+/// the final "wait for `gather_done`" step `WAIT_TIMEOUT` already covered on its own.
+///
+/// Needed because of a real, confirmed gap (see
+/// `docs/tasks/phase-1/1.30-turn-tcp-dependency-gap.md`): the pinned `webrtc-ice` 0.17.1 has no
+/// client-side TURN-over-TCP support at all, and under `IcePolicy::RelayOnly` against a
+/// UDP-blocked network, its relay-candidate gathering worker can stall indefinitely *before*
+/// `local_candidates`'s own `WAIT_TIMEOUT`-bounded wait point is ever reached (empirically, this
+/// hung well past 90 seconds with no output at all — nowhere close to bounded by `WAIT_TIMEOUT`).
+/// Wrapping the whole flow in one outer timeout guarantees this fails loud within a bounded window
+/// instead of hanging silently, regardless of exactly where inside the flow the stall occurs.
+const GATHER_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// How long [`close`](WebRtcTransport::close) will wait for each data channel's `buffered_amount`
 /// to drain to zero before tearing the peer connection down. `send()` (below) only guarantees the
 /// bytes were handed to the SCTP association's outgoing queue, not that they left the process —
@@ -134,6 +149,21 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 /// short, because in practice this only ever needs to cover "let the runtime poll the SCTP
 /// flush task once", not a real network RTT.
 const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// `webrtc-ice`'s own defaults (`disconnected_timeout` 5s + `failed_timeout` 25s, i.e. 30s before
+/// the ICE agent gives up on a `Checking` phase that never found *any* valid pair) exceed
+/// [`WAIT_TIMEOUT`] — under a real NAT, permanently-unreachable host/srflx pairs (expected: that's
+/// just what NAT does) sit in `Checking` well past our own bounded wait, so the caller times out
+/// with "no candidate pair selected yet" long before the ICE agent itself would ever have declared
+/// the direct/srflx pairs a lost cause and kept servicing the (working) relay-vs-relay pair.
+/// Tightened here — confirmed against the real six-namespace NAT/coturn rig (`tools/netns-nat-matrix.sh`)
+/// — so the agent's own give-up horizon sits comfortably inside `WAIT_TIMEOUT`, leaving room for
+/// several full connectivity-check rounds against the relay pair before our own bound expires.
+/// Deliberately still well above one keepalive/check round (not a hair-trigger) so a merely-slow
+/// real link isn't mistaken for a dead one.
+const ICE_DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(2);
+const ICE_FAILED_TIMEOUT: Duration = Duration::from_secs(4);
+const ICE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 
 fn backend_err(e: impl std::fmt::Display) -> TransportError {
     TransportError::Backend(e.to_string())
@@ -214,9 +244,23 @@ impl WebRtcTransport {
     /// A fresh backend with production defaults (no interface/codec restrictions — this crate is
     /// data-only, so the media engine carries no codecs). Infallible: building the `API` object only
     /// assembles config, it never touches the network.
+    ///
+    /// The one non-default knob: `set_ice_timeouts` (see [`ICE_DISCONNECTED_TIMEOUT`] /
+    /// [`ICE_FAILED_TIMEOUT`] / [`ICE_KEEPALIVE_INTERVAL`]'s docs) — without it, `webrtc-ice`'s own
+    /// defaults leave the ICE agent's internal "give up on `Checking`" horizon (30s) past
+    /// [`WAIT_TIMEOUT`] (15s), so a real NAT's permanently-unreachable host/srflx pairs under
+    /// `IcePolicy::Direct`/`PreferRelay` (`RTCIceTransportPolicy::All`) leave us timing out before
+    /// the agent would ever have moved on to nominate the (working) relay-vs-relay pair.
     pub fn new() -> Self {
+        let mut setting_engine = SettingEngine::default();
+        setting_engine.set_ice_timeouts(
+            Some(ICE_DISCONNECTED_TIMEOUT),
+            Some(ICE_FAILED_TIMEOUT),
+            Some(ICE_KEEPALIVE_INTERVAL),
+        );
         let api = APIBuilder::new()
             .with_media_engine(MediaEngine::default())
+            .with_setting_engine(setting_engine)
             .build();
         Self {
             api: Arc::new(api),
@@ -255,6 +299,28 @@ impl WebRtcTransport {
         *sess.committed_local_sdp.lock().unwrap() = Some(sdp_text);
         *sess.pending_offer.lock().unwrap() = None;
         Ok(())
+    }
+
+    /// The actual gather-and-collect body of [`Transport::local_candidates`], factored out so the
+    /// whole thing (commit + wait) can be wrapped in one outer [`GATHER_TIMEOUT`] by the caller.
+    async fn gather_local_candidates(&self, sess: &Arc<Session>) -> Result<Vec<IceCandidate>> {
+        self.ensure_committed(sess).await?;
+
+        if !sess.gather_done_flag.load(Ordering::SeqCst) {
+            let notified = sess.gather_done.notified();
+            if !sess.gather_done_flag.load(Ordering::SeqCst) {
+                let _ = tokio::time::timeout(WAIT_TIMEOUT, notified).await;
+            }
+        }
+        let candidates = sess
+            .local_candidates
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(IceCandidate)
+            .collect();
+        Ok(candidates)
     }
 }
 
@@ -499,23 +565,21 @@ impl Transport for WebRtcTransport {
 
     async fn local_candidates(&self, s: &SessionHandle) -> Result<Vec<IceCandidate>> {
         let sess = self.get_session(s)?;
-        self.ensure_committed(&sess).await?;
-
-        if !sess.gather_done_flag.load(Ordering::SeqCst) {
-            let notified = sess.gather_done.notified();
-            if !sess.gather_done_flag.load(Ordering::SeqCst) {
-                let _ = tokio::time::timeout(WAIT_TIMEOUT, notified).await;
-            }
-        }
-        let candidates = sess
-            .local_candidates
-            .lock()
-            .unwrap()
-            .iter()
-            .cloned()
-            .map(IceCandidate)
-            .collect();
-        Ok(candidates)
+        // See `GATHER_TIMEOUT`'s docs: this bounds `ensure_committed` (which kicks off gathering
+        // for the dialer) *and* the wait for it to finish as a single unit, so a stall anywhere in
+        // that flow — not just at the final `notified()` wait point — still fails loud instead of
+        // hanging.
+        tokio::time::timeout(GATHER_TIMEOUT, self.gather_local_candidates(&sess))
+            .await
+            .map_err(|_| {
+                TransportError::Backend(format!(
+                    "ICE candidate gathering did not complete within {GATHER_TIMEOUT:?} — this is \
+                     a known gap when relay-only policy meets a UDP-blocked network: the pinned \
+                     webrtc-ice 0.17.1 has no client-side TURN-over-TCP support at all, so a TURN \
+                     server reachable only over TCP/TLS can stall gathering indefinitely (see \
+                     docs/tasks/phase-1/1.30-turn-tcp-dependency-gap.md)"
+                ))
+            })?
     }
 
     fn local_fingerprint(&self, s: &SessionHandle) -> Result<Fingerprint> {
