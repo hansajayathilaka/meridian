@@ -29,7 +29,7 @@ $ tcpdump on the "peer" netns confirms: no packets from our real address
 ```
 
 ## Acceptance criteria
-All four NAT matrix cells connect (symmetric×symmetric via relay); TLS-443 fallback works with UDP fully dropped; credentials expire and are distinct per request (reuse of a captured credential within its TTL is bounded by coturn's `user-quota`, not rejected outright); in `relay-only`, a packet capture at the peer contains zero of our host/srflx addresses; TURN sees only DTLS ciphertext (capture inspected in CI).
+All four NAT matrix cells connect (symmetric×symmetric via relay; `udp-blocked` + `relay-only` excepted — proven impossible at the pinned dependency version, see [1.30](../../tasks/phase-1/1.30-turn-tcp-dependency-gap.md)); TLS-443 fallback works with UDP fully dropped; credentials expire and are distinct per request (reuse of a captured credential within its TTL is bounded by coturn's `user-quota`, not rejected outright); in `relay-only`, a packet capture at the peer contains zero of our host/srflx addresses; TURN sees only DTLS ciphertext (capture inspected in CI).
 
 ## Risks / notes
 This task creates the latency-vs-privacy trade surface — the demo must *show* the cost (rtt printed per path) so the org-level decision in §5.4 is made with numbers, not vibes.
@@ -91,6 +91,6 @@ documented before 1.29 (now updated with the two-phase retry) — per this task'
 ("the demo must *show* the cost, rtt printed per path"), the added retry latency is never hidden:
 `SessionInfo::relay_fallback` and `SessionInfo::relay_fallback_wait_ms` (surfaced in `session
 info`/`session connect --json`/`doctor`) tell the operator both that a fallback happened and how long
-the abandoned first attempt was stuck before it did. **Flagged for architect review** (this
+the abandoned first attempt was stuck before it did. **Architect-signed-off (2026-07-23)** — this
 supersedes the acceptance criterion's implicit single-phase assumption above; see
-[1.29](../../tasks/phase-1/1.29-ice-nomination-relay-fallback.md)) — not yet a final sign-off.
+[1.29](../../tasks/phase-1/1.29-ice-nomination-relay-fallback.md) for the full sign-off record.

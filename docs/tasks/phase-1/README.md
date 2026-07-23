@@ -24,8 +24,10 @@ dependencies between fix-tasks are declared per task (notably 1.2→1.1, 1.15→
 1.24-1.27 (see [1.23](./1.23-netns-nat-matrix.md)'s Status); 1.24 and 1.25 were independent of each other
 and proceeded in parallel — both are now done. 1.26 was attempted (needs both); its own harness/tcpdump/pcap
 deliverables work, but its "all four cells connect" deliverable surfaced two real connectivity bugs against
-the real backend, carved out (not silently folded in or dropped) as **1.29** and **1.30** — 1.26 stays
-blocked on both until a re-run confirms all four cells actually connect.
+the real backend, carved out (not silently folded in or dropped) as **1.29** and **1.30** — both are now
+done, and a re-run against both fixes confirms 3/4 cells connect for real, with the 4th failing fast per an
+architect-approved amendment to 1.26's deliverable (see [1.26](./1.26-netns-drive-and-capture.md)'s Status).
+1.26 is now done; 1.27 is next.
 
 ## Tasks (todo)
 <!-- Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
@@ -48,7 +50,7 @@ blocked on both until a re-run confirms all four cells actually connect.
 - [x] **1.11** Re-point opacity-audit harness gate (F8) — [file](./1.11-opacity-harness-gate.md)
 - [x] **1.12** Rendezvous fail-closed config + feature-gate tamper hook (F16, F17) — [file](./1.12-rendezvous-fail-closed.md)
 
-**Group D — Close Features 4/5 honestly** (blocking; honesty fixes cheap, backend weeks)
+**Group D — Close Features 4/5 honestly** (blocking; honesty cheap, backend weeks)
 - [x] **1.13** Feature 4 honesty: transport label + SDP test (F10 honesty) — [file](./1.13-feature4-honesty.md)
 - [x] **1.14** Feature 5 honesty: coturn user-quota + credential-reuse wording (F11 honesty) — [file](./1.14-feature5-honesty.md)
 - [x] **1.15** webrtc-rs `Transport` backend (F10 backend) — [file](./1.15-webrtc-backend.md)
@@ -57,10 +59,10 @@ blocked on both until a re-run confirms all four cells actually connect.
 - [x] **1.23** ~~NAT/relay wire-level acceptance matrix~~ — split before implementation into 1.24-1.27 (see file) — [file](./1.23-netns-nat-matrix.md)
 - [x] **1.24** Real-signaling `SignalRelay` + `session connect` CLI (F11 wire, prerequisite; split from 1.23; depends on 1.22) — [file](./1.24-real-signaling-p2p-cli.md)
 - [x] **1.25** netns topology + NAT-flavor emulation + coturn/rendezvous orchestration (F11 wire; split from 1.23; depends on 1.14) — [file](./1.25-netns-topology-coturn.md)
-- [!] **1.26** Drive real peers across the topology + capture pcaps (F11 wire; split from 1.23; depends on 1.24, 1.25) — blocked on 1.29, 1.30 — [file](./1.26-netns-drive-and-capture.md)
+- [x] **1.26** Drive real peers across the topology + capture pcaps (F11 wire; split from 1.23; depends on 1.24, 1.25) — 3/4 cells connect for real, 4th documented (see file) — [file](./1.26-netns-drive-and-capture.md)
 - [ ] **1.27** pcap-analysis assertions + CI/harness wiring — closes F11 wire-level (split from 1.23; depends on 1.26) — [file](./1.27-pcap-assertions-ci.md)
-- [ ] **1.29** ICE candidate-pair nomination stall under direct/prefer-relay (F11 wire; carved out of 1.26; depends on 1.26) — [file](./1.29-ice-nomination-relay-fallback.md)
-- [ ] **1.30** TURN-over-TCP client gap under relay-only + udp-blocked (F11 wire; carved out of 1.26; depends on 1.26) — [file](./1.30-turn-tcp-dependency-gap.md)
+- [x] **1.29** ICE candidate-pair nomination stall under direct/prefer-relay (F11 wire; carved out of 1.26; depends on 1.26) — [file](./1.29-ice-nomination-relay-fallback.md)
+- [x] **1.30** TURN-over-TCP client gap under relay-only + udp-blocked (F11 wire; carved out of 1.26; depends on 1.26) — [file](./1.30-turn-tcp-dependency-gap.md)
 
 **Group E — Design decisions + remaining should-fix / nit**
 - [ ] **1.17** ADR — deniability vs envelope signature (on-the-fly) — [file](./1.17-adr-deniability-envelope-sig.md)
