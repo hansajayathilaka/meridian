@@ -7,7 +7,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use meridian_transport::{ChannelCfg, IceConfig, SessionHandle, Transport, WebRtcTransport};
+use meridian_transport::{
+    ChannelCfg, IceConfig, IcePolicy, IceServer, SessionHandle, Transport, WebRtcTransport,
+};
 
 async fn connect_pair() -> (
     Arc<WebRtcTransport>,
@@ -218,4 +220,62 @@ async fn ice_restart_keeps_the_live_channel_flowing() {
 
     tb.send(&sb, &cb, b"after restart").await.unwrap();
     assert_eq!(ta.recv(&sa).await.unwrap().unwrap().1, b"after restart");
+}
+
+/// Regression test for 1.30 (`docs/tasks/phase-1/1.30-turn-tcp-dependency-gap.md`): under
+/// `IcePolicy::RelayOnly` against a TURN server whose UDP path never answers — exactly what a
+/// UDP-blocked NAT/firewall looks like from the ICE agent's perspective, and (per the pinned
+/// `webrtc-ice` 0.17.1's total lack of client-side TURN-over-TCP support) the only relay transport
+/// this backend can actually attempt today even when a `transport=tcp` URL is also offered —
+/// `local_candidates` used to be able to stall well past its own bounded waits (empirically, past a
+/// 90s outer script timeout on the real netns/coturn rig). It must now fail loud, quickly, and with
+/// a clear error instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_only_gathering_fails_fast_against_a_silent_turn_server() {
+    // A real UDP socket that accepts packets but never replies — indistinguishable, from the ICE
+    // agent's side, from a firewall that silently drops UDP to the TURN server.
+    let silent_turn = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind silent TURN stand-in");
+    let addr = silent_turn.local_addr().unwrap();
+
+    let ta = Arc::new(WebRtcTransport::new());
+    let cfg = IceConfig {
+        stun_servers: Vec::new(),
+        ice_servers: vec![IceServer {
+            urls: vec![format!("turn:{addr}?transport=udp")],
+            username: Some("regression-test-user".into()),
+            credential: Some("regression-test-pass".into()),
+        }],
+        policy: IcePolicy::RelayOnly,
+    };
+    let sa = ta.new_session(cfg).await.unwrap();
+    ta.add_data_channel(&sa, ChannelCfg::reliable_ordered("mrd.ctrl/1"))
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    // Generous outer guard so a genuine regression (an unbounded hang) fails this test loudly
+    // instead of hanging the whole suite — this is not the bound under test, just a backstop.
+    let outcome = tokio::time::timeout(Duration::from_secs(40), ta.local_candidates(&sa)).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        outcome.is_ok(),
+        "local_candidates hung past the outer 40s test guard after {elapsed:?} — the \
+         gather-and-connect flow is no longer bounded"
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "local_candidates took {elapsed:?} to return — expected it to fail fast (bounded by \
+         GATHER_TIMEOUT), not creep toward the outer test guard"
+    );
+    // Whether it errors outright or returns with no usable candidates, it must not silently
+    // report success with a relay candidate that was never actually reachable.
+    if let Ok(Ok(candidates)) = outcome {
+        assert!(
+            candidates.is_empty(),
+            "gathered a candidate from a TURN server that never answered: {candidates:?}"
+        );
+    }
+
+    drop(silent_turn);
 }
