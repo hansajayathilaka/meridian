@@ -50,6 +50,13 @@ CELLS=(full-cone port-restricted symmetric:symmetric udp-blocked)
 # empirically needs 4-5 concurrent allocations under this coturn 4.6.1 build and blows the quota).
 TEST_PEER_PORT=13480
 
+# 1.26: a fixed local passphrase for the rig's own alice/bob identities (below). Not a real secret
+# in the "never in the repo" sense the TURN static-auth-secret is (that one is rig-generated fresh
+# per rundir by get_or_create_secret and never checked in) — this only wraps two disposable,
+# rig-scratch Ed25519 keyfiles that exist purely to drive a local test topology, exactly like
+# apps/cli/tests/session_connect_webrtc.rs's literal "demo-passphrase" fixture.
+RIG_PASSPHRASE="nat-matrix-rig-passphrase"
+
 # Rig-local scratch state (config, pidfiles, logs). Never reuses/edits the checked-in
 # infra/coturn/turnserver.conf template — this is a fresh rig-generated config with a fresh secret.
 RIG_DIR="${MERIDIAN_NETNS_RIG_DIR:-}"
@@ -69,6 +76,31 @@ EOF
   if ! command -v ip >/dev/null 2>&1; then
     echo "iproute2 ('ip') not found — cannot build the netns topology. Skipping." >&2
     exit 0
+  fi
+}
+
+# 1.26: tcpdump (pcap capture) and jq (JSON parsing of the p2p_connect headline line) may not be
+# preinstalled. Best-effort `apt-get install` if either is missing; tcpdump is load-bearing (no
+# fallback — pcap capture is this task's deliverable) so its continued absence is fatal, while jq's
+# absence only degrades to a sed-based fallback parse (still functional, just less robust).
+ensure_wire_tools() {
+  local missing=()
+  command -v tcpdump >/dev/null 2>&1 || missing+=(tcpdump)
+  command -v jq >/dev/null 2>&1 || missing+=(jq)
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "[nat-matrix] installing missing tool(s) for the real-peer wire capture: ${missing[*]}"
+    apt-get update -qq >/dev/null 2>&1 || true
+    apt-get install -y "${missing[@]}" >/dev/null 2>&1 || true
+  fi
+  if ! command -v tcpdump >/dev/null 2>&1; then
+    echo "[nat-matrix] tcpdump still not available after attempted install — cannot capture the" >&2
+    echo "             pcaps 1.26/1.27 need. Install it manually (apt-get install tcpdump) and" >&2
+    echo "             re-run." >&2
+    exit 1
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "[nat-matrix] jq still not available — falling back to sed for parsing the p2p_connect" >&2
+    echo "             JSON line (functional, just less robust)." >&2
   fi
 }
 
@@ -221,6 +253,22 @@ flavor_for_cell() {
     symmetric:symmetric) echo symmetric ;;
     udp-blocked) echo udp-blocked ;;
     *) echo "flavor_for_cell: unknown cell '$1'" >&2; exit 2 ;;
+  esac
+}
+
+# 1.26: map a cell name to the relay policy `drive_real_peers` configures on BOTH real peers before
+# driving their real `session connect` — the three-rung ladder each NAT flavor is meant to
+# demonstrate (T05 §5.4): cone-like NATs can go direct; symmetric NAT prefers relay (direct is
+# usually unreachable but still attempted first); UDP-blocked egress must go relay-only (no
+# host/srflx candidate could ever be reached anyway, and gathering them would leak addresses for no
+# benefit).
+policy_for_cell() {
+  case "$1" in
+    full-cone) echo direct ;;
+    port-restricted) echo direct ;;
+    symmetric:symmetric) echo prefer-relay ;;
+    udp-blocked) echo relay-only ;;
+    *) echo "policy_for_cell: unknown cell '$1'" >&2; exit 2 ;;
   esac
 }
 
@@ -693,6 +741,206 @@ wire_smoke_cell() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# 1.26: drive two REAL `meridian` processes (alice in ns-alice, bob in ns-bob) across the topology,
+# with tcpdump bracketing each run at ns-bob (b-eth) and ns-turn (t-eth). Everything above (1.25)
+# proves the topology/coturn/rendezvous are real working infrastructure with generic wire-level
+# checks; this section is the first thing that actually puts a real Meridian peer process on each
+# side of the NAT matrix. Strict pcap-content assertions (host/srflx-leak scanning, DTLS-ciphertext-
+# only scanning) are explicitly 1.27's job, not this one's.
+# ---------------------------------------------------------------------------------------------
+
+# alice/bob each get their own $MERIDIAN_HOME under the rig dir so their identities are rig-scratch
+# (never the developer's own ~/.config/meridian) but still persist across cells/invocations, mirroring
+# ensure_topology's idempotent-reuse pattern. These run on the HOST filesystem/mount namespace (`id
+# new`/`config set`/`id show` need no network) — only the `session connect` process itself needs to
+# run inside ns-alice/ns-bob (via `ip netns exec`) to pick up a NATed source address.
+alice_home() { echo "$(rig_dir)/alice-home"; }
+bob_home()   { echo "$(rig_dir)/bob-home"; }
+
+# Idempotent: an `account.json` marker (AccountDescriptor::save's target — see apps/cli/src/account.rs)
+# means this identity already exists; skip regenerating it, exactly like ensure_topology's
+# coturn/rendezvous/test-peer reuse checks above.
+ensure_identities() {
+  local ah bh
+  ah="$(alice_home)"
+  bh="$(bob_home)"
+  mkdir -p "$ah" "$bh"
+
+  if [[ -f "$ah/account.json" ]]; then
+    echo "[nat-matrix] alice identity already exists in $ah, reusing"
+  else
+    echo "[nat-matrix] creating alice identity in $ah"
+    (cd "$ah" && MERIDIAN_HOME="$ah" MERIDIAN_PASSPHRASE="$RIG_PASSPHRASE" \
+      "$REPO_ROOT/$BIN" id new --store file --out meridian.key --hint "$TURN_REALM" >/dev/null)
+  fi
+
+  if [[ -f "$bh/account.json" ]]; then
+    echo "[nat-matrix] bob identity already exists in $bh, reusing"
+  else
+    echo "[nat-matrix] creating bob identity in $bh"
+    (cd "$bh" && MERIDIAN_HOME="$bh" MERIDIAN_PASSPHRASE="$RIG_PASSPHRASE" \
+      "$REPO_ROOT/$BIN" id new --store file --out meridian.key --hint "$TURN_REALM" >/dev/null)
+  fi
+}
+
+alice_id() { MERIDIAN_HOME="$(alice_home)" "$REPO_ROOT/$BIN" id show; }
+bob_id()   { MERIDIAN_HOME="$(bob_home)"   "$REPO_ROOT/$BIN" id show; }
+
+# ---------------------------------------------------------------------------------------------
+# tcpdump capture helpers — same graceful-then-force kill pattern as `down()`'s coturn/rendezvous
+# teardown below, scoped to one capture (identified by a short `tag`, e.g. "full-cone-bob") so two
+# captures (bob + turn) can be started/stopped independently per cell run.
+# ---------------------------------------------------------------------------------------------
+
+start_tcpdump() {
+  local ns="$1" iface="$2" outfile="$3" tag="$4"
+  local d pidfile logfile
+  d="$(rig_dir)"
+  mkdir -p "$d/tcpdump"
+  pidfile="$d/tcpdump/$tag.pid"
+  logfile="$d/tcpdump/$tag.log"
+
+  # -U: packet-buffered writes, so a SIGTERM (below) still leaves a valid, mostly-flushed pcap
+  # rather than data sitting in tcpdump's internal buffer. -s 0: full snaplen (no truncation).
+  ip netns exec "$ns" tcpdump -i "$iface" -w "$outfile" -U -s 0 >"$logfile" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$pidfile"
+  # Give it a brief moment to actually attach before any real traffic is generated.
+  sleep 0.4
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "[nat-matrix] tcpdump ($tag) died immediately — log follows:" >&2
+    cat "$logfile" >&2 || true
+    exit 1
+  fi
+}
+
+stop_tcpdump() {
+  local tag="$1"
+  local d pidfile pid
+  d="$(rig_dir)"
+  pidfile="$d/tcpdump/$tag.pid"
+  if [[ -f "$pidfile" ]]; then
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      for _ in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+      done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+  fi
+}
+
+# Best-effort parse of the `--json` headline line (`{"event":"p2p_connect",...}`) from a captured
+# stdout file, printing one eyeball-able summary line. NOT a strict pass/fail assertion (1.27's
+# job) — if the line is absent (process errored out before establishing), says so plainly instead
+# of failing to parse.
+print_p2p_summary() {
+  local cell="$1" policy="$2" who="$3" outfile="$4"
+  local line path xport role
+  line="$(grep -m1 '"event":"p2p_connect"' "$outfile" 2>/dev/null || true)"
+  if [[ -z "$line" ]]; then
+    echo "[nat-matrix] cell=$cell policy=$policy $who: no p2p_connect event observed (process" \
+         "did not report success) — see $outfile / its .err sibling"
+    return
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    path="$(echo "$line" | jq -r '.path')"
+    xport="$(echo "$line" | jq -r '.transport')"
+    role="$(echo "$line" | jq -r '.role')"
+  else
+    path="$(echo "$line" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')"
+    xport="$(echo "$line" | sed -n 's/.*"transport":"\([^"]*\)".*/\1/p')"
+    role="$(echo "$line" | sed -n 's/.*"role":"\([^"]*\)".*/\1/p')"
+  fi
+  echo "[nat-matrix] cell=$cell policy=$policy $who($role): path=$path transport=$xport"
+}
+
+# The 1.26 headline: drive real `meridian session connect` processes on both sides of the cell's
+# NAT flavor, with tcpdump bracketing the run at ns-bob/b-eth and ns-turn/t-eth. Faithfully reports
+# whatever actually happens — including a real connect FAILURE, which is an expected, useful, valid
+# finding here (suspected candidate-pair-nomination / TURN-TCP-fallback bugs are a separate task's
+# job to fix, not this script's to paper over) — never silently continuing past one.
+drive_real_peers() {
+  local cell="$1"
+  local d aid bid policy
+  d="$(rig_dir)"
+  mkdir -p "$d/pcaps" "$d/session-logs"
+
+  ensure_identities
+  aid="$(alice_id)"
+  bid="$(bob_id)"
+  policy="$(policy_for_cell "$cell")"
+
+  echo "[nat-matrix] cell=$cell — configuring relay policy '$policy' for alice($aid)<->bob($bid)"
+  MERIDIAN_HOME="$(alice_home)" "$REPO_ROOT/$BIN" config set policy "$policy" --contact "$bid" >/dev/null
+  MERIDIAN_HOME="$(bob_home)"   "$REPO_ROOT/$BIN" config set policy "$policy" --contact "$aid" >/dev/null
+
+  local cell_safe="${cell//:/_}"
+  local pcap_bob="$d/pcaps/${cell_safe}-bob.pcap"
+  local pcap_turn="$d/pcaps/${cell_safe}-turn.pcap"
+
+  echo "[nat-matrix] cell=$cell — starting tcpdump captures (ns-bob/b-eth, ns-turn/t-eth)"
+  start_tcpdump ns-bob "b-eth" "$pcap_bob" "${cell_safe}-bob"
+  start_tcpdump ns-turn "t-eth" "$pcap_turn" "${cell_safe}-turn"
+
+  local alice_out="$d/session-logs/${cell_safe}-alice.out"
+  local alice_err="$d/session-logs/${cell_safe}-alice.err"
+  local bob_out="$d/session-logs/${cell_safe}-bob.out"
+  local bob_err="$d/session-logs/${cell_safe}-bob.err"
+
+  echo "[nat-matrix] cell=$cell — driving real 'meridian session connect' concurrently on both sides"
+  # Both sides must be live on the rendezvous at the same time (no offer/answer mailbox — see
+  # apps/cli/tests/session_connect_webrtc.rs's module docs / signal_relay.rs), so both are spawned
+  # in the background before either is waited on. `timeout 90` is a SCRIPT-level safety valve only
+  # (protects this rig's own run loop from ever hanging forever on a stuck process) — it does not
+  # touch, shorten, or otherwise interact with dial_with_config/answer_with_config's own internal
+  # bounded-wait timeouts inside meridian-core/meridian-transport.
+  (
+    export MERIDIAN_HOME="$(alice_home)"
+    export MERIDIAN_PASSPHRASE="$RIG_PASSPHRASE"
+    timeout 90 ip netns exec ns-alice "$REPO_ROOT/$BIN" session connect "$bid" \
+      --server ws://203.0.113.1:8443 --transport webrtc --json
+  ) >"$alice_out" 2>"$alice_err" &
+  local alice_pid=$!
+
+  (
+    export MERIDIAN_HOME="$(bob_home)"
+    export MERIDIAN_PASSPHRASE="$RIG_PASSPHRASE"
+    timeout 90 ip netns exec ns-bob "$REPO_ROOT/$BIN" session connect "$aid" \
+      --server ws://203.0.113.1:8443 --transport webrtc --json
+  ) >"$bob_out" 2>"$bob_err" &
+  local bob_pid=$!
+
+  local alice_ec=0 bob_ec=0
+  wait "$alice_pid" || alice_ec=$?
+  wait "$bob_pid" || bob_ec=$?
+
+  echo "[nat-matrix] cell=$cell — stopping tcpdump captures"
+  stop_tcpdump "${cell_safe}-bob"
+  stop_tcpdump "${cell_safe}-turn"
+
+  print_p2p_summary "$cell" "$policy" "alice" "$alice_out"
+  print_p2p_summary "$cell" "$policy" "bob" "$bob_out"
+  echo "[nat-matrix] cell=$cell — pcaps: $pcap_bob $pcap_turn"
+
+  if [[ "$alice_ec" -ne 0 || "$bob_ec" -ne 0 ]]; then
+    echo "[nat-matrix] FAIL: cell=$cell — real session connect did not succeed on both sides" \
+         "(alice_exit=$alice_ec bob_exit=$bob_ec)" >&2
+    echo "----- alice stdout ($alice_out) -----" >&2; cat "$alice_out" >&2 || true
+    echo "----- alice stderr ($alice_err) -----" >&2; cat "$alice_err" >&2 || true
+    echo "----- bob stdout ($bob_out) -----" >&2; cat "$bob_out" >&2 || true
+    echo "----- bob stderr ($bob_err) -----" >&2; cat "$bob_err" >&2 || true
+    echo "[nat-matrix] pcaps were still captured despite the failure: $pcap_bob $pcap_turn" >&2
+    exit 1
+  fi
+
+  echo "[nat-matrix] cell=$cell — real session connect succeeded on both sides"
+}
+
+# ---------------------------------------------------------------------------------------------
 # Idempotent bring-up: topology build is expensive, so `matrix`/standalone `cell` calls reuse an
 # already-up topology + already-running coturn/rendezvous rather than rebuilding every time; only
 # the per-cell NAT-flavor swap (apply_nat_flavor's flush+reapply) is meant to be cheap and repeated.
@@ -740,11 +988,13 @@ ensure_topology() {
 cell() {
   local name="${1:?usage: cell <full-cone|port-restricted|symmetric:symmetric|udp-blocked>}"
   need_root
+  ensure_wire_tools
   ensure_topology
   echo "[nat-matrix] configuring cell '$name'"
   set_cell_nat "$name"
   smoke_cell "$name"
   wire_smoke_cell "$name"
+  drive_real_peers "$name"
   echo "[nat-matrix] cell '$name': ALL CHECKS PASSED"
 }
 
@@ -777,6 +1027,25 @@ down() {
         fi
       fi
     done
+    # 1.26: any tcpdump capture left running because a `cell` invocation was interrupted mid-run
+    # (Ctrl-C, crash) before its own drive_real_peers/stop_tcpdump calls got to it — same
+    # graceful-then-force pattern as the pidfiles just above.
+    if [[ -d "$d/tcpdump" ]]; then
+      for pidfile in "$d"/tcpdump/*.pid; do
+        if [[ -f "$pidfile" ]]; then
+          local pid
+          pid="$(cat "$pidfile" 2>/dev/null || true)"
+          if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$pid" 2>/dev/null || break
+              sleep 0.1
+            done
+            kill -9 "$pid" 2>/dev/null || true
+          fi
+        fi
+      done
+    fi
   fi
   # Belt-and-suspenders: in case pidfiles were stale/missing, make sure nothing rig-related
   # survives by name too. Guarded on a non-empty rig dir so an empty $d (no rig ever started in
@@ -784,6 +1053,7 @@ down() {
   # coturn on the box.
   if [[ -n "$d" ]]; then
     pkill -f "turnserver -c $d" 2>/dev/null || true
+    pkill -f "tcpdump -i .* -w $d/pcaps" 2>/dev/null || true
   fi
 
   for n in ns-alice ns-natA ns-net ns-turn ns-natB ns-bob; do
