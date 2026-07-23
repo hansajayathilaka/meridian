@@ -253,11 +253,19 @@ async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
     lines.push(info.to_string());
 
     if json {
+        // 1.29 (Bug A): a session that only connected via the relay-only retry surfaces that here
+        // too — never hide the added latency behind a plain "established:true" (Feature 5's "show
+        // the cost" note).
+        let relay_fallback_wait_ms = match info.relay_fallback_wait_ms {
+            Some(ms) => format!("{ms}"),
+            None => "null".to_string(),
+        };
         println!(
-            "{{\"event\":\"p2p_connect\",\"role\":\"{role_label}\",\"peer\":{},\"established\":true,\"transport\":\"{}\",\"path\":\"{}\"}}",
+            "{{\"event\":\"p2p_connect\",\"role\":\"{role_label}\",\"peer\":{},\"established\":true,\"transport\":\"{}\",\"path\":\"{}\",\"relay_fallback\":{},\"relay_fallback_wait_ms\":{relay_fallback_wait_ms}}}",
             json_string(&peer_label),
             info.transport,
             info.path,
+            info.relay_fallback,
         );
     } else {
         println!("— P2P session with {peer_label} ({role_label}) —");
