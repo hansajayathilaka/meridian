@@ -27,7 +27,12 @@ deliverables work, but its "all four cells connect" deliverable surfaced two rea
 the real backend, carved out (not silently folded in or dropped) as **1.29** and **1.30** — both are now
 done, and a re-run against both fixes confirms 3/4 cells connect for real, with the 4th failing fast per an
 architect-approved amendment to 1.26's deliverable (see [1.26](./1.26-netns-drive-and-capture.md)'s Status).
-1.26 is now done; 1.27 is next.
+1.26 is now done. **1.27** (pcap-analysis assertions + CI/harness wiring) is also now done — it turned
+1.26's captures into strict pass/fail assertions, found and fixed two more real bugs during live-rig
+re-verification (a prekey-bundle publish/fetch race, tracked separately as **1.31** since it's out of
+F11's scope; a CI-harness build-order gap), and closed two gaps required-reviewers found in the
+assertions themselves. **F11 (wire-level) is now fully closed** — all of 1.14+1.22+1.24+1.25+1.26+1.27+
+1.29+1.30 are done.
 
 ## Tasks (todo)
 <!-- Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
@@ -60,7 +65,7 @@ architect-approved amendment to 1.26's deliverable (see [1.26](./1.26-netns-driv
 - [x] **1.24** Real-signaling `SignalRelay` + `session connect` CLI (F11 wire, prerequisite; split from 1.23; depends on 1.22) — [file](./1.24-real-signaling-p2p-cli.md)
 - [x] **1.25** netns topology + NAT-flavor emulation + coturn/rendezvous orchestration (F11 wire; split from 1.23; depends on 1.14) — [file](./1.25-netns-topology-coturn.md)
 - [x] **1.26** Drive real peers across the topology + capture pcaps (F11 wire; split from 1.23; depends on 1.24, 1.25) — 3/4 cells connect for real, 4th documented (see file) — [file](./1.26-netns-drive-and-capture.md)
-- [ ] **1.27** pcap-analysis assertions + CI/harness wiring — closes F11 wire-level (split from 1.23; depends on 1.26) — [file](./1.27-pcap-assertions-ci.md)
+- [x] **1.27** pcap-analysis assertions + CI/harness wiring — closes F11 wire-level (split from 1.23; depends on 1.26) — [file](./1.27-pcap-assertions-ci.md)
 - [x] **1.29** ICE candidate-pair nomination stall under direct/prefer-relay (F11 wire; carved out of 1.26; depends on 1.26) — [file](./1.29-ice-nomination-relay-fallback.md)
 - [x] **1.30** TURN-over-TCP client gap under relay-only + udp-blocked (F11 wire; carved out of 1.26; depends on 1.26) — [file](./1.30-turn-tcp-dependency-gap.md)
 
@@ -71,6 +76,7 @@ architect-approved amendment to 1.26's deliverable (see [1.26](./1.26-netns-driv
 - [ ] **1.20** Server-hardening bundle (F21) — [file](./1.20-server-hardening-bundle.md)
 - [ ] **1.21** Coverage tooling or drop the % (F22) — [file](./1.21-coverage-tooling.md)
 - [ ] **1.28** Active relay-rewrite adversarial test (on-the-fly, flagged during 1.23's split; not part of F11's closure) — [file](./1.28-active-relay-rewrite-test.md)
+- [ ] **1.31** Prekey-bundle republish/fetch race on reconnect (on-the-fly, found during 1.27's live-rig verification; not part of F11's closure) — [file](./1.31-prekey-bundle-republish-race.md)
 
 ## Exit criteria
 All fix-tasks `[x]`, tree green (`just build` + `cargo clippy -D warnings` clean), docs synced. Blocking
@@ -99,4 +105,6 @@ On-the-fly decisions: ratchet composition → 1.1 (ADR 0015); deniability vs env
 (ADR); desync auto-recovery → 1.18; active relay-rewrite adversarial test (flagged during 1.23's split,
 not part of F11's closure) → 1.28; ICE nomination stall + TURN-over-TCP dependency gap (both found while
 running 1.26 against the real backend, root-caused by connectivity-debugger, scoped by architect) → 1.29,
-1.30. **No action** (already recorded as deferred): threat-model goal 2 key-substitution half → Feature 8.
+1.30; prekey-bundle republish/fetch race on reconnect (found while personally re-verifying 1.27 against
+the real rig, confirmed by connectivity-debugger, not part of F11's closure) → 1.31. **No action**
+(already recorded as deferred): threat-model goal 2 key-substitution half → Feature 8.

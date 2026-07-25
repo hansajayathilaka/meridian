@@ -48,17 +48,30 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   instead of hanging. Re-run against both fixes: `full-cone`/`port-restricted`/`symmetric:symmetric` all
   connect for real (`path=relay`); `udp-blocked` still can't connect but fails fast and cleanly. Per
   architect sign-off, 1.26's "all four cells connect" criterion was explicitly amended (3/4 connect for
-  real, 4th is a documented upstream ceiling, not a task failure) — **1.26 is now done**.
-- **NEXT:** run **`/next-task`** to continue with Group D — **1.27** (pcap-analysis assertions + CI
-  wiring, depends on 1.26 — now unblocked) is next, closing F11's wire-level half. Per architect review,
-  scope its assertions per cell: the path/rung and DTLS-ciphertext-only assertions apply to the 3
-  connecting cells; the `relay-only` zero-host/srflx-leak assertion should still run against
-  `udp-blocked`'s pcap (it must hold trivially there); add one assertion specific to `udp-blocked` proving
-  the fails-fast claim on the wire. See [1.26](./phase-1/1.26-netns-drive-and-capture.md)'s Status for the
-  full note.
-- After Phase 1 fixes land: **`/pick-next-phase`** selects Phase 2 (T06 Cross-Org Federation).
-  Blocking gate: F1, F2, F3, F10, F11 (→ 1.1, 1.2, 1.6, 1.13+1.15, 1.14+1.22+1.24+1.25+1.26+1.27+1.29+1.30)
-  must close first.
+  real, 4th is a documented upstream ceiling, not a task failure) — **1.26 is now done**. **1.27**
+  (pcap-analysis assertions + CI/harness wiring) is also now done, turning 1.26's captures into strict,
+  fail-closed pass/fail checks (path/rung corroboration, zero host/srflx-leak gated on relay-only policy,
+  DTLS-ciphertext-only, udp-blocked fails-fast) and wiring `harnesses/nat-matrix/run.sh` to build+run them
+  in CI. Personally re-verifying it against the live rig (not just the implementing agent's self-report)
+  surfaced and fixed two more real bugs — a prekey-bundle publish/fetch race on reconnect (rig-scoped fix
+  landed here; the underlying, out-of-scope race in `session_connect.rs` is tracked separately as
+  **1.31**, not part of F11's closure) and a CI-harness build-order gap that silently dropped the
+  `webrtc` feature before the rig ran. security-reviewer and connectivity-debugger's required reviews
+  each found one more real gap in the assertions themselves (a fail-open on an unreadable pcap; assertion
+  (b) gated on the wrong variable), both fixed before merge; a known, honestly-documented residual gap
+  (the actually-connecting relay session for the 3 fallback cells isn't yet independently wire-verified
+  for zero-leak, only `udp-blocked`'s trivial case is) is recorded in 1.27's task file rather than
+  papered over. **Group D (1.13-1.16, 1.22-1.30) is now fully done — F11 (wire-level) is fully closed.**
+- **NEXT:** Group D is complete. The blocking gate for Phase 2 (F1, F2, F3, F10, F11) is now fully
+  satisfied — `/pick-next-phase` can select Phase 2 (T06 Cross-Org Federation) per the Phase 1 Goal's
+  verdict. Phase 1 itself isn't fully `[x]` yet: Group E's should-fix/nit items remain pending — **1.17**
+  (deniability ADR), **1.18** (desync recovery decision), **1.19** (5k-connection capacity test), **1.20**
+  (server-hardening bundle), **1.21** (coverage tooling), **1.28** (active relay-rewrite adversarial
+  test), and the newly-added **1.31** (prekey-bundle republish race, found during 1.27's verification) —
+  run **`/next-task`** to continue with Group E, or **`/pick-next-phase`** to start Phase 2 in parallel
+  per the Goal's explicit blocking-vs-should-fix distinction.
+- After Phase 1 fixes fully land (Group E too): exit criteria are met per
+  [phase-1/README.md](./phase-1/README.md)'s Exit criteria section.
 
 ---
 
@@ -105,7 +118,7 @@ design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 - [x] **1.24** Real-signaling `SignalRelay` + `session connect` CLI (F11 wire, prerequisite; split from 1.23; depends on 1.22) — [file](./phase-1/1.24-real-signaling-p2p-cli.md)
 - [x] **1.25** netns topology + NAT-flavor emulation + coturn/rendezvous orchestration (F11 wire; split from 1.23; depends on 1.14) — [file](./phase-1/1.25-netns-topology-coturn.md)
 - [x] **1.26** Drive real peers across the topology + capture pcaps (F11 wire; split from 1.23; depends on 1.24, 1.25) — 3/4 cells connect for real, 4th documented (see file) — [file](./phase-1/1.26-netns-drive-and-capture.md)
-- [ ] **1.27** pcap-analysis assertions + CI/harness wiring — closes F11 wire-level (split from 1.23; depends on 1.26) — [file](./phase-1/1.27-pcap-assertions-ci.md)
+- [x] **1.27** pcap-analysis assertions + CI/harness wiring — closes F11 wire-level (split from 1.23; depends on 1.26) — [file](./phase-1/1.27-pcap-assertions-ci.md)
 - [x] **1.29** ICE candidate-pair nomination stall under direct/prefer-relay (F11 wire; carved out of 1.26) — [file](./phase-1/1.29-ice-nomination-relay-fallback.md)
 - [x] **1.30** TURN-over-TCP client gap under relay-only + udp-blocked (F11 wire; carved out of 1.26) — [file](./phase-1/1.30-turn-tcp-dependency-gap.md)
 
@@ -116,6 +129,7 @@ design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 - [ ] **1.20** Server-hardening bundle (F21) — [file](./phase-1/1.20-server-hardening-bundle.md)
 - [ ] **1.21** Coverage tooling or drop the % (F22) — [file](./phase-1/1.21-coverage-tooling.md)
 - [ ] **1.28** Active relay-rewrite adversarial test (on-the-fly, flagged during 1.23's split; not part of F11's closure) — [file](./phase-1/1.28-active-relay-rewrite-test.md)
+- [ ] **1.31** Prekey-bundle republish/fetch race on reconnect (on-the-fly, found during 1.27's live-rig verification; not part of F11's closure) — [file](./phase-1/1.31-prekey-bundle-republish-race.md)
 
 ---
 

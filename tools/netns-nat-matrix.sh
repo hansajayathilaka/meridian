@@ -27,9 +27,18 @@
 # peer process across it is 1.26; tcpdump/pcap assertions are 1.27 — both out of scope here.
 #
 # Usage:
+#   cargo build -p meridian-cli --features webrtc   # 1.26+: BIN below must have real WebRtcTransport
 #   sudo tools/netns-nat-matrix.sh matrix        # build + run all four cells (topology stays up)
 #   sudo tools/netns-nat-matrix.sh cell udp-blocked
 #   sudo tools/netns-nat-matrix.sh down
+#
+# The `cargo build --features webrtc` step above is REQUIRED before `matrix`/`cell` (1.26 on): BIN
+# defaults to ./target/debug/meridian, and `session connect` (used by drive_real_peers) fails loud
+# with "meridian-cli was built without the `webrtc` feature" if the binary there was last built
+# without it — e.g. by a plain `cargo test -p meridian-cli` run, whose default features overwrite the
+# binary at the same path. harnesses/nat-matrix/run.sh (the CI entry point) does this rebuild itself
+# immediately before calling `matrix`; a direct/manual `sudo tools/netns-nat-matrix.sh ...` invocation
+# must do it too.
 #
 # Requires root (NET_ADMIN). On CI without it, the script SKIPS with a clear message; the matrix is
 # also covered deterministically by `cargo test -p meridian-cli --test nat_relay`, the loopback unit
@@ -760,13 +769,18 @@ wire_smoke_cell() {
 # Split per the architect-reviewed scope note in the 1.27 task file / feature 05's verification-
 # status paragraphs:
 #   (a) path/rung match          — 3 real-connecting cells only (presupposes an established path).
-#   (b) zero host/srflx leak     — relay-only-POLICY cells only, i.e. udp-blocked (the only cell
-#                                   `policy_for_cell` configures with relay-only in this matrix — see
-#                                   assert_no_alice_leak_in_bob_pcap's header comment for the
-#                                   judgement call: this is a deliberate narrowing from an earlier
-#                                   "all four cells uniformly" framing, made after live-rig evidence
-#                                   showed it would otherwise false-fail on Direct/PreferRelay's
-#                                   documented, by-design host-address exposure).
+#   (b) zero host/srflx leak     — gated on POLICY == relay-only (in this matrix: udp-blocked only,
+#                                   the only cell `policy_for_cell` configures with relay-only) —
+#                                   NOT on cell_expects_success, so the check keeps running for any
+#                                   future relay-only cell regardless of whether it happens to
+#                                   connect or fail (connectivity-debugger, 1.27 review: gating this
+#                                   on success/failure would silently stop checking it the day
+#                                   udp-blocked's 1.30 dependency gap closes upstream and it starts
+#                                   connecting). See assert_no_alice_leak_in_bob_pcap's header
+#                                   comment for the judgement call scoping this to relay-only-POLICY
+#                                   cells rather than all four uniformly, made after live-rig
+#                                   evidence showed the latter would false-fail on Direct/
+#                                   PreferRelay's documented, by-design host-address exposure.
 #   (c) DTLS-ciphertext-only     — 3 real-connecting cells only (presupposes real TURN-relayed
 #                                   application data to scan).
 #   (d) udp-blocked fails fast   — udp-blocked only: proves the "fails fast, not a hang" claim on
@@ -859,9 +873,30 @@ assert_path_and_rung() {
 # fully-compliant behavior. Narrowed to relay-only-policy cells only, which is what the underlying
 # `enforce_relay_only` guarantee actually promises. Any match found for a relay-only cell is still a
 # hard failure, never a warning — never downgrade that half of this invariant.
+#
+# Deliberately does NOT also check ns-turn's capture for alice's addresses (security-reviewer, 1.27
+# review): her raw LAN address (10.0.1.2) is structurally unable to reach ns-turn — NAT rewrites it
+# before it leaves her LAN, and ICE candidates only ever travel over the signed rendezvous channel,
+# never sent to TURN directly. Her NAT-mapped address (203.0.113.10) is inherently and legitimately
+# visible to TURN the moment ANY client contacts it for a relay allocation, under every policy
+# including relay-only — that's accepted infrastructure exposure (anonymity-and-retention.md: "TURN
+# relay sees ciphertext flow metadata (IPs, volume, timing)"), not part of the peer-IP-hiding claim
+# this assertion proves. Checking for it here would encode a guarantee Meridian doesn't make.
 assert_no_alice_leak_in_bob_pcap() {
   local cell="$1" pcap_bob="$2"
-  local leaked
+  local leaked total_count
+  # security-reviewer (1.27 review): a missing/truncated/unreadable capture makes `tcpdump -r`
+  # exit nonzero with empty stdout, which the `|| true` below would otherwise silently turn into a
+  # false PASS — this assertion is the load-bearing one, so it must fail closed on "couldn't check"
+  # too, not just on "checked and found a match". Mirrors assert_path_and_rung's ns-turn UDP-count
+  # sanity guard against a vacuously-empty capture.
+  total_count="$(tcpdump -r "$pcap_bob" -n 2>/dev/null | wc -l)"
+  if [[ "$total_count" -eq 0 ]]; then
+    echo "[nat-matrix] cell=$cell: pcap assertion (b) FAIL: ns-bob's capture ($pcap_bob) is" \
+         "missing, unreadable, or empty — cannot verify the zero-leak invariant, and an" \
+         "unreadable capture must never be treated as a passing one" >&2
+    exit 1
+  fi
   leaked="$(tcpdump -r "$pcap_bob" -n "host 10.0.1.2 or host 203.0.113.10" 2>/dev/null || true)"
   if [[ -n "$leaked" ]]; then
     echo "[nat-matrix] cell=$cell: pcap assertion (b) FAIL: ns-bob's capture contains packet(s)" \
@@ -871,7 +906,7 @@ assert_no_alice_leak_in_bob_pcap() {
     exit 1
   fi
   echo "[nat-matrix] cell=$cell: pcap assertion (b) PASS: zero packets touching alice's" \
-       "host/srflx address in ns-bob's capture"
+       "host/srflx address in ns-bob's capture ($total_count total packets captured)"
 }
 
 # Assertion (c): DTLS-ciphertext-only in ns-turn's capture — 3 connecting cells only. The
@@ -1190,6 +1225,19 @@ drive_real_peers() {
   print_p2p_summary "$cell" "$policy" "bob" "$bob_out"
   echo "[nat-matrix] cell=$cell — pcaps: $pcap_bob $pcap_turn"
 
+  # connectivity-debugger (1.27 review): assertion (b) must be gated on POLICY ("is this cell
+  # configured relay-only"), never on cell_expects_success ("did this cell connect"). Today the two
+  # happen to coincide (udp-blocked is the only relay-only cell AND the only one expected to fail),
+  # but they are not the same invariant — the day 1.30's dependency gap closes upstream and
+  # udp-blocked starts succeeding, gating on success/failure would silently stop running the
+  # zero-host/srflx-leak check for it, the exact load-bearing assertion the task's Reviews line
+  # calls out for security-reviewer. Run (b) unconditionally, independent of whether this cell is
+  # expected to connect, keyed only on the policy this cell was actually configured with.
+  if [[ "$policy" == "relay-only" ]]; then
+    echo "[nat-matrix] cell=$cell — running pcap assertion (b) (policy=relay-only)"
+    assert_no_alice_leak_in_bob_pcap "$cell" "$pcap_bob"
+  fi
+
   # 1.27: the 3 real-connecting cells still hard-fail on any nonzero exit (unchanged from 1.26).
   # udp-blocked is the one cell where a nonzero exit is the CORRECT, EXPECTED outcome (1.30's
   # proven-impossible dependency gap) — see cell_expects_success().
@@ -1205,20 +1253,15 @@ drive_real_peers() {
       exit 1
     fi
     echo "[nat-matrix] cell=$cell — real session connect succeeded on both sides (elapsed=${elapsed}s)"
-    echo "[nat-matrix] cell=$cell — running pcap assertions (a)(c) [(b) is scoped to relay-only-" \
-         "policy cells only -- see assert_no_alice_leak_in_bob_pcap's header comment -- this cell's" \
-         "policy is '$policy', not relay-only]"
+    echo "[nat-matrix] cell=$cell — running pcap assertions (a)(c)"
     assert_path_and_rung "$cell" "$alice_out" "$bob_out" "$pcap_turn"
     assert_dtls_ciphertext_only "$cell" "$pcap_turn"
   else
     echo "[nat-matrix] cell=$cell — session connect did NOT establish (alice_exit=$alice_ec" \
          "bob_exit=$bob_ec, elapsed=${elapsed}s) — EXPECTED for udp-blocked per 1.30's documented," \
          "proven-impossible-at-this-dependency-version failure mode. Verifying it failed the RIGHT" \
-         "way (fails fast + zero address leak), not just that it failed at all."
-    echo "[nat-matrix] cell=$cell — running pcap assertions (b)(d) [udp-blocked is the one cell" \
-         "configured with relay-only policy in this matrix -- see assert_no_alice_leak_in_bob_pcap's" \
-         "header comment for why (b) is scoped here rather than run uniformly]"
-    assert_no_alice_leak_in_bob_pcap "$cell" "$pcap_bob"
+         "way (fails fast + zero address leak, checked above), not just that it failed at all."
+    echo "[nat-matrix] cell=$cell — running pcap assertion (d)"
     assert_udp_blocked_fails_fast "$cell" "$alice_ec" "$bob_ec" "$alice_err" "$bob_err" "$elapsed" \
       "$pcap_turn" "$alice_out" "$bob_out"
   fi
