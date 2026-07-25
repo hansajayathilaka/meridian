@@ -69,8 +69,18 @@ jobs:
       # would pass in both cases. A check that cannot fail is not a gate (cf. F4/F18).
       - name: test-tamper-hook is not active in a normal/release build (F17)
         run: |
-          feats=$(cargo tree --workspace -e normal -f '{p} {f}' \
-                  | grep -o 'meridian-rendezvous v[^ ]* ([^)]*) .*' | head -1)
+          set -euo pipefail
+          # Capture cargo's own exit status, not grep's. Without `set -o pipefail` (and the explicit
+          # empty check below) a `cargo tree` failure would leave $feats empty, and an empty string
+          # trivially fails the `grep -q` — i.e. the gate would PASS precisely when it could not
+          # verify anything. Fail closed instead: no parsed output is a hard error, never a pass.
+          tree=$(cargo tree --workspace -e normal -f '{p} {f}')
+          feats=$(printf '%s\n' "$tree" | grep -o 'meridian-rendezvous v[^ ]* ([^)]*) .*' | head -1 || true)
+          if [ -z "$feats" ]; then
+            echo "::error::could not resolve meridian-rendezvous features from 'cargo tree' output — refusing to pass a check that verified nothing (F17)." >&2
+            printf '%s\n' "$tree" | head -20 >&2
+            exit 1
+          fi
           echo "resolved: $feats"
           if printf '%s' "$feats" | grep -q 'test-tamper-hook'; then
             echo "::error::test-tamper-hook is active in a NORMAL (non-dev) build — the hook would ship in the release binary (F17)." >&2
