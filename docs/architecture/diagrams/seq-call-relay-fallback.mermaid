@@ -19,6 +19,20 @@ sequenceDiagram
   TB->>B: SRTP ciphertext
   Note over TA,TB: relays meter flows —<br/>cannot decrypt (DTLS-SRTP is end-to-end for 1:1)
 
+  rect rgb(247, 235, 232)
+    Note over A,B: 1.29 (Bug A) — real-NAT contingency, not the common case:<br/>under a real NAT, direct+srflx pairs can gather but never reach a<br/>terminal state in time, so *nomination itself* can stall past the<br/>bounded wait even though a relay pair would have worked. When that<br/>happens (and a TURN grant was available), the substrate does not wait<br/>forever — it retries the *entire* offer/answer/ICE exchange once more,<br/>forcing relay-only, rather than the single ICE-gathering-phase flow<br/>above. See feature-05 spec + docs/tasks/phase-1/1.29-ice-nomination-relay-fallback.md.
+    A--xB: bounded wait elapses with no candidate pair selected<br/>(transport error: no candidate pair selected yet)
+    A->>RA: new ring/offer envelope, IceConfig{policy: relay-only}<br/>(second full round trip — real added latency, never hidden)
+    RA->>B: deliver (via RB, omitted)
+    B-->>A: new answer (relay-only: host/srflx never gathered)
+    A->>TA: TURN allocation (ephemeral HMAC cred from RA)
+    B->>TB: TURN allocation
+    A->>TA: SRTP ciphertext
+    TA->>TB: relay leg
+    TB->>B: SRTP ciphertext
+    Note over A,B: SessionInfo.relay_fallback = true,<br/>relay_fallback_wait_ms = time spent stuck before the retry<br/>(surfaced in `session info`/`doctor`, never hidden)
+  end
+
   rect rgb(232, 238, 247)
     Note over A: mid-call: Wi-Fi → LTE
     A->>B: ICE restart within session

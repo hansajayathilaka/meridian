@@ -26,6 +26,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::Instant;
 
 use meridian_envelope::ctrl::ChanCfgWire;
 use meridian_envelope::{ChatContent, CtrlFrame, MessageId, SignalContent, StreamAdvert};
@@ -175,6 +176,16 @@ pub struct SessionInfo {
     pub offered: GatherClasses,
     /// A short human explanation of why this path was chosen.
     pub reason: String,
+    /// `true` if this session only connected because the first attempt (under the configured
+    /// `Direct`/`PreferRelay` policy) never converged and we retried forcing `RelayOnly` (1.29, Bug
+    /// A). `policy`/`offered` above already reflect the retry's `RelayOnly` reality; this flag is
+    /// what tells the operator a *fallback happened at all* rather than that being the configured
+    /// policy from the start.
+    pub relay_fallback: bool,
+    /// How long the abandoned first attempt spent stuck before we gave up and retried — the added
+    /// latency the fallback cost, surfaced rather than hidden (Feature 5's "show the cost" note).
+    /// `None` unless `relay_fallback` is `true`.
+    pub relay_fallback_wait_ms: Option<f64>,
 }
 
 impl SessionInfo {
@@ -206,7 +217,17 @@ impl std::fmt::Display for SessionInfo {
             " policy={} why={}",
             relay::policy_str(self.policy),
             self.reason
-        )
+        )?;
+        if self.relay_fallback {
+            match self.relay_fallback_wait_ms {
+                Some(ms) => write!(
+                    f,
+                    " relay_fallback=true (direct/prefer-relay attempt stalled {ms:.0}ms before retrying relay-only)"
+                )?,
+                None => write!(f, " relay_fallback=true")?,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -269,6 +290,12 @@ pub struct P2pSession<T: Transport> {
     /// once, from the exact lines sent to the peer in the offer/answer, not re-derived from
     /// `policy` on every call.
     offered: GatherClasses,
+    /// Set by [`Self::mark_relay_fallback`] when this session only connected via 1.29's Bug-A
+    /// relay-only retry — see [`SessionInfo::relay_fallback`].
+    relay_fallback: bool,
+    /// The abandoned first attempt's wait, when `relay_fallback` is set — see
+    /// [`SessionInfo::relay_fallback_wait_ms`].
+    relay_fallback_wait_ms: Option<f64>,
 }
 
 impl<T: Transport> P2pSession<T> {
@@ -292,6 +319,15 @@ impl<T: Transport> P2pSession<T> {
         self.policy
     }
 
+    /// Record that this session only exists because [`dial_with_config`]/[`answer_with_config`]
+    /// retried under a forced `relay-only` policy after the first attempt (under the caller's
+    /// configured `Direct`/`PreferRelay`) never converged (1.29, Bug A). `wait_ms` is how long that
+    /// abandoned first attempt was stuck before we gave up — the added latency the fallback cost.
+    fn mark_relay_fallback(&mut self, wait_ms: f64) {
+        self.relay_fallback = true;
+        self.relay_fallback_wait_ms = Some(wait_ms);
+    }
+
     /// A snapshot for the demo/diagnostics.
     pub async fn info(&self) -> SessionInfo {
         let detail = self
@@ -313,6 +349,8 @@ impl<T: Transport> P2pSession<T> {
             policy: self.policy,
             offered: self.offered,
             reason: path_reason(self.policy, detail.class),
+            relay_fallback: self.relay_fallback,
+            relay_fallback_wait_ms: self.relay_fallback_wait_ms,
         }
     }
 
@@ -628,6 +666,22 @@ pub async fn dial<T: Transport>(
 /// fingerprint into an envelope, routes it over `relay`, applies the answer, **cross-checks the
 /// fingerprint (§4.6)**, then exchanges `Hello` and opens the chat stream. The crypto session with
 /// `peer_ik` must already exist (T03's X3DH).
+///
+/// ## Relay fallback (1.29, Bug A)
+/// Under a real NAT, `Direct`/`PreferRelay` can gather permanently-unreachable host/srflx
+/// candidates that never resolve — the transport's own bounded wait (`selected_path`) then reports
+/// [`TransportError::NoPath`] even though a relay pair would have worked (confirmed against the real
+/// six-namespace NAT/coturn rig; see `docs/tasks/phase-1/1.29-ice-nomination-relay-fallback.md`).
+/// When that happens **and** a TURN grant was actually available ([`relay_fallback_eligible`]), this
+/// retries the *entire* offer/answer/ICE exchange once more forcing [`IcePolicy::RelayOnly`] — a
+/// second full round trip through `relay`, not a silent instant retry, so it costs real wall-clock
+/// time on top of the failed first attempt. That cost is never hidden: [`SessionInfo::relay_fallback`]
+/// and [`SessionInfo::relay_fallback_wait_ms`] surface it (see `session info`/`doctor`), matching
+/// Feature 5's "show the cost" requirement. This is a real behavioral addition to the single-phase
+/// fallback [`seq-call-relay-fallback.mermaid`](../../../docs/architecture/diagrams/seq-call-relay-fallback.mermaid)
+/// documented before 1.29 — see that diagram and
+/// [Feature 5's spec](../../../docs/architecture/features/05-nat-traversal-relay-policy.md) for the
+/// now-documented two-phase retry.
 #[allow(clippy::too_many_arguments)]
 pub async fn dial_with_config<T: Transport>(
     transport: Arc<T>,
@@ -640,19 +694,66 @@ pub async fn dial_with_config<T: Transport>(
     registry: Arc<StreamRegistry>,
     cfg: IceConfig,
 ) -> Result<P2pSession<T>, SessionError> {
+    let attempt_start = Instant::now();
     let policy = cfg.policy;
-    let conn = transport.new_session(cfg).await?;
+    let conn = transport.new_session(cfg.clone()).await?;
     // Every path below is fallible after the session exists; close it on any of them rather than
     // leaking a live peer connection (real backends hold real ICE agents/UDP sockets — a malicious
     // or malformed peer that keeps failing this handshake must not be able to leak one per attempt).
     let result = dial_established(
-        &transport, conn, policy, store, handle, our_ik, peer_ik, chat, relay, registry,
+        &transport,
+        conn,
+        policy,
+        store,
+        handle,
+        our_ik,
+        peer_ik,
+        chat,
+        relay,
+        registry.clone(),
     )
     .await;
-    if result.is_err() {
-        let _ = transport.close(&conn).await;
+    match result {
+        Ok(session) => Ok(session),
+        Err(SessionError::Transport(meridian_transport::TransportError::NoPath))
+            if relay_fallback_eligible(&cfg) =>
+        {
+            let _ = transport.close(&conn).await;
+            let wait_ms = attempt_start.elapsed().as_secs_f64() * 1000.0;
+            let fallback_cfg = IceConfig {
+                policy: IcePolicy::RelayOnly,
+                ..cfg
+            };
+            let conn2 = transport.new_session(fallback_cfg).await?;
+            let result2 = dial_established(
+                &transport,
+                conn2,
+                IcePolicy::RelayOnly,
+                store,
+                handle,
+                our_ik,
+                peer_ik,
+                chat,
+                relay,
+                registry,
+            )
+            .await;
+            match result2 {
+                Ok(mut session) => {
+                    session.mark_relay_fallback(wait_ms);
+                    Ok(session)
+                }
+                Err(e) => {
+                    let _ = transport.close(&conn2).await;
+                    Err(e)
+                }
+            }
+        }
+        Err(e) => {
+            let _ = transport.close(&conn).await;
+            Err(e)
+        }
     }
-    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -729,6 +830,8 @@ async fn dial_established<T: Transport>(
         last_rtt_ms: None,
         policy,
         offered,
+        relay_fallback: false,
+        relay_fallback_wait_ms: None,
     };
     session.handshake(store, handle, chat).await?;
     Ok(session)
@@ -764,6 +867,14 @@ pub async fn answer<T: Transport>(
 /// envelope over `relay`, creates the peer connection (gathering per the policy), seals the answer,
 /// cross-checks the fingerprint (§4.6), then exchanges `Hello`. The offer envelope is also the X3DH
 /// opening message, so this establishes the responder ratchet if not already present.
+///
+/// ## Relay fallback (1.29, Bug A)
+/// Mirrors [`dial_with_config`]'s retry (see its docs for the full rationale): if our own
+/// `selected_path` wait times out under `Direct`/`PreferRelay` with a TURN grant available
+/// ([`relay_fallback_eligible`]), we close this attempt and wait for the dialer's *retried* offer
+/// (it independently detects the same timeout and re-dials forcing `RelayOnly`), then answer that
+/// one instead. `chat`'s ratchet is already established from the first offer, so this second
+/// `recv_sdp` is an ordinary subsequent envelope, not a second X3DH open.
 #[allow(clippy::too_many_arguments)]
 pub async fn answer_with_config<T: Transport>(
     transport: Arc<T>,
@@ -776,11 +887,12 @@ pub async fn answer_with_config<T: Transport>(
     registry: Arc<StreamRegistry>,
     cfg: IceConfig,
 ) -> Result<P2pSession<T>, SessionError> {
+    let attempt_start = Instant::now();
     let policy = cfg.policy;
     let (offer_sdp, asserted_fp, offer_ice) =
         recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, true).await?;
 
-    let conn = transport.new_session(cfg).await?;
+    let conn = transport.new_session(cfg.clone()).await?;
     // See `dial_with_config`'s comment: close the session on any failure below rather than
     // leaking a live peer connection.
     let result = answer_established(
@@ -796,13 +908,64 @@ pub async fn answer_with_config<T: Transport>(
         peer_ik,
         chat,
         relay,
-        registry,
+        registry.clone(),
     )
     .await;
-    if result.is_err() {
-        let _ = transport.close(&conn).await;
+    match result {
+        Ok(session) => Ok(session),
+        Err(SessionError::Transport(meridian_transport::TransportError::NoPath))
+            if relay_fallback_eligible(&cfg) =>
+        {
+            let _ = transport.close(&conn).await;
+            let wait_ms = attempt_start.elapsed().as_secs_f64() * 1000.0;
+            let (offer_sdp2, asserted_fp2, offer_ice2) =
+                recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, true).await?;
+            let fallback_cfg = IceConfig {
+                policy: IcePolicy::RelayOnly,
+                ..cfg
+            };
+            let conn2 = transport.new_session(fallback_cfg).await?;
+            let result2 = answer_established(
+                &transport,
+                conn2,
+                IcePolicy::RelayOnly,
+                offer_sdp2,
+                offer_ice2,
+                asserted_fp2,
+                store,
+                handle,
+                our_ik,
+                peer_ik,
+                chat,
+                relay,
+                registry,
+            )
+            .await;
+            match result2 {
+                Ok(mut session) => {
+                    session.mark_relay_fallback(wait_ms);
+                    Ok(session)
+                }
+                Err(e) => {
+                    let _ = transport.close(&conn2).await;
+                    Err(e)
+                }
+            }
+        }
+        Err(e) => {
+            let _ = transport.close(&conn).await;
+            Err(e)
+        }
     }
-    result
+}
+
+/// Whether a [`TransportError::NoPath`] from the *first* `selected_path` wait is eligible for the
+/// relay-only retry (1.29, Bug A): only for `Direct`/`PreferRelay` (a `RelayOnly` session that
+/// already failed under the strictest policy has nowhere cheaper to fall back to) **and** only when
+/// a TURN grant was actually configured (retrying with no relay servers at all would just repeat
+/// the identical failure — never spin on a hopeless retry).
+fn relay_fallback_eligible(cfg: &IceConfig) -> bool {
+    cfg.policy != IcePolicy::RelayOnly && !cfg.ice_servers.is_empty()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -873,6 +1036,8 @@ async fn answer_established<T: Transport>(
         last_rtt_ms: None,
         policy,
         offered,
+        relay_fallback: false,
+        relay_fallback_wait_ms: None,
     };
     session.handshake(store, handle, chat).await?;
     Ok(session)

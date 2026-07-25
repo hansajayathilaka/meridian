@@ -30,6 +30,16 @@ fn symmetric_nat_relays_over_udp() {
 #[test]
 fn udp_blocked_falls_back_to_tls_443() {
     // ./testrig up --block-udp → path=relay (turn-a, tls-443) ← hostile-egress fallback
+    //
+    // NOTE (1.30, docs/tasks/phase-1/1.30-turn-tcp-dependency-gap.md): this drives `session demo`,
+    // which runs entirely in-process against `LoopbackTransport`'s deterministic, enum-based NAT
+    // simulation (`NatScenario::UdpBlocked`) — it proves the *policy/ladder logic* (relay-only
+    // stripping, TLS-443 fallback selection) is correct, not that the real webrtc-rs-backed
+    // `WebRtcTransport` can actually achieve this path against a genuinely UDP-blocked network. It
+    // cannot: the pinned `webrtc-ice` 0.17.1 (confirmed still true of 0.17.2) has no client-side
+    // TURN-over-TCP support at all, so under `relay-only` + real UDP-blocked egress the real backend
+    // has no usable relay candidate — see 1.30 and Feature 5's "Verification status" note for the
+    // real-backend gap this simulation does not (and cannot) exercise.
     let text = run(&["session", "demo", "--nat", "udp-blocked"]);
     assert!(
         text.contains("path=relay (turn-a, tls-443)"),
