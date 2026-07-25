@@ -991,20 +991,37 @@ assert_udp_blocked_fails_fast() {
 # ---------------------------------------------------------------------------------------------
 
 # alice/bob each get their own $MERIDIAN_HOME under the rig dir so their identities are rig-scratch
-# (never the developer's own ~/.config/meridian) but still persist across cells/invocations, mirroring
-# ensure_topology's idempotent-reuse pattern. These run on the HOST filesystem/mount namespace (`id
-# new`/`config set`/`id show` need no network) — only the `session connect` process itself needs to
-# run inside ns-alice/ns-bob (via `ip netns exec`) to pick up a NATed source address.
-alice_home() { echo "$(rig_dir)/alice-home"; }
-bob_home()   { echo "$(rig_dir)/bob-home"; }
+# (never the developer's own ~/.config/meridian). These run on the HOST filesystem/mount namespace
+# (`id new`/`config set`/`id show` need no network) — only the `session connect` process itself needs
+# to run inside ns-alice/ns-bob (via `ip netns exec`) to pick up a NATed source address.
+#
+# 1.27: scoped PER CELL ($1, the cell-safe name), not shared across the whole matrix() run as before.
+# Found during live-rig verification: `session connect` republishes a brand-new SPK/OTK bundle to the
+# rendezvous at the start of EVERY invocation (apps/cli/src/session_connect.rs::run_webrtc, both
+# roles), but there is no synchronization forcing the peer's fetch to wait for that publish to land —
+# `fetch_with_retry` retries on "not found yet", which is fine for a never-before-published identity,
+# but if a PRIOR cell already published a bundle under the same identity, a same-cell fetch that wins
+# the race against this cell's in-flight republish silently gets that stale-but-well-formed prior
+# bundle instead of a "not found" — the responder's freshly-regenerated vault has no secret for that
+# stale OTK id, so the session fails with "no matching prekey secret for incoming session". This is a
+# real, load-bearing bug independent of anything else 1.27 touches; fixing the underlying race belongs
+# in session_connect.rs's publish/fetch flow (core CLI code, out of this task's pcap-assertion scope)
+# and is flagged for follow-up. The rig-only mitigation here removes the precondition instead: giving
+# each cell its own fresh identity means there is never a prior bundle to race against, so
+# `fetch_with_retry`'s existing not-found retry is sufficient. `id new` is a local, no-network
+# operation, so doing it 4x instead of once is cheap.
+alice_home() { echo "$(rig_dir)/alice-home-$1"; }
+bob_home()   { echo "$(rig_dir)/bob-home-$1"; }
 
 # Idempotent: an `account.json` marker (AccountDescriptor::save's target — see apps/cli/src/account.rs)
 # means this identity already exists; skip regenerating it, exactly like ensure_topology's
-# coturn/rendezvous/test-peer reuse checks above.
+# coturn/rendezvous/test-peer reuse checks above. Per the cell-scoping note above, this now only ever
+# matters for re-running the SAME cell twice against the SAME rig dir (e.g. `cell <name>` re-run after
+# a partial `matrix` failure), not across different cells within one matrix() pass.
 ensure_identities() {
-  local ah bh
-  ah="$(alice_home)"
-  bh="$(bob_home)"
+  local cell_safe="$1" ah bh
+  ah="$(alice_home "$cell_safe")"
+  bh="$(bob_home "$cell_safe")"
   mkdir -p "$ah" "$bh"
 
   if [[ -f "$ah/account.json" ]]; then
@@ -1024,8 +1041,8 @@ ensure_identities() {
   fi
 }
 
-alice_id() { MERIDIAN_HOME="$(alice_home)" "$REPO_ROOT/$BIN" id show; }
-bob_id()   { MERIDIAN_HOME="$(bob_home)"   "$REPO_ROOT/$BIN" id show; }
+alice_id() { MERIDIAN_HOME="$(alice_home "$1")" "$REPO_ROOT/$BIN" id show; }
+bob_id()   { MERIDIAN_HOME="$(bob_home "$1")"   "$REPO_ROOT/$BIN" id show; }
 
 # ---------------------------------------------------------------------------------------------
 # tcpdump capture helpers — same graceful-then-force kill pattern as `down()`'s coturn/rendezvous
@@ -1106,20 +1123,20 @@ print_p2p_summary() {
 # job to fix, not this script's to paper over) — never silently continuing past one.
 drive_real_peers() {
   local cell="$1"
-  local d aid bid policy
+  local d aid bid policy cell_safe
   d="$(rig_dir)"
   mkdir -p "$d/pcaps" "$d/session-logs"
 
-  ensure_identities
-  aid="$(alice_id)"
-  bid="$(bob_id)"
+  cell_safe="${cell//:/_}"
+  ensure_identities "$cell_safe"
+  aid="$(alice_id "$cell_safe")"
+  bid="$(bob_id "$cell_safe")"
   policy="$(policy_for_cell "$cell")"
 
   echo "[nat-matrix] cell=$cell — configuring relay policy '$policy' for alice($aid)<->bob($bid)"
-  MERIDIAN_HOME="$(alice_home)" "$REPO_ROOT/$BIN" config set policy "$policy" --contact "$bid" >/dev/null
-  MERIDIAN_HOME="$(bob_home)"   "$REPO_ROOT/$BIN" config set policy "$policy" --contact "$aid" >/dev/null
+  MERIDIAN_HOME="$(alice_home "$cell_safe")" "$REPO_ROOT/$BIN" config set policy "$policy" --contact "$bid" >/dev/null
+  MERIDIAN_HOME="$(bob_home "$cell_safe")"   "$REPO_ROOT/$BIN" config set policy "$policy" --contact "$aid" >/dev/null
 
-  local cell_safe="${cell//:/_}"
   local pcap_bob="$d/pcaps/${cell_safe}-bob.pcap"
   local pcap_turn="$d/pcaps/${cell_safe}-turn.pcap"
 
@@ -1140,7 +1157,7 @@ drive_real_peers() {
   # touch, shorten, or otherwise interact with dial_with_config/answer_with_config's own internal
   # bounded-wait timeouts inside meridian-core/meridian-transport.
   (
-    export MERIDIAN_HOME="$(alice_home)"
+    export MERIDIAN_HOME="$(alice_home "$cell_safe")"
     export MERIDIAN_PASSPHRASE="$RIG_PASSPHRASE"
     timeout 90 ip netns exec ns-alice "$REPO_ROOT/$BIN" session connect "$bid" \
       --server ws://203.0.113.1:8443 --transport webrtc --json
@@ -1148,7 +1165,7 @@ drive_real_peers() {
   local alice_pid=$!
 
   (
-    export MERIDIAN_HOME="$(bob_home)"
+    export MERIDIAN_HOME="$(bob_home "$cell_safe")"
     export MERIDIAN_PASSPHRASE="$RIG_PASSPHRASE"
     timeout 90 ip netns exec ns-bob "$REPO_ROOT/$BIN" session connect "$aid" \
       --server ws://203.0.113.1:8443 --transport webrtc --json
