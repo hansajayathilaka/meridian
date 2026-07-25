@@ -89,6 +89,12 @@ bind = "127.0.0.1:8443"
 admission = "open"               # open | invite
 invite_tokens = []               # for invite admission
 allow_test_tamper = false        # TEST HOOK — must be false in production
+allow_test_route_tamper = false  # TEST HOOK — must be false in production. Actively REWRITES
+                                 # routed blobs in transit (task 1.28). Inert unless built with
+                                 # `--features test-tamper-hook`, AND additionally requires
+                                 # allow_test_tamper. Unlike allow_test_tamper it has NO
+                                 # per-request opt-in: once on it corrupts EVERY routed blob for
+                                 # EVERY user, while still replying route_ok{delivered:true}.
 database_url = "sqlite://rendezvous.db"   # only used with the `sqlite` feature
 
 [limits]                         # anti-abuse, fixed one-minute windows

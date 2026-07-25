@@ -114,15 +114,33 @@ async fn connect_and_publish(peer: &mut Peer, url: &str) -> SignalingClient {
 }
 
 /// What happened to one side of the handshake.
+///
+/// `Rejected` keeps the *classified* error, not just its text. Matching on the variant rather than a
+/// message substring is deliberate: it is what makes the assertions below non-vacuous (a bare
+/// `Relay`/`SignalingEnded` must NOT satisfy "the rewrite was detected"), and it survives
+/// [ADR 0016](../../../docs/adr/0016-envelope-deniability.md) — at envelope v2 the detector moves
+/// from the Ed25519 signature check to the ratchet AEAD, which is still a `Chat` error, whereas a
+/// string assertion on "signature verification failed" would go stale.
 #[derive(Debug)]
 enum Outcome {
     /// A session came up. In the adversarial case this is the security failure.
     Established,
-    /// Explicitly rejected with a diagnosable reason — the *detection* the task asks for.
-    Rejected(String),
+    /// Explicitly rejected — the *detection* the task asks for, when the class is right.
+    Rejected(SessionError),
     /// Neither established nor rejected: this side is still waiting. Fail-closed (no session), but
-    /// undiagnosed — see the residual noted on `relay_rewriting_routed_blobs_is_detected`.
+    /// undiagnosed — see the residual on the adversarial test.
     StillWaiting,
+}
+
+impl Outcome {
+    /// Did this side reject at the **envelope-authentication** layer? `SessionError::Chat` wraps
+    /// `ChatError`, which is where a tampered blob is caught (signature today, ratchet AEAD at
+    /// envelope v2). A `Relay`/`SignalingEnded`/`Transport` error is explicitly NOT this: those are
+    /// the signature of an unrelated regression, and treating them as "detected" is exactly how this
+    /// test could go green while the property it asserts is broken.
+    fn is_envelope_rejection(&self) -> bool {
+        matches!(self, Outcome::Rejected(SessionError::Chat(_)))
+    }
 }
 
 /// How long a side may wait before we call it `StillWaiting`. Generous relative to loopback
@@ -204,7 +222,7 @@ async fn establish_through(url: &str) -> (Outcome, Outcome) {
                 let _ = s.close().await;
                 Outcome::Established
             }
-            Ok(Err(e)) => Outcome::Rejected(e.to_string()),
+            Ok(Err(e)) => Outcome::Rejected(e),
             Err(_) => Outcome::StillWaiting,
         }
     }
@@ -231,26 +249,31 @@ async fn relay_rewriting_routed_blobs_is_detected_and_fails_closed() {
         );
     }
 
-    // (2) Detected. A rewrite that produced only a silent stall on both sides would be fail-closed
-    // but undiagnosable, and would not satisfy this task's "the rewrite is detected".
-    let rejections: Vec<&String> = [&alice, &bob]
-        .iter()
-        .filter_map(|o| match o {
-            Outcome::Rejected(msg) => Some(msg),
-            _ => None,
-        })
-        .collect();
+    // (2) Detected — by the RESPONDER specifically, at the envelope-authentication layer.
+    //
+    // Pinning both the side and the error class is what stops this test passing vacuously. Accepting
+    // "either side rejected with any message" would go green in a scenario where the hook had become
+    // inert and an unrelated signaling regression made the dialer error out with
+    // `Relay(..)`/`SignalingEnded`: nobody establishes (so (1) passes) and something errored (so a
+    // loose (2) passes) — green test, untested property. The control case cannot catch that, since it
+    // runs against an honest server.
     assert!(
-        !rejections.is_empty(),
-        "the rewrite must be DETECTED by at least one side, not absorbed into a silent stall on \
-         both. dialer={alice:?} responder={bob:?}"
+        bob.is_envelope_rejection(),
+        "the RESPONDER must reject the rewritten offer at the envelope-authentication layer \
+         (SessionError::Chat). Anything else — Relay, SignalingEnded, Transport, or a stall — means \
+         the rewrite was not actually detected and this test would otherwise pass vacuously. \
+         Got: {bob:?}"
     );
-    for msg in rejections {
-        assert!(
-            !msg.is_empty(),
-            "a rejection must carry a diagnosable reason"
-        );
-    }
+
+    // The dialer's only legitimate outcomes: it waits forever for an answer that never comes (the
+    // documented residual), or it too rejects at the envelope layer. A bare Relay/SignalingEnded here
+    // is the signature of the vacuous-pass scenario above, so it is rejected explicitly.
+    assert!(
+        matches!(alice, Outcome::StillWaiting) || alice.is_envelope_rejection(),
+        "the dialer must either stall awaiting an answer (the documented residual) or reject at the \
+         envelope layer — never fail with an unrelated relay/transport error, which would mean this \
+         test is measuring something other than the rewrite. Got: {alice:?}"
+    );
 }
 
 /// **Control.** The identical flow through an honest relay must establish on both sides, or the

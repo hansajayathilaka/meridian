@@ -50,6 +50,33 @@ jobs:
         run: cargo build --workspace
       - name: Unit + integration tests
         run: cargo test --workspace
+      # REQUIRED for F17, and not redundant with --workspace above. Resolver-2 feature unification
+      # turns `test-tamper-hook` ON workspace-wide whenever dev targets are built, because
+      # apps/cli's dev-dependency pins that feature — so every #[cfg(not(feature =
+      # "test-tamper-hook"))] guard in apps/rendezvous/tests is compiled OUT under --workspace.
+      # This package-scoped run with default features is the only invocation under which the
+      # tamper-hook inertness guards execute at all. Before it existed,
+      # `tamper_flag_is_inert_without_feature` (task 1.12) had never run in CI.
+      - name: Tamper-hook compile-gate guards (default features only — see comment)
+        run: cargo test -p meridian-rendezvous
+      # F17, checked at the level that actually decides it: feature *resolution*. A release/normal
+      # build must not activate `test-tamper-hook`, even though apps/cli's DEV-dependency pins it —
+      # resolver 2 is what keeps dev-dep features out of the normal graph, and this step fails if
+      # that ever stops holding (a resolver downgrade, or someone promoting the dev-dep).
+      #
+      # Deliberately NOT an `nm`-symbol check on the release binary: that was tried and is worthless
+      # here — the symbol is absent from an optimised build whether the feature is on or off, so it
+      # would pass in both cases. A check that cannot fail is not a gate (cf. F4/F18).
+      - name: test-tamper-hook is not active in a normal/release build (F17)
+        run: |
+          feats=$(cargo tree --workspace -e normal -f '{p} {f}' \
+                  | grep -o 'meridian-rendezvous v[^ ]* ([^)]*) .*' | head -1)
+          echo "resolved: $feats"
+          if printf '%s' "$feats" | grep -q 'test-tamper-hook'; then
+            echo "::error::test-tamper-hook is active in a NORMAL (non-dev) build — the hook would ship in the release binary (F17)." >&2
+            exit 1
+          fi
+          echo "OK: normal build does not activate test-tamper-hook."
       - name: Real webrtc-rs transport backend (1.15; real ICE/SCTP/DTLS on localhost, no NET_ADMIN needed)
         run: |
           cargo test -p meridian-transport --features webrtc

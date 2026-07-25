@@ -125,6 +125,72 @@ async fn tamper_flag_is_inert_without_feature() {
     assert_eq!(bundle.account_pub, bob.pubkey);
 }
 
+// F17 for the 1.28 *route*-rewrite hook — the structural counterpart to
+// `apps/cli/tests/relay_rewrite.rs` (which only runs *with* the feature). Without
+// `test-tamper-hook`, `handle_route` has no expression that can produce a different blob, so even a
+// config with BOTH flags set must deliver bytes untouched.
+//
+// NOTE ON WHY THIS NEEDS ITS OWN CI STEP: `cargo test --workspace` cannot run this test. Resolver-2
+// feature unification turns `test-tamper-hook` ON workspace-wide whenever dev targets are built,
+// because `apps/cli/Cargo.toml`'s dev-dependency pins that feature — so every
+// `#[cfg(not(feature = "test-tamper-hook"))]` test here is compiled out under `--workspace`. The CI
+// `lint`/`test` jobs therefore run `cargo test -p meridian-rendezvous` separately, with default
+// features, which is the only invocation under which these two guards actually execute. Before that
+// step existed, `tamper_flag_is_inert_without_feature` above had never run in CI at all.
+#[cfg(not(feature = "test-tamper-hook"))]
+#[tokio::test]
+async fn route_tamper_is_inert_without_feature() {
+    let mut config = config_open();
+    config.server.allow_test_tamper = true; // both flags "enabled" at the config layer...
+    config.server.allow_test_route_tamper = true;
+    let url = spawn(config).await;
+
+    let alice = new_acct("localhost");
+    let bob = new_acct("localhost");
+    let mut bc = bob.connect(&url).await.unwrap();
+    let mut ac = alice.connect(&url).await.unwrap();
+
+    // ...and the routed blob still arrives byte-identical: the rewrite code is not in this build.
+    let payload = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33];
+    assert!(ac.route(bob.pubkey, payload.clone()).await.unwrap());
+    let msg = bc.next_deliver().await.unwrap();
+    assert_eq!(msg.from, alice.pubkey);
+    assert_eq!(
+        msg.blob.as_bytes(),
+        payload.as_slice(),
+        "without the test-tamper-hook feature the route hook must not exist at all"
+    );
+}
+
+// The other half of the double gate, and the configuration that actually ships in `demo.toml`:
+// `allow_test_tamper = true` (for the documented `fetch-bundle --tamper` demo) with
+// `allow_test_route_tamper = false`. Routed traffic must be untouched — otherwise enabling the
+// bundle-substitution demo would silently corrupt every envelope on that server. This runs *with*
+// the feature, so it verifies the runtime AND, not the compile gate.
+#[cfg(feature = "test-tamper-hook")]
+#[tokio::test]
+async fn route_tamper_requires_its_own_flag_not_just_allow_test_tamper() {
+    let mut config = config_open();
+    config.server.allow_test_tamper = true;
+    config.server.allow_test_route_tamper = false; // the demo.toml configuration
+    let url = spawn(config).await;
+
+    let alice = new_acct("localhost");
+    let bob = new_acct("localhost");
+    let mut bc = bob.connect(&url).await.unwrap();
+    let mut ac = alice.connect(&url).await.unwrap();
+
+    let payload = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33];
+    assert!(ac.route(bob.pubkey, payload.clone()).await.unwrap());
+    let msg = bc.next_deliver().await.unwrap();
+    assert_eq!(
+        msg.blob.as_bytes(),
+        payload.as_slice(),
+        "allow_test_tamper alone must NOT rewrite routed blobs — the bundle-substitution demo must \
+         not corrupt live routing (allow_test_route_tamper is a separate, additional gate)"
+    );
+}
+
 // -- acceptance: exact-key-only (anti-enumeration) ---------------------------
 
 #[tokio::test]

@@ -272,7 +272,8 @@ async fn handle_route(
     #[cfg(not(feature = "test-tamper-hook"))]
     let out_blob = body.blob;
 
-    // Build the delivery frame WITHOUT ever inspecting the blob's contents — it stays opaque.
+    // Build the delivery frame without ever *inspecting* the blob's contents — and, outside the
+    // cfg-gated test hook above, without altering them either. It stays opaque.
     let deliver = Deliver {
         from: *account_pub,
         blob: out_blob,

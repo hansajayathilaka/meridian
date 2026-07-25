@@ -114,14 +114,24 @@ pub fn substitute_bundle(original: &PrekeyBundle) -> PrekeyBundle {
 /// client-side instead, by `apps/core/tests/p2p_session.rs::fingerprint_mismatch_tears_down` via
 /// `LoopbackTransport::new_mitm`.
 ///
-/// **Do not read this as "the strongest attack a relay has".** It is not. A byte flip breaks the
-/// Ed25519 envelope signature, so the receiver rejects at the *signature* check and the ratchet AEAD
-/// and the §4.6 DTLS-fingerprint cross-check are never reached. A relay also has attacks that need no
-/// key material and would pass the signature check — **replay** of an earlier valid envelope,
-/// **reorder**, **drop**, and **cross-delivery** of an envelope from another session — and those
-/// probe deeper into the ratchet. They are a genuine, acknowledged gap in this hook's coverage,
-/// recorded in task 1.28's file for a follow-up rather than folded in here (this hook's deliverable
-/// is specifically an in-transit *rewrite*).
+/// **Do not read this as "the strongest attack a relay has".** It is not — it is the *cheapest*,
+/// chosen because it needs no envelope knowledge whatsoever. Scope it precisely:
+///
+/// * A byte flip is stopped at the **signature** check, strictly *earlier* than the ratchet AEAD and
+///   the §4.6 fingerprint cross-check, which this path never reaches.
+/// * That is not a gap but an **impossibility**: `MessageEnvelope` has exactly four fields, and
+///   `signing_input` covers `sender_pub + prekey + ct` with `sig` the remainder — so *every* byte is
+///   either signed or is the signature, and any single-byte mutation must fail CBOR decode or
+///   `verify`. A rewrite that *survives* the signature check is unreachable for this server anyway:
+///   no `meridian-envelope` dependency, no sender identity key, no ratchet state.
+/// * Strictly stronger relay attacks exist and are covered elsewhere or open: bundle substitution
+///   ([`substitute_bundle`], right above — the server ends up holding real ratchet state with both
+///   peers) → `tampered_bundle_is_rejected` + T08; transport-level fingerprint MITM →
+///   `p2p_session.rs::fingerprint_mismatch_tears_down`; and **open**: a forged `Deliver.from` (the
+///   server asserts that field itself, so forging it is free) plus **replay / reorder / drop /
+///   cross-delivery**, none of which need key material and all of which *pass* the signature check
+///   and probe deeper. Those are recorded as a follow-up in task 1.28's file rather than folded in
+///   here, since this hook's deliverable is specifically an in-transit *rewrite*.
 ///
 /// Compiled in only under the `test-tamper-hook` cargo feature (off by default, absent from release
 /// binaries — F17); additionally gated at runtime by `allow_test_tamper && allow_test_route_tamper`.
@@ -131,8 +141,9 @@ pub fn rewrite_routed_blob(original: &[u8]) -> Vec<u8> {
     if out.is_empty() {
         return out;
     }
-    // Middle byte: inside the ratchet ciphertext for any realistic envelope, so this lands on
-    // signed, AEAD-protected material rather than harmlessly on framing.
+    // Middle byte: lands inside `ct` for any realistic envelope. Per the note above, *which* byte is
+    // not actually load-bearing — every byte is either signed or is the signature — but hitting `ct`
+    // keeps the simulated attack a plausible "rewrite the SDP" rather than CBOR framing damage.
     let idx = out.len() / 2;
     out[idx] ^= 0xFF;
     out

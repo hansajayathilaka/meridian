@@ -12,7 +12,7 @@ JSON fixtures from T01 (IDs, checksums) and T08 (safety numbers, fingerprints). 
 A proxy/harness (T03, extended by T04/T06/T07) captures every byte each server component handles for scripted flows and asserts: no plaintext substrings, encrypted ratchet headers (no visible counters), SDP never in cleartext, mailbox DB pages carry only opaque blobs. Green on every commit; a regression fails the build.
 
 ## 3. Adversarial harnesses (the A2/A6/A7 guarantees)
-- `meridian-mitm-sim` (T08): malicious rendezvous substitutes keys/bundles against `tofu` and `verified` states → matrix must show 0 silent successes.
+- `meridian-mitm-sim` (T08): malicious rendezvous substitutes keys/bundles against `tofu` and `verified` states → matrix must show 0 silent successes. Also (task 1.28) a rendezvous actively **rewriting routed blobs** in transit during a real `dial`/`answer`: the rewrite is detected at envelope authentication and no session establishes, with a control case through an honest relay so the assertion cannot pass vacuously. Relay attacks that pass the signature check (replay, reorder, drop, cross-delivery, forged `Deliver.from`) are **not** yet covered — see that task's file.
 - Ghost-device harness (T13): forged record (bad sig → reject) and key-theft variant (→ blocking alert on verified contacts).
 - FS/PCS harness (T03): snapshot ratchet at N, prove <N undecryptable; simulate state theft, prove self-heal within one round-trip.
 - Fingerprint-mismatch (T04): forced DTLS fp mismatch tears down 100% (`LoopbackTransport::new_mitm`,
