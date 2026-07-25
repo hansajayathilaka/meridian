@@ -33,6 +33,14 @@ cargo test -q -p meridian-rendezvous --test rendezvous each_turn_request_mints_a
 echo "[nat-matrix] CLI: doctor connects all four cells; relay-only hides our IPs…"
 cargo test -q -p meridian-cli --test nat_relay
 
+echo "[nat-matrix] building meridian-cli with the webrtc feature for the netns rig…"
+# The plain `cargo test` steps above build meridian-cli without --features webrtc (its default),
+# which overwrites any previously-built ./target/debug/meridian at the same path with a
+# webrtc-less binary — the netns rig needs the real WebRtcTransport backend (1.15) to run `session
+# connect`, so it must be rebuilt with the feature immediately before invoking the rig, not assumed
+# to still be present from an earlier, unrelated build.
+cargo build -q -p meridian-cli --features webrtc
+
 echo "[nat-matrix] netns wire-level rig + pcap assertions (skips without NET_ADMIN)…"
 bash tools/netns-nat-matrix.sh matrix
 
