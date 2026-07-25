@@ -21,14 +21,21 @@ jobs:
           components: rustfmt, clippy
       - name: rustfmt
         run: cargo fmt --all -- --check
-      - name: Repo invariants (server-no-core, no-serde-on-blob, metrics-allowlist)
+      - name: Repo invariants (server-no-core, no-serde-on-blob, metrics-allowlist, no-raw-id-logging)
         run: |
           bash tools/lint-server-no-core.sh
+          # Guards the guard: fails CI if the cargo-tree check stops catching a TRANSITIVE core
+          # dependency — the route the old grep-based lint could never see (F21).
+          bash tools/lint-server-no-core.sh --selftest
           bash tools/lint-no-serde-on-blob.sh
           # Guards the guard: fails CI if a future edit to the lint silently regresses its
           # module-qualified-path / multi-line bypass coverage (F15).
           bash tools/lint-no-serde-on-blob.sh --selftest
           bash tools/lint-metrics-allowlist.sh
+          # Invariant #4: no raw identifiers in server log lines (F21). Landed ahead of the
+          # observability stack so the first log line added cannot break it silently.
+          bash tools/lint-no-raw-id-logging.sh
+          bash tools/lint-no-raw-id-logging.sh --selftest
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

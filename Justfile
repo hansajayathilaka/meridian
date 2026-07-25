@@ -20,11 +20,18 @@ fmt-check:
 # Enforceable architecture/security invariants (see tools/).
 lint-invariants:
     bash tools/lint-server-no-core.sh
+    # Guards the guard: proves the cargo-tree check still trips on a TRANSITIVE core dependency
+    # (the route the old grep-based version could never see) rather than silently regressing.
+    bash tools/lint-server-no-core.sh --selftest
     bash tools/lint-no-serde-on-blob.sh
     # Guards the guard: proves check-3 above still trips on the F15 bypass patterns (module-
     # qualified type paths, multi-line `let x: T = ... .decode()`) rather than silently regressing.
     bash tools/lint-no-serde-on-blob.sh --selftest
     bash tools/lint-metrics-allowlist.sh
+    # Invariant #4 (server logs no raw identifiers) — landed ahead of observability, so the first
+    # log line added cannot break it silently. See apps/rendezvous/src/logid.rs.
+    bash tools/lint-no-raw-id-logging.sh
+    bash tools/lint-no-raw-id-logging.sh --selftest
 
 # Tests: unit/integration + adversarial harnesses + (later) conformance vectors.
 test: build harnesses
