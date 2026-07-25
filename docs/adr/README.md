@@ -22,6 +22,7 @@ are the stack/repo decisions (extracted from [stack](../architecture/stack.md) �
 | [0013](./0013-server-web-framework.md) | axum server framework | stack §6 |
 | [0014](./0014-media-stack.md) | Media: **libwebrtc for media, webrtc-rs for data** (Accepted) | design §12 |
 | [0015](./0015-ratchet-composition.md) | Double Ratchet composed in `meridian-crypto` from RustCrypto primitives (Accepted; supersedes 0011's ratchet mechanism) | T03 spike |
+| [0016](./0016-envelope-deniability.md) | Envelope **v2 drops the per-message identity-key signature** so transcripts become deniable (Accepted; implementation deferred to a build task, gates Feature 07) | Phase-1 review |
 
 **Previously-open decisions, now resolved at handoff:** [0011 ratchet library](./0011-ratchet-library.md)
 X3DH layer → hand-wired over RustCrypto primitives (unchanged); Double Ratchet mechanism → composed

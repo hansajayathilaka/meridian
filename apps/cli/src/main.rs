@@ -28,6 +28,19 @@ use account::{AccountDescriptor, StoreKind};
 
 const OS_KEYSTORE_SERVICE: &str = "meridian";
 
+/// Wall-clock unix seconds, for the APIs in `meridian-core` that take time as a parameter rather
+/// than reading a clock themselves (`PrekeyVault::set_bundle` /
+/// `PrekeyVault::expire_previous_generation`, task 1.31). The core crate stays clock-free because it
+/// also compiles to wasm32, where `SystemTime::now()` is unavailable; the CLI is a native binary, so
+/// reading the clock here is fine. A clock before the epoch yields 0 rather than panicking — that
+/// only makes a retained prekey generation expire sooner, which is the fail-closed direction.
+pub(crate) fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[derive(Parser)]
 #[command(
     name = "meridian",

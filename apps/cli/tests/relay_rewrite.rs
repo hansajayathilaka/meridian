@@ -1,0 +1,293 @@
+//! Task 1.28 — **active relay-rewrite adversarial test**.
+//!
+//! Closes the gap left open by `harnesses/mitm-sim/run.sh` and `apps/core/src/session.rs`'s module
+//! doc: until now, no test drove a real `dial`/`answer` P2P establishment through a rendezvous that
+//! was *actively rewriting routed blobs in transit*. The existing coverage was adjacent but not this:
+//!
+//!   * `meridian-rendezvous`'s `tampered_bundle_is_rejected` attacks **key distribution** (a
+//!     substituted `Fetch` bundle), not the routed signaling path.
+//!   * `apps/core/tests/p2p_session.rs::fingerprint_mismatch_tears_down` attacks the **transport**
+//!     (`LoopbackTransport::new_mitm` forces a DTLS fingerprint mismatch) with an honest relay.
+//!
+//! This test attacks the **relay itself**: a real `meridian-rendezvous`, built with
+//! `test-tamper-hook` and configured with `allow_test_route_tamper`, mutates every routed blob as it
+//! passes through. Both peers run in-process over a shared `LoopbackFabric` for the *data* path, but
+//! their signaling is real: two `SignalingClient`s over real sockets to that hostile server.
+//!
+//! **The asserted property:** establishment **fails closed**. The rewrite is detected and no session
+//! comes up — never a silently-accepted substituted offer/answer. It cannot come up "differently" or
+//! "insecurely"; the only outcomes are no-session or secure-session (threat-model goal 6).
+//!
+//! **What this does NOT cover, stated so the coverage is not overread:** a byte-level rewrite breaks
+//! the Ed25519 envelope signature, so rejection happens at the *signature* check — the ratchet AEAD
+//! and the §4.6 fingerprint cross-check are never exercised on this path. A relay's key-material-free
+//! attacks that *would* pass the signature check (replay of an earlier valid envelope, reorder, drop,
+//! cross-delivery from another session) are not exercised here; see task 1.28's file.
+//!
+//! The control case in `honest_relay_establishes_the_same_session` is load-bearing: it runs the
+//! identical flow with route-tampering off and asserts the session *does* establish. Without it, the
+//! fail-closed assertion would be satisfied by any unrelated breakage (a port mixup, a missing
+//! bundle) and would pass while proving nothing.
+
+use std::sync::mpsc;
+use std::sync::Arc;
+
+use meridian_core::chat::ChatState;
+use meridian_core::identity::{generate_account, AccountId, MemorySecretStore};
+use meridian_core::session::{answer, dial, SessionError};
+use meridian_core::signal_relay::RendezvousRelay;
+use meridian_core::signaling::{SignalingClient, DEFAULT_OTK_COUNT};
+use meridian_core::streams::StreamRegistry;
+use meridian_core::transport::{LoopbackFabric, LoopbackTransport};
+use meridian_rendezvous::{serve, AppState, Config, MemoryStore};
+
+/// Start a real server on an ephemeral port. `rewrite_routed_blobs` turns on the 1.28 hook.
+fn spawn_server(rewrite_routed_blobs: bool) -> String {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let mut config = Config::default();
+            config.server.allow_test_tamper = rewrite_routed_blobs;
+            config.server.allow_test_route_tamper = rewrite_routed_blobs;
+            // Both peers connect from 127.0.0.1 in-process.
+            config.limits.auth_per_ip_per_min = 1_000_000;
+            let store = Arc::new(MemoryStore::new());
+            let state = AppState::new(config, store);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tx.send(addr).unwrap();
+            let _ = serve(state, listener).await;
+        });
+    });
+    format!("ws://{}", rx.recv().unwrap())
+}
+
+struct Peer {
+    store: MemorySecretStore,
+    account: AccountId,
+    chat: ChatState,
+}
+
+impl Peer {
+    fn new(hint: &str) -> Self {
+        let store = MemorySecretStore::new();
+        let account = generate_account(&store, hint).unwrap();
+        Self {
+            store,
+            account,
+            chat: ChatState::default(),
+        }
+    }
+    fn ik(&self) -> [u8; 32] {
+        *self.account.public_key().as_bytes()
+    }
+}
+
+/// Connect a peer, publish its bundle, and record the matching secrets in its vault.
+async fn connect_and_publish(peer: &mut Peer, url: &str) -> SignalingClient {
+    let ik = peer.ik();
+    let mut client = SignalingClient::connect(url, &peer.store, peer.account.handle(), ik, None, 1)
+        .await
+        .expect("connect to rendezvous");
+    let generated = client
+        .publish_bundle(&peer.store, peer.account.handle(), DEFAULT_OTK_COUNT)
+        .await
+        .expect("publish bundle");
+    let otks: Vec<([u8; 32], [u8; 32])> = generated
+        .bundle
+        .otks
+        .iter()
+        .zip(generated.otk_secrets.iter())
+        .map(|(p, s)| (*p, **s))
+        .collect();
+    peer.chat.vault.set_bundle(
+        generated.bundle.spk,
+        *generated.spk_secret,
+        otks,
+        1_700_000_000,
+    );
+    client
+}
+
+/// What happened to one side of the handshake.
+///
+/// `Rejected` keeps the *classified* error, not just its text. Matching on the variant rather than a
+/// message substring is deliberate: it is what makes the assertions below non-vacuous (a bare
+/// `Relay`/`SignalingEnded` must NOT satisfy "the rewrite was detected"), and it survives
+/// [ADR 0016](../../../docs/adr/0016-envelope-deniability.md) — at envelope v2 the detector moves
+/// from the Ed25519 signature check to the ratchet AEAD, which is still a `Chat` error, whereas a
+/// string assertion on "signature verification failed" would go stale.
+#[derive(Debug)]
+enum Outcome {
+    /// A session came up. In the adversarial case this is the security failure.
+    Established,
+    /// Explicitly rejected — the *detection* the task asks for, when the class is right.
+    Rejected(SessionError),
+    /// Neither established nor rejected: this side is still waiting. Fail-closed (no session), but
+    /// undiagnosed — see the residual on the adversarial test.
+    StillWaiting,
+}
+
+impl Outcome {
+    /// Did this side reject at the **envelope-authentication** layer? `SessionError::Chat` wraps
+    /// `ChatError`, which is where a tampered blob is caught (signature today, ratchet AEAD at
+    /// envelope v2). A `Relay`/`SignalingEnded`/`Transport` error is explicitly NOT this: those are
+    /// the signature of an unrelated regression, and treating them as "detected" is exactly how this
+    /// test could go green while the property it asserts is broken.
+    fn is_envelope_rejection(&self) -> bool {
+        matches!(self, Outcome::Rejected(SessionError::Chat(_)))
+    }
+}
+
+/// How long a side may wait before we call it `StillWaiting`. Generous relative to loopback
+/// establishment (sub-second in the control case), so this only ever bites the stalled path.
+const SIDE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Drive a full dial/answer through the given server, timing out **each side independently** so the
+/// two outcomes stay distinguishable. Joining them under a single timeout hides detection: the
+/// responder rejects a rewritten offer immediately, but the dialer then waits for an answer that
+/// never arrives, so a combined timeout reports only the stall and the rejection goes unobserved.
+async fn establish_through(url: &str) -> (Outcome, Outcome) {
+    let mut alice = Peer::new("relay.a");
+    let mut bob = Peer::new("relay.b");
+    let (alice_ik, bob_ik) = (alice.ik(), bob.ik());
+
+    let mut alice_client = connect_and_publish(&mut alice, url).await;
+    let mut bob_client = connect_and_publish(&mut bob, url).await;
+
+    // Alice initiates: fetch + verify Bob's bundle, then X3DH.
+    let bob_bundle = alice_client
+        .fetch_bundle(bob_ik, false)
+        .await
+        .expect("fetch bob's bundle");
+    alice
+        .chat
+        .start_initiator_session(
+            &alice.store,
+            alice.account.handle(),
+            &alice_ik,
+            &bob_ik,
+            &bob_bundle.spk,
+            bob_bundle.otks.first().copied(),
+        )
+        .expect("x3dh");
+
+    // Shared loopback fabric for the DATA path; the SIGNALING path is the real hostile server.
+    let fabric = LoopbackFabric::new();
+    let alice_tp = Arc::new(LoopbackTransport::new(fabric.clone()));
+    let bob_tp = Arc::new(LoopbackTransport::new(fabric));
+    let registry = Arc::new(StreamRegistry::with_builtins());
+
+    let mut alice_relay = RendezvousRelay::new(&mut alice_client);
+    let mut bob_relay = RendezvousRelay::new(&mut bob_client);
+
+    let alice_fut = dial(
+        alice_tp,
+        &alice.store,
+        alice.account.handle(),
+        alice_ik,
+        bob_ik,
+        &mut alice.chat,
+        &mut alice_relay,
+        registry.clone(),
+    );
+    let bob_fut = answer(
+        bob_tp,
+        &bob.store,
+        bob.account.handle(),
+        bob_ik,
+        alice_ik,
+        &mut bob.chat,
+        &mut bob_relay,
+        registry,
+    );
+
+    let (a, b) = tokio::join!(
+        tokio::time::timeout(SIDE_TIMEOUT, alice_fut),
+        tokio::time::timeout(SIDE_TIMEOUT, bob_fut),
+    );
+
+    async fn classify<T: meridian_core::transport::Transport>(
+        r: Result<
+            Result<meridian_core::session::P2pSession<T>, SessionError>,
+            tokio::time::error::Elapsed,
+        >,
+    ) -> Outcome {
+        match r {
+            Ok(Ok(mut s)) => {
+                let _ = s.close().await;
+                Outcome::Established
+            }
+            Ok(Err(e)) => Outcome::Rejected(e),
+            Err(_) => Outcome::StillWaiting,
+        }
+    }
+    (classify(a).await, classify(b).await)
+}
+
+/// **The adversarial case.** Two properties, asserted separately:
+///   1. **Fail-closed:** neither side establishes a session. This is the security property.
+///   2. **Detected:** at least one side rejects *explicitly*, with a reason — the rewrite is not
+///      merely absorbed into a silent stall.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_rewriting_routed_blobs_is_detected_and_fails_closed() {
+    let url = spawn_server(true);
+    let (alice, bob) = establish_through(&url).await;
+    eprintln!("[1.28] hostile relay → dialer: {alice:?} / responder: {bob:?}");
+
+    // (1) Fail-closed. Neither side may come up.
+    for (who, outcome) in [("dialer", &alice), ("responder", &bob)] {
+        assert!(
+            !matches!(outcome, Outcome::Established),
+            "SECURITY FAILURE: the {who} established a P2P session through a rendezvous that was \
+             actively rewriting routed signaling blobs. A relay-rewrite attempt must fail closed — \
+             never be silently accepted (threat-model goal 6: no 'weaker session')."
+        );
+    }
+
+    // (2) Detected — by the RESPONDER specifically, at the envelope-authentication layer.
+    //
+    // Pinning both the side and the error class is what stops this test passing vacuously. Accepting
+    // "either side rejected with any message" would go green in a scenario where the hook had become
+    // inert and an unrelated signaling regression made the dialer error out with
+    // `Relay(..)`/`SignalingEnded`: nobody establishes (so (1) passes) and something errored (so a
+    // loose (2) passes) — green test, untested property. The control case cannot catch that, since it
+    // runs against an honest server.
+    assert!(
+        bob.is_envelope_rejection(),
+        "the RESPONDER must reject the rewritten offer at the envelope-authentication layer \
+         (SessionError::Chat). Anything else — Relay, SignalingEnded, Transport, or a stall — means \
+         the rewrite was not actually detected and this test would otherwise pass vacuously. \
+         Got: {bob:?}"
+    );
+
+    // The dialer's only legitimate outcomes: it waits forever for an answer that never comes (the
+    // documented residual), or it too rejects at the envelope layer. A bare Relay/SignalingEnded here
+    // is the signature of the vacuous-pass scenario above, so it is rejected explicitly.
+    assert!(
+        matches!(alice, Outcome::StillWaiting) || alice.is_envelope_rejection(),
+        "the dialer must either stall awaiting an answer (the documented residual) or reject at the \
+         envelope layer — never fail with an unrelated relay/transport error, which would mean this \
+         test is measuring something other than the rewrite. Got: {alice:?}"
+    );
+}
+
+/// **Control.** The identical flow through an honest relay must establish on both sides, or the
+/// assertions above are vacuous — they would pass on any unrelated breakage (a port mixup, a missing
+/// bundle, a signaling regression).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn honest_relay_establishes_the_same_session() {
+    let url = spawn_server(false);
+    let (alice, bob) = establish_through(&url).await;
+    for (who, outcome) in [("dialer", &alice), ("responder", &bob)] {
+        assert!(
+            matches!(outcome, Outcome::Established),
+            "control case: the {who} must establish through an HONEST relay, else the adversarial \
+             assertions prove nothing. Got: {outcome:?}"
+        );
+    }
+}

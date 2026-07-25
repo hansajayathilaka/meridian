@@ -50,6 +50,9 @@ clap = { workspace = true }
 hmac = { workspace = true }
 sha1 = { workspace = true }
 data-encoding = { workspace = true }
+# Salted log identifiers (LogId, task 1.20) — HMAC-SHA256 under a per-process salt. A primitive,
+# same as the two above; NOT meridian-core.
+sha2 = { workspace = true }
 
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"], optional = true }
 

@@ -70,13 +70,17 @@ assertions themselves. **F11 (wire-level) is now fully closed** — all of 1.14+
 - [x] **1.30** TURN-over-TCP client gap under relay-only + udp-blocked (F11 wire; carved out of 1.26; depends on 1.26) — [file](./1.30-turn-tcp-dependency-gap.md)
 
 **Group E — Design decisions + remaining should-fix / nit**
-- [ ] **1.17** ADR — deniability vs envelope signature (on-the-fly) — [file](./1.17-adr-deniability-envelope-sig.md)
-- [ ] **1.18** Desync → fresh-X3DH auto-recovery decision (F13, on-the-fly) — [file](./1.18-desync-recovery-decision.md)
-- [ ] **1.19** 5k-connection capacity test (F12) — [file](./1.19-capacity-test-5k.md)
-- [ ] **1.20** Server-hardening bundle (F21) — [file](./1.20-server-hardening-bundle.md)
-- [ ] **1.21** Coverage tooling or drop the % (F22) — [file](./1.21-coverage-tooling.md)
-- [ ] **1.28** Active relay-rewrite adversarial test (on-the-fly, flagged during 1.23's split; not part of F11's closure) — [file](./1.28-active-relay-rewrite-test.md)
-- [ ] **1.31** Prekey-bundle republish/fetch race on reconnect (on-the-fly, found during 1.27's live-rig verification; not part of F11's closure) — [file](./1.31-prekey-bundle-republish-race.md)
+- [x] **1.17** ADR — deniability vs envelope signature (on-the-fly) — [file](./1.17-adr-deniability-envelope-sig.md)
+- [x] **1.18** Desync → fresh-X3DH auto-recovery decision (F13, on-the-fly) — [file](./1.18-desync-recovery-decision.md)
+- [x] **1.19** 5k-connection capacity test (F12) — [file](./1.19-capacity-test-5k.md)
+- [x] **1.20** Server-hardening bundle (F21) — [file](./1.20-server-hardening-bundle.md)
+- [x] **1.21** Coverage tooling or drop the % (F22) — [file](./1.21-coverage-tooling.md)
+- [x] **1.28** Active relay-rewrite adversarial test (on-the-fly, flagged during 1.23's split; not part of F11's closure) — [file](./1.28-active-relay-rewrite-test.md)
+- [x] **1.31** Prekey-bundle republish/fetch race on reconnect (on-the-fly, found during 1.27's live-rig verification; not part of F11's closure) — [file](./1.31-prekey-bundle-republish-race.md)
+
+**Group E follow-ups — surfaced by Group E's own reviews** (not in the original Group E set)
+- [ ] **1.32** Relay attacks that PASS the envelope signature check (from-spoof / replay / reorder / cross-delivery; from 1.28's security review, fold into [ADR 0016](../../adr/0016-envelope-deniability.md)'s test obligations) — [file](./1.32-relay-attacks-past-signature.md)
+- [ ] **1.33** Bound the dialer's wait for an answer in `recv_sdp` (availability/diagnostics; from 1.28) — [file](./1.33-bound-answer-wait.md)
 
 ## Exit criteria
 All fix-tasks `[x]`, tree green (`just build` + `cargo clippy -D warnings` clean), docs synced. Blocking

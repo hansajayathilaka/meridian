@@ -98,3 +98,53 @@ pub fn substitute_bundle(original: &PrekeyBundle) -> PrekeyBundle {
         device_record: None,
     }
 }
+
+/// TEST HOOK (task 1.28): actively **rewrite a routed blob in transit** — the malicious-relay
+/// attack that [`substitute_bundle`] does not cover. Where bundle substitution attacks *key
+/// distribution*, this attacks the *routed signaling path*: a compromised rendezvous mutating the
+/// SDP/ICE envelopes that establish a P2P session, trying to swap in its own DTLS fingerprint and
+/// terminate the session itself.
+///
+/// **What this hook can and cannot simulate, precisely.** It flips one byte in the middle of the
+/// blob. It does **not** construct a substitute envelope carrying the attacker's own fingerprint,
+/// because the server *cannot*: `meridian-rendezvous` does not depend on `meridian-envelope`, so
+/// envelope/content types are not in scope for this crate at all (the F15 dependency split — see
+/// `apps/envelope/src/lib.rs`), and it holds no ratchet state to encrypt an inner `SignalContent`
+/// under. The "attacker fabricates a whole offer with its own fingerprint" case is covered
+/// client-side instead, by `apps/core/tests/p2p_session.rs::fingerprint_mismatch_tears_down` via
+/// `LoopbackTransport::new_mitm`.
+///
+/// **Do not read this as "the strongest attack a relay has".** It is not — it is the *cheapest*,
+/// chosen because it needs no envelope knowledge whatsoever. Scope it precisely:
+///
+/// * A byte flip is stopped at the **signature** check, strictly *earlier* than the ratchet AEAD and
+///   the §4.6 fingerprint cross-check, which this path never reaches.
+/// * That is not a gap but an **impossibility**: `MessageEnvelope` has exactly four fields, and
+///   `signing_input` covers `sender_pub + prekey + ct` with `sig` the remainder — so *every* byte is
+///   either signed or is the signature, and any single-byte mutation must fail CBOR decode or
+///   `verify`. A rewrite that *survives* the signature check is unreachable for this server anyway:
+///   no `meridian-envelope` dependency, no sender identity key, no ratchet state.
+/// * Strictly stronger relay attacks exist and are covered elsewhere or open: bundle substitution
+///   ([`substitute_bundle`], right above — the server ends up holding real ratchet state with both
+///   peers) → `tampered_bundle_is_rejected` + T08; transport-level fingerprint MITM →
+///   `p2p_session.rs::fingerprint_mismatch_tears_down`; and **open**: a forged `Deliver.from` (the
+///   server asserts that field itself, so forging it is free) plus **replay / reorder / drop /
+///   cross-delivery**, none of which need key material and all of which *pass* the signature check
+///   and probe deeper. Those are recorded as a follow-up in task 1.28's file rather than folded in
+///   here, since this hook's deliverable is specifically an in-transit *rewrite*.
+///
+/// Compiled in only under the `test-tamper-hook` cargo feature (off by default, absent from release
+/// binaries — F17); additionally gated at runtime by `allow_test_tamper && allow_test_route_tamper`.
+#[cfg(feature = "test-tamper-hook")]
+pub fn rewrite_routed_blob(original: &[u8]) -> Vec<u8> {
+    let mut out = original.to_vec();
+    if out.is_empty() {
+        return out;
+    }
+    // Middle byte: lands inside `ct` for any realistic envelope. Per the note above, *which* byte is
+    // not actually load-bearing — every byte is either signed or is the signature — but hitting `ct`
+    // keeps the simulated attack a plausible "rewrite the SDP" rather than CBOR framing damage.
+    let idx = out.len() / 2;
+    out[idx] ^= 0xFF;
+    out
+}

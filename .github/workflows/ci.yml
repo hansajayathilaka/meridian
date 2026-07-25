@@ -21,14 +21,21 @@ jobs:
           components: rustfmt, clippy
       - name: rustfmt
         run: cargo fmt --all -- --check
-      - name: Repo invariants (server-no-core, no-serde-on-blob, metrics-allowlist)
+      - name: Repo invariants (server-no-core, no-serde-on-blob, metrics-allowlist, no-raw-id-logging)
         run: |
           bash tools/lint-server-no-core.sh
+          # Guards the guard: fails CI if the cargo-tree check stops catching a TRANSITIVE core
+          # dependency — the route the old grep-based lint could never see (F21).
+          bash tools/lint-server-no-core.sh --selftest
           bash tools/lint-no-serde-on-blob.sh
           # Guards the guard: fails CI if a future edit to the lint silently regresses its
           # module-qualified-path / multi-line bypass coverage (F15).
           bash tools/lint-no-serde-on-blob.sh --selftest
           bash tools/lint-metrics-allowlist.sh
+          # Invariant #4: no raw identifiers in server log lines (F21). Landed ahead of the
+          # observability stack so the first log line added cannot break it silently.
+          bash tools/lint-no-raw-id-logging.sh
+          bash tools/lint-no-raw-id-logging.sh --selftest
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -43,6 +50,43 @@ jobs:
         run: cargo build --workspace
       - name: Unit + integration tests
         run: cargo test --workspace
+      # REQUIRED for F17, and not redundant with --workspace above. Resolver-2 feature unification
+      # turns `test-tamper-hook` ON workspace-wide whenever dev targets are built, because
+      # apps/cli's dev-dependency pins that feature — so every #[cfg(not(feature =
+      # "test-tamper-hook"))] guard in apps/rendezvous/tests is compiled OUT under --workspace.
+      # This package-scoped run with default features is the only invocation under which the
+      # tamper-hook inertness guards execute at all. Before it existed,
+      # `tamper_flag_is_inert_without_feature` (task 1.12) had never run in CI.
+      - name: Tamper-hook compile-gate guards (default features only — see comment)
+        run: cargo test -p meridian-rendezvous
+      # F17, checked at the level that actually decides it: feature *resolution*. A release/normal
+      # build must not activate `test-tamper-hook`, even though apps/cli's DEV-dependency pins it —
+      # resolver 2 is what keeps dev-dep features out of the normal graph, and this step fails if
+      # that ever stops holding (a resolver downgrade, or someone promoting the dev-dep).
+      #
+      # Deliberately NOT an `nm`-symbol check on the release binary: that was tried and is worthless
+      # here — the symbol is absent from an optimised build whether the feature is on or off, so it
+      # would pass in both cases. A check that cannot fail is not a gate (cf. F4/F18).
+      - name: test-tamper-hook is not active in a normal/release build (F17)
+        run: |
+          set -euo pipefail
+          # Capture cargo's own exit status, not grep's. Without `set -o pipefail` (and the explicit
+          # empty check below) a `cargo tree` failure would leave $feats empty, and an empty string
+          # trivially fails the `grep -q` — i.e. the gate would PASS precisely when it could not
+          # verify anything. Fail closed instead: no parsed output is a hard error, never a pass.
+          tree=$(cargo tree --workspace -e normal -f '{p} {f}')
+          feats=$(printf '%s\n' "$tree" | grep -o 'meridian-rendezvous v[^ ]* ([^)]*) .*' | head -1 || true)
+          if [ -z "$feats" ]; then
+            echo "::error::could not resolve meridian-rendezvous features from 'cargo tree' output — refusing to pass a check that verified nothing (F17)." >&2
+            printf '%s\n' "$tree" | head -20 >&2
+            exit 1
+          fi
+          echo "resolved: $feats"
+          if printf '%s' "$feats" | grep -q 'test-tamper-hook'; then
+            echo "::error::test-tamper-hook is active in a NORMAL (non-dev) build — the hook would ship in the release binary (F17)." >&2
+            exit 1
+          fi
+          echo "OK: normal build does not activate test-tamper-hook."
       - name: Real webrtc-rs transport backend (1.15; real ICE/SCTP/DTLS on localhost, no NET_ADMIN needed)
         run: |
           cargo test -p meridian-transport --features webrtc
@@ -72,6 +116,30 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --workspace --release
+
+  coverage:
+    name: Coverage (measurement only, non-blocking)
+    needs: test
+    runs-on: ubuntu-latest
+    # Reports region/line/function coverage so the number is visible in CI instead of asserted in a
+    # spec (task 1.21 / F22). Deliberately NOT a gate: it does not block the merge queue, and no
+    # threshold is enforced — gating is a separate, later decision. Note that Rust on stable emits no
+    # branch coverage, so a "branch coverage" target is not measurable here.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Coverage summary
+        run: cargo llvm-cov --workspace --summary-only
+      - name: Coverage report (lcov artifact)
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
 
   supply-chain:
     name: License / advisory gate

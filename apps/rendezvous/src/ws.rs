@@ -257,10 +257,26 @@ async fn handle_route(
         Ok(b) => b,
         Err(_) => return send_err(tx, frame.id, error_codes::BAD_REQUEST, "malformed").await,
     };
-    // Build the delivery frame WITHOUT ever inspecting `body.blob` — it stays opaque.
+    // TEST HOOK (task 1.28): actively rewrite the routed blob, simulating a compromised rendezvous
+    // mounting a relay-rewrite attack on the P2P signaling path. Compiled in only under the
+    // `test-tamper-hook` cargo feature — absent from default/release builds entirely — and gated at
+    // runtime by BOTH flags, so the bundle-substitution demo is unaffected. Note this still does not
+    // *inspect* the blob: it mutates opaque bytes, which is all a real relay can do.
+    #[cfg(feature = "test-tamper-hook")]
+    let out_blob =
+        if state.config.server.allow_test_tamper && state.config.server.allow_test_route_tamper {
+            meridian_proto::OpaqueBlob::new(crate::auth::rewrite_routed_blob(body.blob.as_bytes()))
+        } else {
+            body.blob
+        };
+    #[cfg(not(feature = "test-tamper-hook"))]
+    let out_blob = body.blob;
+
+    // Build the delivery frame without ever *inspecting* the blob's contents — and, outside the
+    // cfg-gated test hook above, without altering them either. It stays opaque.
     let deliver = Deliver {
         from: *account_pub,
-        blob: body.blob,
+        blob: out_blob,
     };
     let Ok(frame_out) = Frame::new(Op::Deliver, 0, &deliver) else {
         return send_err(tx, frame.id, error_codes::BAD_REQUEST, "encode failed").await;

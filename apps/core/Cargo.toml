@@ -22,6 +22,8 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 getrandom = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
+# Zeroizes superseded prekey-generation secrets (task 1.31), matching meridian-crypto's convention.
+zeroize = { workspace = true }
 
 [features]
 default = []
@@ -32,3 +34,7 @@ webrtc = ["meridian-transport/webrtc"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+# Lets the desync test (task 1.18) serialize ChatState and assert it is byte-identical before and
+# after a rejected envelope — the check that stops a future contributor adding a reset-on-desync
+# oracle.
+ciborium = { workspace = true }

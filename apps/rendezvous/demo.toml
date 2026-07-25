@@ -9,3 +9,7 @@ domain = "localhost"
 bind = "0.0.0.0:8443"
 admission = "open"
 allow_test_tamper = true
+# Deliberately left OFF: this would additionally rewrite every ROUTED blob in transit (task
+# 1.28), which would break the demo's own chat/session flows rather than just the bundle fetch.
+# The 1.28 adversarial test enables it explicitly, in-process, for its own server instance only.
+allow_test_route_tamper = false

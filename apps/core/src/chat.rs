@@ -16,6 +16,7 @@ use meridian_crypto::{at_rest, PrekeyMaterial, Session};
 use meridian_envelope::{ChatContent, MessageEnvelope, Prekey};
 use meridian_identity::{sign, verify, KeyHandle, PublicKey, SecretStore, Signature};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 /// Errors from the chat session manager.
 #[derive(Debug, thiserror::Error)]
@@ -39,9 +40,35 @@ pub enum ChatError {
     /// A first message from an unknown peer arrived without the X3DH preamble.
     #[error("no session and no prekey preamble to establish one")]
     NoSession,
+    /// The envelope's ratchet header opened under **neither** header key, so this session cannot
+    /// advance: either the peer has lost its ratchet state (a genuine desync — restored backup,
+    /// wiped session store) or the input is hostile. Distinguished from the general
+    /// [`Crypto`](ChatError::Crypto) case purely so callers can *report* desync diagnosably; it is a
+    /// hard rejection like any other, and callers MUST NOT react to it by resetting or re-keying the
+    /// session (task 1.18 — doing so would hand an active attacker a session-reset,
+    /// skipped-key-destruction, and prekey-depletion oracle). Recovery is driven only by the peer
+    /// that knows it lost state; see `docs/api/messaging-envelope-v1.md` §3 "Desync recovery".
+    #[error("ratchet desync: header undecryptable under either header key")]
+    Desync,
 }
 
+/// How long a *superseded* prekey generation stays usable after a republish, in seconds (task 1.31).
+///
+/// Every `session connect` / `chat` invocation republishes a fresh bundle, so a peer whose fetch
+/// landed on the bundle that was current a moment ago would otherwise hit a hard
+/// [`ChatError::UnknownPrekey`] on its X3DH init (a reconnect race, not a hostile input). 60 seconds
+/// comfortably covers that race — fetch → X3DH → route → deliver is single-digit seconds even over a
+/// relayed path with retries — while staying far below any real prekey-rotation period, so the
+/// window in which a compromise of the *old* secrets could still open a session stays negligible.
+/// Forward secrecy is bounded on both axes: at most **one** prior generation is ever retained
+/// (see [`PrekeyVault::set_bundle`]) and it is dropped + zeroized once this window passes (see
+/// [`PrekeyVault::expire_previous_generation`]).
+pub const PREV_GENERATION_GRACE_SECS: u64 = 60;
+
 /// One published one-time prekey's key pair (public + X25519 secret).
+///
+/// The secret is zeroized on drop (matching `meridian-crypto`'s `DoubleRatchet` style), so removing
+/// an OTK from a generation — on consumption, expiry, or rotation — clears its key material.
 #[derive(Clone, Serialize, Deserialize)]
 struct Otk {
     #[serde(with = "b32")]
@@ -50,8 +77,57 @@ struct Otk {
     secret: [u8; 32],
 }
 
+impl Drop for Otk {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+/// The single retained *previous* prekey generation: the secrets behind the bundle that the most
+/// recent [`PrekeyVault::set_bundle`] superseded, plus the absolute unix second at which they stop
+/// being accepted. The expiry is stored absolute (not as a duration) precisely so it survives the
+/// at-rest seal/open round-trip unchanged.
+#[derive(Clone, Serialize, Deserialize)]
+struct PrevGeneration {
+    #[serde(with = "opt_b32", default)]
+    spk_public: Option<[u8; 32]>,
+    #[serde(with = "opt_b32", default)]
+    spk_secret: Option<[u8; 32]>,
+    #[serde(default)]
+    otks: Vec<Otk>,
+    #[serde(default)]
+    expires_at_unix: u64,
+}
+
+impl PrevGeneration {
+    /// Zeroize every secret-bearing field in place. Shared by [`Drop::drop`] and mirrors
+    /// `meridian_crypto`'s ratchet convention.
+    fn zeroize_secrets(&mut self) {
+        if let Some(mut s) = self.spk_secret.take() {
+            s.zeroize();
+        }
+        // Each `Otk`'s own `Drop` clears its secret too; do it here as well so an in-place
+        // zeroize (without a drop) leaves nothing behind.
+        for o in &mut self.otks {
+            o.secret.zeroize();
+        }
+        self.otks.clear();
+    }
+}
+
+impl Drop for PrevGeneration {
+    fn drop(&mut self) {
+        self.zeroize_secrets();
+    }
+}
+
 /// The local secrets behind this account's *published* prekey bundle — needed to answer incoming
 /// X3DH handshakes. One-time prekeys are consumed (removed) on first use.
+///
+/// A republish rotates the current generation into a single "previous" slot for
+/// [`PREV_GENERATION_GRACE_SECS`] so a peer that fetched the just-superseded bundle can still
+/// complete X3DH (task 1.31's reconnect race). One-time prekeys stay single-use *across* both
+/// generations.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct PrekeyVault {
     #[serde(with = "opt_b32", default)]
@@ -59,16 +135,47 @@ pub struct PrekeyVault {
     #[serde(with = "opt_b32", default)]
     spk_secret: Option<[u8; 32]>,
     otks: Vec<Otk>,
+    /// At most one superseded generation, retained for a bounded window. `serde(default)` so a
+    /// state sealed before 1.31 still opens.
+    #[serde(default)]
+    previous: Option<PrevGeneration>,
 }
 
 impl PrekeyVault {
-    /// Record the secrets for a freshly published bundle (replacing any prior set).
+    /// Record the secrets for a freshly published bundle, rotating the outgoing generation into the
+    /// bounded-lifetime "previous" slot.
+    ///
+    /// `now_unix` is the caller's wall clock in unix seconds: this crate is deliberately clock-free
+    /// (it compiles to wasm32, where `std::time::SystemTime::now()` is unavailable), so time is
+    /// injected rather than read here. The previous generation's expiry is recorded as
+    /// `now_unix + PREV_GENERATION_GRACE_SECS` and enforced by
+    /// [`expire_previous_generation`](Self::expire_previous_generation).
+    ///
+    /// Retention is hard-bounded to **one** generation: this replaces (and therefore zeroizes)
+    /// whatever was in the previous slot, so a chain of republishes can never accumulate a tail of
+    /// live prekey secrets.
     pub fn set_bundle(
         &mut self,
         spk_public: [u8; 32],
         spk_secret: [u8; 32],
         otks: impl IntoIterator<Item = ([u8; 32], [u8; 32])>,
+        now_unix: u64,
     ) {
+        let prior_public = self.spk_public.take();
+        let prior_secret = self.spk_secret.take();
+        let prior_otks = std::mem::take(&mut self.otks);
+        // Assigning here drops the old `previous` (zeroizing it via `PrevGeneration::drop`).
+        self.previous = match (prior_public, prior_secret) {
+            (Some(p), Some(s)) => Some(PrevGeneration {
+                spk_public: Some(p),
+                spk_secret: Some(s),
+                otks: prior_otks,
+                expires_at_unix: now_unix.saturating_add(PREV_GENERATION_GRACE_SECS),
+            }),
+            // Nothing was published before (first-ever publish): nothing to retain, and any
+            // older previous generation is dropped rather than carried forward.
+            _ => None,
+        };
         self.spk_public = Some(spk_public);
         self.spk_secret = Some(spk_secret);
         self.otks = otks
@@ -77,17 +184,71 @@ impl PrekeyVault {
             .collect();
     }
 
+    /// Drop + zeroize the retained previous generation once its grace window has passed.
+    ///
+    /// Time is supplied by the caller for the same reason as in [`set_bundle`](Self::set_bundle).
+    /// Callers that answer incoming X3DH handshakes should call this (with a real wall clock)
+    /// before opening inbound blobs, so a superseded generation fails closed with
+    /// [`ChatError::UnknownPrekey`] once expired instead of being silently accepted.
+    pub fn expire_previous_generation(&mut self, now_unix: u64) {
+        let expired = self
+            .previous
+            .as_ref()
+            .map(|p| now_unix >= p.expires_at_unix)
+            .unwrap_or(false);
+        if expired {
+            self.previous = None;
+        }
+    }
+
     fn spk_secret_for(&self, spk_public: &[u8; 32]) -> Option<[u8; 32]> {
-        match (self.spk_public, self.spk_secret) {
+        // Exact match on the requested SPK only — never substitute a different one.
+        if let (Some(p), Some(s)) = (self.spk_public, self.spk_secret) {
+            if &p == spk_public {
+                return Some(s);
+            }
+        }
+        // Grace window: a fetch that landed on the just-superseded bundle must still complete.
+        let prev = self.previous.as_ref()?;
+        match (prev.spk_public, prev.spk_secret) {
             (Some(p), Some(s)) if &p == spk_public => Some(s),
             _ => None,
         }
     }
 
+    /// Consume the secret for `opk_public`, whichever generation holds it.
+    ///
+    /// Single-use is enforced *across* generations: the OTK is removed from the current generation
+    /// **and** from the retained previous one, so one published one-time prekey can never establish
+    /// two sessions (a second attempt with the same public returns `None` →
+    /// [`ChatError::UnknownPrekey`]).
     fn take_otk_secret(&mut self, opk_public: &[u8; 32]) -> Option<[u8; 32]> {
-        let idx = self.otks.iter().position(|o| &o.public == opk_public)?;
-        Some(self.otks.remove(idx).secret)
+        let from_current = take_otk(&mut self.otks, opk_public);
+        let from_prev = self
+            .previous
+            .as_mut()
+            .and_then(|p| take_otk(&mut p.otks, opk_public));
+        from_current.or(from_prev)
     }
+}
+
+/// Remove **every** entry matching `opk_public` from `otks`, returning the first secret found.
+/// Removing all matches (rather than just the first) is what makes single-use robust even if the
+/// same public somehow appears twice; each removed [`Otk`] zeroizes its own copy on drop.
+fn take_otk(otks: &mut Vec<Otk>, opk_public: &[u8; 32]) -> Option<[u8; 32]> {
+    let mut found = None;
+    let mut i = 0;
+    while i < otks.len() {
+        if &otks[i].public == opk_public {
+            let otk = otks.remove(i);
+            if found.is_none() {
+                found = Some(otk.secret);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    found
 }
 
 /// The full persistable chat state: the prekey vault + all live sessions, keyed by peer identity.
@@ -262,7 +423,14 @@ impl ChatState {
             .sessions
             .get_mut(&envelope.sender_pub)
             .ok_or(ChatError::NoSession)?;
-        Ok(session.decrypt(&envelope.ct)?)
+        // Classify an undecryptable header as `Desync` so callers can *report* it distinguishably
+        // from malformed/tampered input (task 1.18). This changes no rejection decision: the
+        // envelope is dropped either way and the session is left untouched. Callers MUST NOT treat
+        // `Desync` as a trigger to reset or re-key — see the variant's doc comment.
+        session.decrypt(&envelope.ct).map_err(|e| match e {
+            meridian_crypto::CryptoError::UndecryptableHeader => ChatError::Desync,
+            other => ChatError::Crypto(other),
+        })
     }
 
     /// Serialize and seal the whole state under a key derived from the account key in `store`.

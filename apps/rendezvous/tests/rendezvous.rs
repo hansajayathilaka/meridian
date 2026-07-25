@@ -125,6 +125,72 @@ async fn tamper_flag_is_inert_without_feature() {
     assert_eq!(bundle.account_pub, bob.pubkey);
 }
 
+// F17 for the 1.28 *route*-rewrite hook — the structural counterpart to
+// `apps/cli/tests/relay_rewrite.rs` (which only runs *with* the feature). Without
+// `test-tamper-hook`, `handle_route` has no expression that can produce a different blob, so even a
+// config with BOTH flags set must deliver bytes untouched.
+//
+// NOTE ON WHY THIS NEEDS ITS OWN CI STEP: `cargo test --workspace` cannot run this test. Resolver-2
+// feature unification turns `test-tamper-hook` ON workspace-wide whenever dev targets are built,
+// because `apps/cli/Cargo.toml`'s dev-dependency pins that feature — so every
+// `#[cfg(not(feature = "test-tamper-hook"))]` test here is compiled out under `--workspace`. The CI
+// `lint`/`test` jobs therefore run `cargo test -p meridian-rendezvous` separately, with default
+// features, which is the only invocation under which these two guards actually execute. Before that
+// step existed, `tamper_flag_is_inert_without_feature` above had never run in CI at all.
+#[cfg(not(feature = "test-tamper-hook"))]
+#[tokio::test]
+async fn route_tamper_is_inert_without_feature() {
+    let mut config = config_open();
+    config.server.allow_test_tamper = true; // both flags "enabled" at the config layer...
+    config.server.allow_test_route_tamper = true;
+    let url = spawn(config).await;
+
+    let alice = new_acct("localhost");
+    let bob = new_acct("localhost");
+    let mut bc = bob.connect(&url).await.unwrap();
+    let mut ac = alice.connect(&url).await.unwrap();
+
+    // ...and the routed blob still arrives byte-identical: the rewrite code is not in this build.
+    let payload = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33];
+    assert!(ac.route(bob.pubkey, payload.clone()).await.unwrap());
+    let msg = bc.next_deliver().await.unwrap();
+    assert_eq!(msg.from, alice.pubkey);
+    assert_eq!(
+        msg.blob.as_bytes(),
+        payload.as_slice(),
+        "without the test-tamper-hook feature the route hook must not exist at all"
+    );
+}
+
+// The other half of the double gate, and the configuration that actually ships in `demo.toml`:
+// `allow_test_tamper = true` (for the documented `fetch-bundle --tamper` demo) with
+// `allow_test_route_tamper = false`. Routed traffic must be untouched — otherwise enabling the
+// bundle-substitution demo would silently corrupt every envelope on that server. This runs *with*
+// the feature, so it verifies the runtime AND, not the compile gate.
+#[cfg(feature = "test-tamper-hook")]
+#[tokio::test]
+async fn route_tamper_requires_its_own_flag_not_just_allow_test_tamper() {
+    let mut config = config_open();
+    config.server.allow_test_tamper = true;
+    config.server.allow_test_route_tamper = false; // the demo.toml configuration
+    let url = spawn(config).await;
+
+    let alice = new_acct("localhost");
+    let bob = new_acct("localhost");
+    let mut bc = bob.connect(&url).await.unwrap();
+    let mut ac = alice.connect(&url).await.unwrap();
+
+    let payload = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33];
+    assert!(ac.route(bob.pubkey, payload.clone()).await.unwrap());
+    let msg = bc.next_deliver().await.unwrap();
+    assert_eq!(
+        msg.blob.as_bytes(),
+        payload.as_slice(),
+        "allow_test_tamper alone must NOT rewrite routed blobs — the bundle-substitution demo must \
+         not corrupt live routing (allow_test_route_tamper is a separate, additional gate)"
+    );
+}
+
 // -- acceptance: exact-key-only (anti-enumeration) ---------------------------
 
 #[tokio::test]
@@ -437,21 +503,53 @@ async fn fetch_rate_limit_trips() {
 // -- capacity ----------------------------------------------------------------
 
 /// Concurrency smoke: the async server holds many simultaneous connections on one runtime (no
-/// thread-per-connection). This runs a modest count in CI; the 5k-on-2-vCPU acceptance target is a
-/// perf-box run (`cargo test --release -- --ignored capacity`). See the T02 acceptance criteria.
+/// thread-per-connection). This runs a modest count in CI; the 5k acceptance target is the
+/// `#[ignore]`d [`capacity_concurrent_connections`] below, which must be run explicitly on a box with
+/// a high enough fd limit. See the T02 acceptance criteria.
 #[tokio::test]
 async fn holds_many_concurrent_connections() {
-    const N: usize = 250;
+    hold_n_concurrent_connections(250).await;
+}
+
+/// The 5k-concurrent-WSS-connection acceptance criterion from the T02 spec (F12 / task 1.19).
+///
+/// `#[ignore]`d because it is **not** runnable in a default sandbox: this test drives both ends
+/// in-process, so every connection costs ~2 file descriptors, and 5k connections need >10k fds plus
+/// slack. Run it explicitly, in release, on a box whose fd limit has been raised:
+///
+/// ```text
+/// ulimit -n 20000
+/// cargo test --release -p meridian-rendezvous -- --ignored capacity
+/// ```
+///
+/// `MERIDIAN_CAPACITY_CONNS` overrides the target (default 5000) so the same test can characterise a
+/// smaller box. The fd preflight below fails with an actionable message rather than letting the run
+/// die partway through with an opaque `Os { code: 24, kind: Uncategorized }`.
+#[tokio::test]
+#[ignore = "capacity: needs ~2 fds per connection (>10k for the 5k target) — raise ulimit -n and run explicitly"]
+async fn capacity_concurrent_connections() {
+    let target: usize = std::env::var("MERIDIAN_CAPACITY_CONNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000);
+    preflight_fd_limit(target);
+    hold_n_concurrent_connections(target).await;
+}
+
+/// Open `n` authenticated connections, hold them all open at once, and assert the server reports
+/// exactly `n` active. Shared by the CI smoke and the `--ignored` capacity run so both measure the
+/// same thing.
+async fn hold_n_concurrent_connections(n: usize) {
     let mut config = config_open();
     config.limits.auth_per_ip_per_min = 1_000_000; // all conns share 127.0.0.1 in this test
     let url = spawn(config).await;
 
-    let mut accts = Vec::with_capacity(N);
-    for _ in 0..N {
+    let mut accts = Vec::with_capacity(n);
+    for _ in 0..n {
         accts.push(new_acct("localhost"));
     }
     // Connect all concurrently and hold the sessions open.
-    let mut clients = Vec::with_capacity(N);
+    let mut clients = Vec::with_capacity(n);
     for acct in &accts {
         clients.push(acct.connect(&url).await.unwrap());
     }
@@ -459,10 +557,34 @@ async fn holds_many_concurrent_connections() {
     let host = url.strip_prefix("ws://").unwrap().to_string();
     let body = http_get(&host, "/metrics").await;
     assert!(
-        body.contains(&format!("meridian_connections_active {N}")),
-        "expected {N} active connections; got:\n{body}"
+        body.contains(&format!("meridian_connections_active {n}")),
+        "expected {n} active connections; got:\n{body}"
     );
     drop(clients);
+}
+
+/// Refuse to start a capacity run that the process's fd limit cannot possibly complete, naming the
+/// number to raise it to. Reads `/proc/self/limits` (Linux); on any other platform, or if the limit
+/// cannot be parsed, this is a no-op and the run proceeds.
+fn preflight_fd_limit(target: usize) {
+    // Two fds per connection (both ends are in this process) plus the listener, the /metrics probe,
+    // and the harness's own handles.
+    let needed = target * 2 + 64;
+    let Ok(limits) = std::fs::read_to_string("/proc/self/limits") else {
+        return;
+    };
+    let soft = limits
+        .lines()
+        .find(|l| l.starts_with("Max open files"))
+        .and_then(|l| l.split_whitespace().nth(3))
+        .and_then(|v| v.parse::<usize>().ok());
+    let Some(soft) = soft else { return };
+    assert!(
+        soft >= needed,
+        "fd limit too low for a {target}-connection capacity run: soft limit is {soft}, need >= \
+         {needed} (~2 fds per in-process connection). Raise it (`ulimit -n {needed}`) or set \
+         MERIDIAN_CAPACITY_CONNS to a target this box can hold."
+    );
 }
 
 // -- low-level frame helpers -------------------------------------------------

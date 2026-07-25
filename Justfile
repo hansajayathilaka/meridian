@@ -4,6 +4,7 @@
 # Install toolchains (targets/tools). Scaffold: documents the intent.
 setup:
     @echo "TODO: rustup targets (wasm32, aarch64-*); pnpm; cargo-nextest/-ndk/-deny; just"
+    @echo "coverage (just coverage): rustup component add llvm-tools-preview && cargo install cargo-llvm-cov"
 
 # Build the whole workspace.
 build:
@@ -19,11 +20,18 @@ fmt-check:
 # Enforceable architecture/security invariants (see tools/).
 lint-invariants:
     bash tools/lint-server-no-core.sh
+    # Guards the guard: proves the cargo-tree check still trips on a TRANSITIVE core dependency
+    # (the route the old grep-based version could never see) rather than silently regressing.
+    bash tools/lint-server-no-core.sh --selftest
     bash tools/lint-no-serde-on-blob.sh
     # Guards the guard: proves check-3 above still trips on the F15 bypass patterns (module-
     # qualified type paths, multi-line `let x: T = ... .decode()`) rather than silently regressing.
     bash tools/lint-no-serde-on-blob.sh --selftest
     bash tools/lint-metrics-allowlist.sh
+    # Invariant #4 (server logs no raw identifiers) — landed ahead of observability, so the first
+    # log line added cannot break it silently. See apps/rendezvous/src/logid.rs.
+    bash tools/lint-no-raw-id-logging.sh
+    bash tools/lint-no-raw-id-logging.sh --selftest
 
 # Tests: unit/integration + adversarial harnesses + (later) conformance vectors.
 test: build harnesses
@@ -41,6 +49,21 @@ harnesses:
     bash harnesses/mitm-sim/run.sh
     bash harnesses/ghost-device/run.sh
     bash harnesses/nat-matrix/run.sh
+
+# Coverage measurement (task 1.21 / review finding F22). MEASUREMENT ONLY — deliberately not a
+# blocking gate, and not part of `lint` or `test`. Needs `cargo install cargo-llvm-cov` and the
+# `llvm-tools-preview` rustup component (see `setup`).
+#
+# NOTE: this reports region/line/function coverage. Rust on **stable** does not emit branch coverage
+# (llvm-cov's Branches column stays empty), so a "branch coverage" target is not measurable with the
+# toolchain this repo pins — see docs/architecture/features/01-identity-keystore-core.md.
+coverage:
+    cargo llvm-cov --workspace --summary-only
+
+# Same, as an HTML report under target/llvm-cov/html for drilling into uncovered lines.
+coverage-html:
+    cargo llvm-cov --workspace --html
+    @echo "report: target/llvm-cov/html/index.html"
 
 # Codegen (UniFFI + wasm-bindgen) and conformance vectors.
 codegen:

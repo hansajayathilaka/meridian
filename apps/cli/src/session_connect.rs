@@ -147,8 +147,12 @@ async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
         .zip(generated.otk_secrets.iter())
         .map(|(p, s)| (*p, **s))
         .collect();
-    chat.vault
-        .set_bundle(generated.bundle.spk, *generated.spk_secret, otks);
+    chat.vault.set_bundle(
+        generated.bundle.spk,
+        *generated.spk_secret,
+        otks,
+        crate::now_unix(),
+    );
 
     // Roles are decided by key order so two peers both running `session connect` settle on exactly
     // one dialer without racing (mirrors chat.rs).
