@@ -27,9 +27,18 @@
 # peer process across it is 1.26; tcpdump/pcap assertions are 1.27 — both out of scope here.
 #
 # Usage:
+#   cargo build -p meridian-cli --features webrtc   # 1.26+: BIN below must have real WebRtcTransport
 #   sudo tools/netns-nat-matrix.sh matrix        # build + run all four cells (topology stays up)
 #   sudo tools/netns-nat-matrix.sh cell udp-blocked
 #   sudo tools/netns-nat-matrix.sh down
+#
+# The `cargo build --features webrtc` step above is REQUIRED before `matrix`/`cell` (1.26 on): BIN
+# defaults to ./target/debug/meridian, and `session connect` (used by drive_real_peers) fails loud
+# with "meridian-cli was built without the `webrtc` feature" if the binary there was last built
+# without it — e.g. by a plain `cargo test -p meridian-cli` run, whose default features overwrite the
+# binary at the same path. harnesses/nat-matrix/run.sh (the CI entry point) does this rebuild itself
+# immediately before calling `matrix`; a direct/manual `sudo tools/netns-nat-matrix.sh ...` invocation
+# must do it too.
 #
 # Requires root (NET_ADMIN). On CI without it, the script SKIPS with a clear message; the matrix is
 # also covered deterministically by `cargo test -p meridian-cli --test nat_relay`, the loopback unit
@@ -269,6 +278,18 @@ policy_for_cell() {
     symmetric:symmetric) echo prefer-relay ;;
     udp-blocked) echo relay-only ;;
     *) echo "policy_for_cell: unknown cell '$1'" >&2; exit 2 ;;
+  esac
+}
+
+# 1.27: which cells are expected to actually establish a real P2P session against the pinned
+# webrtc-ice 0.17.1 backend. Only `udp-blocked` is expected to fail — a proven-impossible
+# dependency-level gap (1.30: no client-side TURN-over-TCP support at all), not a bug. Centralizing
+# the cell-name branch here (rather than scattering `[[ "$cell" == "udp-blocked" ]]` checks inline)
+# keeps `drive_real_peers` readable and gives future cells a single place to declare themselves.
+cell_expects_success() {
+  case "$1" in
+    udp-blocked) return 1 ;;
+    *) return 0 ;;
   esac
 }
 
@@ -741,6 +762,261 @@ wire_smoke_cell() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# 1.27: pcap-analysis assertions — turns 1.26's raw captures into strict, fail-closed pass/fail
+# checks. This is the task that actually closes F11's wire-level half: the wire is the only place
+# to independently verify the real transport rung, not just trust the CLI's --json self-report.
+#
+# Split per the architect-reviewed scope note in the 1.27 task file / feature 05's verification-
+# status paragraphs:
+#   (a) path/rung match          — 3 real-connecting cells only (presupposes an established path).
+#   (b) zero host/srflx leak     — gated on POLICY == relay-only (in this matrix: udp-blocked only,
+#                                   the only cell `policy_for_cell` configures with relay-only) —
+#                                   NOT on cell_expects_success, so the check keeps running for any
+#                                   future relay-only cell regardless of whether it happens to
+#                                   connect or fail (connectivity-debugger, 1.27 review: gating this
+#                                   on success/failure would silently stop checking it the day
+#                                   udp-blocked's 1.30 dependency gap closes upstream and it starts
+#                                   connecting). See assert_no_alice_leak_in_bob_pcap's header
+#                                   comment for the judgement call scoping this to relay-only-POLICY
+#                                   cells rather than all four uniformly, made after live-rig
+#                                   evidence showed the latter would false-fail on Direct/
+#                                   PreferRelay's documented, by-design host-address exposure.
+#   (c) DTLS-ciphertext-only     — 3 real-connecting cells only (presupposes real TURN-relayed
+#                                   application data to scan).
+#   (d) udp-blocked fails fast   — udp-blocked only: proves the "fails fast, not a hang" claim on
+#                                   the wire, not just via CLI stdout/exit code.
+#
+# Dependency-light by design (matching the rest of this script): tcpdump -r / grep -a / wc -l — no
+# tshark, no bespoke STUN/TURN message parser. `grep -a` (not `strings`) is used to scan pcaps for
+# the plaintext oracle strings: it works directly against the binary pcap bytes with no extra tool
+# dependency and is exactly as sufficient for a literal-substring scan.
+# ---------------------------------------------------------------------------------------------
+
+# Strict parse of one field from the captured `p2p_connect` --json headline line. Unlike
+# print_p2p_summary (an eyeball summary that never fails), assertions below DO fail loudly on a
+# missing line/field — callers decide what "missing" means for their cell. Returns nonzero (empty
+# stdout) if the line isn't present at all.
+parse_p2p_field() {
+  local outfile="$1" field="$2"
+  local line
+  line="$(grep -m1 '"event":"p2p_connect"' "$outfile" 2>/dev/null || true)"
+  [[ -z "$line" ]] && return 1
+  if command -v jq >/dev/null 2>&1; then
+    echo "$line" | jq -r ".$field"
+  else
+    case "$field" in
+      path) echo "$line" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p' ;;
+      relay_fallback) echo "$line" | sed -n 's/.*"relay_fallback":\([a-z]*\).*/\1/p' ;;
+      *) return 1 ;;
+    esac
+  fi
+}
+
+# Assertion (a): path/rung match — 3 connecting cells only. Corroborates the CLI's own self-report
+# (path=="relay" AND relay_fallback==true on BOTH sides — see 1.29's two-phase fallback / feature
+# 05's verification-status note: direct/srflx never nominates under the pinned webrtc-ice 0.17.1,
+# so the session-level retry always lands on relay for all 3 connecting cells; asserting
+# path=="direct" here would be WRONG) with a wire-level sanity count that ns-turn's capture
+# actually shows nonzero UDP volume in this window. An empty/trivially-small ns-turn capture for a
+# supposedly-connected cell would let assertion (c) pass vacuously, so this also guards (c).
+assert_path_and_rung() {
+  local cell="$1" alice_out="$2" bob_out="$3" pcap_turn="$4"
+  local who out path relay_fallback who_out
+  for who_out in "alice:$alice_out" "bob:$bob_out"; do
+    who="${who_out%%:*}"
+    out="${who_out#*:}"
+    path="$(parse_p2p_field "$out" path)" || {
+      echo "[nat-matrix] cell=$cell: pcap assertion (a) FAIL: no p2p_connect event observed for" \
+           "$who ($out) — cannot corroborate the negotiated path" >&2
+      exit 1
+    }
+    relay_fallback="$(parse_p2p_field "$out" relay_fallback || true)"
+    if [[ "$path" != "relay" ]]; then
+      echo "[nat-matrix] cell=$cell: pcap assertion (a) FAIL: $who path=$path, expected relay" \
+           "(see 1.29 / feature 05's verification-status note — direct/srflx never nominates under" \
+           "the pinned webrtc-ice 0.17.1; the session-level fallback always lands on relay for the" \
+           "3 connecting cells)" >&2
+      exit 1
+    fi
+    if [[ "$relay_fallback" != "true" ]]; then
+      echo "[nat-matrix] cell=$cell: pcap assertion (a) FAIL: $who relay_fallback=$relay_fallback," \
+           "expected true" >&2
+      exit 1
+    fi
+  done
+  local turn_udp_count
+  turn_udp_count="$(tcpdump -r "$pcap_turn" -n udp 2>/dev/null | wc -l)"
+  if [[ "$turn_udp_count" -eq 0 ]]; then
+    echo "[nat-matrix] cell=$cell: pcap assertion (a) FAIL: ns-turn's capture shows ZERO UDP" \
+         "packets for a cell that reported path=relay on both sides — the capture likely missed" \
+         "the relay traffic assertion (c) is supposed to be proving is DTLS-only" >&2
+    exit 1
+  fi
+  echo "[nat-matrix] cell=$cell: pcap assertion (a) PASS: path=relay relay_fallback=true (both" \
+       "sides), ns-turn UDP packet count=$turn_udp_count"
+}
+
+# Assertion (b): zero host/srflx leak in ns-bob's capture — scoped to cells CONFIGURED with
+# relay-only policy (in this matrix: udp-blocked only). This is the anonymity-model "must never"
+# invariant (docs/security/anonymity-and-retention.md / .claude/skills/anonymity-model/SKILL.md):
+# under relay-only, a peer must never see our real (10.0.1.2) or NAT-mapped/srflx (203.0.113.10)
+# address — 1.16's `enforce_relay_only` (apps/core/src/session.rs) strips host/srflx BEFORE
+# gathering only when `policy == IcePolicy::RelayOnly`; it is an explicit no-op for Direct/
+# PreferRelay (see that function's own unit tests: Direct/PreferRelay candidates pass through
+# untouched). full-cone/port-restricted run Direct and symmetric:symmetric runs PreferRelay — under
+# those policies, host/srflx exposure during the FIRST (pre-relay_fallback) connectivity-check
+# attempt is DOCUMENTED, by-design behavior (SKILL.md: "direct-mode peers see each other's IPs"),
+# not a leak. Judgement call, made after live-rig evidence: an earlier draft of this assertion ran
+# uniformly across all four cells (matching the 1.27 task file's literal wording); against the real
+# rig, ns-bob's capture for full-cone genuinely contains host-address packets from that legitimate
+# first attempt, which a universal zero-leak assertion would (incorrectly) flag as a hard failure on
+# fully-compliant behavior. Narrowed to relay-only-policy cells only, which is what the underlying
+# `enforce_relay_only` guarantee actually promises. Any match found for a relay-only cell is still a
+# hard failure, never a warning — never downgrade that half of this invariant.
+#
+# Deliberately does NOT also check ns-turn's capture for alice's addresses (security-reviewer, 1.27
+# review): her raw LAN address (10.0.1.2) is structurally unable to reach ns-turn — NAT rewrites it
+# before it leaves her LAN, and ICE candidates only ever travel over the signed rendezvous channel,
+# never sent to TURN directly. Her NAT-mapped address (203.0.113.10) is inherently and legitimately
+# visible to TURN the moment ANY client contacts it for a relay allocation, under every policy
+# including relay-only — that's accepted infrastructure exposure (anonymity-and-retention.md: "TURN
+# relay sees ciphertext flow metadata (IPs, volume, timing)"), not part of the peer-IP-hiding claim
+# this assertion proves. Checking for it here would encode a guarantee Meridian doesn't make.
+assert_no_alice_leak_in_bob_pcap() {
+  local cell="$1" pcap_bob="$2"
+  local leaked total_count
+  # security-reviewer (1.27 review): a missing/truncated/unreadable capture makes `tcpdump -r`
+  # exit nonzero with empty stdout, which the `|| true` below would otherwise silently turn into a
+  # false PASS — this assertion is the load-bearing one, so it must fail closed on "couldn't check"
+  # too, not just on "checked and found a match". Mirrors assert_path_and_rung's ns-turn UDP-count
+  # sanity guard against a vacuously-empty capture.
+  total_count="$(tcpdump -r "$pcap_bob" -n 2>/dev/null | wc -l)"
+  if [[ "$total_count" -eq 0 ]]; then
+    echo "[nat-matrix] cell=$cell: pcap assertion (b) FAIL: ns-bob's capture ($pcap_bob) is" \
+         "missing, unreadable, or empty — cannot verify the zero-leak invariant, and an" \
+         "unreadable capture must never be treated as a passing one" >&2
+    exit 1
+  fi
+  leaked="$(tcpdump -r "$pcap_bob" -n "host 10.0.1.2 or host 203.0.113.10" 2>/dev/null || true)"
+  if [[ -n "$leaked" ]]; then
+    echo "[nat-matrix] cell=$cell: pcap assertion (b) FAIL: ns-bob's capture contains packet(s)" \
+         "to/from alice's host (10.0.1.2) or NAT-mapped/srflx (203.0.113.10) address — a hard" \
+         "host/srflx leak, the anonymity-model 'must never' invariant. Offending packets:" >&2
+    echo "$leaked" >&2
+    exit 1
+  fi
+  echo "[nat-matrix] cell=$cell: pcap assertion (b) PASS: zero packets touching alice's" \
+       "host/srflx address in ns-bob's capture ($total_count total packets captured)"
+}
+
+# Assertion (c): DTLS-ciphertext-only in ns-turn's capture — 3 connecting cells only. The
+# known-good plaintext oracle: apps/cli/src/session_connect.rs's `run_webrtc` always sends the
+# literal chat strings below as real application data, post-DTLS+ratchet, over the established P2P
+# session. TURN only ever relays opaque ciphertext at the channel-data/UDP framing layer and never
+# terminates DTLS — if either literal string appears anywhere in ns-turn's capture, that's a hard,
+# load-bearing failure, never a downgrade.
+assert_dtls_ciphertext_only() {
+  local cell="$1" pcap_turn="$2"
+  local hits1 hits2
+  hits1="$(grep -a -c -F -- 'hello over p2p' "$pcap_turn" 2>/dev/null || true)"
+  hits2="$(grep -a -c -F -- 'hi back — no server in the path' "$pcap_turn" 2>/dev/null || true)"
+  hits1="${hits1:-0}"
+  hits2="${hits2:-0}"
+  if [[ "$hits1" -ne 0 || "$hits2" -ne 0 ]]; then
+    echo "[nat-matrix] cell=$cell: pcap assertion (c) FAIL: cleartext chat payload found in" \
+         "ns-turn's capture (hits: 'hello over p2p'=$hits1 'hi back — no server in the path'=$hits2)" \
+         "— TURN must only ever relay opaque DTLS ciphertext, never terminate it" >&2
+    exit 1
+  fi
+  echo "[nat-matrix] cell=$cell: pcap assertion (c) PASS: zero plaintext chat-payload matches in" \
+       "ns-turn's capture"
+}
+
+# 1.27, informative threshold for assertion (d)'s data-channel-silence check: udp-blocked drops UDP
+# egress in ns-natA/ns-natB's FORWARD chain, before a blocked packet is ever routed/NAT'd onto the
+# bridge — so ns-turn should see literally zero packets belonging to this run's alice/bob traffic.
+# A small nonzero allowance (rather than a strict ==0) absorbs incidental bridge-segment noise (e.g.
+# ARP) that isn't Meridian data-channel traffic at all; real data-channel/relay volume for a
+# connecting cell is easily in the hundreds of packets, so this threshold cannot be satisfied by
+# accident.
+UDP_BLOCKED_MAX_TURN_UDP_PACKETS=5
+# Wall-clock bound for assertion (d)'s fails-fast check: comfortably above the ~20-50s observed in
+# 1.30, comfortably below the 90s script-level `timeout` — catches a regression toward "hangs to the
+# full 90s" without being a flaky near-miss on the observed range.
+UDP_BLOCKED_FAILS_FAST_BOUND_SECS=70
+
+# Assertion (d): udp-blocked-specific fails-fast assertion (new in 1.27, not part of 1.26). Proves
+# 1.30's documented failure mode on the wire: no established session, the documented error
+# signature, a bounded wall-clock time, and (informatively) no data-channel traffic ever reached
+# ns-turn.
+assert_udp_blocked_fails_fast() {
+  local cell="$1" alice_ec="$2" bob_ec="$3" alice_err="$4" bob_err="$5" elapsed="$6" \
+        pcap_turn="$7" alice_out="$8" bob_out="$9"
+
+  # established:true on EITHER side would mean the proven-impossible dependency gap somehow closed
+  # without anyone updating 1.30/feature 05's docs — a surprising regression worth failing loudly
+  # on, not silently accepting.
+  if grep -q '"event":"p2p_connect"' "$alice_out" "$bob_out" 2>/dev/null; then
+    echo "[nat-matrix] cell=$cell: pcap assertion (d) FAIL: a p2p_connect (established) event was" \
+         "observed for udp-blocked — this is unexpected: 1.30 documented this combination as" \
+         "proven-impossible at the pinned webrtc-ice version. If this genuinely changed (e.g. a" \
+         "dependency bump), update 1.30 / feature 05's docs — don't just let this pass silently." >&2
+    exit 1
+  fi
+
+  if [[ "$alice_ec" -eq 0 && "$bob_ec" -eq 0 ]]; then
+    echo "[nat-matrix] cell=$cell: pcap assertion (d) FAIL: both sides exited 0 — udp-blocked is" \
+         "expected to fail (1.30's proven-impossible dependency gap); a clean success on both" \
+         "sides is a regression worth investigating, not silently accepting." >&2
+    exit 1
+  fi
+
+  # Two distinct, both-legitimate wire-level manifestations of the SAME udp-blocked+relay-only
+  # dependency gap (1.30), confirmed by live-rig reproduction of both during 1.27 verification:
+  #   1. `local_candidates()`'s own GATHER_TIMEOUT (20s) fires first if the underlying webrtc-ice
+  #      STUN/TURN retry cycle for the (silently UDP-dropped) TURN allocation takes longer than
+  #      that — "ICE candidate gathering did not complete…" (apps/transport/src/webrtc_backend.rs).
+  #   2. Gathering completes just under 20s (with zero usable candidates, since relay-only strips
+  #      host/srflx before gathering and TURN-TCP URLs are silently dropped per 1.30) — the offer/
+  #      answer still goes out empty-handed, and `selected_path`'s own separate bounded wait times
+  #      out afterward with `TransportError::NoPath` — "no candidate pair selected yet"
+  #      (apps/transport/src/lib.rs). relay_fallback_eligible() is false for RelayOnly policy (see
+  #      apps/core/src/session.rs), so this propagates straight up as the final error, not retried.
+  # Which of the two races first is a real, benign timing nondeterminism in the pinned
+  # webrtc-ice/coturn versions, not a distinct bug — both prove the exact same thing this assertion
+  # cares about (no session ever establishes, and it fails with a clear, immediate error either
+  # way), so both are accepted.
+  if ! grep -Eq "ICE candidate gathering did not complete|no candidate pair selected yet" \
+       "$alice_err" "$bob_err" 2>/dev/null; then
+    echo "[nat-matrix] cell=$cell: pcap assertion (d) FAIL: neither side's stderr contains either" \
+         "expected 1.30 fails-fast error signature ('ICE candidate gathering did not complete' or" \
+         "'no candidate pair selected yet') — see $alice_err / $bob_err" >&2
+    exit 1
+  fi
+
+  if [[ "$elapsed" -ge "$UDP_BLOCKED_FAILS_FAST_BOUND_SECS" ]]; then
+    echo "[nat-matrix] cell=$cell: pcap assertion (d) FAIL: drive_real_peers took ${elapsed}s," \
+         "expected well under ${UDP_BLOCKED_FAILS_FAST_BOUND_SECS}s (observed ~20-50s per 1.30) —" \
+         "this looks like a regression toward hanging to the full 90s script-level timeout" >&2
+    exit 1
+  fi
+
+  local turn_udp_packets
+  turn_udp_packets="$(tcpdump -r "$pcap_turn" -n udp 2>/dev/null | wc -l)"
+  if [[ "$turn_udp_packets" -gt "$UDP_BLOCKED_MAX_TURN_UDP_PACKETS" ]]; then
+    echo "[nat-matrix] cell=$cell: pcap assertion (d) FAIL: ns-turn's capture shows" \
+         "$turn_udp_packets UDP packets, more than the informative" \
+         "${UDP_BLOCKED_MAX_TURN_UDP_PACKETS}-packet threshold expected when UDP egress is genuinely" \
+         "blocked upstream and no data-channel traffic should ever flow" >&2
+    exit 1
+  fi
+
+  echo "[nat-matrix] cell=$cell: pcap assertion (d) PASS: fails fast (${elapsed}s <" \
+       "${UDP_BLOCKED_FAILS_FAST_BOUND_SECS}s), error signature present, no established session," \
+       "ns-turn UDP packet count=$turn_udp_packets (<= ${UDP_BLOCKED_MAX_TURN_UDP_PACKETS})"
+}
+
+# ---------------------------------------------------------------------------------------------
 # 1.26: drive two REAL `meridian` processes (alice in ns-alice, bob in ns-bob) across the topology,
 # with tcpdump bracketing each run at ns-bob (b-eth) and ns-turn (t-eth). Everything above (1.25)
 # proves the topology/coturn/rendezvous are real working infrastructure with generic wire-level
@@ -750,20 +1026,37 @@ wire_smoke_cell() {
 # ---------------------------------------------------------------------------------------------
 
 # alice/bob each get their own $MERIDIAN_HOME under the rig dir so their identities are rig-scratch
-# (never the developer's own ~/.config/meridian) but still persist across cells/invocations, mirroring
-# ensure_topology's idempotent-reuse pattern. These run on the HOST filesystem/mount namespace (`id
-# new`/`config set`/`id show` need no network) — only the `session connect` process itself needs to
-# run inside ns-alice/ns-bob (via `ip netns exec`) to pick up a NATed source address.
-alice_home() { echo "$(rig_dir)/alice-home"; }
-bob_home()   { echo "$(rig_dir)/bob-home"; }
+# (never the developer's own ~/.config/meridian). These run on the HOST filesystem/mount namespace
+# (`id new`/`config set`/`id show` need no network) — only the `session connect` process itself needs
+# to run inside ns-alice/ns-bob (via `ip netns exec`) to pick up a NATed source address.
+#
+# 1.27: scoped PER CELL ($1, the cell-safe name), not shared across the whole matrix() run as before.
+# Found during live-rig verification: `session connect` republishes a brand-new SPK/OTK bundle to the
+# rendezvous at the start of EVERY invocation (apps/cli/src/session_connect.rs::run_webrtc, both
+# roles), but there is no synchronization forcing the peer's fetch to wait for that publish to land —
+# `fetch_with_retry` retries on "not found yet", which is fine for a never-before-published identity,
+# but if a PRIOR cell already published a bundle under the same identity, a same-cell fetch that wins
+# the race against this cell's in-flight republish silently gets that stale-but-well-formed prior
+# bundle instead of a "not found" — the responder's freshly-regenerated vault has no secret for that
+# stale OTK id, so the session fails with "no matching prekey secret for incoming session". This is a
+# real, load-bearing bug independent of anything else 1.27 touches; fixing the underlying race belongs
+# in session_connect.rs's publish/fetch flow (core CLI code, out of this task's pcap-assertion scope)
+# and is flagged for follow-up. The rig-only mitigation here removes the precondition instead: giving
+# each cell its own fresh identity means there is never a prior bundle to race against, so
+# `fetch_with_retry`'s existing not-found retry is sufficient. `id new` is a local, no-network
+# operation, so doing it 4x instead of once is cheap.
+alice_home() { echo "$(rig_dir)/alice-home-$1"; }
+bob_home()   { echo "$(rig_dir)/bob-home-$1"; }
 
 # Idempotent: an `account.json` marker (AccountDescriptor::save's target — see apps/cli/src/account.rs)
 # means this identity already exists; skip regenerating it, exactly like ensure_topology's
-# coturn/rendezvous/test-peer reuse checks above.
+# coturn/rendezvous/test-peer reuse checks above. Per the cell-scoping note above, this now only ever
+# matters for re-running the SAME cell twice against the SAME rig dir (e.g. `cell <name>` re-run after
+# a partial `matrix` failure), not across different cells within one matrix() pass.
 ensure_identities() {
-  local ah bh
-  ah="$(alice_home)"
-  bh="$(bob_home)"
+  local cell_safe="$1" ah bh
+  ah="$(alice_home "$cell_safe")"
+  bh="$(bob_home "$cell_safe")"
   mkdir -p "$ah" "$bh"
 
   if [[ -f "$ah/account.json" ]]; then
@@ -783,8 +1076,8 @@ ensure_identities() {
   fi
 }
 
-alice_id() { MERIDIAN_HOME="$(alice_home)" "$REPO_ROOT/$BIN" id show; }
-bob_id()   { MERIDIAN_HOME="$(bob_home)"   "$REPO_ROOT/$BIN" id show; }
+alice_id() { MERIDIAN_HOME="$(alice_home "$1")" "$REPO_ROOT/$BIN" id show; }
+bob_id()   { MERIDIAN_HOME="$(bob_home "$1")"   "$REPO_ROOT/$BIN" id show; }
 
 # ---------------------------------------------------------------------------------------------
 # tcpdump capture helpers — same graceful-then-force kill pattern as `down()`'s coturn/rendezvous
@@ -865,20 +1158,20 @@ print_p2p_summary() {
 # job to fix, not this script's to paper over) — never silently continuing past one.
 drive_real_peers() {
   local cell="$1"
-  local d aid bid policy
+  local d aid bid policy cell_safe
   d="$(rig_dir)"
   mkdir -p "$d/pcaps" "$d/session-logs"
 
-  ensure_identities
-  aid="$(alice_id)"
-  bid="$(bob_id)"
+  cell_safe="${cell//:/_}"
+  ensure_identities "$cell_safe"
+  aid="$(alice_id "$cell_safe")"
+  bid="$(bob_id "$cell_safe")"
   policy="$(policy_for_cell "$cell")"
 
   echo "[nat-matrix] cell=$cell — configuring relay policy '$policy' for alice($aid)<->bob($bid)"
-  MERIDIAN_HOME="$(alice_home)" "$REPO_ROOT/$BIN" config set policy "$policy" --contact "$bid" >/dev/null
-  MERIDIAN_HOME="$(bob_home)"   "$REPO_ROOT/$BIN" config set policy "$policy" --contact "$aid" >/dev/null
+  MERIDIAN_HOME="$(alice_home "$cell_safe")" "$REPO_ROOT/$BIN" config set policy "$policy" --contact "$bid" >/dev/null
+  MERIDIAN_HOME="$(bob_home "$cell_safe")"   "$REPO_ROOT/$BIN" config set policy "$policy" --contact "$aid" >/dev/null
 
-  local cell_safe="${cell//:/_}"
   local pcap_bob="$d/pcaps/${cell_safe}-bob.pcap"
   local pcap_turn="$d/pcaps/${cell_safe}-turn.pcap"
 
@@ -899,7 +1192,7 @@ drive_real_peers() {
   # touch, shorten, or otherwise interact with dial_with_config/answer_with_config's own internal
   # bounded-wait timeouts inside meridian-core/meridian-transport.
   (
-    export MERIDIAN_HOME="$(alice_home)"
+    export MERIDIAN_HOME="$(alice_home "$cell_safe")"
     export MERIDIAN_PASSPHRASE="$RIG_PASSPHRASE"
     timeout 90 ip netns exec ns-alice "$REPO_ROOT/$BIN" session connect "$bid" \
       --server ws://203.0.113.1:8443 --transport webrtc --json
@@ -907,16 +1200,22 @@ drive_real_peers() {
   local alice_pid=$!
 
   (
-    export MERIDIAN_HOME="$(bob_home)"
+    export MERIDIAN_HOME="$(bob_home "$cell_safe")"
     export MERIDIAN_PASSPHRASE="$RIG_PASSPHRASE"
     timeout 90 ip netns exec ns-bob "$REPO_ROOT/$BIN" session connect "$aid" \
       --server ws://203.0.113.1:8443 --transport webrtc --json
   ) >"$bob_out" 2>"$bob_err" &
   local bob_pid=$!
 
+  # 1.27: bracket the wait with a wall-clock timestamp — assertion (d) needs this to prove
+  # udp-blocked fails FAST (well under the 90s script-level `timeout`), not just that it fails.
+  local start_ts end_ts elapsed
+  start_ts="$(date +%s)"
   local alice_ec=0 bob_ec=0
   wait "$alice_pid" || alice_ec=$?
   wait "$bob_pid" || bob_ec=$?
+  end_ts="$(date +%s)"
+  elapsed=$(( end_ts - start_ts ))
 
   echo "[nat-matrix] cell=$cell — stopping tcpdump captures"
   stop_tcpdump "${cell_safe}-bob"
@@ -926,18 +1225,46 @@ drive_real_peers() {
   print_p2p_summary "$cell" "$policy" "bob" "$bob_out"
   echo "[nat-matrix] cell=$cell — pcaps: $pcap_bob $pcap_turn"
 
-  if [[ "$alice_ec" -ne 0 || "$bob_ec" -ne 0 ]]; then
-    echo "[nat-matrix] FAIL: cell=$cell — real session connect did not succeed on both sides" \
-         "(alice_exit=$alice_ec bob_exit=$bob_ec)" >&2
-    echo "----- alice stdout ($alice_out) -----" >&2; cat "$alice_out" >&2 || true
-    echo "----- alice stderr ($alice_err) -----" >&2; cat "$alice_err" >&2 || true
-    echo "----- bob stdout ($bob_out) -----" >&2; cat "$bob_out" >&2 || true
-    echo "----- bob stderr ($bob_err) -----" >&2; cat "$bob_err" >&2 || true
-    echo "[nat-matrix] pcaps were still captured despite the failure: $pcap_bob $pcap_turn" >&2
-    exit 1
+  # connectivity-debugger (1.27 review): assertion (b) must be gated on POLICY ("is this cell
+  # configured relay-only"), never on cell_expects_success ("did this cell connect"). Today the two
+  # happen to coincide (udp-blocked is the only relay-only cell AND the only one expected to fail),
+  # but they are not the same invariant — the day 1.30's dependency gap closes upstream and
+  # udp-blocked starts succeeding, gating on success/failure would silently stop running the
+  # zero-host/srflx-leak check for it, the exact load-bearing assertion the task's Reviews line
+  # calls out for security-reviewer. Run (b) unconditionally, independent of whether this cell is
+  # expected to connect, keyed only on the policy this cell was actually configured with.
+  if [[ "$policy" == "relay-only" ]]; then
+    echo "[nat-matrix] cell=$cell — running pcap assertion (b) (policy=relay-only)"
+    assert_no_alice_leak_in_bob_pcap "$cell" "$pcap_bob"
   fi
 
-  echo "[nat-matrix] cell=$cell — real session connect succeeded on both sides"
+  # 1.27: the 3 real-connecting cells still hard-fail on any nonzero exit (unchanged from 1.26).
+  # udp-blocked is the one cell where a nonzero exit is the CORRECT, EXPECTED outcome (1.30's
+  # proven-impossible dependency gap) — see cell_expects_success().
+  if cell_expects_success "$cell"; then
+    if [[ "$alice_ec" -ne 0 || "$bob_ec" -ne 0 ]]; then
+      echo "[nat-matrix] FAIL: cell=$cell — real session connect did not succeed on both sides" \
+           "(alice_exit=$alice_ec bob_exit=$bob_ec)" >&2
+      echo "----- alice stdout ($alice_out) -----" >&2; cat "$alice_out" >&2 || true
+      echo "----- alice stderr ($alice_err) -----" >&2; cat "$alice_err" >&2 || true
+      echo "----- bob stdout ($bob_out) -----" >&2; cat "$bob_out" >&2 || true
+      echo "----- bob stderr ($bob_err) -----" >&2; cat "$bob_err" >&2 || true
+      echo "[nat-matrix] pcaps were still captured despite the failure: $pcap_bob $pcap_turn" >&2
+      exit 1
+    fi
+    echo "[nat-matrix] cell=$cell — real session connect succeeded on both sides (elapsed=${elapsed}s)"
+    echo "[nat-matrix] cell=$cell — running pcap assertions (a)(c)"
+    assert_path_and_rung "$cell" "$alice_out" "$bob_out" "$pcap_turn"
+    assert_dtls_ciphertext_only "$cell" "$pcap_turn"
+  else
+    echo "[nat-matrix] cell=$cell — session connect did NOT establish (alice_exit=$alice_ec" \
+         "bob_exit=$bob_ec, elapsed=${elapsed}s) — EXPECTED for udp-blocked per 1.30's documented," \
+         "proven-impossible-at-this-dependency-version failure mode. Verifying it failed the RIGHT" \
+         "way (fails fast + zero address leak, checked above), not just that it failed at all."
+    echo "[nat-matrix] cell=$cell — running pcap assertion (d)"
+    assert_udp_blocked_fails_fast "$cell" "$alice_ec" "$bob_ec" "$alice_err" "$bob_err" "$elapsed" \
+      "$pcap_turn" "$alice_out" "$bob_out"
+  fi
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1004,7 +1331,11 @@ matrix() {
   for c in "${CELLS[@]}"; do
     cell "$c"
   done
-  echo "[nat-matrix] all four cells exercised. Topology stays up — run '$0 down' to tear it down."
+  echo "[nat-matrix] all four cells exercised and all pcap assertions passed: full-cone," \
+       "port-restricted, and symmetric:symmetric connect via relay (1.29's session-level fallback)" \
+       "with zero address leak and DTLS-ciphertext-only on the wire; udp-blocked fails fast and" \
+       "cleanly by design (1.30's proven-impossible dependency gap), with zero address leak" \
+       "verified even in the failure case. Topology stays up — run '$0 down' to tear it down."
 }
 
 down() {
