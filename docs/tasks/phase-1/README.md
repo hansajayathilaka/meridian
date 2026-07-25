@@ -70,13 +70,13 @@ assertions themselves. **F11 (wire-level) is now fully closed** — all of 1.14+
 - [x] **1.30** TURN-over-TCP client gap under relay-only + udp-blocked (F11 wire; carved out of 1.26; depends on 1.26) — [file](./1.30-turn-tcp-dependency-gap.md)
 
 **Group E — Design decisions + remaining should-fix / nit**
-- [~] **1.17** ADR — deniability vs envelope signature (on-the-fly) — [file](./1.17-adr-deniability-envelope-sig.md)
-- [~] **1.18** Desync → fresh-X3DH auto-recovery decision (F13, on-the-fly) — [file](./1.18-desync-recovery-decision.md)
-- [~] **1.19** 5k-connection capacity test (F12) — [file](./1.19-capacity-test-5k.md)
+- [x] **1.17** ADR — deniability vs envelope signature (on-the-fly) — [file](./1.17-adr-deniability-envelope-sig.md)
+- [x] **1.18** Desync → fresh-X3DH auto-recovery decision (F13, on-the-fly) — [file](./1.18-desync-recovery-decision.md)
+- [x] **1.19** 5k-connection capacity test (F12) — [file](./1.19-capacity-test-5k.md)
 - [~] **1.20** Server-hardening bundle (F21) — [file](./1.20-server-hardening-bundle.md)
-- [~] **1.21** Coverage tooling or drop the % (F22) — [file](./1.21-coverage-tooling.md)
+- [x] **1.21** Coverage tooling or drop the % (F22) — [file](./1.21-coverage-tooling.md)
 - [~] **1.28** Active relay-rewrite adversarial test (on-the-fly, flagged during 1.23's split; not part of F11's closure) — [file](./1.28-active-relay-rewrite-test.md)
-- [~] **1.31** Prekey-bundle republish/fetch race on reconnect (on-the-fly, found during 1.27's live-rig verification; not part of F11's closure) — [file](./1.31-prekey-bundle-republish-race.md)
+- [x] **1.31** Prekey-bundle republish/fetch race on reconnect (on-the-fly, found during 1.27's live-rig verification; not part of F11's closure) — [file](./1.31-prekey-bundle-republish-race.md)
 
 ## Exit criteria
 All fix-tasks `[x]`, tree green (`just build` + `cargo clippy -D warnings` clean), docs synced. Blocking

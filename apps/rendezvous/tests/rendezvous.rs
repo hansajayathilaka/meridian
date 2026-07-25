@@ -437,21 +437,53 @@ async fn fetch_rate_limit_trips() {
 // -- capacity ----------------------------------------------------------------
 
 /// Concurrency smoke: the async server holds many simultaneous connections on one runtime (no
-/// thread-per-connection). This runs a modest count in CI; the 5k-on-2-vCPU acceptance target is a
-/// perf-box run (`cargo test --release -- --ignored capacity`). See the T02 acceptance criteria.
+/// thread-per-connection). This runs a modest count in CI; the 5k acceptance target is the
+/// `#[ignore]`d [`capacity_concurrent_connections`] below, which must be run explicitly on a box with
+/// a high enough fd limit. See the T02 acceptance criteria.
 #[tokio::test]
 async fn holds_many_concurrent_connections() {
-    const N: usize = 250;
+    hold_n_concurrent_connections(250).await;
+}
+
+/// The 5k-concurrent-WSS-connection acceptance criterion from the T02 spec (F12 / task 1.19).
+///
+/// `#[ignore]`d because it is **not** runnable in a default sandbox: this test drives both ends
+/// in-process, so every connection costs ~2 file descriptors, and 5k connections need >10k fds plus
+/// slack. Run it explicitly, in release, on a box whose fd limit has been raised:
+///
+/// ```text
+/// ulimit -n 20000
+/// cargo test --release -p meridian-rendezvous -- --ignored capacity
+/// ```
+///
+/// `MERIDIAN_CAPACITY_CONNS` overrides the target (default 5000) so the same test can characterise a
+/// smaller box. The fd preflight below fails with an actionable message rather than letting the run
+/// die partway through with an opaque `Os { code: 24, kind: Uncategorized }`.
+#[tokio::test]
+#[ignore = "capacity: needs ~2 fds per connection (>10k for the 5k target) — raise ulimit -n and run explicitly"]
+async fn capacity_concurrent_connections() {
+    let target: usize = std::env::var("MERIDIAN_CAPACITY_CONNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000);
+    preflight_fd_limit(target);
+    hold_n_concurrent_connections(target).await;
+}
+
+/// Open `n` authenticated connections, hold them all open at once, and assert the server reports
+/// exactly `n` active. Shared by the CI smoke and the `--ignored` capacity run so both measure the
+/// same thing.
+async fn hold_n_concurrent_connections(n: usize) {
     let mut config = config_open();
     config.limits.auth_per_ip_per_min = 1_000_000; // all conns share 127.0.0.1 in this test
     let url = spawn(config).await;
 
-    let mut accts = Vec::with_capacity(N);
-    for _ in 0..N {
+    let mut accts = Vec::with_capacity(n);
+    for _ in 0..n {
         accts.push(new_acct("localhost"));
     }
     // Connect all concurrently and hold the sessions open.
-    let mut clients = Vec::with_capacity(N);
+    let mut clients = Vec::with_capacity(n);
     for acct in &accts {
         clients.push(acct.connect(&url).await.unwrap());
     }
@@ -459,10 +491,34 @@ async fn holds_many_concurrent_connections() {
     let host = url.strip_prefix("ws://").unwrap().to_string();
     let body = http_get(&host, "/metrics").await;
     assert!(
-        body.contains(&format!("meridian_connections_active {N}")),
-        "expected {N} active connections; got:\n{body}"
+        body.contains(&format!("meridian_connections_active {n}")),
+        "expected {n} active connections; got:\n{body}"
     );
     drop(clients);
+}
+
+/// Refuse to start a capacity run that the process's fd limit cannot possibly complete, naming the
+/// number to raise it to. Reads `/proc/self/limits` (Linux); on any other platform, or if the limit
+/// cannot be parsed, this is a no-op and the run proceeds.
+fn preflight_fd_limit(target: usize) {
+    // Two fds per connection (both ends are in this process) plus the listener, the /metrics probe,
+    // and the harness's own handles.
+    let needed = target * 2 + 64;
+    let Ok(limits) = std::fs::read_to_string("/proc/self/limits") else {
+        return;
+    };
+    let soft = limits
+        .lines()
+        .find(|l| l.starts_with("Max open files"))
+        .and_then(|l| l.split_whitespace().nth(3))
+        .and_then(|v| v.parse::<usize>().ok());
+    let Some(soft) = soft else { return };
+    assert!(
+        soft >= needed,
+        "fd limit too low for a {target}-connection capacity run: soft limit is {soft}, need >= \
+         {needed} (~2 fds per in-process connection). Raise it (`ulimit -n {needed}`) or set \
+         MERIDIAN_CAPACITY_CONNS to a target this box can hold."
+    );
 }
 
 // -- low-level frame helpers -------------------------------------------------

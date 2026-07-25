@@ -4,6 +4,7 @@
 # Install toolchains (targets/tools). Scaffold: documents the intent.
 setup:
     @echo "TODO: rustup targets (wasm32, aarch64-*); pnpm; cargo-nextest/-ndk/-deny; just"
+    @echo "coverage (just coverage): rustup component add llvm-tools-preview && cargo install cargo-llvm-cov"
 
 # Build the whole workspace.
 build:
@@ -41,6 +42,21 @@ harnesses:
     bash harnesses/mitm-sim/run.sh
     bash harnesses/ghost-device/run.sh
     bash harnesses/nat-matrix/run.sh
+
+# Coverage measurement (task 1.21 / review finding F22). MEASUREMENT ONLY — deliberately not a
+# blocking gate, and not part of `lint` or `test`. Needs `cargo install cargo-llvm-cov` and the
+# `llvm-tools-preview` rustup component (see `setup`).
+#
+# NOTE: this reports region/line/function coverage. Rust on **stable** does not emit branch coverage
+# (llvm-cov's Branches column stays empty), so a "branch coverage" target is not measurable with the
+# toolchain this repo pins — see docs/architecture/features/01-identity-keystore-core.md.
+coverage:
+    cargo llvm-cov --workspace --summary-only
+
+# Same, as an HTML report under target/llvm-cov/html for drilling into uncovered lines.
+coverage-html:
+    cargo llvm-cov --workspace --html
+    @echo "report: target/llvm-cov/html/index.html"
 
 # Codegen (UniFFI + wasm-bindgen) and conformance vectors.
 codegen:

@@ -4,10 +4,15 @@
 //! like chat, SDP and ICE candidates **never travel to a server in cleartext** (webrtc-nat-traversal
 //! invariant 2) — the rendezvous routes opaque blobs and can neither read nor edit an SDP offer.
 //!
-//! The DTLS fingerprint is carried *inside* the offer/answer here, so it is authenticated by the
-//! envelope's Ed25519 signature and bound to the sender's identity. After the handshake the
-//! substrate cross-checks the transport's negotiated fingerprint against [`dtls_fp`] — a mismatch
-//! tears the session down (§4.6).
+//! The DTLS fingerprint is carried *inside* the offer/answer here, so it is bound to the sender's
+//! identity. **What binds it is the ratchet, not the envelope signature**: `SignalContent` is
+//! ratchet *plaintext*, and the envelope's Ed25519 signature covers only the ciphertext — so the
+//! fingerprint's authentication comes from the message AEAD, whose AAD carries
+//! `AD = IK_initiator ‖ IK_responder`, and (on first contact) from X3DH's `DH1`. This distinction is
+//! load-bearing: it is why [ADR 0016](../../../docs/adr/0016-envelope-deniability.md)'s removal of
+//! the per-message signature at envelope v2 is a no-op for fingerprint binding. After the handshake
+//! the substrate cross-checks the transport's negotiated fingerprint against [`dtls_fp`] — a
+//! mismatch tears the session down (§4.6).
 //!
 //! [`dtls_fp`]: SignalContent::SdpOffer
 
@@ -21,7 +26,8 @@ use meridian_proto::{decode, encode, CodecError};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SignalContent {
     /// The dialing side's offer: the opaque SDP, the asserted DTLS fingerprint (identity-bound by
-    /// the envelope signature), and any already-gathered ICE candidates.
+    /// the ratchet AEAD's `AD = IK_initiator ‖ IK_responder`, *not* by the envelope signature — see
+    /// the module doc), and any already-gathered ICE candidates.
     SdpOffer {
         #[serde(with = "meridian_proto::bytes::bytes_vec")]
         sdp: Vec<u8>,

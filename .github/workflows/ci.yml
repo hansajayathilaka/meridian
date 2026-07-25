@@ -73,6 +73,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --workspace --release
 
+  coverage:
+    name: Coverage (measurement only, non-blocking)
+    needs: test
+    runs-on: ubuntu-latest
+    # Reports region/line/function coverage so the number is visible in CI instead of asserted in a
+    # spec (task 1.21 / F22). Deliberately NOT a gate: it does not block the merge queue, and no
+    # threshold is enforced — gating is a separate, later decision. Note that Rust on stable emits no
+    # branch coverage, so a "branch coverage" target is not measurable here.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Coverage summary
+        run: cargo llvm-cov --workspace --summary-only
+      - name: Coverage report (lcov artifact)
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+
   supply-chain:
     name: License / advisory gate
     runs-on: ubuntu-latest

@@ -40,3 +40,12 @@ an isolated build/primitive probe confirming wasm32 and aarch64 compatibility in
 no wasm32 target build wired into CI yet — that lands with fix-tasks 1.6 (conformance vectors + CI) or
 1.8 (real CI gates), whichever adds the target build first. Until then this criterion is **deferred, not
 met**; do not read this spec as claiming CI-verified wasm32/aarch64 builds.
+
+**Desync-recovery scope (recorded honestly, task 1.18):** deliverable 1's "desync→fresh-X3DH recovery
+per §10" is met only in its *safe half*. The peer that knows it lost state re-initiates automatically
+(no session ⇒ fetch bundle ⇒ X3DH), which works today. The peer whose session is healthy does **not**
+detect a desynced counterpart or renegotiate on undecryptable input, and deliberately will not until
+Feature 08 lands: reacting to undecryptable traffic is an attacker-triggerable session-reset,
+skipped-key-destruction, and prekey-depletion oracle, and its re-handshake performs a bundle fetch that
+needs verified-contact block-on-key-change to guard it. Until then this half is **deferred, not met**;
+do not read deliverable 1 as claiming automatic receiver-side recovery.

@@ -40,6 +40,16 @@ pub enum ChatError {
     /// A first message from an unknown peer arrived without the X3DH preamble.
     #[error("no session and no prekey preamble to establish one")]
     NoSession,
+    /// The envelope's ratchet header opened under **neither** header key, so this session cannot
+    /// advance: either the peer has lost its ratchet state (a genuine desync — restored backup,
+    /// wiped session store) or the input is hostile. Distinguished from the general
+    /// [`Crypto`](ChatError::Crypto) case purely so callers can *report* desync diagnosably; it is a
+    /// hard rejection like any other, and callers MUST NOT react to it by resetting or re-keying the
+    /// session (task 1.18 — doing so would hand an active attacker a session-reset,
+    /// skipped-key-destruction, and prekey-depletion oracle). Recovery is driven only by the peer
+    /// that knows it lost state; see `docs/api/messaging-envelope-v1.md` §3 "Desync recovery".
+    #[error("ratchet desync: header undecryptable under either header key")]
+    Desync,
 }
 
 /// How long a *superseded* prekey generation stays usable after a republish, in seconds (task 1.31).
@@ -413,7 +423,14 @@ impl ChatState {
             .sessions
             .get_mut(&envelope.sender_pub)
             .ok_or(ChatError::NoSession)?;
-        Ok(session.decrypt(&envelope.ct)?)
+        // Classify an undecryptable header as `Desync` so callers can *report* it distinguishably
+        // from malformed/tampered input (task 1.18). This changes no rejection decision: the
+        // envelope is dropped either way and the session is left untouched. Callers MUST NOT treat
+        // `Desync` as a trigger to reset or re-key — see the variant's doc comment.
+        session.decrypt(&envelope.ct).map_err(|e| match e {
+            meridian_crypto::CryptoError::UndecryptableHeader => ChatError::Desync,
+            other => ChatError::Crypto(other),
+        })
     }
 
     /// Serialize and seal the whole state under a key derived from the account key in `store`.

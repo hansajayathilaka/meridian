@@ -29,7 +29,24 @@ $ meridian fetch-bundle --tamper mrd1:<bob>@localhost            # test flag: se
 ```
 
 ## Acceptance criteria
-Auth rejects replayed challenges; fetch by partial/prefix ID is impossible at the API level (anti-enumeration §3.5); the tampered-bundle test fails closed with a non-zero exit; server process holds zero plaintext-content code paths (envelope bodies are `Vec<u8>` end to end — enforced by a lint that the routing module has no serde on blob contents); 5k concurrent WSS connections on a 2-vCPU box.
+Auth rejects replayed challenges; fetch by partial/prefix ID is impossible at the API level (anti-enumeration §3.5); the tampered-bundle test fails closed with a non-zero exit; server process holds zero plaintext-content code paths (envelope bodies are `Vec<u8>` end to end — enforced by a lint that the routing module has no serde on blob contents); 5k concurrent WSS connections on a 2-vCPU box (see "Capacity status" below — the test exists and is runnable, but 5k is **not yet demonstrated**).
+
+### Capacity status (F12 / task 1.19)
+The 5k target is exercised by `capacity_concurrent_connections` in `apps/rendezvous/tests/rendezvous.rs`,
+`#[ignore]`d because it drives both ends in-process (~2 fds per connection, so >10k fds for 5k):
+
+```
+ulimit -n 20000
+cargo test --release -p meridian-rendezvous -- --ignored capacity     # MERIDIAN_CAPACITY_CONNS overrides the 5000 default
+```
+
+**Demonstrated so far: 2,000 concurrent authenticated WSS connections**, held simultaneously with the
+server reporting `meridian_connections_active 2000`, in 0.82 s (release, 4-vCPU dev container). That
+figure is bounded by the container's **hard** fd limit of 4096, not by the server — it was the largest
+target the box could attempt. **5k is therefore neither demonstrated nor disproven here**; the server
+showed no strain at 2k, but the acceptance criterion stays open until someone runs the test above on a
+box with the fds for it. The test's fd preflight fails with the exact `ulimit -n` value to set rather
+than dying partway through with an opaque `EMFILE`.
 
 ## Risks / notes
 Resist adding features here — every capability this server gains is attack surface and trust creep. The "cannot" column of §2.3 is the review checklist for this task's PRs.

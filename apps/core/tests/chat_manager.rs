@@ -72,6 +72,22 @@ impl Party {
     fn vault_expire(&mut self, now_unix: u64) {
         self.state.vault.expire_previous_generation(now_unix);
     }
+    /// Like [`recv`](Self::recv) but surfaces the real error, for tests that assert on which
+    /// rejection happened rather than merely that one did.
+    fn recv_err(&mut self, from: &[u8; 32], blob: &[u8]) -> Option<meridian_core::chat::ChatError> {
+        let ik = self.ik();
+        self.state
+            .open_inbound(&self.store, self.account.handle(), &ik, from, blob)
+            .err()
+    }
+    /// Re-sign a (possibly modified) envelope under this party's identity key, so it is authentic
+    /// rather than merely forged — the signature/sender checks pass and the ratchet is reached.
+    fn resign(&self, mut env: MessageEnvelope) -> Vec<u8> {
+        let sig = meridian_identity::sign(&self.store, self.account.handle(), &env.signing_bytes())
+            .unwrap();
+        env.sig = *sig.as_bytes();
+        env.to_blob().unwrap()
+    }
 }
 
 struct ChatErr;
@@ -368,5 +384,109 @@ fn one_time_prekey_is_single_use_across_generations() {
     assert!(
         bob.recv(&carol_ik, &carol_blob).is_err(),
         "a one-time prekey must be consumed exactly once across BOTH generations"
+    );
+}
+
+// -- task 1.18: desync must NOT be an attacker-triggerable session reset -----
+//
+// `messaging-envelope-v1.md` §3 specifies recovery as "the peer that lost state re-initiates X3DH".
+// It has been misread as "the receiver detects desync and renegotiates" — which would hand an active
+// attacker (threat-model A2) a session-reset, skipped-key-destruction, and prekey-depletion oracle:
+// junk traffic would discard a healthy ratchet and its retained skipped-message keys, and force a
+// re-handshake (and a bundle fetch) at a moment of the attacker's choosing. This test pins the
+// specified behaviour so that oracle cannot be introduced by a well-meaning future edit.
+
+/// Deterministic CBOR of the whole chat state, for a byte-identical before/after comparison.
+/// (`seal_at_rest` is unusable here — its AEAD nonce is random, so two seals of identical state
+/// differ.)
+fn state_bytes(state: &ChatState) -> Vec<u8> {
+    let mut out = Vec::new();
+    ciborium::into_writer(state, &mut out).unwrap();
+    out
+}
+
+/// An undecryptable envelope is rejected as `Desync` and leaves the session **byte-identically**
+/// unchanged — no reset, no re-key, no discarded skipped-message keys.
+#[test]
+fn undecryptable_envelope_is_rejected_without_touching_the_session() {
+    let mut alice = Party::new("desync.a");
+    let mut bob = Party::new("desync.b");
+    let bob_bundle = bob.publish();
+    let (bob_ik, alice_ik) = (bob.ik(), alice.ik());
+    alice.start(
+        &bob_ik,
+        &bob_bundle.bundle.spk,
+        Some(bob_bundle.bundle.otks[0]),
+    );
+
+    // Establish a healthy, live session.
+    let opening = alice.send(
+        &bob_ik,
+        &ChatContent::Text {
+            id: [1u8; 16],
+            body: "hello".into(),
+        },
+    );
+    bob.recv(&alice_ik, &opening).ok().unwrap();
+
+    // Alice sends two more; hold the FIRST back so Bob retains a skipped-message key for it.
+    // Destroying that key is one of the things a reset-on-desync oracle would achieve.
+    let held = alice.send(
+        &bob_ik,
+        &ChatContent::Text {
+            id: [2u8; 16],
+            body: "held back".into(),
+        },
+    );
+    let later = alice.send(
+        &bob_ik,
+        &ChatContent::Text {
+            id: [3u8; 16],
+            body: "arrives first".into(),
+        },
+    );
+    bob.recv(&alice_ik, &later).ok().unwrap(); // out of order -> skipped key retained for `held`
+
+    let before = state_bytes(&bob.state);
+
+    // An *authentic* envelope from Alice whose ratchet header opens under neither of Bob's header
+    // keys: mangle a byte inside the encrypted header, then re-sign as Alice so it passes the
+    // signature and sender checks and reaches the ratchet. This is precisely the input a naive
+    // "N undecryptable envelopes => re-handshake" rule would react to.
+    let mut env = MessageEnvelope::from_blob(&alice.send(
+        &bob_ik,
+        &ChatContent::Text {
+            id: [4u8; 16],
+            body: "will be mangled".into(),
+        },
+    ))
+    .unwrap();
+    env.ct[2] ^= 0xFF; // inside enc_header (past the 2-byte length prefix)
+    let mangled = alice.resign(env);
+
+    match bob.recv_err(&alice_ik, &mangled) {
+        Some(e) => assert!(
+            matches!(e, meridian_core::chat::ChatError::Desync),
+            "an undecryptable header must classify as Desync, got: {e:?}"
+        ),
+        None => panic!("an undecryptable envelope must be rejected, not accepted"),
+    }
+
+    assert_eq!(
+        before,
+        state_bytes(&bob.state),
+        "a rejected undecryptable envelope must leave the session byte-identically unchanged — no \
+         reset, no re-key, no discarded skipped-message keys (task 1.18)"
+    );
+
+    // And the session is genuinely still live: the held-back message still opens from its retained
+    // skipped key.
+    let got = bob.recv(&alice_ik, &held).ok().unwrap();
+    assert_eq!(
+        got,
+        ChatContent::Text {
+            id: [2u8; 16],
+            body: "held back".into()
+        }
     );
 }
