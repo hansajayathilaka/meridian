@@ -98,3 +98,42 @@ pub fn substitute_bundle(original: &PrekeyBundle) -> PrekeyBundle {
         device_record: None,
     }
 }
+
+/// TEST HOOK (task 1.28): actively **rewrite a routed blob in transit** — the malicious-relay
+/// attack that [`substitute_bundle`] does not cover. Where bundle substitution attacks *key
+/// distribution*, this attacks the *routed signaling path*: a compromised rendezvous mutating the
+/// SDP/ICE envelopes that establish a P2P session, trying to swap in its own DTLS fingerprint and
+/// terminate the session itself.
+///
+/// **What this hook can and cannot simulate, precisely.** It flips one byte in the middle of the
+/// blob. It does **not** construct a substitute envelope carrying the attacker's own fingerprint,
+/// because the server *cannot*: `meridian-rendezvous` does not depend on `meridian-envelope`, so
+/// envelope/content types are not in scope for this crate at all (the F15 dependency split — see
+/// `apps/envelope/src/lib.rs`), and it holds no ratchet state to encrypt an inner `SignalContent`
+/// under. The "attacker fabricates a whole offer with its own fingerprint" case is covered
+/// client-side instead, by `apps/core/tests/p2p_session.rs::fingerprint_mismatch_tears_down` via
+/// `LoopbackTransport::new_mitm`.
+///
+/// **Do not read this as "the strongest attack a relay has".** It is not. A byte flip breaks the
+/// Ed25519 envelope signature, so the receiver rejects at the *signature* check and the ratchet AEAD
+/// and the §4.6 DTLS-fingerprint cross-check are never reached. A relay also has attacks that need no
+/// key material and would pass the signature check — **replay** of an earlier valid envelope,
+/// **reorder**, **drop**, and **cross-delivery** of an envelope from another session — and those
+/// probe deeper into the ratchet. They are a genuine, acknowledged gap in this hook's coverage,
+/// recorded in task 1.28's file for a follow-up rather than folded in here (this hook's deliverable
+/// is specifically an in-transit *rewrite*).
+///
+/// Compiled in only under the `test-tamper-hook` cargo feature (off by default, absent from release
+/// binaries — F17); additionally gated at runtime by `allow_test_tamper && allow_test_route_tamper`.
+#[cfg(feature = "test-tamper-hook")]
+pub fn rewrite_routed_blob(original: &[u8]) -> Vec<u8> {
+    let mut out = original.to_vec();
+    if out.is_empty() {
+        return out;
+    }
+    // Middle byte: inside the ratchet ciphertext for any realistic envelope, so this lands on
+    // signed, AEAD-protected material rather than harmlessly on framing.
+    let idx = out.len() / 2;
+    out[idx] ^= 0xFF;
+    out
+}

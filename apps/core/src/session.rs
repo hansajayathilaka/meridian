@@ -13,10 +13,17 @@
 //! tears the session down before a byte of content flows. A relay that only sees opaque ciphertext
 //! cannot read or forge the inner SDP (that opacity is a property of the envelope encryption itself,
 //! independent of transport backend), and a MITM that terminates DTLS presents a fingerprint that
-//! fails the check. An automated test actively mounting a relay rewrite attempt against a real
-//! backend is still open (TODO: 1.28, flagged during 1.23's split into 1.24-1.27); today's suite
-//! proves the fingerprint cross-check, not that specific attack. This is why we can put the servers out
-//! of the data path and still trust it.
+//! fails the check. An automated test actively mounting a relay-rewrite attempt against a real
+//! rendezvous now exists (task 1.28: `apps/cli/tests/relay_rewrite.rs`, run by
+//! `harnesses/mitm-sim/run.sh`) — a server rewriting routed blobs is detected at the envelope
+//! signature check and no session establishes. This is why we can put the servers out of the data
+//! path and still trust it.
+//!
+//! One honest residual that test surfaced: the *responder* rejects a rewritten offer immediately,
+//! but the **dialer** then waits indefinitely for an answer that never comes — a hostile relay can
+//! hang it with no diagnostic. Fail-closed (no session, nothing downgraded) and squarely inside
+//! threat-model goal 6's conceded "a malicious server can deny service", but poor diagnostics. Not
+//! fixed in 1.28, whose scope is adversarial test infrastructure; see that task's file.
 //!
 //! ## Transport independence
 //! Once connected, chat and ctrl ride data channels peer-to-peer; the relay is only used for

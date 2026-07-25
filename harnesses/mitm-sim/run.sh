@@ -7,8 +7,9 @@
 # T04 EXTENDS it to the transport layer: SDP/ICE ride inside ratchet-encrypted envelopes, so a relay
 # seeing only ciphertext cannot read or forge the inner SDP, and the DTLS fingerprint is cross-checked
 # against the identity-bound value after the handshake — a mismatch (a MITM that terminated DTLS)
-# tears the session down 100% of the time (§4.6). An automated test actively mounting a relay-rewrite
-# attempt against a real backend is still open — tracked for 1.28.
+# tears the session down 100% of the time (§4.6).
+# Task 1.28 CLOSED the remaining gap: a real rendezvous actively REWRITING routed blobs in transit,
+# driven through a real dial/answer, is now exercised below.
 # T08 EXTENDS this harness with the tofu/verified trust-state matrix — do not delete these cases.
 # See docs/testing/strategy.md §3 and docs/security/threat-mitigation-matrix.md.
 set -euo pipefail
@@ -23,5 +24,14 @@ echo "[mitm-sim] DTLS fingerprint-binding teardown (T04 §4.6)…"
 cargo test -q -p meridian-core --test p2p_session fingerprint_mismatch_tears_down
 cargo test -q -p meridian-core --test p2p_session relay_path_connects_healthily
 echo "[mitm-sim] OK: fingerprint mismatch tears the session down; a healthy relay path still binds"
-echo "  matching fingerprints. NOTE: an active relay SDP-rewrite attack is not yet exercised here —"
-echo "  tracked for 1.28 once the real transport backend lands."
+echo "  matching fingerprints."
+
+# 1.28: the relay itself is the adversary. A real meridian-rendezvous (test-tamper-hook +
+# allow_test_route_tamper) rewrites every routed signaling blob while two peers run a real
+# dial/answer. Asserts BOTH that no session establishes (fail-closed) and that at least one side
+# rejects explicitly (detected, not a silent stall). Ships with a control case through an honest
+# relay, so the adversarial assertion cannot pass vacuously on unrelated breakage.
+echo "[mitm-sim] active relay-rewrite of routed blobs (1.28)…"
+cargo test -q -p meridian-cli --test relay_rewrite
+echo "[mitm-sim] OK: a rendezvous rewriting routed blobs is detected (envelope signature check) and"
+echo "  cannot establish a session; the same flow through an honest relay does establish."

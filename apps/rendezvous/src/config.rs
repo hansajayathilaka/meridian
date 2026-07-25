@@ -29,6 +29,13 @@ pub struct Server {
     /// not merely gated at runtime, F17). This flag stays present (harmlessly inert) without the
     /// feature so downstream config/test plumbing that merely sets it keeps compiling.
     pub allow_test_tamper: bool,
+    /// TEST HOOK (task 1.28): actively **rewrite routed blobs in transit** — the malicious-relay
+    /// attack that `allow_test_tamper`'s bundle substitution does not cover. Like that flag, the
+    /// rewrite logic only exists under the `test-tamper-hook` cargo feature, and this is an
+    /// *additional* gate on top of `allow_test_tamper`: both must be true. Separate from
+    /// `allow_test_tamper` on purpose — the bundle-substitution demo (`fetch-bundle --tamper`) must
+    /// keep working without every routed envelope also being corrupted.
+    pub allow_test_route_tamper: bool,
     /// SQLite/sqlx URL, used only with the `sqlite` feature; ignored by the in-memory default.
     pub database_url: String,
 }
@@ -101,6 +108,7 @@ impl Default for Server {
             admission: Admission::Open,
             invite_tokens: Vec::new(),
             allow_test_tamper: false,
+            allow_test_route_tamper: false,
             database_url: "sqlite://rendezvous.db".into(),
         }
     }
