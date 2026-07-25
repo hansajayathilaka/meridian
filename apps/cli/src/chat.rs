@@ -60,9 +60,12 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
         .zip(generated.otk_secrets.iter())
         .map(|(p, s)| (*p, **s))
         .collect();
-    state
-        .vault
-        .set_bundle(generated.bundle.spk, *generated.spk_secret, otks);
+    state.vault.set_bundle(
+        generated.bundle.spk,
+        *generated.spk_secret,
+        otks,
+        crate::now_unix(),
+    );
 
     // Roles are decided by key order so two peers both running `chat` establish exactly one X3DH.
     // Only the initiator needs the peer's bundle; the responder derives everything from the
@@ -227,6 +230,12 @@ async fn handle_inbound(
     json: bool,
     pending: &mut Vec<String>,
 ) -> Result<(), String> {
+    // Retire a superseded prekey generation whose grace window has passed *before* consulting the
+    // vault, so 1.31's reconnect-race allowance stays time-bounded in a long-running process rather
+    // than lasting until the next republish. Expiry is enforced here, at the point of use, because
+    // `meridian-core` is clock-free (wasm32) — see `crate::now_unix`.
+    state.vault.expire_previous_generation(crate::now_unix());
+
     let content = match state.open_inbound(
         store,
         handle,

@@ -92,9 +92,12 @@ pub fn run_audit(rounds: usize) -> Result<AuditReport, String> {
         .zip(bob_bundle.otk_secrets.iter())
         .map(|(p, s)| (*p, **s))
         .collect();
-    bob.state
-        .vault
-        .set_bundle(bob_bundle.bundle.spk, *bob_bundle.spk_secret, otks);
+    bob.state.vault.set_bundle(
+        bob_bundle.bundle.spk,
+        *bob_bundle.spk_secret,
+        otks,
+        crate::now_unix(),
+    );
     alice
         .state
         .start_initiator_session(

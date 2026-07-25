@@ -17,6 +17,12 @@
 
 use std::sync::Arc;
 
+/// Fixed wall clock for `PrekeyVault::set_bundle` (task 1.31 takes time as a parameter rather than
+/// reading a clock, so `meridian-core` stays wasm-safe). These tests publish exactly one bundle
+/// generation, so any fixed value works — the generation-rotation/expiry behaviour itself is covered
+/// by `chat_manager.rs`.
+const TEST_NOW_UNIX: u64 = 1_700_000_000;
+
 use meridian_core::chat::ChatState;
 use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{generate_account, AccountId, KeyHandle, MemorySecretStore};
@@ -61,7 +67,7 @@ fn establish_ratchet(alice: &mut Peer, bob: &mut Peer) {
         .collect();
     bob.chat
         .vault
-        .set_bundle(bundle.bundle.spk, *bundle.spk_secret, otks);
+        .set_bundle(bundle.bundle.spk, *bundle.spk_secret, otks, TEST_NOW_UNIX);
     alice
         .chat
         .start_initiator_session(

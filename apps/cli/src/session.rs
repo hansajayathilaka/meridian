@@ -100,9 +100,12 @@ async fn establish<T: Transport>(
         .zip(bundle.otk_secrets.iter())
         .map(|(p, s)| (*p, **s))
         .collect();
-    bob.chat
-        .vault
-        .set_bundle(bundle.bundle.spk, *bundle.spk_secret, otks);
+    bob.chat.vault.set_bundle(
+        bundle.bundle.spk,
+        *bundle.spk_secret,
+        otks,
+        crate::now_unix(),
+    );
     alice
         .chat
         .start_initiator_session(

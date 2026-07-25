@@ -2,7 +2,7 @@
 //! receipt) driven entirely through opaque blobs, plus tamper rejection and sealed persistence.
 //! No network: the "relay" is just handing blob bytes between two [`ChatState`]s.
 
-use meridian_core::chat::ChatState;
+use meridian_core::chat::{ChatState, PREV_GENERATION_GRACE_SECS};
 use meridian_envelope::{ChatContent, MessageEnvelope};
 use meridian_identity::{generate_account, AccountId, MemorySecretStore};
 use meridian_signaling::{generate_bundle, GeneratedBundle};
@@ -28,6 +28,13 @@ impl Party {
     }
     /// Publish a bundle: record the prekey secrets in the vault and return the public bundle.
     fn publish(&mut self) -> GeneratedBundle {
+        self.publish_at(TEST_NOW_UNIX)
+    }
+
+    /// [`publish`](Self::publish) at an explicit wall clock, for the task-1.31 generation-rotation
+    /// tests. `set_bundle` takes time as a parameter (rather than reading a clock) so
+    /// `meridian-core` stays wasm-safe; that also makes the grace window testable without sleeping.
+    fn publish_at(&mut self, now_unix: u64) -> GeneratedBundle {
         let ik = self.ik();
         let gen = generate_bundle(&self.store, self.account.handle(), ik, 5).unwrap();
         let otks: Vec<([u8; 32], [u8; 32])> = gen
@@ -39,7 +46,7 @@ impl Party {
             .collect();
         self.state
             .vault
-            .set_bundle(gen.bundle.spk, *gen.spk_secret, otks);
+            .set_bundle(gen.bundle.spk, *gen.spk_secret, otks, now_unix);
         gen
     }
     fn start(&mut self, peer: &[u8; 32], spk: &[u8; 32], opk: Option<[u8; 32]>) {
@@ -60,9 +67,17 @@ impl Party {
             .open_inbound(&self.store, self.account.handle(), &ik, from, blob)
             .map_err(|_| ChatErr)
     }
+    /// Retire a superseded prekey generation whose grace window has passed, exactly as the CLI's
+    /// inbound path does before opening a delivered blob (task 1.31).
+    fn vault_expire(&mut self, now_unix: u64) {
+        self.state.vault.expire_previous_generation(now_unix);
+    }
 }
 
 struct ChatErr;
+
+/// Fixed base wall clock for the tests that don't care about time.
+const TEST_NOW_UNIX: u64 = 1_700_000_000;
 
 #[test]
 fn full_relayed_exchange_with_receipt() {
@@ -181,5 +196,177 @@ fn state_survives_sealed_restart() {
             id: [2u8; 16],
             body: "after".into()
         }
+    );
+}
+
+// -- task 1.31: prekey-bundle republish/fetch race on reconnect --------------
+//
+// Every `session connect` / `chat` invocation republishes a fresh bundle for BOTH roles, but nothing
+// synchronizes a peer's fetch against that publish landing. Before 1.31 `PrekeyVault::set_bundle` was
+// a single-slot overwrite, so an initiator whose fetch landed on the generation that was current a
+// moment ago referenced OTK/SPK ids the responder no longer held secrets for — a hard
+// `ChatError::UnknownPrekey` ("no matching prekey secret for incoming session"), not a retry. The fix
+// retains exactly ONE superseded generation for a bounded grace window; these tests pin both bounds
+// (one generation, and `PREV_GENERATION_GRACE_SECS`) so neither can silently become unbounded.
+
+/// Build an initiator session on `from` against an explicit (spk, opk) pair, then seal an opening
+/// prekey envelope. Mirrors what a real initiator does after fetching a bundle.
+fn prekey_envelope_against(
+    from: &mut Party,
+    peer_ik: &[u8; 32],
+    spk: &[u8; 32],
+    opk: Option<[u8; 32]>,
+    id: u8,
+) -> Vec<u8> {
+    from.start(peer_ik, spk, opk);
+    from.send(
+        peer_ik,
+        &ChatContent::Text {
+            id: [id; 16],
+            body: "raced".into(),
+        },
+    )
+}
+
+/// The regression itself: an envelope built against the *just-superseded* generation still opens.
+///
+/// Against the pre-1.31 single-slot `set_bundle` this fails with `UnknownPrekey`: `bob.publish()`
+/// below replaced `spk_public`/`spk_secret` and cleared `otks` wholesale, so the gen-N `used_spk`
+/// Alice referenced had no secret left in Bob's vault at all.
+#[test]
+fn envelope_against_just_superseded_generation_still_opens() {
+    let mut alice = Party::new("race.a");
+    let mut bob = Party::new("race.b");
+    let (bob_ik, alice_ik) = (bob.ik(), alice.ik());
+
+    // Bob publishes generation N; Alice fetches it and builds her opening envelope.
+    let gen_n = bob.publish_at(TEST_NOW_UNIX);
+    let blob = prekey_envelope_against(
+        &mut alice,
+        &bob_ik,
+        &gen_n.bundle.spk,
+        gen_n.bundle.otks.first().copied(),
+        1,
+    );
+
+    // Bob reconnects and republishes generation N+1 *before* Alice's envelope arrives.
+    let gen_n1 = bob.publish_at(TEST_NOW_UNIX + 1);
+    assert_ne!(
+        gen_n.bundle.spk, gen_n1.bundle.spk,
+        "republish must produce a genuinely different generation for this test to mean anything"
+    );
+
+    // The in-flight gen-N envelope must still establish the responder session.
+    let got = bob
+        .recv(&alice_ik, &blob)
+        .ok()
+        .expect("an envelope against the just-superseded generation must still open (1.31)");
+    assert_eq!(
+        got,
+        ChatContent::Text {
+            id: [1u8; 16],
+            body: "raced".into()
+        }
+    );
+}
+
+/// Time bound: past the grace window the superseded generation is gone and fails **closed**.
+///
+/// Bob's state is snapshotted via the at-rest seal (the same trick
+/// `state_survives_sealed_restart` uses) so the inside-window and past-window cases both start from
+/// the identical vault — the first `recv` consumes the one-time prekey, which would otherwise
+/// contaminate the second.
+#[test]
+fn superseded_generation_is_rejected_once_the_grace_window_passes() {
+    let mut alice = Party::new("expire.a");
+    let mut bob = Party::new("expire.b");
+    let (bob_ik, alice_ik) = (bob.ik(), alice.ik());
+
+    let gen_n = bob.publish_at(TEST_NOW_UNIX);
+    let blob = prekey_envelope_against(
+        &mut alice,
+        &bob_ik,
+        &gen_n.bundle.spk,
+        gen_n.bundle.otks.first().copied(),
+        2,
+    );
+    // Rotation happens here, so gen N expires at (TEST_NOW_UNIX + 1) + PREV_GENERATION_GRACE_SECS.
+    bob.publish_at(TEST_NOW_UNIX + 1);
+    let rotated_at = TEST_NOW_UNIX + 1;
+    let snapshot = bob
+        .state
+        .seal_at_rest(&bob.store, bob.account.handle())
+        .unwrap();
+
+    // Just inside the window it still works…
+    bob.vault_expire(rotated_at + PREV_GENERATION_GRACE_SECS - 1);
+    assert!(
+        bob.recv(&alice_ik, &blob).is_ok(),
+        "inside the grace window the superseded generation must still be accepted"
+    );
+
+    // …and past it, it is rejected rather than silently accepted.
+    bob.state = ChatState::open_at_rest(&bob.store, bob.account.handle(), &snapshot).unwrap();
+    bob.vault_expire(rotated_at + PREV_GENERATION_GRACE_SECS);
+    assert!(
+        bob.recv(&alice_ik, &blob).is_err(),
+        "past the grace window the superseded generation must fail closed"
+    );
+}
+
+/// Generation bound: only ONE prior generation is retained, so two republishes retire gen N.
+#[test]
+fn only_one_prior_generation_is_retained() {
+    let mut alice = Party::new("gen.a");
+    let mut bob = Party::new("gen.b");
+    let (bob_ik, alice_ik) = (bob.ik(), alice.ik());
+
+    let gen_n = bob.publish_at(TEST_NOW_UNIX);
+    let blob = prekey_envelope_against(
+        &mut alice,
+        &bob_ik,
+        &gen_n.bundle.spk,
+        gen_n.bundle.otks.first().copied(),
+        3,
+    );
+
+    // N -> N+1 (gen N becomes "previous"), then N+1 -> N+2 (gen N is dropped entirely).
+    bob.publish_at(TEST_NOW_UNIX + 1);
+    bob.publish_at(TEST_NOW_UNIX + 2);
+
+    assert!(
+        bob.recv(&alice_ik, &blob).is_err(),
+        "gen N must be gone after two republishes — retention is capped at one prior generation"
+    );
+}
+
+/// One-time prekeys stay single-use *across* generations: the same OTK can never open two sessions,
+/// whether it is found in the current generation or the retained previous one.
+#[test]
+fn one_time_prekey_is_single_use_across_generations() {
+    let mut alice = Party::new("otk.a");
+    let mut carol = Party::new("otk.c");
+    let mut bob = Party::new("otk.b");
+    let (bob_ik, alice_ik, carol_ik) = (bob.ik(), alice.ik(), carol.ik());
+
+    // Both Alice and Carol fetch gen N and (pathologically) reference the SAME one-time prekey.
+    let gen_n = bob.publish_at(TEST_NOW_UNIX);
+    let shared_otk = gen_n.bundle.otks.first().copied();
+    assert!(shared_otk.is_some(), "test needs a one-time prekey");
+    let alice_blob = prekey_envelope_against(&mut alice, &bob_ik, &gen_n.bundle.spk, shared_otk, 4);
+    let carol_blob = prekey_envelope_against(&mut carol, &bob_ik, &gen_n.bundle.spk, shared_otk, 5);
+
+    // Rotate, so the OTK now lives only in the retained previous generation.
+    bob.publish_at(TEST_NOW_UNIX + 1);
+
+    // First use succeeds (from the previous generation — the 1.31 allowance)…
+    assert!(
+        bob.recv(&alice_ik, &alice_blob).is_ok(),
+        "first use of the superseded generation's OTK must succeed"
+    );
+    // …and the second use of that same OTK must not, even though it came from a different peer.
+    assert!(
+        bob.recv(&carol_ik, &carol_blob).is_err(),
+        "a one-time prekey must be consumed exactly once across BOTH generations"
     );
 }
