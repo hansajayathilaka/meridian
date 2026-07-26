@@ -3,7 +3,7 @@
 
 # Phase 2 — Cross-Org Federation
 
-**Kind:** build · **Status:** planning · **Reviews phase(s):** n/a (build phase; Phase 3 will review it)
+**Kind:** build · **Status:** in progress · **Reviews phase(s):** n/a (build phase; Phase 3 will review it)
 
 ## Goal
 Ship **Feature 06 — Cross-Org Federation**: a user registered on Org A's rendezvous establishes a
@@ -123,7 +123,48 @@ rather than a normalized schema — *"TODO: confirm normalized schema + Postgres
 
 ## Tasks (todo)
 <!-- Filled by /plan-phase. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
-_Not yet broken down — run `/plan-phase`._
+
+**Gate — Phase-1 follow-ups that must land first** (they stay numbered under Phase 1)
+- [ ] **1.32** Relay attacks that pass the envelope signature check — [file](../phase-1/1.32-relay-attacks-past-signature.md)
+- [ ] **1.33** Bound the dialer's wait for an answer in `recv_sdp` — [file](../phase-1/1.33-bound-answer-wait.md)
+
+**Decide before any byte is shaped**
+- [ ] **2.1** ADR 0017 — federation trust boundary (peer auth + cross-org `from` attestation) — [file](./2.1-adr-federation-trust-boundary.md)
+
+**Contracts**
+- [ ] **2.2** `federation-protocol-v1.md` + s2s wire types + conformance vectors — [file](./2.2-federation-protocol-v1.md)
+- [ ] **2.3** c2s extension for federation (hint fields, error codes, vectors) — [file](./2.3-c2s-federation-extension.md)
+
+**Server spine**
+- [ ] **2.4** s2s mTLS link: listener + dialer (WebPKI and private-CA) — [file](./2.4-s2s-mtls-link.md)
+- [ ] **2.5** Discovery: DNS SRV + `federation_map.toml` static mode — [file](./2.5-federation-discovery.md)
+- [ ] **2.6** Federation policy (`open | allowlist | closed`) + edge rate limits — [file](./2.6-federation-policy-limits.md)
+- [ ] **2.7** Federated prekey fetch, both sides (§3.3 steps 2–4) — [file](./2.7-federated-prekey-fetch.md)
+- [ ] **2.8** Federated envelope forwarding + per-request reachability (§3.3 step 5, §3.4) — [file](./2.8-federated-route-reachability.md)
+
+**Client**
+- [ ] **2.9** Client federation error taxonomy: clean `closed` error + stale-hint case — [file](./2.9-client-federation-errors.md)
+- [ ] **2.10** First-contact message-request gate (client-side, §3.5) — [file](./2.10-message-request-gate.md)
+
+**Demo + exit gate**
+- [ ] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./2.11-demo-two-orgs.md)
+- [ ] **2.12** Cross-org abuse + acceptance suite (the phase exit gate) — [file](./2.12-cross-org-abuse-acceptance.md)
+
+### Dependency order
+```
+1.32 ─┬─► 2.1 ─► 2.2 ─┬─► 2.3 ─┐
+      │                └─► 2.4 ─► 2.6 ─┤
+      └────────────────────────────────┼─► 2.7 ─► 2.8 ─► 2.9 ─┐
+                            2.5 ───────┘         ▲            │
+                                                 │            ├─► 2.12
+                            1.33 ────────────────┴────────────┘
+                            2.10 ─────────────────────────────┘
+                            2.4,2.5,2.7,2.8 ─► 2.11 ──────────┘
+```
+**Parallel tracks.** Track P (no dependencies, start immediately): **2.5**, **2.10**, **1.33**.
+Track S (server spine, serialized): 1.32 → 2.1 → 2.2 → 2.3 → 2.4 → 2.6 → 2.7 → 2.8.
+2.9 ∥ 2.11 once 2.8 lands. **2.12 is the join point.**
+2.4 and 2.5 both touch `config::Federation` — sequence them if one developer.
 
 ## Exit criteria
 - Every Phase 2 task `[x]`.

@@ -72,7 +72,31 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   `/plan-phase` also inherits one delegated **`TODO: confirm`** — `rendezvous-protocol-v1.md` stores a
   prekey bundle as a single CBOR blob and defers "normalized schema + Postgres" to T06/T07; it must be
   resolved or explicitly re-deferred.
-- **NEXT:** `/plan-phase` to break T06 into tasks. **Two Phase-1 follow-ups are still open** — **1.32**
+- **ALSO NOW:** **Phase 2 is planned — 12 tasks (2.1-2.12)**, [phase README](./phase-2/README.md).
+  Two agent findings reshaped the breakdown, and both are worth carrying forward:
+  **(1) The forwarding path is not implementable as specified.** `Deliver{from}` is *required* by the
+  client (`apps/core/src/chat.rs` hard-rejects `envelope.sender_pub != from` with `SenderMismatch`),
+  but `wire-protocol.md` §4's `fed_route{to, envelope}` carries **no** `from`, and server B cannot
+  derive one — the envelope is opaque to it, and decoding it would need `meridian-envelope`, which the
+  server must never depend on. `wire-protocol.md` §2 supplies a *third* divergent shape,
+  `deliver {from_server, blob}`. So the very first task is **2.1 — ADR 0017**, deciding what the
+  receiving server may believe: which name the peer cert authenticates (in both WebPKI and private-CA
+  modes) and who attests `from` across the boundary. It must also **scope-correct ADR 0016's residual
+  R4**, whose "the routing `from` is taken from the authenticated WebSocket session" is true
+  single-hop and **false federated**. Nothing that shapes s2s bytes may land before it — retrofitting
+  provenance into a published contract is a wire break with vectors already generated.
+  **(2) Two live doc contradictions** that would otherwise be settled by whichever task hard-coded an
+  answer first: `wire-protocol.md` §2 specifies `fetch_bundle {target, hint}` where the implemented
+  `Fetch` has no hint (2.3 reconciles), and `data-model.md` defines `federation_map` as a **DB table**
+  while the feature spec calls it a **config file** (2.5 settles).
+  Also settled: the delegated `TODO: confirm` on normalized schema + Postgres is **re-deferred to
+  T07** with its reason recorded (2.3) — Feature 06 adds no new persisted state, and T07's mailbox is
+  the first consumer a normalized schema would have. And `lint-server-no-core.sh` is a crate-**name**
+  allowlist, so federation lives *inside* `apps/rendezvous/` with shared types in `apps/proto/`; a
+  `meridian-federation` crate would fail the lint without touching core.
+- **NEXT:** `/next-task`. The first unblocked work is **1.32** (the hard gate — see below), and in
+  parallel **1.33**, **2.5** (discovery) and **2.10** (message-request gate), which have no
+  dependencies. **Two Phase-1 follow-ups are still open** — **1.32**
   (relay attacks that *pass* the signature check: forged `Deliver.from`, replay, reorder,
   cross-delivery — to be folded into ADR 0016's existing mitm-sim test obligations, one thread not two)
   and **1.33** (bound the dialer's unbounded `recv_sdp` wait; availability/diagnostics only). Neither
@@ -82,9 +106,13 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   decisions about `from`-attestation, replay windows and de-dup would otherwise be made with no
   adversarial harness in hand, then retrofitted), and 06's "a `closed`-policy org rejects inbound
   federation with a **clean client-side error**" criterion is precisely the case 1.33's unbounded wait
-  turns into a hang. **Recommendation: close 1.32 and 1.33 before the first Phase 2 task that touches
-  s2s routing or signaling.** They stay numbered under Phase 1 (they are Phase-1 findings); Phase 1
-  cannot be marked fully `[x]` while they are open.
+  turns into a hang. **Planning hardened this from a recommendation into a dependency: 1.32 is now a
+  hard gate on 2.1** — its forged-`Deliver.from` cell *is* the single-hop form of the question ADR 0017
+  has to answer, and making that call with no adversarial harness in hand, then retrofitting the
+  harness onto a two-hop cross-trust-boundary path, is the expensive ordering. **1.33 gates 2.9** only
+  (it touches `apps/core/src/session.rs`, which no server task touches), so it runs in parallel.
+  They stay numbered under Phase 1 (they are Phase-1 findings); Phase 1 cannot be marked fully `[x]`
+  while they are open, and closing them also closes Phase 1.
 - Phase 1's other exit criteria are met: tree green (`cargo test --workspace` 45 suites / 0 failures,
   `cargo clippy --workspace --all-targets -D warnings` clean), all four invariant lints + their
   selftests pass, docs synced (`tools/check-docs.sh`, 1222 links, none broken).
@@ -151,7 +179,7 @@ design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 - [ ] **1.32** Relay attacks that PASS the envelope signature check (from-spoof / replay / reorder / cross-delivery; from 1.28's security review, fold into [ADR 0016](../adr/0016-envelope-deniability.md)'s test obligations) — [file](./phase-1/1.32-relay-attacks-past-signature.md)
 - [ ] **1.33** Bound the dialer's wait for an answer in `recv_sdp` (availability/diagnostics; from 1.28) — [file](./phase-1/1.33-bound-answer-wait.md)
 
-### Phase 2 — Cross-Org Federation · **planning** · [details](./phase-2/README.md)
+### Phase 2 — Cross-Org Federation · **in progress** · [details](./phase-2/README.md)
 Build phase. **[T06 — Cross-Org Federation](../architecture/features/06-cross-org-federation.md)**
 alone: s2s mTLS (WebPKI + private-CA), federated prekey fetch + envelope forwarding on the strict
 `client → own server → foreign server → client` invariant, DNS-SRV **and** static-map discovery,
@@ -159,7 +187,28 @@ alone: s2s mTLS (WebPKI + private-CA), federated prekey fetch + envelope forward
 gate, and a new `federation-protocol-v1.md` wire contract. Deps `T04 (T05 recommended)` both done;
 Phase 2's blocking gate (F1, F2, F3, F10, F11) satisfied by Phase 1 Group D. Acceptance = the §7.1
 cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery modes.
-- Tasks not yet broken down — run `/plan-phase`.
+
+**Decide before any byte is shaped**
+- [ ] **2.1** ADR 0017 — federation trust boundary: peer auth + cross-org `from` attestation — [file](./phase-2/2.1-adr-federation-trust-boundary.md)
+
+**Contracts**
+- [ ] **2.2** `federation-protocol-v1.md` + s2s wire types + conformance vectors — [file](./phase-2/2.2-federation-protocol-v1.md)
+- [ ] **2.3** c2s extension for federation (hint fields, error codes, vectors; re-defers the §8 schema `TODO` to T07) — [file](./phase-2/2.3-c2s-federation-extension.md)
+
+**Server spine**
+- [ ] **2.4** s2s mTLS link: listener + dialer (WebPKI and private-CA) — [file](./phase-2/2.4-s2s-mtls-link.md)
+- [ ] **2.5** Discovery: DNS SRV `_meridian-fed._tcp` + `federation_map.toml` static mode — [file](./phase-2/2.5-federation-discovery.md)
+- [ ] **2.6** Federation policy (`open | allowlist | closed`) + edge rate limits — [file](./phase-2/2.6-federation-policy-limits.md)
+- [ ] **2.7** Federated prekey fetch, both sides (§3.3 steps 2–4) — [file](./phase-2/2.7-federated-prekey-fetch.md)
+- [ ] **2.8** Federated envelope forwarding + per-request reachability (§3.3 step 5, §3.4) — [file](./phase-2/2.8-federated-route-reachability.md)
+
+**Client**
+- [ ] **2.9** Client federation error taxonomy: clean `closed` error + stale-hint case — [file](./phase-2/2.9-client-federation-errors.md)
+- [ ] **2.10** First-contact message-request gate (client-side, §3.5) — [file](./phase-2/2.10-message-request-gate.md)
+
+**Demo + exit gate**
+- [ ] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./phase-2/2.11-demo-two-orgs.md)
+- [ ] **2.12** Cross-org abuse + acceptance suite (the phase exit gate) — [file](./phase-2/2.12-cross-org-abuse-acceptance.md)
 
 ---
 
