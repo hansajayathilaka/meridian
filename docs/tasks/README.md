@@ -59,13 +59,31 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   (an `nm`-symbol check was **rejected** as a fake gate — measured, it passes whether the feature is on
   or off). It also caught that 1.28's own test could pass vacuously; the outcome is now pinned to
   `Rejected(Chat(BadSignature))` on the responder specifically.
-- **NEXT:** Two follow-ups **surfaced by Group E's own reviews** are filed and pending — **1.32**
+- **ALSO NOW:** **Phase 2 is picked — T06 Cross-Org Federation**, alone
+  ([phase README](./phase-2/README.md)). With Features 01-05 done the unblocked set was {06, 08, 09};
+  06 wins on the dependency DAG (Track C `02→06→07→14` — it is the sole gate on Features 07, 10 and 14
+  and transitively on 11/12/15, and it is P1) and its declared deps `T04 (T05 recommended)` are both
+  complete. **08 was rejected as a parallel pick because it *consumes* 06** — its scope pulls in the
+  message-request UX "from T06" and cross-org attestation ingest, and 1.18 already deferred desync
+  auto-recovery into it, so running the two together would race on one first-contact/trust surface.
+  **09 is genuinely parallel** (Track B, additive stream type, registry-only) but was left out on
+  sizing: 06 alone is ~3 eng-weeks of new s2s protocol + new wire contract + two-stack demo + abuse
+  suite, and bundling 09 would roughly double what Phase 3's review sweep has to cover.
+  `/plan-phase` also inherits one delegated **`TODO: confirm`** — `rendezvous-protocol-v1.md` stores a
+  prekey bundle as a single CBOR blob and defers "normalized schema + Postgres" to T06/T07; it must be
+  resolved or explicitly re-deferred.
+- **NEXT:** `/plan-phase` to break T06 into tasks. **Two Phase-1 follow-ups are still open** — **1.32**
   (relay attacks that *pass* the signature check: forged `Deliver.from`, replay, reorder,
   cross-delivery — to be folded into ADR 0016's existing mitm-sim test obligations, one thread not two)
   and **1.33** (bound the dialer's unbounded `recv_sdp` wait; availability/diagnostics only). Neither
-  is blocking: Phase 2's gate (F1, F2, F3, F10, F11) was already fully satisfied by Group D, and both
-  are should-fix/nit class. **Decision for the user:** fold 1.32/1.33 into Phase 1 before closing it,
-  or defer them and run `/pick-next-phase` to start **Phase 2 (T06 Cross-Org Federation)** now. Phase 1
+  blocks Phase 2's gate (F1, F2, F3, F10, F11 — already fully satisfied by Group D) and both are
+  should-fix/nit class, **but both sit on exactly the code T06 extends**: 06 turns the single-hop route
+  into a two-hop cross-trust-boundary route where the *foreign* server asserts `from` (so 1.32's
+  decisions about `from`-attestation, replay windows and de-dup would otherwise be made with no
+  adversarial harness in hand, then retrofitted), and 06's "a `closed`-policy org rejects inbound
+  federation with a **clean client-side error**" criterion is precisely the case 1.33's unbounded wait
+  turns into a hang. **Recommendation: close 1.32 and 1.33 before the first Phase 2 task that touches
+  s2s routing or signaling.** They stay numbered under Phase 1 (they are Phase-1 findings); Phase 1
   cannot be marked fully `[x]` while they are open.
 - Phase 1's other exit criteria are met: tree green (`cargo test --workspace` 45 suites / 0 failures,
   `cargo clippy --workspace --all-targets -D warnings` clean), all four invariant lints + their
@@ -132,6 +150,16 @@ design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 **Group E follow-ups — surfaced by Group E's own reviews** (not in the original Group E set)
 - [ ] **1.32** Relay attacks that PASS the envelope signature check (from-spoof / replay / reorder / cross-delivery; from 1.28's security review, fold into [ADR 0016](../adr/0016-envelope-deniability.md)'s test obligations) — [file](./phase-1/1.32-relay-attacks-past-signature.md)
 - [ ] **1.33** Bound the dialer's wait for an answer in `recv_sdp` (availability/diagnostics; from 1.28) — [file](./phase-1/1.33-bound-answer-wait.md)
+
+### Phase 2 — Cross-Org Federation · **planning** · [details](./phase-2/README.md)
+Build phase. **[T06 — Cross-Org Federation](../architecture/features/06-cross-org-federation.md)**
+alone: s2s mTLS (WebPKI + private-CA), federated prekey fetch + envelope forwarding on the strict
+`client → own server → foreign server → client` invariant, DNS-SRV **and** static-map discovery,
+`open | allowlist | closed` policy, federation-edge rate limits, the first-contact message-request
+gate, and a new `federation-protocol-v1.md` wire contract. Deps `T04 (T05 recommended)` both done;
+Phase 2's blocking gate (F1, F2, F3, F10, F11) satisfied by Phase 1 Group D. Acceptance = the §7.1
+cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery modes.
+- Tasks not yet broken down — run `/plan-phase`.
 
 ---
 
