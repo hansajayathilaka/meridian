@@ -14,6 +14,10 @@ pub mod config;
 pub mod logid;
 pub mod metrics;
 pub mod ratelimit;
+/// TEST HOOK (task 1.32): malicious-relay attacks on the routed path that pass the envelope
+/// signature check. Compiled in only under the `test-tamper-hook` cargo feature (F17).
+#[cfg(feature = "test-tamper-hook")]
+pub mod route_tamper;
 pub mod state;
 pub mod store;
 pub mod turn;

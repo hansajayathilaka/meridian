@@ -257,35 +257,47 @@ async fn handle_route(
         Ok(b) => b,
         Err(_) => return send_err(tx, frame.id, error_codes::BAD_REQUEST, "malformed").await,
     };
-    // TEST HOOK (task 1.28): actively rewrite the routed blob, simulating a compromised rendezvous
-    // mounting a relay-rewrite attack on the P2P signaling path. Compiled in only under the
-    // `test-tamper-hook` cargo feature — absent from default/release builds entirely — and gated at
-    // runtime by BOTH flags, so the bundle-substitution demo is unaffected. Note this still does not
-    // *inspect* the blob: it mutates opaque bytes, which is all a real relay can do.
-    #[cfg(feature = "test-tamper-hook")]
-    let out_blob =
-        if state.config.server.allow_test_tamper && state.config.server.allow_test_route_tamper {
-            meridian_proto::OpaqueBlob::new(crate::auth::rewrite_routed_blob(body.blob.as_bytes()))
-        } else {
-            body.blob
-        };
+    // The honest path, and the ONLY path compiled into a default/release build: exactly one
+    // `Deliver`, to the requested recipient, carrying the client's bytes unaltered, with `from` set
+    // to the key this connection authenticated as. The blob is never *inspected* — it stays opaque.
     #[cfg(not(feature = "test-tamper-hook"))]
-    let out_blob = body.blob;
+    let delivered = match deliver_one(state, &body.to, *account_pub, body.blob.0) {
+        Some(ok) => ok,
+        None => return send_err(tx, frame.id, error_codes::BAD_REQUEST, "encode failed").await,
+    };
 
-    // Build the delivery frame without ever *inspecting* the blob's contents — and, outside the
-    // cfg-gated test hook above, without altering them either. It stays opaque.
-    let deliver = Deliver {
-        from: *account_pub,
-        blob: out_blob,
+    // TEST HOOKS (tasks 1.28 + 1.32): a compromised rendezvous mounting the relay attacks it can
+    // actually mount — rewriting a blob in transit (1.28), and the key-material-free attacks that
+    // pass the envelope signature check because they never touch the bytes: forging `Deliver.from`,
+    // replay, reorder, drop, cross-delivery (1.32). Compiled in only under the `test-tamper-hook`
+    // cargo feature — absent from default/release builds entirely (the block above is what ships) —
+    // and gated at runtime by the umbrella flags plus each attack's own flag, so the
+    // bundle-substitution demo is unaffected. Note the hook still never *inspects* the blob: it
+    // moves, duplicates, withholds and (for 1.28) mutates opaque bytes, which is all a real relay
+    // can do. With every mode flag off, `plan` is the identity and this is byte-for-byte the honest
+    // path above.
+    #[cfg(feature = "test-tamper-hook")]
+    let delivered = {
+        let plan =
+            state
+                .route_tamper
+                .plan(&state.config.server, body.to, *account_pub, body.blob.0);
+        let mut delivered = false;
+        for d in plan.deliveries {
+            match deliver_one(state, &d.to, d.from, d.blob) {
+                Some(ok) => delivered |= ok,
+                None => {
+                    return send_err(tx, frame.id, error_codes::BAD_REQUEST, "encode failed").await
+                }
+            }
+        }
+        // A drop/reorder hook that withheld the blob still acks it as delivered, if the recipient is
+        // in fact connected — that is the lie a real dropping relay tells, and a client's security
+        // must not depend on being able to distinguish it from a true delivery.
+        delivered || (plan.claim_delivered && state.registry.is_connected(&body.to))
     };
-    let Ok(frame_out) = Frame::new(Op::Deliver, 0, &deliver) else {
-        return send_err(tx, frame.id, error_codes::BAD_REQUEST, "encode failed").await;
-    };
-    let Ok(bytes) = frame_out.to_bytes() else {
-        return send_err(tx, frame.id, error_codes::BAD_REQUEST, "encode failed").await;
-    };
-    if state.registry.send_to(&body.to, Message::Binary(bytes)) {
-        state.metrics.envelope_routed();
+
+    if delivered {
         send(tx, Op::RouteOk, frame.id, &RouteOk { delivered: true }).await;
     } else {
         // Offline delivery / mailbox is T07; here an offline recipient is an error.
@@ -296,6 +308,31 @@ async fn handle_route(
             "recipient offline",
         )
         .await;
+    }
+}
+
+/// Encode one `Deliver` and push it to every live connection for `to`. `Some(true)` if at least one
+/// connection took it, `Some(false)` if the recipient is offline, `None` if encoding failed.
+///
+/// `from` and `blob` are parameters rather than being read from the request precisely so the
+/// cfg-gated test hook can pass forged/duplicated/withheld values through the *same* code path a
+/// real delivery takes — the hook decides *which* triples to emit, never how they are emitted.
+fn deliver_one(
+    state: &Arc<AppState>,
+    to: &[u8; 32],
+    from: [u8; 32],
+    blob: Vec<u8>,
+) -> Option<bool> {
+    let deliver = Deliver {
+        from,
+        blob: meridian_proto::OpaqueBlob::new(blob),
+    };
+    let bytes = Frame::new(Op::Deliver, 0, &deliver).ok()?.to_bytes().ok()?;
+    if state.registry.send_to(to, Message::Binary(bytes)) {
+        state.metrics.envelope_routed();
+        Some(true)
+    } else {
+        Some(false)
     }
 }
 

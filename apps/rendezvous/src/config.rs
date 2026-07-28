@@ -29,13 +29,37 @@ pub struct Server {
     /// not merely gated at runtime, F17). This flag stays present (harmlessly inert) without the
     /// feature so downstream config/test plumbing that merely sets it keeps compiling.
     pub allow_test_tamper: bool,
-    /// TEST HOOK (task 1.28): actively **rewrite routed blobs in transit** — the malicious-relay
-    /// attack that `allow_test_tamper`'s bundle substitution does not cover. Like that flag, the
-    /// rewrite logic only exists under the `test-tamper-hook` cargo feature, and this is an
-    /// *additional* gate on top of `allow_test_tamper`: both must be true. Separate from
-    /// `allow_test_tamper` on purpose — the bundle-substitution demo (`fetch-bundle --tamper`) must
-    /// keep working without every routed envelope also being corrupted.
+    /// TEST HOOK (tasks 1.28 + 1.32): the **umbrella** gate for tampering with the *routed* path —
+    /// the malicious-relay attacks that `allow_test_tamper`'s bundle substitution does not cover.
+    /// Like that flag, none of the logic exists at all without the `test-tamper-hook` cargo
+    /// feature, and this is an *additional* gate on top of `allow_test_tamper`: both must be true.
+    /// Separate from `allow_test_tamper` on purpose — the bundle-substitution demo
+    /// (`fetch-bundle --tamper`) must keep working without every routed envelope also being
+    /// corrupted.
+    ///
+    /// On its own this flag does nothing: since 1.32 each attack has its own `allow_test_route_*`
+    /// mode flag below, and at least one must also be set. (Before 1.32 this flag *was* the
+    /// in-transit rewrite; that attack is now `allow_test_route_rewrite`. The change is in the
+    /// fail-closed direction — an old config that set only this flag now tampers with nothing.)
     pub allow_test_route_tamper: bool,
+    /// TEST HOOK (task 1.28): actively **rewrite a routed blob in transit** (flip one byte inside
+    /// the opaque payload). Requires the umbrella gate above. Provably stopped at the envelope
+    /// signature — see [`crate::auth::rewrite_routed_blob`].
+    pub allow_test_route_rewrite: bool,
+    /// TEST HOOK (task 1.32): forge `Deliver.from`. The server asserts that field itself, so
+    /// forging it needs no key material and passes the envelope signature check untouched.
+    pub allow_test_route_spoof_from: bool,
+    /// TEST HOOK (task 1.32): re-deliver a routed blob a second time, byte-identical.
+    pub allow_test_route_replay: bool,
+    /// TEST HOOK (task 1.32): swallow each sender's first routed blob while still replying
+    /// `route_ok{delivered:true}` — the lie a dropping relay tells.
+    pub allow_test_route_drop: bool,
+    /// TEST HOOK (task 1.32): hold one blob back and release it *behind* the next one (a delay is
+    /// the degenerate case). Nothing is lost — a pure permutation.
+    pub allow_test_route_reorder: bool,
+    /// TEST HOOK (task 1.32): deliver a valid envelope captured from one session to a *different*
+    /// recipient, with its original `from` intact.
+    pub allow_test_route_cross_deliver: bool,
     /// SQLite/sqlx URL, used only with the `sqlite` feature; ignored by the in-memory default.
     pub database_url: String,
 }
@@ -109,6 +133,12 @@ impl Default for Server {
             invite_tokens: Vec::new(),
             allow_test_tamper: false,
             allow_test_route_tamper: false,
+            allow_test_route_rewrite: false,
+            allow_test_route_spoof_from: false,
+            allow_test_route_replay: false,
+            allow_test_route_drop: false,
+            allow_test_route_reorder: false,
+            allow_test_route_cross_deliver: false,
             database_url: "sqlite://rendezvous.db".into(),
         }
     }

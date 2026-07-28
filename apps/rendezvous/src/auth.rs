@@ -124,17 +124,24 @@ pub fn substitute_bundle(original: &PrekeyBundle) -> PrekeyBundle {
 ///   either signed or is the signature, and any single-byte mutation must fail CBOR decode or
 ///   `verify`. A rewrite that *survives* the signature check is unreachable for this server anyway:
 ///   no `meridian-envelope` dependency, no sender identity key, no ratchet state.
-/// * Strictly stronger relay attacks exist and are covered elsewhere or open: bundle substitution
+/// * Strictly stronger relay attacks exist and are **all now covered**: bundle substitution
 ///   ([`substitute_bundle`], right above — the server ends up holding real ratchet state with both
 ///   peers) → `tampered_bundle_is_rejected` + T08; transport-level fingerprint MITM →
-///   `p2p_session.rs::fingerprint_mismatch_tears_down`; and **open**: a forged `Deliver.from` (the
-///   server asserts that field itself, so forging it is free) plus **replay / reorder / drop /
-///   cross-delivery**, none of which need key material and all of which *pass* the signature check
-///   and probe deeper. Those are recorded as a follow-up in task 1.28's file rather than folded in
-///   here, since this hook's deliverable is specifically an in-transit *rewrite*.
+///   `p2p_session.rs::fingerprint_mismatch_tears_down`; and the key-material-free attacks that
+///   *pass* the signature check because they never touch the bytes — a forged `Deliver.from` (the
+///   server asserts that field itself, so forging it is free), **replay / reorder / drop /
+///   cross-delivery** — which task **1.32** added as their own modes in
+///   [`crate::route_tamper`], driven by `apps/cli/tests/relay_attacks.rs`. Those are the ones that
+///   probe deeper: the forged origin reaches `ChatError::SenderMismatch`, the replay reaches the
+///   ratchet, the cross-delivery reaches the X3DH prekey lookup.
+/// * Still out of reach for *any* server-side hook, by construction: mutating the X3DH preamble
+///   (`used_opk`/`used_spk`) is mutating signed bytes and needs envelope types this crate does not
+///   have. ADR 0016's obligations for it are discharged client-side, in
+///   `apps/core/tests/preamble_mutation.rs`.
 ///
 /// Compiled in only under the `test-tamper-hook` cargo feature (off by default, absent from release
-/// binaries — F17); additionally gated at runtime by `allow_test_tamper && allow_test_route_tamper`.
+/// binaries — F17); additionally gated at runtime by `allow_test_tamper && allow_test_route_tamper`
+/// (the umbrella) **and** `allow_test_route_rewrite` (this attack's own mode flag, added by 1.32).
 #[cfg(feature = "test-tamper-hook")]
 pub fn rewrite_routed_blob(original: &[u8]) -> Vec<u8> {
     let mut out = original.to_vec();

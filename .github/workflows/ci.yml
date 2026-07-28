@@ -57,6 +57,10 @@ jobs:
       # This package-scoped run with default features is the only invocation under which the
       # tamper-hook inertness guards execute at all. Before it existed,
       # `tamper_flag_is_inert_without_feature` (task 1.12) had never run in CI.
+      # NOTE: this step needs no change as guards are added — it is package-scoped and runs the whole
+      # default-feature test binary, so task 1.32's per-mode inertness tests
+      # (route_{spoof_from,replay,reorder,drop,cross_deliver}_is_inert_without_feature and
+      # all_route_modes_are_inert_without_feature) are picked up automatically.
       - name: Tamper-hook compile-gate guards (default features only — see comment)
         run: cargo test -p meridian-rendezvous
       # F17, checked at the level that actually decides it: feature *resolution*. A release/normal
