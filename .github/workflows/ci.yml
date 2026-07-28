@@ -57,8 +57,28 @@ jobs:
       # This package-scoped run with default features is the only invocation under which the
       # tamper-hook inertness guards execute at all. Before it existed,
       # `tamper_flag_is_inert_without_feature` (task 1.12) had never run in CI.
+      # NOTE: this step needs no change as guards are added — it is package-scoped and runs the whole
+      # default-feature test binary, so task 1.32's per-mode inertness tests
+      # (route_{spoof_from,replay,reorder,drop,cross_deliver}_is_inert_without_feature and
+      # all_route_modes_are_inert_without_feature) are picked up automatically.
       - name: Tamper-hook compile-gate guards (default features only — see comment)
         run: cargo test -p meridian-rendezvous
+      # The MIRROR of the step above, and just as load-bearing. The runtime-gate tests — the
+      # `route_tamper` unit tests, `umbrella_flag_alone_arms_no_attack`, and
+      # `route_tamper_requires_its_own_flag_not_just_allow_test_tamper` — are all
+      # #[cfg(feature = "test-tamper-hook")], so they are compiled OUT of the default-features step
+      # above. Without this step they would execute only as a SIDE EFFECT of resolver-2 unification
+      # under `cargo test --workspace`, via apps/cli's dev-dependency feature pin. That is the same
+      # accidental coupling task 1.28's review flagged as a hazard, load-bearing in the other
+      # direction: dropping that pin (the hygienic thing to do) would silently stop running every
+      # runtime-gate test everywhere — `-p` with default features compiles them out, `--workspace`
+      # runs them TODAY only via that dev-dep accident, and mitm-sim's filtered invocation skips
+      # them. (Stated precisely because it is checkable: right now `cargo test --workspace` does run
+      # them. A reader who checks a sloppier claim, finds it false, and concludes this step is stale
+      # might delete it — which is exactly the regression it exists to prevent.) Feature-on coverage
+      # must not depend on a dev-dep.
+      - name: Tamper-hook runtime-gate tests (feature ON — see comment)
+        run: cargo test -p meridian-rendezvous --features test-tamper-hook
       # F17, checked at the level that actually decides it: feature *resolution*. A release/normal
       # build must not activate `test-tamper-hook`, even though apps/cli's DEV-dependency pins it —
       # resolver 2 is what keeps dev-dep features out of the normal graph, and this step fails if

@@ -150,6 +150,12 @@ rather than a normalized schema — *"TODO: confirm normalized schema + Postgres
 - [ ] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./2.11-demo-two-orgs.md)
 - [ ] **2.12** Cross-org abuse + acceptance suite (the phase exit gate) — [file](./2.12-cross-org-abuse-acceptance.md)
 
+**Carried in from Phase 1** — not T06 work, and not on the DAG below. A production defect surfaced by
+[1.32](../phase-1/1.32-relay-attacks-past-signature.md) and confirmed by its security review: it lands
+here because it needs fixing, not because Feature 06 depends on it. It is independent of every task
+above and can run at any point in the phase.
+- [ ] **2.13** A replayed envelope permanently wedges the receiving ratchet — [file](./2.13-ratchet-replay-dos.md)
+
 ### Dependency order
 ```
 1.32 ─┬─► 2.1 ─► 2.2 ─┬─► 2.3 ─┐

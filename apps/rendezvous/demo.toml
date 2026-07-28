@@ -9,7 +9,10 @@ domain = "localhost"
 bind = "0.0.0.0:8443"
 admission = "open"
 allow_test_tamper = true
-# Deliberately left OFF: this would additionally rewrite every ROUTED blob in transit (task
-# 1.28), which would break the demo's own chat/session flows rather than just the bundle fetch.
-# The 1.28 adversarial test enables it explicitly, in-process, for its own server instance only.
+# Deliberately left OFF: this is the umbrella gate for tampering with every ROUTED blob in transit
+# (rewrite, from-spoofing, replay, reorder, drop, cross-delivery — tasks 1.28 and 1.32), which would
+# break the demo's own chat/session flows rather than just the bundle fetch. The adversarial tests
+# enable it, plus exactly one attack's own mode flag, in-process, for their own server instance
+# only. The per-attack flags (allow_test_route_rewrite/_spoof_from/_replay/_drop/_reorder/
+# _cross_deliver — see rendezvous.example.toml) all default to false and are omitted here.
 allow_test_route_tamper = false

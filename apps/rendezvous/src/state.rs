@@ -85,6 +85,11 @@ pub struct AppState {
     pub turn_limiter: RateLimiter,
     /// Resolved TURN minting config (empty secret ⇒ minting disabled).
     pub turn: TurnConfig,
+    /// TEST HOOK (task 1.32): byte-level buffers for the replay/reorder/drop/cross-delivery relay
+    /// attacks. Compiled in only under the `test-tamper-hook` cargo feature — this field does not
+    /// exist in a default/release build (F17).
+    #[cfg(feature = "test-tamper-hook")]
+    pub route_tamper: crate::route_tamper::RouteTamper,
     conn_seq: AtomicU64,
 }
 
@@ -110,6 +115,8 @@ impl AppState {
             route_limiter,
             turn_limiter,
             turn,
+            #[cfg(feature = "test-tamper-hook")]
+            route_tamper: crate::route_tamper::RouteTamper::default(),
             conn_seq: AtomicU64::new(1),
         })
     }

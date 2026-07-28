@@ -89,12 +89,20 @@ bind = "127.0.0.1:8443"
 admission = "open"               # open | invite
 invite_tokens = []               # for invite admission
 allow_test_tamper = false        # TEST HOOK — must be false in production
-allow_test_route_tamper = false  # TEST HOOK — must be false in production. Actively REWRITES
-                                 # routed blobs in transit (task 1.28). Inert unless built with
-                                 # `--features test-tamper-hook`, AND additionally requires
-                                 # allow_test_tamper. Unlike allow_test_tamper it has NO
-                                 # per-request opt-in: once on it corrupts EVERY routed blob for
-                                 # EVERY user, while still replying route_ok{delivered:true}.
+allow_test_route_tamper = false  # TEST HOOK — must be false in production. UMBRELLA gate for
+                                 # tampering with the routed path (tasks 1.28 + 1.32). Inert unless
+                                 # built with `--features test-tamper-hook`, AND additionally
+                                 # requires allow_test_tamper, AND on its own arms nothing — each
+                                 # attack has its own flag below. Unlike allow_test_tamper these
+                                 # have NO per-request opt-in: once on, they affect EVERY routed
+                                 # blob for EVERY user, while still replying
+                                 # route_ok{delivered:true}.
+allow_test_route_rewrite = false      # 1.28: flip a byte inside a routed blob in transit
+allow_test_route_spoof_from = false   # 1.32: forge Deliver.from (the server asserts it itself)
+allow_test_route_replay = false       # 1.32: re-deliver a blob byte-identically
+allow_test_route_drop = false         # 1.32: swallow a blob but still ack delivered = true
+allow_test_route_reorder = false      # 1.32: release blobs out of order
+allow_test_route_cross_deliver = false # 1.32: deliver one session's envelope to the wrong recipient
 database_url = "sqlite://rendezvous.db"   # only used with the `sqlite` feature
 
 [limits]                         # anti-abuse, fixed one-minute windows

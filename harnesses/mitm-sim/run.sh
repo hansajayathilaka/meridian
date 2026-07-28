@@ -14,9 +14,11 @@
 # EARLIER than the §4.6 fingerprint cross-check, which that path never reaches. No test exists in
 # which a hostile *relay* causes §4.6 to fire, and none can by mutation: every envelope byte is
 # either signed or is the signature, so any mutation fails CBOR decode or signature verification
-# first. Fingerprint binding is proven separately, with an honest relay. Relay attacks that need no
-# key material and WOULD pass the signature check (replay, reorder, drop, cross-delivery, and a
-# forged Deliver.from) are still open — see docs/tasks/phase-1/1.28-active-relay-rewrite-test.md.
+# first. Fingerprint binding is proven separately, with an honest relay.
+# Task 1.32 ADDS the relay attacks that need no key material and DO pass the signature check because
+# they never touch the bytes — a forged Deliver.from, replay, reorder, drop, cross-delivery — plus
+# the X3DH preamble mutations ADR 0016 requires, which a relay cannot mount (no envelope types
+# server-side) and which are therefore driven client-side.
 # T08 EXTENDS this harness with the tofu/verified trust-state matrix — do not delete these cases.
 # See docs/testing/strategy.md §3 and docs/security/threat-mitigation-matrix.md.
 set -euo pipefail
@@ -46,3 +48,29 @@ cargo test -q -p meridian-cli --test relay_rewrite
 echo "[mitm-sim] OK: a rendezvous rewriting routed blobs is detected at the envelope signature"
 echo "  check (earlier than the §4.6 fingerprint check, which this path never reaches) and cannot"
 echo "  establish a session; the same flow through an honest relay does establish."
+
+# 1.32: the attacks a routing relay mounts WITHOUT touching the bytes, so the signature check waves
+# them through and they reach the ratchet — which no earlier cell does. One server-side mode flag per
+# attack (spoof_from / replay / reorder / drop / cross_deliver), each armed alone, each pinning the
+# SPECIFIC error variant on the SPECIFIC side: SenderMismatch for a forged Deliver.from, a ratchet
+# refusal for a byte-identical replay, UnknownPrekey for a cross-delivered envelope. Reorder is the
+# deliberate exception: it must SUCCEED (a permutation of authentic messages is what the ratchet's
+# skipped-key handling exists for), so that cell asserts nothing is lost or forged and proves the
+# swap really happened. Drop asserts denial stays denial — the relay lies "delivered: true" and the
+# message is simply gone. Each cell has a control through an honest relay.
+echo "[mitm-sim] relay attacks that PASS the signature check (1.32)…"
+cargo test -q -p meridian-cli --test relay_attacks
+echo "[mitm-sim] OK: forged from / replay / cross-delivery are each refused with their own"
+echo "  diagnosable error; reorder is tolerated without forgery; a dropped message stays dropped."
+
+# 1.32 + ADR 0016 test obligations: X3DH preamble mutation (used_opk -> None, used_opk -> another
+# held OTK, used_spk -> previous generation) and a forged prekey envelope claiming from = Alice.
+# NOT a relay cell by construction: meridian-rendezvous has no envelope types (lint-server-no-core),
+# so it cannot reach the preamble even in a test hook — these are driven directly against
+# ChatState::open_inbound. Each asserts all four of ADR 0016's properties: rejected at the SIGNATURE
+# specifically, OTK pool depth unchanged, no session installed, and the genuine envelope still opens
+# afterwards. That last pair is the anti-DoS property: rejection costs the recipient nothing.
+echo "[mitm-sim] X3DH preamble mutation + prekey-depletion (1.32 / ADR 0016)…"
+cargo test -q -p meridian-core --test preamble_mutation
+echo "[mitm-sim] OK: a mutated preamble is rejected before the vault is touched — no prekey burned,"
+echo "  no poisoned session, and the genuine envelope still establishes."

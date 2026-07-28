@@ -9,13 +9,22 @@ invite_tokens = []               # tokens accepted when admission = "invite"
 allow_test_tamper = false        # TEST HOOK — only takes effect when built with `--features
                                   # test-tamper-hook` (the substitution code is compiled out
                                   # otherwise). MUST be false in production.
-allow_test_route_tamper = false  # TEST HOOK (task 1.28) — actively rewrites ROUTED blobs in
-                                  # transit, to prove a malicious relay cannot get a substituted
-                                  # offer/answer accepted. Same compile gate as above, and
-                                  # additionally requires allow_test_tamper = true. Unlike
-                                  # allow_test_tamper there is NO per-request opt-in: enabling
-                                  # this corrupts EVERY routed blob for EVERY user of the
-                                  # server. MUST be false in production.
+allow_test_route_tamper = false  # TEST HOOK (tasks 1.28 + 1.32) — UMBRELLA gate for tampering with
+                                  # the ROUTED path, to prove a malicious relay cannot get anything
+                                  # accepted. Same compile gate as above, and additionally requires
+                                  # allow_test_tamper = true. On its own it does nothing: each
+                                  # attack below must also be enabled. Unlike allow_test_tamper
+                                  # there is NO per-request opt-in — enabling any of these affects
+                                  # EVERY routed blob for EVERY user of the server. All MUST be
+                                  # false in production.
+# One flag per attack. Each additionally requires allow_test_tamper AND allow_test_route_tamper
+# above, and none exists at all without `--features test-tamper-hook`. Intended one at a time.
+allow_test_route_rewrite = false      # 1.28: flip a byte inside a routed blob in transit
+allow_test_route_spoof_from = false   # 1.32: forge Deliver.from (the server asserts it itself)
+allow_test_route_replay = false       # 1.32: re-deliver a blob a second time, byte-identical
+allow_test_route_drop = false         # 1.32: swallow a blob but still reply delivered = true
+allow_test_route_reorder = false      # 1.32: release blobs out of order (a delay, generalised)
+allow_test_route_cross_deliver = false # 1.32: hand one session's envelope to the wrong recipient
 database_url = "sqlite://rendezvous.db"   # only used when built with --features sqlite
 
 [limits]                         # anti-abuse, fixed one-minute windows

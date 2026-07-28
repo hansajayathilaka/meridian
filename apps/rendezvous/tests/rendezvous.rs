@@ -143,6 +143,7 @@ async fn route_tamper_is_inert_without_feature() {
     let mut config = config_open();
     config.server.allow_test_tamper = true; // both flags "enabled" at the config layer...
     config.server.allow_test_route_tamper = true;
+    config.server.allow_test_route_rewrite = true;
     let url = spawn(config).await;
 
     let alice = new_acct("localhost");
@@ -159,6 +160,161 @@ async fn route_tamper_is_inert_without_feature() {
         msg.blob.as_bytes(),
         payload.as_slice(),
         "without the test-tamper-hook feature the route hook must not exist at all"
+    );
+}
+
+// -- F17 for the 1.32 route-attack modes -------------------------------------
+//
+// One inertness test per mode, in the same style as the two above and for the same reason: without
+// `test-tamper-hook` the whole `route_tamper` module (and `AppState::route_tamper` itself) does not
+// exist, so no config can reach it. Each test arms `allow_test_tamper + allow_test_route_tamper +`
+// its own mode flag — the maximal configuration for that attack — and asserts the delivery is
+// exactly what an honest relay produces.
+//
+// These run ONLY under `cargo test -p meridian-rendezvous` with default features; see the note on
+// `route_tamper_is_inert_without_feature` above for why `--workspace` compiles them out. That CI
+// step (added by 1.28) already covers these new tests with no change: it is package-scoped and runs
+// the whole default-feature test binary, so every `#[cfg(not(feature = ...))]` test in this file
+// executes.
+
+/// The shared shape: route two blobs Alice → Bob and require exactly those two blobs back, in order,
+/// each with `from = alice`, and nothing else. That single assertion is strong enough to catch every
+/// 1.32 mode at once — a spoofed `from`, a duplicate (replay), a swap (reorder), a missing blob
+/// (drop), and an injected foreign blob (cross-delivery) all break it.
+#[cfg(not(feature = "test-tamper-hook"))]
+async fn assert_route_hook_inert(config: Config) {
+    let url = spawn(config).await;
+    let alice = new_acct("localhost");
+    let bob = new_acct("localhost");
+    let mut bc = bob.connect(&url).await.unwrap();
+    let mut ac = alice.connect(&url).await.unwrap();
+
+    let first = vec![0x11u8, 0x22, 0x33, 0x44];
+    let second = vec![0x55u8, 0x66, 0x77, 0x88];
+    assert!(ac.route(bob.pubkey, first.clone()).await.unwrap());
+    assert!(ac.route(bob.pubkey, second.clone()).await.unwrap());
+
+    for expected in [&first, &second] {
+        let msg = bc.next_deliver().await.unwrap();
+        assert_eq!(
+            msg.from, alice.pubkey,
+            "the routing origin must be the authenticated sender — no mode flag can forge it \
+             without the test-tamper-hook feature"
+        );
+        assert_eq!(
+            msg.blob.as_bytes(),
+            expected.as_slice(),
+            "without the test-tamper-hook feature the 1.32 route hooks must not exist at all: \
+             deliveries must be the routed blobs, unaltered, in order, exactly once"
+        );
+    }
+    // Nothing extra (a replayed or cross-delivered blob would show up here).
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), bc.next_deliver())
+            .await
+            .is_err(),
+        "no third delivery may arrive — a replay or cross-delivery would appear here"
+    );
+}
+
+#[cfg(not(feature = "test-tamper-hook"))]
+fn config_route_armed() -> Config {
+    let mut config = config_open();
+    config.server.allow_test_tamper = true;
+    config.server.allow_test_route_tamper = true;
+    config
+}
+
+#[cfg(not(feature = "test-tamper-hook"))]
+#[tokio::test]
+async fn route_spoof_from_is_inert_without_feature() {
+    let mut config = config_route_armed();
+    config.server.allow_test_route_spoof_from = true;
+    assert_route_hook_inert(config).await;
+}
+
+#[cfg(not(feature = "test-tamper-hook"))]
+#[tokio::test]
+async fn route_replay_is_inert_without_feature() {
+    let mut config = config_route_armed();
+    config.server.allow_test_route_replay = true;
+    assert_route_hook_inert(config).await;
+}
+
+#[cfg(not(feature = "test-tamper-hook"))]
+#[tokio::test]
+async fn route_reorder_is_inert_without_feature() {
+    let mut config = config_route_armed();
+    config.server.allow_test_route_reorder = true;
+    assert_route_hook_inert(config).await;
+}
+
+#[cfg(not(feature = "test-tamper-hook"))]
+#[tokio::test]
+async fn route_drop_is_inert_without_feature() {
+    let mut config = config_route_armed();
+    config.server.allow_test_route_drop = true;
+    assert_route_hook_inert(config).await;
+}
+
+#[cfg(not(feature = "test-tamper-hook"))]
+#[tokio::test]
+async fn route_cross_deliver_is_inert_without_feature() {
+    let mut config = config_route_armed();
+    config.server.allow_test_route_cross_deliver = true;
+    assert_route_hook_inert(config).await;
+}
+
+/// Belt and braces: every mode flag on at once is still inert.
+#[cfg(not(feature = "test-tamper-hook"))]
+#[tokio::test]
+async fn all_route_modes_are_inert_without_feature() {
+    let mut config = config_route_armed();
+    config.server.allow_test_route_rewrite = true;
+    config.server.allow_test_route_spoof_from = true;
+    config.server.allow_test_route_replay = true;
+    config.server.allow_test_route_reorder = true;
+    config.server.allow_test_route_drop = true;
+    config.server.allow_test_route_cross_deliver = true;
+    assert_route_hook_inert(config).await;
+}
+
+/// The runtime half of the gate, WITH the feature compiled in: the umbrella flag alone (no mode
+/// flag) must still deliver honestly. This is the counterpart of
+/// `route_tamper_requires_its_own_flag_not_just_allow_test_tamper` one level down — it pins that
+/// 1.32's re-shaping of `allow_test_route_tamper` into an umbrella did not leave any attack armed
+/// by default. Unlike the tests above it runs under `--workspace` too.
+#[cfg(feature = "test-tamper-hook")]
+#[tokio::test]
+async fn umbrella_flag_alone_arms_no_attack() {
+    let mut config = config_open();
+    config.server.allow_test_tamper = true;
+    config.server.allow_test_route_tamper = true; // umbrella on, every mode flag off
+    let url = spawn(config).await;
+
+    let alice = new_acct("localhost");
+    let bob = new_acct("localhost");
+    let mut bc = bob.connect(&url).await.unwrap();
+    let mut ac = alice.connect(&url).await.unwrap();
+
+    let first = vec![0x11u8, 0x22, 0x33, 0x44];
+    let second = vec![0x55u8, 0x66, 0x77, 0x88];
+    assert!(ac.route(bob.pubkey, first.clone()).await.unwrap());
+    assert!(ac.route(bob.pubkey, second.clone()).await.unwrap());
+    for expected in [&first, &second] {
+        let msg = bc.next_deliver().await.unwrap();
+        assert_eq!(msg.from, alice.pubkey);
+        assert_eq!(
+            msg.blob.as_bytes(),
+            expected.as_slice(),
+            "the umbrella gate alone must arm no attack: every mode needs its own flag"
+        );
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), bc.next_deliver())
+            .await
+            .is_err(),
+        "no extra delivery may arrive with every mode flag off"
     );
 }
 

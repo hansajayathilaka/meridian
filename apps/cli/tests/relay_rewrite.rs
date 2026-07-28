@@ -21,8 +21,9 @@
 //! **What this does NOT cover, stated so the coverage is not overread:** a byte-level rewrite breaks
 //! the Ed25519 envelope signature, so rejection happens at the *signature* check — the ratchet AEAD
 //! and the §4.6 fingerprint cross-check are never exercised on this path. A relay's key-material-free
-//! attacks that *would* pass the signature check (replay of an earlier valid envelope, reorder, drop,
-//! cross-delivery from another session) are not exercised here; see task 1.28's file.
+//! attacks that *would* pass the signature check (a forged `Deliver.from`, replay of an earlier valid
+//! envelope, reorder, drop, cross-delivery from another session) are not exercised here — they are
+//! task **1.32**, and now live in `relay_attacks.rs` next to this file.
 //!
 //! The control case in `honest_relay_establishes_the_same_session` is load-bearing: it runs the
 //! identical flow with route-tampering off and asserts the session *does* establish. Without it, the
@@ -53,6 +54,9 @@ fn spawn_server(rewrite_routed_blobs: bool) -> String {
             let mut config = Config::default();
             config.server.allow_test_tamper = rewrite_routed_blobs;
             config.server.allow_test_route_tamper = rewrite_routed_blobs;
+            // Since 1.32 `allow_test_route_tamper` is the umbrella gate for the whole family of
+            // route attacks and each has its own mode flag; the in-transit rewrite is this one.
+            config.server.allow_test_route_rewrite = rewrite_routed_blobs;
             // Both peers connect from 127.0.0.1 in-process.
             config.limits.auth_per_ip_per_min = 1_000_000;
             let store = Arc::new(MemoryStore::new());

@@ -225,17 +225,39 @@ AAD changes the *ratchet message* construction, so `test-vectors/ratchet-v1.json
 `apps/crypto/tests/conformance.rs`. Coordinate with [task 1.6](../tasks/phase-1/1.6-conformance-vectors.md).
 
 ### Test obligations
-- **R3 / C2** → new `mitm-sim` cells: a forged prekey envelope claiming `from = Alice`, and *mutated*
-  preamble on a genuine envelope (`used_opk`→`None`, `used_opk`→another held OTK, `used_spk`→previous
-  generation). Assert decrypt fails **and** OTK pool depth unchanged **and** no session installed
-  **and** Alice's genuine envelope subsequently succeeds.
-- **C3** → an Ed25519 sign-flipped `sender_pub` case. Note a **live gap even in v1**:
-  `apps/core/tests/chat_manager.rs` covers wrong-`from` and a ciphertext byte-flip, but **not** preamble
-  mutation.
-- **R1** → a documented-by-test KCI cell. **Conflict to resolve:** the test strategy requires the
-  mitm-sim matrix show "0 silent successes", but under v2 the SPK-compromise row *will* be an attacker
-  success. Re-scope that invariant to "0 silent successes outside the enumerated accepted residuals",
-  or the harness will contradict this ADR.
+
+Task [1.32](../tasks/phase-1/1.32-relay-attacks-past-signature.md) discharged the v1-reachable ones
+(folded into a single thread with its own relay-attack cells, as this ADR asked). Status per item:
+
+- **R3 / C2 — DISCHARGED for v1** by `apps/core/tests/preamble_mutation.rs` (in the `mitm-sim`
+  harness): a forged prekey envelope claiming `from = Alice`, and *mutated* preamble on a genuine
+  envelope (`used_opk`→`None`, `used_opk`→another held OTK, `used_spk`→previous generation). Each
+  asserts all four properties — decrypt fails (pinned to `ChatError::BadSignature`, the v1 detector),
+  OTK pool depth unchanged (counted, with a positive control proving the counter is sensitive), no
+  session installed (in fact the whole `ChatState` is byte-identical), and Alice's genuine envelope
+  subsequently succeeds. The relay-mounted half of the forged-`from` case is
+  `apps/cli/tests/relay_attacks.rs::forged_deliver_from_is_rejected_as_sender_mismatch`, which drives
+  it from a real hostile rendezvous (`ChatError::SenderMismatch`).
+  **Still open for the v2 build task:** these cells pin `ChatError::BadSignature` as the detector, so
+  they fail at the v2 cutover **regardless** — the detector they name ceases to exist. They are not a
+  C2 detector today. Once re-pointed at the ratchet AEAD they *become* one: a v2 without C2
+  (commit-on-successful-decrypt) fails their OTK-depth and byte-identical-state assertions, because
+  the OTK would be consumed and the session installed before the AEAD failed. Re-point, never delete.
+- **C3 — OPEN (v2).** The Ed25519 sign-flipped `sender_pub` case is a v2 property: under v1 the
+  signature covers `sender_pub`, so a flip is caught trivially, and the case only becomes meaningful
+  once the AAD carries the raw Ed25519 encodings. The **live gap in v1** this item recorded —
+  `apps/core/tests/chat_manager.rs` covering wrong-`from` and a ciphertext byte-flip but **not**
+  preamble mutation — is now closed by `preamble_mutation.rs` above.
+- **R1 — OPEN (v2).** The documented-by-test KCI cell lands with envelope v2. The **conflict is
+  resolved**: [testing/strategy.md](../testing/strategy.md) and
+  [threat-mitigation-matrix.md](../security/threat-mitigation-matrix.md) now say "0 silent successes
+  **outside the enumerated accepted residuals**", so the harness no longer contradicts this ADR. The
+  wording is deliberately not weaker: "enumerated" means listed as an accepted residual **in this
+  ADR** or in [threat-model.md §1.3](../security/threat-model.md) — not "in any ADR", which is an
+  open set a future decision could quietly extend. The exception is **not live under envelope v1**:
+  no enumerated residual applies to that matrix today, so the current requirement is 0 silent
+  successes, unqualified. Extending the enumerated list requires a new ADR with security-reviewer
+  sign-off; the list is not to be extended to make a harness go green.
 - **§4.6 unchanged** → `apps/transport/tests/webrtc_backend.rs`'s tampered-fingerprint test must stay
   green across the v2 cutover; that is the evidence that dropping the signature is a no-op for
   fingerprint binding.
