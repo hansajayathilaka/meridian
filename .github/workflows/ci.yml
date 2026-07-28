@@ -63,6 +63,18 @@ jobs:
       # all_route_modes_are_inert_without_feature) are picked up automatically.
       - name: Tamper-hook compile-gate guards (default features only — see comment)
         run: cargo test -p meridian-rendezvous
+      # The MIRROR of the step above, and just as load-bearing. The runtime-gate tests — the
+      # `route_tamper` unit tests, `umbrella_flag_alone_arms_no_attack`, and
+      # `route_tamper_requires_its_own_flag_not_just_allow_test_tamper` — are all
+      # #[cfg(feature = "test-tamper-hook")], so they are compiled OUT of the default-features step
+      # above. Without this step they would execute only as a SIDE EFFECT of resolver-2 unification
+      # under `cargo test --workspace`, via apps/cli's dev-dependency feature pin. That is the same
+      # accidental coupling task 1.28's review flagged as a hazard, load-bearing in the other
+      # direction: dropping that pin (the hygienic thing to do) would silently stop running every
+      # runtime-gate test everywhere — --workspace and -p both compile them out, and mitm-sim's
+      # filtered invocation skips them. Feature-on coverage must not depend on a dev-dep.
+      - name: Tamper-hook runtime-gate tests (feature ON — see comment)
+        run: cargo test -p meridian-rendezvous --features test-tamper-hook
       # F17, checked at the level that actually decides it: feature *resolution*. A release/normal
       # build must not activate `test-tamper-hook`, even though apps/cli's DEV-dependency pins it —
       # resolver 2 is what keeps dev-dep features out of the normal graph, and this step fails if

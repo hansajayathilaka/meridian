@@ -41,6 +41,21 @@
 //! Modes compose (they are applied in a fixed order below), but they are **intended to be used one
 //! at a time**: each harness cell turns on exactly one, so the outcome it asserts is attributable to
 //! that attack and not to an interaction.
+//!
+//! # What the buffers below are, in "must never" terms
+//!
+//! Replay, reorder/drop and cross-delivery all need the server to *hold on to* routed bytes. So the
+//! state in this module retains routed ciphertext and raw account keys, process-wide, unbounded,
+//! never cleared, and **spanning accounts** — precisely the who-talks-to-whom materialization and
+//! the retention behaviour that the
+//! [anonymity-model](../../../.claude/skills/anonymity-model/SKILL.md) "must never" list forbids a
+//! Meridian server to have.
+//!
+//! That is tolerable here for exactly one reason: this module **cannot exist in a release build**.
+//! It is not a runtime-disabled feature, it is absent code. If this is ever promoted to a runtime
+//! flag, or the `#[cfg]` on the module is relaxed so the buffers can be reached by configuration
+//! alone, that is a **defect, not a test hook** — the "must never" list has no test-mode exemption.
+//! Any change in that direction needs security-reviewer sign-off before it lands.
 
 use std::collections::HashSet;
 use std::sync::Mutex;

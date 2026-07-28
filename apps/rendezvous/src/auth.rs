@@ -124,7 +124,8 @@ pub fn substitute_bundle(original: &PrekeyBundle) -> PrekeyBundle {
 ///   either signed or is the signature, and any single-byte mutation must fail CBOR decode or
 ///   `verify`. A rewrite that *survives* the signature check is unreachable for this server anyway:
 ///   no `meridian-envelope` dependency, no sender identity key, no ratchet state.
-/// * Strictly stronger relay attacks exist and are **all now covered**: bundle substitution
+/// * Strictly stronger relay attacks exist and are all now covered **on the routing path**: bundle
+///   substitution
 ///   ([`substitute_bundle`], right above — the server ends up holding real ratchet state with both
 ///   peers) → `tampered_bundle_is_rejected` + T08; transport-level fingerprint MITM →
 ///   `p2p_session.rs::fingerprint_mismatch_tears_down`; and the key-material-free attacks that
@@ -134,6 +135,18 @@ pub fn substitute_bundle(original: &PrekeyBundle) -> PrekeyBundle {
 ///   [`crate::route_tamper`], driven by `apps/cli/tests/relay_attacks.rs`. Those are the ones that
 ///   probe deeper: the forged origin reaches `ChatError::SenderMismatch`, the replay reaches the
 ///   ratchet, the cross-delivery reaches the X3DH prekey lookup.
+/// * **Not modelled** — key-material-free attacks by this same adversary that no hook here covers,
+///   listed so "covered on the routing path" is not misread as "covered". (1) **Stale-bundle
+///   replay on the FETCH path:** `PrekeyBundle` carries `v` but no timestamp or generation counter,
+///   so a malicious server can serve a correctly-signed *old* bundle forever and the fetcher cannot
+///   detect it — pinning a victim to a never-rotating SPK, which is the compensating control ADR
+///   0016 C1/R1 leans on. Arguably a spec gap, not only a test gap. (2) **Same OTK to many
+///   fetchers:** `get_bundle` never consumes an OTK, so one one-time prekey can be handed to every
+///   fetcher; single-use is enforced only at the responder's vault, so every initiator after the
+///   first gets `UnknownPrekey` — an unattributable targeted DoS that looks like a crypto fault.
+///   (3) **Reflection:** no mode echoes a blob back to its own sender. (4) **Selective per-device
+///   delivery**, splitting a multi-device user's view. (5) **Skipped-key exhaustion** (ADR 0016 R2)
+///   and (6) **delay past the SPK grace window**, which reorder does not reach.
 /// * Still out of reach for *any* server-side hook, by construction: mutating the X3DH preamble
 ///   (`used_opk`/`used_spk`) is mutating signed bytes and needs envelope types this crate does not
 ///   have. ADR 0016's obligations for it are discharged client-side, in

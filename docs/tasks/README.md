@@ -210,6 +210,9 @@ cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery 
 - [ ] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./phase-2/2.11-demo-two-orgs.md)
 - [ ] **2.12** Cross-org abuse + acceptance suite (the phase exit gate) — [file](./phase-2/2.12-cross-org-abuse-acceptance.md)
 
+**Carried in from Phase 1** (production defect surfaced by 1.32; not part of T06)
+- [ ] **2.13** A replayed envelope permanently wedges the receiving ratchet (`Ratchet::decrypt` commits `ckr`/`nr` before `aead_open` and never rolls back — unauthenticated permanent session DoS) — [file](./phase-2/2.13-ratchet-replay-dos.md)
+
 ---
 
 ## Legend / how to read

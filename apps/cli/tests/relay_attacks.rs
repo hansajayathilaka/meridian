@@ -422,6 +422,36 @@ async fn reordered_delivery_is_tolerated_without_forgery() {
     assert_eq!(a.body(), Some("second"));
     assert_eq!(b.body(), Some("first"));
     assert!(bob.chat.has_session(&alice_ik));
+
+    // A permutation must not DUPLICATE. Without this, a hook that reordered *and* replayed would
+    // satisfy every assertion above (both blobs opened, order swapped) and this cell would go green
+    // on an attack it does not model. Mirrors the same tail in the drop and cross-deliver cells.
+    assert!(
+        matches!(bob.recv().await, Received::Nothing),
+        "a reorder must permute deliveries, never add one: a third delivery means the relay \
+         duplicated a blob, which is the replay attack and is asserted separately."
+    );
+
+    // ...and must not WEDGE the session. The swap leaves msg 1 opened from the skipped-key store —
+    // the only cell in this suite that exercises that path — so the receiving chain's head is now
+    // ahead of a message that was opened out of band. A SECOND round proves the ratchet recovered
+    // rather than merely survived the two it was handed. This is deliberately pinned here because
+    // the replay cell measured the adjacent NEGATIVE result (see its UNRESOLVED FINDING: one
+    // duplicate permanently poisons the chain), and the contrast is the point — reorder is
+    // tolerated, replay currently is not.
+    //
+    // It takes a *pair*, not a single message: the mode holds one blob and releases it behind the
+    // next, so a lone msg 3 would sit in the hook's buffer and this would assert a hook property,
+    // not a ratchet one.
+    alice.send(bob_ik, 3, "third").await;
+    alice.send(bob_ik, 4, "fourth").await;
+    let (c, d) = (bob.recv().await, bob.recv().await);
+    assert_eq!(
+        (c.body(), d.body()),
+        (Some("fourth"), Some("third")),
+        "after a tolerated reorder the session must keep working: a second reordered pair must \
+         still open, both messages, correct bodies. Got {c:?} / {d:?}"
+    );
 }
 
 // -- 4. drop ------------------------------------------------------------------

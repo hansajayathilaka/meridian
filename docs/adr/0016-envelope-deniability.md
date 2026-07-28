@@ -238,9 +238,11 @@ Task [1.32](../tasks/phase-1/1.32-relay-attacks-past-signature.md) discharged th
   subsequently succeeds. The relay-mounted half of the forged-`from` case is
   `apps/cli/tests/relay_attacks.rs::forged_deliver_from_is_rejected_as_sender_mismatch`, which drives
   it from a real hostile rendezvous (`ChatError::SenderMismatch`).
-  **Still open for the v2 build task:** these cells pin the *signature* as the detector, so v2 must
-  re-point them at the ratchet AEAD — and they are precisely the cells that will fail if C2
-  (commit-on-successful-decrypt) is not implemented. Re-point, never delete.
+  **Still open for the v2 build task:** these cells pin `ChatError::BadSignature` as the detector, so
+  they fail at the v2 cutover **regardless** — the detector they name ceases to exist. They are not a
+  C2 detector today. Once re-pointed at the ratchet AEAD they *become* one: a v2 without C2
+  (commit-on-successful-decrypt) fails their OTK-depth and byte-identical-state assertions, because
+  the OTK would be consumed and the session installed before the AEAD failed. Re-point, never delete.
 - **C3 — OPEN (v2).** The Ed25519 sign-flipped `sender_pub` case is a v2 property: under v1 the
   signature covers `sender_pub`, so a flip is caught trivially, and the case only becomes meaningful
   once the AAD carries the raw Ed25519 encodings. The **live gap in v1** this item recorded —
@@ -250,8 +252,12 @@ Task [1.32](../tasks/phase-1/1.32-relay-attacks-past-signature.md) discharged th
   resolved**: [testing/strategy.md](../testing/strategy.md) and
   [threat-mitigation-matrix.md](../security/threat-mitigation-matrix.md) now say "0 silent successes
   **outside the enumerated accepted residuals**", so the harness no longer contradicts this ADR. The
-  wording is deliberately not weaker: "enumerated" means listed as an accepted residual here or in
-  the threat model, and the list is not to be extended to make a harness go green.
+  wording is deliberately not weaker: "enumerated" means listed as an accepted residual **in this
+  ADR** or in [threat-model.md §1.3](../security/threat-model.md) — not "in any ADR", which is an
+  open set a future decision could quietly extend. The exception is **not live under envelope v1**:
+  no enumerated residual applies to that matrix today, so the current requirement is 0 silent
+  successes, unqualified. Extending the enumerated list requires a new ADR with security-reviewer
+  sign-off; the list is not to be extended to make a harness go green.
 - **§4.6 unchanged** → `apps/transport/tests/webrtc_backend.rs`'s tampered-fingerprint test must stay
   green across the v2 cutover; that is the evidence that dropping the signature is a no-op for
   fingerprint binding.
