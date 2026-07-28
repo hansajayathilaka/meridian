@@ -13,8 +13,11 @@
 //!   is free. Probes `ChatError::SenderMismatch`.
 //! * **`replay`** — re-deliver a previously-delivered blob, byte-identical.
 //! * **`reorder`** / **`drop`** — hold blobs and emit them out of order, or withhold one entirely
-//!   while still replying `route_ok{delivered:true}`. (A *delay* is the degenerate case of a
-//!   reorder, so it gets no separate flag.)
+//!   while still replying `route_ok{delivered:true}`. (A *delay* is the degenerate case of a reorder
+//!   **for ordering**, so it gets no separate flag: to a ratchet, a delayed-but-in-order message is
+//!   indistinguishable from an honest one. That is not the same as saying delay is covered — a delay
+//!   long enough to cross `PREV_GENERATION_GRACE_SECS` is a *distinct* attack on prekey aging, and it
+//!   is **not** covered here. See frontier item 6 in `harnesses/mitm-sim/README.md`.)
 //! * **`cross_deliver`** — take a valid envelope captured from one session and hand it to a
 //!   *different* recipient.
 //!

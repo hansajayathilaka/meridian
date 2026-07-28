@@ -300,6 +300,12 @@ async fn forged_deliver_from_is_rejected_as_sender_mismatch() {
         !bob.chat.has_session(&alice_ik),
         "a rejected envelope must install NO session (fail closed)"
     );
+    // COUPLED, DELIBERATELY: this recomputes the hook's forging scheme (`spoofed[0] ^= 0x01`) from
+    // `meridian_rendezvous::route_tamper::RouteTamper::plan`. Keep the two in step — if the hook ever
+    // flips a different byte and this is not updated, the assertion silently goes vacuous: it would
+    // assert the absence of a session under a key nobody ever claimed, which is trivially true.
+    // (The coupling-free alternative — "no session under ANY key" — would need a `session_count()`
+    // accessor on `ChatState`, i.e. new public API, which task 1.32's `Out:` puts out of scope.)
     assert!(
         !bob.chat.has_session(&{
             let mut spoofed = alice_ik;

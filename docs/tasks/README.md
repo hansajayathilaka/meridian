@@ -94,25 +94,47 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   the first consumer a normalized schema would have. And `lint-server-no-core.sh` is a crate-**name**
   allowlist, so federation lives *inside* `apps/rendezvous/` with shared types in `apps/proto/`; a
   `meridian-federation` crate would fail the lint without touching core.
-- **NEXT:** `/next-task`. The first unblocked work is **1.32** (the hard gate — see below), and in
-  parallel **1.33**, **2.5** (discovery) and **2.10** (message-request gate), which have no
-  dependencies. **Two Phase-1 follow-ups are still open** — **1.32**
-  (relay attacks that *pass* the signature check: forged `Deliver.from`, replay, reorder,
-  cross-delivery — to be folded into ADR 0016's existing mitm-sim test obligations, one thread not two)
-  and **1.33** (bound the dialer's unbounded `recv_sdp` wait; availability/diagnostics only). Neither
-  blocks Phase 2's gate (F1, F2, F3, F10, F11 — already fully satisfied by Group D) and both are
-  should-fix/nit class, **but both sit on exactly the code T06 extends**: 06 turns the single-hop route
-  into a two-hop cross-trust-boundary route where the *foreign* server asserts `from` (so 1.32's
-  decisions about `from`-attestation, replay windows and de-dup would otherwise be made with no
-  adversarial harness in hand, then retrofitted), and 06's "a `closed`-policy org rejects inbound
-  federation with a **clean client-side error**" criterion is precisely the case 1.33's unbounded wait
-  turns into a hang. **Planning hardened this from a recommendation into a dependency: 1.32 is now a
-  hard gate on 2.1** — its forged-`Deliver.from` cell *is* the single-hop form of the question ADR 0017
-  has to answer, and making that call with no adversarial harness in hand, then retrofitting the
-  harness onto a two-hop cross-trust-boundary path, is the expensive ordering. **1.33 gates 2.9** only
-  (it touches `apps/core/src/session.rs`, which no server task touches), so it runs in parallel.
-  They stay numbered under Phase 1 (they are Phase-1 findings); Phase 1 cannot be marked fully `[x]`
-  while they are open, and closing them also closes Phase 1.
+- **ALSO NOW:** **1.32 is done** — [PR #32](https://github.com/hansajayathilaka/meridian/pull/32).
+  **2.1 is therefore unblocked**, which was the point of running it first. The relay now has its four
+  key-material-free attacks as independently-gated server modes (`spoof_from` → `SenderMismatch`,
+  `replay` → refused at the ratchet, `reorder` → tolerated without loss/forgery/duplication, `drop` →
+  denial stays denial, `cross_deliver` → `UnknownPrekey`), plus ADR 0016's preamble-mutation cells
+  client-side. Both required reviews signed off; three findings outlive the task:
+  **(1) A production defect, filed as [2.13](./phase-2/2.13-ratchet-replay-dos.md).** One replayed
+  envelope **permanently wedges the receiving ratchet**: `Ratchet::decrypt` advances `ckr`/`nr` before
+  `aead_open` and never rolls back, so after one duplicate every subsequent genuine message from that
+  peer fails. Unauthenticated, key-material-free, permanent, mountable by any relay — and it breaks
+  *benign* duplicate delivery too, which T07's mailbox will produce with no attacker at all. Left
+  unfixed on purpose (1.32's `Out:` is production code; asserting today's behaviour would entrench
+  it) but recorded in the threat-mitigation matrix's A2/A3 rows so it survives Phase 1 being archived.
+  It is a **defect, not an accepted residual** — it contradicts threat-model goal 6.
+  **(2) The CI gate was half-unexercised, again.** The feature-**ON** tests had no deterministic
+  invocation: `-p` with default features compiles them out, mitm-sim's filtered call skips them, and
+  they ran only via resolver-2 unification through `apps/cli`'s dev-dep pin. The same accidental
+  coupling 1.28 found, load-bearing in the *other* direction — dropping that pin would have silently
+  stopped running every runtime-gate test. Now an explicit CI step. Measured proof the two runs are
+  disjoint: default-features 13 lib + 20 integration, feature-on 20 + 15.
+  **(3) Non-vacuity was re-derived, not asserted.** test-engineer neutered code and observed failure:
+  hook inert → 5 of 6 cells fail, each on its own attack-specific assertion; the `SenderMismatch`
+  check deleted → exactly one fails; the signature check stubbed → all 4 preamble cells fail with the
+  OTK consumed and a poisoned session installed (ADR 0016's C2 exposure, measured); and with the
+  error-class pin *also* loosened they **still** fail, on the OTK-depth and no-session assertions — so
+  the three anti-DoS properties are independently load-bearing.
+  Scope correction recorded rather than papered over: *delay* needs no flag (a delayed-but-in-order
+  message is indistinguishable from an honest one); the one observable delay attack is aging past the
+  SPK grace window, now named as uncovered in the harness frontier list — along with stale-bundle
+  replay on the fetch path, same-OTK-to-many-fetchers, reflection, per-device delivery and
+  skipped-key exhaustion.
+- **NEXT:** `/next-task`. Unblocked now: **2.1** (ADR 0017 — federation trust boundary, the gate on
+  every task that shapes s2s bytes), and in parallel **1.33**, **2.5** (discovery), **2.10**
+  (message-request gate) and **2.13** (the ratchet defect above), none of which have dependencies.
+  **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
+  availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
+  by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
+  inbound federation with a **clean client-side error**" criterion is precisely the case an unbounded
+  wait turns into a hang. **1.33 gates 2.9** only (it touches `apps/core/src/session.rs`, which no
+  server task touches), so it runs in parallel. It stays numbered under Phase 1 (it is a Phase-1
+  finding); Phase 1 cannot be marked fully `[x]` while it is open, and closing it closes Phase 1.
 - Phase 1's other exit criteria are met: tree green (`cargo test --workspace` 45 suites / 0 failures,
   `cargo clippy --workspace --all-targets -D warnings` clean), all four invariant lints + their
   selftests pass, docs synced (`tools/check-docs.sh`, 1222 links, none broken).
@@ -176,7 +198,7 @@ design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 - [x] **1.31** Prekey-bundle republish/fetch race on reconnect (on-the-fly, found during 1.27's live-rig verification; not part of F11's closure) — [file](./phase-1/1.31-prekey-bundle-republish-race.md)
 
 **Group E follow-ups — surfaced by Group E's own reviews** (not in the original Group E set)
-- [~] **1.32** Relay attacks that PASS the envelope signature check (from-spoof / replay / reorder / cross-delivery; from 1.28's security review, fold into [ADR 0016](../adr/0016-envelope-deniability.md)'s test obligations) — [file](./phase-1/1.32-relay-attacks-past-signature.md)
+- [x] **1.32** Relay attacks that PASS the envelope signature check (from-spoof / replay / reorder / cross-delivery; from 1.28's security review, fold into [ADR 0016](../adr/0016-envelope-deniability.md)'s test obligations) — [file](./phase-1/1.32-relay-attacks-past-signature.md)
 - [ ] **1.33** Bound the dialer's wait for an answer in `recv_sdp` (availability/diagnostics; from 1.28) — [file](./phase-1/1.33-bound-answer-wait.md)
 
 ### Phase 2 — Cross-Org Federation · **in progress** · [details](./phase-2/README.md)
