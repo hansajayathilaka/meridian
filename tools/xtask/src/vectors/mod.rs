@@ -5,6 +5,7 @@
 //! self-consistency is itself asserted by CI (`git diff --exit-code test-vectors/`).
 
 mod envelope;
+mod federation;
 mod identity;
 mod ratchet;
 mod safety_numbers;
@@ -37,5 +38,6 @@ pub fn generate() -> Result<(), String> {
     ratchet::generate_ratchet()?;
     envelope::generate_envelope()?;
     safety_numbers::generate_safety_numbers()?;
+    federation::generate_federation()?;
     Ok(())
 }

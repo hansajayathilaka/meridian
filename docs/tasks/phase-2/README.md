@@ -132,7 +132,7 @@ rather than a normalized schema — *"TODO: confirm normalized schema + Postgres
 - [x] **2.1** ADR 0017 — federation trust boundary (peer auth + cross-org `from` attestation) — [file](./2.1-adr-federation-trust-boundary.md)
 
 **Contracts**
-- [ ] **2.2** `federation-protocol-v1.md` + s2s wire types + conformance vectors — [file](./2.2-federation-protocol-v1.md)
+- [x] **2.2** `federation-protocol-v1.md` + s2s wire types + conformance vectors — [file](./2.2-federation-protocol-v1.md)
 - [ ] **2.3** c2s extension for federation (hint fields, error codes, vectors) — [file](./2.3-c2s-federation-extension.md)
 
 **Server spine**

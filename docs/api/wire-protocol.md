@@ -71,7 +71,18 @@ threat-model goal 4 is unmet until v2.
 
 ## 4. Server ↔ Server (federation, mTLS)
 
-`fed_fetch_bundle{target, requesting_server}`, `fed_route{to, envelope}`, `fed_reachability{target}` → `{connected: bool}` (per-request only — no presence subscriptions cross-org). Rate limits keyed by (origin server, origin account). Optional `contact_token{issuer_sig, audience, exp}` field on first-contact routes when the target org's policy requires it.
+After the mTLS handshake (peer identity established per [ADR 0017](../adr/0017-federation-trust-boundary.md)),
+each side exchanges `fed_hello{v, domain}` once, then `fed_fetch_bundle{target, requesting_server}`
+↔ `fed_bundle{bundle}`, `fed_route{to, from, envelope}` (fire-and-forget on success), and
+`fed_reachability{target}` → `fed_reachable{connected: bool}` (per-request only — no presence
+subscriptions cross-org). Rate limits keyed by (origin server, origin account) — origin server is
+the mTLS peer identity, origin account is the `from` the sending server asserts (ADR 0017 C5).
+`fed_route`'s `from: bstr[32]` is routing metadata asserted by the sending server, carried
+alongside — never decoded from — the opaque `envelope` (ADR 0017 C1/C2). An optional
+`contact_token{issuer_sig, audience, exp}` field on first-contact routes, gated by the target
+org's policy, is **documented but not implemented** — reserved for T08/T14. The concrete T06 s2s
+framing, ops, and error codes are specified in
+**[federation-protocol-v1.md](./federation-protocol-v1.md)** — the authority for this section.
 
 ## 5. mrd.ctrl/1 (channel 0)
 
