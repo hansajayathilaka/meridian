@@ -176,8 +176,13 @@ envelope decrypts against the stale session and fails. v2 rewrites this exact fu
 > signatures proving a key was live at a given server at a given time. Nor does it defeat *server
 > testimony*: the routing `from` is taken from the authenticated WebSocket session, so an operator can
 > attest that a blob arrived on a given account's connection — testimony that requires trusting the
-> operator, not a transferable cryptographic proof. This is weak, Signal-grade deniability, not OTR- or
-> court-grade, and there is no online/interactive deniability.
+> operator, not a transferable cryptographic proof. **This is true single-hop.** It is **false as
+> stated for a federated route**: the routing `from` a client sees originates as the *sending* server's
+> assertion, relayed unchanged by the *receiving* server, so federated server testimony is one hop
+> further from the client than the single-hop case and requires trusting the federation partner an
+> org's own server chose to route to — see [ADR 0017](./0017-federation-trust-boundary.md) for the
+> federated case. This is weak, Signal-grade deniability, not OTR- or court-grade, and there is no
+> online/interactive deniability.
 
 > **R5 — Hard flag day.** v1 and v2 envelopes do not interoperate and there is no negotiation, by
 > design: negotiating *message authentication* would itself be a deniability-downgrade oracle (a

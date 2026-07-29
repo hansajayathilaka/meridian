@@ -211,7 +211,7 @@ Phase 2's blocking gate (F1, F2, F3, F10, F11) satisfied by Phase 1 Group D. Acc
 cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery modes.
 
 **Decide before any byte is shaped**
-- [ ] **2.1** ADR 0017 — federation trust boundary: peer auth + cross-org `from` attestation — [file](./phase-2/2.1-adr-federation-trust-boundary.md)
+- [~] **2.1** ADR 0017 — federation trust boundary: peer auth + cross-org `from` attestation — [file](./phase-2/2.1-adr-federation-trust-boundary.md)
 
 **Contracts**
 - [ ] **2.2** `federation-protocol-v1.md` + s2s wire types + conformance vectors — [file](./phase-2/2.2-federation-protocol-v1.md)
