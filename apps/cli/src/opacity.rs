@@ -68,6 +68,7 @@ impl Party {
 fn routed_bytes(to: &[u8; 32], blob: &[u8]) -> Vec<u8> {
     let body = RouteBody {
         to: *to,
+        to_hint: None,
         blob: OpaqueBlob::new(blob.to_vec()),
     };
     Frame::new(Op::Route, 0, &body)

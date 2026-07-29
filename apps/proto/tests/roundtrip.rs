@@ -55,6 +55,7 @@ fn frame_and_bodies_roundtrip() {
 
     let fetch = Fetch {
         target: [5u8; 32],
+        hint: None,
         tamper: false,
     };
     let f = Frame::new(Op::Fetch, 4, &fetch).unwrap();
@@ -62,6 +63,7 @@ fn frame_and_bodies_roundtrip() {
 
     let route = RouteBody {
         to: [1u8; 32],
+        to_hint: None,
         blob: OpaqueBlob::new(vec![0xDE, 0xAD, 0xBE, 0xEF]),
     };
     let f = Frame::new(Op::Route, 5, &route).unwrap();
@@ -88,6 +90,66 @@ fn opaque_blob_encodes_as_cbor_byte_string() {
     let blob = OpaqueBlob::new(vec![0xAA, 0xBB, 0xCC, 0xDD]);
     let bytes = meridian_proto::encode(&blob).unwrap();
     assert_eq!(bytes, vec![0x44, 0xAA, 0xBB, 0xCC, 0xDD]);
+}
+
+#[test]
+fn fetch_hint_absent_is_byte_identical_to_pre_2_3_shape() {
+    // A hint-less Fetch (existing clients) must encode identically whether or not the `hint`
+    // field exists in the struct at all — `skip_serializing_if` must actually omit the map key,
+    // not merely encode a CBOR null.
+    let with_field_absent = Fetch {
+        target: [9u8; 32],
+        hint: None,
+        tamper: true,
+    };
+    let bytes = meridian_proto::encode(&with_field_absent).unwrap();
+    // { target: bstr[32], tamper: true } — exactly two map entries, no "hint" key anywhere.
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(!text.contains("hint"));
+    assert_eq!(
+        meridian_proto::decode::<Fetch>(&bytes).unwrap(),
+        with_field_absent
+    );
+}
+
+#[test]
+fn fetch_hint_present_empty_and_over_length_roundtrip() {
+    for hint in [
+        "org-b.test".to_string(),
+        String::new(),
+        "x".repeat(400), // over the 253-byte DNS-name ceiling identity-format.md documents;
+                         // the wire type itself places no length limit — enforcement, if any,
+                         // is server behaviour deferred to 2.7.
+    ] {
+        let fetch = Fetch {
+            target: [3u8; 32],
+            hint: Some(hint.clone()),
+            tamper: false,
+        };
+        let f = Frame::new(Op::Fetch, 10, &fetch).unwrap();
+        assert_eq!(f.decode::<Fetch>().unwrap(), fetch);
+        assert_eq!(f.decode::<Fetch>().unwrap().hint, Some(hint));
+    }
+}
+
+#[test]
+fn route_to_hint_present_and_absent_roundtrip() {
+    let absent = RouteBody {
+        to: [4u8; 32],
+        to_hint: None,
+        blob: OpaqueBlob::new(vec![1, 2, 3]),
+    };
+    let bytes = meridian_proto::encode(&absent).unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("to_hint"));
+    assert_eq!(meridian_proto::decode::<RouteBody>(&bytes).unwrap(), absent);
+
+    let present = RouteBody {
+        to: [4u8; 32],
+        to_hint: Some("org-b.test".to_string()),
+        blob: OpaqueBlob::new(vec![1, 2, 3]),
+    };
+    let f = Frame::new(Op::Route, 11, &present).unwrap();
+    assert_eq!(f.decode::<RouteBody>().unwrap(), present);
 }
 
 #[test]

@@ -153,10 +153,23 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   required; code-reviewer: approve, two non-blocking nits (redundant test case; b32 fields lack a
   dedicated compact-CBOR-shape unit assertion, covered indirectly by the vectors + CI's byte-identical
   gate).
-- **NEXT:** `/next-task`. **2.3** (c2s extension for federation) and **2.4** (s2s mTLS link) are now
-  unblocked — 2.4 depends only on 2.2 (done); 2.3 also depends only on 2.2. In parallel, still
-  unblocked with no dependencies: **1.33**, **2.5** (discovery), **2.10** (message-request gate) and
-  **2.13** (the ratchet defect below).
+- **ALSO NOW:** **2.3 is done** — [PR #35](https://github.com/hansajayathilaka/meridian/pull/35). The
+  c2s contract gains `Fetch.hint` / `RouteBody.to_hint` (optional, backward-compatible plain domain
+  strings — byte-identical on the wire for hint-less clients, test-proven not just claimed) and
+  `fed_denied`/`fed_unreachable`/`not_found_at_hint`. `Deliver` is unchanged, per ADR 0017 C2's
+  decision that the canonical c2s push stays `Deliver{from, blob}` — only its doc comment now records
+  the federated-`from` provenance (ADR 0017 (b)/C2/C6). `wire-protocol.md §2` and
+  `rendezvous-protocol-v1.md` are reconciled to the canonical shapes (the stale `deliver{from_server,
+  ...}` duplicate is gone), and the delegated `TODO: confirm normalized schema + Postgres` is
+  resolved — **re-deferred to T07**, reasoning recorded in both the doc and `sqlite.rs`. Contracts-only
+  as scoped: zero diff in `apps/rendezvous/src/ws.rs`, no client error-copy (2.9's job). All three
+  reviewers signed off clean: architect — consistent, no revision; security-reviewer — APPROVE, no
+  changes required; code-reviewer — APPROVE, no blocking findings (one doc nit fixed inline, one left
+  as a non-blocking informational note).
+- **NEXT:** `/next-task`. **2.4** (s2s mTLS link) is now unblocked — it depends on 2.2 (done) and,
+  per the phase's Track-S sequencing, follows 2.3 (now also done). In parallel, still unblocked with
+  no dependencies: **1.33**, **2.5** (discovery), **2.10** (message-request gate) and **2.13** (the
+  ratchet defect below).
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -244,7 +257,7 @@ cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery 
 
 **Contracts**
 - [x] **2.2** `federation-protocol-v1.md` + s2s wire types + conformance vectors — [file](./phase-2/2.2-federation-protocol-v1.md)
-- [ ] **2.3** c2s extension for federation (hint fields, error codes, vectors; re-defers the §8 schema `TODO` to T07) — [file](./phase-2/2.3-c2s-federation-extension.md)
+- [x] **2.3** c2s extension for federation (hint fields, error codes, vectors; re-defers the §8 schema `TODO` to T07) — [file](./phase-2/2.3-c2s-federation-extension.md)
 
 **Server spine**
 - [ ] **2.4** s2s mTLS link: listener + dialer (WebPKI and private-CA) — [file](./phase-2/2.4-s2s-mtls-link.md)

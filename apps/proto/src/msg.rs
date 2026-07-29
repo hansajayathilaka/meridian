@@ -67,6 +67,20 @@ pub struct PublishOk {
 pub struct Fetch {
     #[serde(with = "crate::bytes::b32")]
     pub target: [u8; 32],
+    /// Optional foreign-domain hint, present when `target` names an account this server is not
+    /// itself authoritative for — the wire encoding of the routing invariant *client → own server
+    /// → foreign server → client* (docs/api/federation-protocol-v1.md). It is a **plain domain
+    /// string**, never a parsed `mrd1:` ID: the server must not decode identity strings (that
+    /// needs `meridian-identity`, which would break `tools/lint-server-no-core.sh`); parsing stays
+    /// client-side in `apps/identity/src/id.rs`. Advisory only, same footing as
+    /// [`crate::fed::FedHello::domain`] — a stale hint is a routing failure
+    /// (`not_found_at_hint`/`fed_unreachable`), never a security warning (ADR 0001). Absent for a
+    /// same-server fetch; omitted from the wire entirely when `None`, so existing hint-less clients
+    /// are unaffected. Whether the server enforces a max length or LDH form is server behaviour,
+    /// deferred to whichever task first needs it (2.7) — this type places no constraint beyond
+    /// being a CBOR text string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
     /// TEST HOOK ONLY: ask the server to substitute a different key (malicious-server demo). The
     /// server honors it *only* when started with `allow_test_tamper = true`; production ignores it.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -80,12 +94,18 @@ pub struct Bundle {
     pub bundle: PrekeyBundle,
 }
 
-/// Client → server: route an opaque, client-signed envelope to an online peer of this org.
-/// `blob` is never inspected by the server.
+/// Client → server: route an opaque, client-signed envelope to a peer, of this org or a federated
+/// one. `blob` is never inspected by the server.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteBody {
     #[serde(with = "crate::bytes::b32")]
     pub to: [u8; 32],
+    /// Optional foreign-domain hint, same shape and caveats as [`Fetch::hint`] — present when `to`
+    /// names an account this server is not itself authoritative for, telling the server to forward
+    /// across the federation boundary (`FedRoute`, docs/api/federation-protocol-v1.md) rather than
+    /// deliver locally. Absent for a same-server route; omitted from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_hint: Option<String>,
     pub blob: OpaqueBlob,
 }
 
@@ -97,7 +117,17 @@ pub struct RouteOk {
 }
 
 /// Server → recipient: a routed envelope pushed to a connected client. `from` is the sender key
-/// the envelope claims; the recipient verifies the envelope signature under it (T03).
+/// the envelope claims; the recipient verifies the envelope signature under it (T03), rejecting a
+/// mismatch as `ChatError::SenderMismatch`.
+///
+/// **Federated origin (ADR 0017 (b)/C2/C6).** This shape is unchanged by federation and carries no
+/// new field: for a route that crossed a federation boundary, `from` is the value the *foreign*
+/// server asserted in its `FedRoute{from}` (docs/api/federation-protocol-v1.md), relayed verbatim
+/// by this server exactly as it already does for a purely local route. The client-side check does
+/// not weaken — it now compares against server testimony that is one hop further from the client
+/// (own server relaying a foreign server's assertion, not asserting its own connection), the same
+/// "server testimony, not a cryptographic proof" category as the single-hop case
+/// ([ADR 0016](../../../docs/adr/0016-envelope-deniability.md) residual R4, scope-corrected).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deliver {
     #[serde(with = "crate::bytes::b32")]
@@ -158,6 +188,22 @@ pub mod error_codes {
     /// relay). The client falls back to the STUN/host ladder and surfaces the blocked path via
     /// `meridian doctor` (T05).
     pub const TURN_UNAVAILABLE: &str = "turn_unavailable";
+    /// A `Fetch`/`RouteBody` named a foreign target, but this org's federation policy
+    /// (`open | allowlist | closed`) refuses to fetch from, or route to, the hinted domain
+    /// ([2.6](../../../docs/tasks/phase-2/2.6-federation-policy-limits.md) emits this).
+    pub const FED_DENIED: &str = "fed_denied";
+    /// The hinted foreign server could not be reached (discovery failure, dial failure, or the
+    /// federation link itself returned an error) — a connectivity/availability outcome, distinct
+    /// from `fed_denied`'s policy outcome
+    /// ([2.7](../../../docs/tasks/phase-2/2.7-federated-prekey-fetch.md)/
+    /// [2.8](../../../docs/tasks/phase-2/2.8-federated-route-reachability.md) emit this).
+    pub const FED_UNREACHABLE: &str = "fed_unreachable";
+    /// `Fetch.hint` resolved to a foreign server that reached back with `FedErr{not_found}`, or
+    /// otherwise doesn't hold `target` — the federated analogue of `not_found`, kept distinct so a
+    /// client can tell "no such account here" from "no such account at the org your hint named"
+    /// (the stale-hint case, ADR 0001 consequences — a UX/reachability outcome, never a security
+    /// warning) ([2.7](../../../docs/tasks/phase-2/2.7-federated-prekey-fetch.md) emits this).
+    pub const NOT_FOUND_AT_HINT: &str = "not_found_at_hint";
 }
 
 fn is_false(b: &bool) -> bool {
