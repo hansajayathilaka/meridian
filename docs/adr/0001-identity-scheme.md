@@ -3,7 +3,7 @@
 
 # ADR 0001: Identity scheme — self-certifying key + routing hint
 
-**Status:** Proposed · **Context:** The ID must be shareable to anyone, survive malicious servers, and work with no central directory.
+**Status:** Accepted · **Context:** The ID must be shareable to anyone, survive malicious servers, and work with no central directory.
 
 | Option | Security anchor | Routability | Human factors |
 |---|---|---|---|

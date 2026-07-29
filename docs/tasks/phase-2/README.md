@@ -125,11 +125,11 @@ rather than a normalized schema — *"TODO: confirm normalized schema + Postgres
 <!-- Filled by /plan-phase. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
 
 **Gate — Phase-1 follow-ups that must land first** (they stay numbered under Phase 1)
-- [ ] **1.32** Relay attacks that pass the envelope signature check — [file](../phase-1/1.32-relay-attacks-past-signature.md)
+- [x] **1.32** Relay attacks that pass the envelope signature check — [file](../phase-1/1.32-relay-attacks-past-signature.md)
 - [ ] **1.33** Bound the dialer's wait for an answer in `recv_sdp` — [file](../phase-1/1.33-bound-answer-wait.md)
 
 **Decide before any byte is shaped**
-- [ ] **2.1** ADR 0017 — federation trust boundary (peer auth + cross-org `from` attestation) — [file](./2.1-adr-federation-trust-boundary.md)
+- [x] **2.1** ADR 0017 — federation trust boundary (peer auth + cross-org `from` attestation) — [file](./2.1-adr-federation-trust-boundary.md)
 
 **Contracts**
 - [ ] **2.2** `federation-protocol-v1.md` + s2s wire types + conformance vectors — [file](./2.2-federation-protocol-v1.md)
