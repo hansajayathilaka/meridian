@@ -192,7 +192,11 @@ dial target**, in both WebPKI and private-CA modes (see (a)).
 
 **C4 — `federation_map.toml` entries MUST carry an explicit pinned peer identity** (SAN/CN) per partner;
 a private-CA cert that chains to the trusted CA but does not match the entry's pinned identity MUST be
-rejected. This is a schema requirement handed to
+rejected. **A map entry missing or malformed its pinned identity is a fail-closed configuration error**
+— the entry MUST be rejected at config load (refuse to start, or refuse to federate toward that domain
+alone if per-entry config is hot-reloadable), never silently fall back to "chains to the trusted CA"
+with no name check. A permissive fallback here would reopen exactly the impersonation hole this ADR
+exists to close. This is a schema requirement handed to
 [2.5](../tasks/phase-2/2.5-federation-discovery.md).
 
 **C5 — Rate limiting keys "origin server" to the mTLS peer identity from (a) and "origin account" to the
@@ -202,6 +206,17 @@ account-label churn. Handed to [2.6](../tasks/phase-2/2.6-federation-policy-limi
 **C6 — [ADR 0016](./0016-envelope-deniability.md) residual R4 is scope-corrected** to state its "routing
 `from` is taken from the authenticated WebSocket session" claim is true only single-hop, and point to
 this ADR for the federated case (see [Consequences](#consequences)).
+
+**C7 — s2s mTLS MUST terminate in-process, never at a proxy/VIP upstream of the server.** (a)'s
+guarantee — that the peer identity checked is the one every policy and rate-limit decision downstream
+relies on — is void if TLS is terminated by infrastructure the server itself does not control: an
+unauthenticated hop between "whatever terminated TLS" and the server would let that hop assert any
+peer identity it likes, the same class of gap C1–C4 exist to close. This resolves
+[2.4](../tasks/phase-2/2.4-s2s-mtls-link.md)'s open `TODO: confirm` on termination point — decisively,
+in-process — and is a deliberate departure from [ADR 0008](./0008-infra-topology.md)'s proxy/VIP
+termination for c2s, which is safe there only because c2s identity comes from the post-TLS `Auth`
+signature, not from the TLS layer itself; s2s has no such second factor, so the TLS layer *is* the
+identity check and must not be delegated.
 
 ## Accepted residual risks
 
@@ -251,8 +266,9 @@ this ADR for the federated case (see [Consequences](#consequences)).
   `fed_route{to, from, envelope}` per C1/C2, and reconciles wire-protocol.md §2/§4's divergent shapes to
   the canonical `Deliver{from, blob}` naming.
 - **[2.4](../tasks/phase-2/2.4-s2s-mtls-link.md)** implements domain-pinned certificate verification
-  (C3) for both WebPKI and private-CA dialers/listeners — not "chains to a trusted root" alone.
+  (C3) for both WebPKI and private-CA dialers/listeners — not "chains to a trusted root" alone — and
+  terminates TLS in-process per C7, resolving its own open `TODO: confirm` on termination point.
 - **[2.5](../tasks/phase-2/2.5-federation-discovery.md)** adds the pinned-identity field to
-  `federation_map.toml`'s schema (C4).
+  `federation_map.toml`'s schema, with fail-closed handling of a missing/malformed pin (C4).
   **[2.6](../tasks/phase-2/2.6-federation-policy-limits.md)** keys federation-edge rate limits per C5.
 - No wire bytes are shaped by this ADR itself — it is docs/ADR only, per its task's Scope.

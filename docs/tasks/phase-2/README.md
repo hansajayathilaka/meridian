@@ -129,7 +129,7 @@ rather than a normalized schema — *"TODO: confirm normalized schema + Postgres
 - [ ] **1.33** Bound the dialer's wait for an answer in `recv_sdp` — [file](../phase-1/1.33-bound-answer-wait.md)
 
 **Decide before any byte is shaped**
-- [~] **2.1** ADR 0017 — federation trust boundary (peer auth + cross-org `from` attestation) — [file](./2.1-adr-federation-trust-boundary.md)
+- [x] **2.1** ADR 0017 — federation trust boundary (peer auth + cross-org `from` attestation) — [file](./2.1-adr-federation-trust-boundary.md)
 
 **Contracts**
 - [ ] **2.2** `federation-protocol-v1.md` + s2s wire types + conformance vectors — [file](./2.2-federation-protocol-v1.md)

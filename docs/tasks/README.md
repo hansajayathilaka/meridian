@@ -125,9 +125,19 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   SPK grace window, now named as uncovered in the harness frontier list — along with stale-bundle
   replay on the fetch path, same-OTK-to-many-fetchers, reflection, per-device delivery and
   skipped-key exhaustion.
-- **NEXT:** `/next-task`. Unblocked now: **2.1** (ADR 0017 — federation trust boundary, the gate on
-  every task that shapes s2s bytes), and in parallel **1.33**, **2.5** (discovery), **2.10**
-  (message-request gate) and **2.13** (the ratchet defect above), none of which have dependencies.
+- **ALSO NOW:** **2.1 is done** — [PR #33](https://github.com/hansajayathilaka/meridian/pull/33). ADR
+  0017 resolves the forcing problem (`fed_route` gains a server-asserted `from: bstr[32]`, bounded by
+  the client-side `SenderMismatch` check exactly as the single-hop case already is), pins peer-cert
+  verification to the hint/discovery domain (never the literal SRV target) in both WebPKI and
+  private-CA modes with a fail-closed missing-pin rule, keys federation-edge rate limits to (mTLS peer
+  identity, asserted `from`), scope-corrects ADR 0016 R4 to single-hop, and flips ADRs 0001–0008
+  `Proposed` → `Accepted`. architect: consistent, no revision. security-reviewer: APPROVE-WITH-CHANGES,
+  both changes landed — C4 now fail-closes a missing/malformed `federation_map.toml` pin, and new C7
+  requires s2s mTLS to terminate **in-process** (never proxy/VIP), resolving task 2.4's open
+  termination-point `TODO: confirm`.
+- **NEXT:** `/next-task`. **2.2** (`federation-protocol-v1.md` + s2s wire types) is now unblocked —
+  its dependency 2.1 is done. In parallel, still unblocked with no dependencies: **1.33**, **2.5**
+  (discovery), **2.10** (message-request gate) and **2.13** (the ratchet defect below).
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -211,7 +221,7 @@ Phase 2's blocking gate (F1, F2, F3, F10, F11) satisfied by Phase 1 Group D. Acc
 cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery modes.
 
 **Decide before any byte is shaped**
-- [~] **2.1** ADR 0017 — federation trust boundary: peer auth + cross-org `from` attestation — [file](./phase-2/2.1-adr-federation-trust-boundary.md)
+- [x] **2.1** ADR 0017 — federation trust boundary: peer auth + cross-org `from` attestation — [file](./phase-2/2.1-adr-federation-trust-boundary.md)
 
 **Contracts**
 - [ ] **2.2** `federation-protocol-v1.md` + s2s wire types + conformance vectors — [file](./phase-2/2.2-federation-protocol-v1.md)
