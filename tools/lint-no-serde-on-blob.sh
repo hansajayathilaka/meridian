@@ -33,7 +33,14 @@ FAIL=0
 # Control-plane types meridian-rendezvous is legitimately allowed to `frame.decode()` — client<->
 # server protocol requests/replies, never envelope/message *content*. Keep in sync with
 # apps/proto/src/msg.rs's exports. Anything not on this list trips check 3 below.
-ALLOWLIST='^(Auth|AuthOk|Publish|PublishOk|Fetch|Bundle|RouteBody|RouteOk|Deliver|TurnReq|TurnGrant|ErrBody|Challenge)$'
+#
+# FedHello|FedFetchBundle|FedBundle|FedRoute|FedReachability|FedReachable|FedErr (task 2.2): the
+# s2s federation control-plane types from apps/proto/src/fed.rs. Added now, as an explicit,
+# reviewed line item, even though no apps/rendezvous code decodes them yet (that lands in
+# 2.4+) — same reasoning as Deliver/RouteBody already on this list: they carry
+# OpaqueBlob/opaque routing fields (FedRoute.envelope) or plain routing metadata
+# (target/to/from/domain/requesting_server/connected/code/msg), never decoded content.
+ALLOWLIST='^(Auth|AuthOk|Publish|PublishOk|Fetch|Bundle|RouteBody|RouteOk|Deliver|TurnReq|TurnGrant|ErrBody|Challenge|FedHello|FedFetchBundle|FedBundle|FedRoute|FedReachability|FedReachable|FedErr)$'
 
 # Multi-line-aware scan for `let NAME: TYPE = ....decode()` across every *.rs file under the given
 # roots, emitting `file:line:leaf_type_name` — one per match, with TYPE already resolved to its

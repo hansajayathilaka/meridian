@@ -135,9 +135,28 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   both changes landed — C4 now fail-closes a missing/malformed `federation_map.toml` pin, and new C7
   requires s2s mTLS to terminate **in-process** (never proxy/VIP), resolving task 2.4's open
   termination-point `TODO: confirm`.
-- **NEXT:** `/next-task`. **2.2** (`federation-protocol-v1.md` + s2s wire types) is now unblocked —
-  its dependency 2.1 is done. In parallel, still unblocked with no dependencies: **1.33**, **2.5**
-  (discovery), **2.10** (message-request gate) and **2.13** (the ratchet defect below).
+- **ALSO NOW:** **2.2 is done** — `federation-protocol-v1.md` (new doc) + `apps/proto/src/fed.rs`
+  (`FedOp`, `FedFrame`, `FedHello`, `FedFetchBundle`, `FedBundle`, `FedRoute{to, from, envelope}`,
+  `FedReachability`, `FedReachable`, `FedErr`, `fed_error_codes`) implement ADR 0017's decisions
+  verbatim — the C1/C2 canonical `fed_route` shape, C5's mTLS-peer-identity-is-authoritative rule
+  (both `FedHello.domain` and `FedFetchBundle.requesting_server` are documented as self-asserted/
+  informational only, never a policy input), and C7's in-process-termination framing (length-delimited
+  CBOR directly on the mTLS byte stream, no WS/HTTP2). `FedOp`/`FedFrame` are a structurally distinct
+  plane from the c2s `Op`/`Frame` — verified by grep, `apps/rendezvous/` has zero references. `id = 0`
+  is reserved for a two-way `FedHello` exchange; every other id is chosen by whichever side initiates
+  (s2s has no client/server asymmetry to reserve a shared id space around, unlike c2s). `contact_token`
+  is recorded reserved-and-unimplemented, no field added. `test-vectors/federation-v1.json` covers all
+  7 body types deterministically; `lint-no-serde-on-blob.sh`'s allowlist extended as an explicit,
+  reviewed line item. Contracts-only as scoped: zero diff in `apps/rendezvous/`; `wire-protocol.md §2`'s
+  stale `deliver{from_server, blob}` duplicate deliberately left for 2.3. All three listed reviewers
+  signed off clean — architect: consistent, no revision; security-reviewer: APPROVE, no changes
+  required; code-reviewer: approve, two non-blocking nits (redundant test case; b32 fields lack a
+  dedicated compact-CBOR-shape unit assertion, covered indirectly by the vectors + CI's byte-identical
+  gate).
+- **NEXT:** `/next-task`. **2.3** (c2s extension for federation) and **2.4** (s2s mTLS link) are now
+  unblocked — 2.4 depends only on 2.2 (done); 2.3 also depends only on 2.2. In parallel, still
+  unblocked with no dependencies: **1.33**, **2.5** (discovery), **2.10** (message-request gate) and
+  **2.13** (the ratchet defect below).
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -224,7 +243,7 @@ cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery 
 - [x] **2.1** ADR 0017 — federation trust boundary: peer auth + cross-org `from` attestation — [file](./phase-2/2.1-adr-federation-trust-boundary.md)
 
 **Contracts**
-- [ ] **2.2** `federation-protocol-v1.md` + s2s wire types + conformance vectors — [file](./phase-2/2.2-federation-protocol-v1.md)
+- [x] **2.2** `federation-protocol-v1.md` + s2s wire types + conformance vectors — [file](./phase-2/2.2-federation-protocol-v1.md)
 - [ ] **2.3** c2s extension for federation (hint fields, error codes, vectors; re-defers the §8 schema `TODO` to T07) — [file](./phase-2/2.3-c2s-federation-extension.md)
 
 **Server spine**

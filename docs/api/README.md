@@ -10,6 +10,9 @@ anywhere in the repo disagrees with these files, **these files win** and the oth
 - [Rendezvous protocol (v1)](./rendezvous-protocol-v1.md) — the client↔server CBOR framing: the
   `{op,id,body}` frame, challenge–response auth, bundle publish/fetch (with the client's mandatory
   verification), opaque routing, config, and metrics (T02).
+- [Federation protocol (v1)](./federation-protocol-v1.md) — the server↔server CBOR framing over
+  mTLS: length-delimited `FedFrame`, `Hello`/`FetchBundle`/`Bundle`/`Route`/`Reachability`/
+  `Reachable`/`Err`, error codes, and the cross-org exposure ceiling (T06).
 - [Core API contracts](./core-api-contracts.md) — the stable Rust traits (`Transport`,
   `SecretStore`, `StreamType`) and public `meridian-core` surface consumed by every client shim.
 - [Messaging envelope (v1)](./messaging-envelope-v1.md) — the E2EE 1:1 messaging spec: X3DH, the

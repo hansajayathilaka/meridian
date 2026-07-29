@@ -20,10 +20,15 @@
 pub mod bytes;
 
 pub mod bundle;
+pub mod fed;
 pub mod frame;
 pub mod msg;
 
 pub use bundle::{PrekeyBundle, BUNDLE_VERSION, MAX_ONE_TIME_PREKEYS};
+pub use fed::{
+    fed_error_codes, FedBundle, FedErr, FedFetchBundle, FedFrame, FedHello, FedOp, FedReachability,
+    FedReachable, FedRoute, FED_VERSION,
+};
 pub use frame::{decode, encode, CodecError, Frame, Op};
 pub use msg::{
     error_codes, Auth, AuthOk, Bundle, Challenge, Deliver, ErrBody, Fetch, Publish, PublishOk,
