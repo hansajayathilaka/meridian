@@ -152,8 +152,10 @@ introduced by this doc.
 - **No behavior yet.** This doc and `apps/proto/src/fed.rs` fix the wire shape only; there is no
   listener, dialer, discovery, policy, or handler code — those land in
   [2.4](../tasks/phase-2/2.4-s2s-mtls-link.md)–[2.8](../tasks/phase-2/2.8-federated-route-reachability.md).
-- **No c2s changes.** `wire-protocol.md §2`'s reconciliation to the canonical `Deliver{from,
-  blob}` naming is [2.3](../tasks/phase-2/2.3-c2s-federation-extension.md)'s job, not this task's.
+- **No c2s changes (as of this task).** `wire-protocol.md §2`'s reconciliation to the canonical
+  `Deliver{from, blob}` naming, and the `Fetch.hint`/`RouteBody.to_hint` fields, were
+  [2.3](../tasks/phase-2/2.3-c2s-federation-extension.md)'s job, not this task's — 2.3 has since
+  landed them.
 - **`contact_token` is reserved, not implemented** — see §2 above.
 - **No cryptographic s2s provenance attestation.** `from` is server testimony, not a signature —
   ADR 0017 (b) decision C, rejected for v1; see ADR 0017 for the full reasoning and residual risk
