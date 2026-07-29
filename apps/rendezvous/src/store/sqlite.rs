@@ -3,7 +3,9 @@
 //! The runtime query API is used (no compile-time `query!` macros) so the crate builds without a
 //! live `DATABASE_URL`. Bundles are stored as one CBOR blob keyed by account key — all public key
 //! material; normalizing into the per-column data-model schema is a later refinement.
-//! TODO: confirm normalized columns + Postgres backend in T06/T07.
+//! Re-deferred to T07 (task 2.3, docs/api/rendezvous-protocol-v1.md §8): Feature 06 adds no new
+//! persisted state of its own, so it has no need to drive this normalization; T07's mailbox is the
+//! first consumer a normalized schema (and Postgres) would actually have.
 
 use async_trait::async_trait;
 use meridian_proto::PrekeyBundle;

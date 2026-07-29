@@ -32,9 +32,9 @@ All 32-byte keys and 64-byte signatures are encoded as **CBOR byte strings** (ma
 | `AuthOk` | S→C | `{ server_domain: tstr }` | auth accepted |
 | `Publish` | C→S | `{ bundle: PrekeyBundle }` | store this account's bundle |
 | `PublishOk` | S→C | `{ accepted_otks: uint }` | stored |
-| `Fetch` | C→S | `{ target: bstr[32], tamper?: bool }` | fetch a bundle by **exact** key |
+| `Fetch` | C→S | `{ target: bstr[32], hint?: tstr, tamper?: bool }` | fetch a bundle by **exact** key |
 | `Bundle` | S→C | `{ bundle: PrekeyBundle }` | the requested bundle |
-| `Route` | C→S | `{ to: bstr[32], blob: bstr }` | route an opaque envelope |
+| `Route` | C→S | `{ to: bstr[32], to_hint?: tstr, blob: bstr }` | route an opaque envelope |
 | `RouteOk` | S→C | `{ delivered: bool }` | routed to a live peer |
 | `Deliver` | S→C | `{ from: bstr[32], blob: bstr }` | a delivered envelope |
 | `TurnReq` | C→S | `{}` | request ephemeral TURN credentials (T05) |
@@ -43,7 +43,7 @@ All 32-byte keys and 64-byte signatures are encoded as **CBOR byte strings** (ma
 
 `PrekeyBundle = { v, account_pub: bstr[32], spk: bstr[32], spk_sig: bstr[64], otks: [*bstr[32]], otk_sigs: [*bstr[64]], device_record?: bstr }` — every `*_sig` is `Ed25519(account_pub)` over the corresponding public key. `device_record` is opaque and account-signed (T13). ≤100 one-time prekeys.
 
-**Error codes:** `auth_required`, `auth_failed`, `replay`, `admission_denied`, `not_found`, `not_connected`, `rate_limited`, `bad_bundle`, `bad_request`, `turn_unavailable`.
+**Error codes:** `auth_required`, `auth_failed`, `replay`, `admission_denied`, `not_found`, `not_connected`, `rate_limited`, `bad_bundle`, `bad_request`, `turn_unavailable`, `fed_denied`, `fed_unreachable`, `not_found_at_hint` (the last three are T06/[2.3](../tasks/phase-2/2.3-c2s-federation-extension.md) additions — see §4).
 
 ## 2. Handshake & registration
 
@@ -61,6 +61,38 @@ All 32-byte keys and 64-byte signatures are encoded as **CBOR byte strings** (ma
 ## 4. Routing
 
 `Route{to, blob}` delivers `blob` verbatim to every live connection for `to` as `Deliver{from, blob}`, and replies `RouteOk{delivered:true}`; an offline recipient is `not_connected` (the ciphertext mailbox is [T07](../architecture/features/07-offline-mailbox.md)). The server **never** decodes `blob` — it is `OpaqueBlob` end to end, enforced by `tools/lint-no-serde-on-blob.sh`.
+
+### Federation hints (T06)
+
+`Fetch.hint` and `RouteBody.to_hint` are the wire encoding of the routing invariant *client → own
+server → foreign server → client*: a client names a foreign target by attaching the domain part of
+its `mrd1:…@domain` ID as `hint`/`to_hint`, telling its **own** server that `target`/`to` may not be
+an account it holds and, if not, to forward across the federation boundary instead of returning
+`not_found`. Both fields are a **plain domain string** — never a parsed `mrd1:` ID. The server must
+not decode identity strings (that needs `meridian-identity`, which would break
+`tools/lint-server-no-core.sh`); parsing an ID into key + hint stays entirely client-side
+(`apps/identity/src/id.rs::validate_hint`). Absent for a same-server operation; omitted from the
+wire entirely when not present, so existing hint-less clients are byte-identical to before this
+addition. This doc fixes the field shape only — this task (2.3) adds **no** server behaviour that
+reads either field; the server consuming them to actually forward is
+[2.7](../tasks/phase-2/2.7-federated-prekey-fetch.md)/[2.8](../tasks/phase-2/2.8-federated-route-reachability.md)'s
+job, and the s2s side of that forward is specified in
+[federation-protocol-v1.md](./federation-protocol-v1.md).
+
+Three new error codes cover the federated outcomes a hint can produce, distinct from the local
+`not_found`/`rate_limited` cases above: `fed_denied` (this org's federation policy refuses the
+hinted domain), `fed_unreachable` (the hinted server could not be reached at all — discovery or
+dial failure), and `not_found_at_hint` (the hinted server was reached but doesn't hold the target —
+the stale-hint case). The stale-hint case is explicitly a reachability/UX outcome, never a security
+warning ([ADR 0001](../adr/0001-identity-scheme.md) consequences) — a client presents it as "unreachable at hint," not as a trust warning.
+
+**Federated `Deliver.from`** ([ADR 0017](../adr/0017-federation-trust-boundary.md) (b)/C2/C6): the
+shape is unchanged — no new field — but for a route that crossed a federation boundary, `from` is
+the value the *foreign* server asserted in its `FedRoute{from}`, relayed verbatim by this server
+exactly as it already does for a purely local route. The client's `sender_pub != from` check
+([ADR 0016](../adr/0016-envelope-deniability.md) residual R4, scope-corrected by ADR 0017 C6) does
+not weaken: it now compares against server testimony one hop further from the client, still never a
+cryptographic proof.
 
 ## 4a. TURN credentials (T05)
 
@@ -133,6 +165,6 @@ Storage is a trait ([`store.rs`](../../apps/rendezvous/src/store.rs)). The MVP d
 ## 8. Known MVP simplifications (T02)
 
 - TLS is proxy/VIP-terminated in this increment (ws on the bind address); direct rustls termination is a follow-up.
-- Persistence defaults to in-memory; the sqlx/SQLite impl is feature-gated and stores each bundle as one CBOR blob rather than the fully normalized [data-model](../architecture/data-model.md) columns. *TODO: confirm normalized schema + Postgres in T06/T07.*
+- Persistence defaults to in-memory; the sqlx/SQLite impl is feature-gated and stores each bundle as one CBOR blob rather than the fully normalized [data-model](../architecture/data-model.md) columns. **Resolved, re-deferred to T07** ([2.3](../tasks/phase-2/2.3-c2s-federation-extension.md)): Feature 06 adds no new persisted state of its own — the federation map, policy and allowlist are config (not DB rows), rate limits are in-memory counters, reachability is live `Registry` state, and the bundle a federated fetch serves is the same blob already stored today. [T07](../architecture/features/07-offline-mailbox.md)'s mailbox is the first feature that needs per-envelope rows, TTL sweeps and quota accounting — the first actual consumer a normalized schema would have. Normalized schema + Postgres remain out of scope until then.
 - Prekey **secret** lifecycle (persistence, rotation) is deferred to T03 (X3DH); T02 publishes real, signed public prekeys. *TODO: confirm in T03.*
 - Offline delivery returns `not_connected`; the ciphertext mailbox is T07.

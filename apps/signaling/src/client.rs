@@ -111,7 +111,11 @@ impl SignalingClient {
     /// A bundle that fails verification (including one claiming a different key) is a hard error —
     /// the client refuses to proceed rather than downgrading.
     pub async fn fetch_bundle(&mut self, target: [u8; 32], tamper: bool) -> Result<PrekeyBundle> {
-        let fetch = Fetch { target, tamper };
+        let fetch = Fetch {
+            target,
+            hint: None,
+            tamper,
+        };
         let reply = self
             .request(Op::Fetch, &fetch, Op::Bundle, "bundle")
             .await?;
@@ -125,6 +129,7 @@ impl SignalingClient {
     pub async fn route(&mut self, to: [u8; 32], blob: Vec<u8>) -> Result<bool> {
         let body = RouteBody {
             to,
+            to_hint: None,
             blob: OpaqueBlob::new(blob),
         };
         let reply = self

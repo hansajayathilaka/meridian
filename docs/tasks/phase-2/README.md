@@ -133,7 +133,7 @@ rather than a normalized schema — *"TODO: confirm normalized schema + Postgres
 
 **Contracts**
 - [x] **2.2** `federation-protocol-v1.md` + s2s wire types + conformance vectors — [file](./2.2-federation-protocol-v1.md)
-- [ ] **2.3** c2s extension for federation (hint fields, error codes, vectors) — [file](./2.3-c2s-federation-extension.md)
+- [~] **2.3** c2s extension for federation (hint fields, error codes, vectors) — [file](./2.3-c2s-federation-extension.md)
 
 **Server spine**
 - [ ] **2.4** s2s mTLS link: listener + dialer (WebPKI and private-CA) — [file](./2.4-s2s-mtls-link.md)

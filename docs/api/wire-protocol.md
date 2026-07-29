@@ -24,9 +24,9 @@ Auth handshake: server → `challenge{v, nonce[32], server_time}`; client → `a
 | op | body | notes |
 |---|---|---|
 | `publish_bundle` | `{v, spk, spk_sig, otks[], otk_sigs[], device_record}` | all sigs under account key |
-| `fetch_bundle` | `{target: pubkey, hint}` | exact full key only — no prefix ops exist |
-| `route` | `{to: pubkey, blob: bstr}` | blob is opaque; server code path has no serde on it (lint-enforced) |
-| `deliver` | `{from_server, blob: bstr}` | push to client |
+| `fetch_bundle` | `{target: pubkey, hint?}` | exact full key only — no prefix ops exist; `hint` is an optional plain domain string, present when `target` may be a foreign account (T06, [2.3](../tasks/phase-2/2.3-c2s-federation-extension.md)) |
+| `route` | `{to: pubkey, to_hint?, blob: bstr}` | blob is opaque; server code path has no serde on it (lint-enforced); `to_hint` is `fetch_bundle.hint`'s counterpart for routing (T06) |
+| `deliver` | `{from, blob: bstr}` | push to client; `from` is the sender key the envelope claims — for a federated route it is the foreign server's assertion relayed verbatim (ADR 0017), not a new field |
 | `mailbox_ack` | `{envelope_ids[]}` | triggers deletion |
 | `turn_cred` | `{}` → `{urls[], username, credential, ttl}` | ephemeral HMAC per session |
 
