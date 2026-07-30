@@ -4,9 +4,12 @@
 # Copy this to rendezvous.toml and edit, or leave rendezvous.toml as-is (or absent) and override
 # individual keys with `MERIDIAN_<SECTION>__<FIELD>` environment variables instead — handy for
 # docker-compose/k8s deploys where the generated file shouldn't carry secrets. Every key below has
-# a matching env var, shown in the comment; env values always win over the file. A `MERIDIAN_*`
-# var that's set but fails to parse (bad bool/int/admission) is a fatal boot error, not a silent
-# no-op — see `Config::apply_env_overrides` in src/config.rs.
+# a matching env var, shown in the comment; env values always win over the file (merged via
+# `figment`, see ADR 0018 and `Config::load` in src/config.rs). List values use TOML/JSON bracket
+# syntax, e.g. `MERIDIAN_TURN__URLS=["turn:a","turn:b"]` — not comma-separated. A `MERIDIAN_*` var
+# that's set but fails to parse (bad bool/int/admission/list) is a fatal boot error, not a silent
+# no-op — and as of ADR 0018, so is a malformed rendezvous.toml itself, whether loaded via
+# `--config` or picked up implicitly from the working directory.
 
 [server]
 domain = "chat.example"          # this server's hint-domain; folded into the auth challenge
@@ -14,8 +17,8 @@ domain = "chat.example"          # this server's hint-domain; folded into the au
 bind = "0.0.0.0:8443"            # WebSocket bind; TLS is terminated by the proxy/VIP (ADR-8)
                                   # env: MERIDIAN_SERVER__BIND
 admission = "open"               # open | invite -- env: MERIDIAN_SERVER__ADMISSION
-invite_tokens = []               # tokens accepted when admission = "invite" -- comma-separated,
-                                  # env: MERIDIAN_SERVER__INVITE_TOKENS (e.g. "tok-a,tok-b")
+invite_tokens = []               # tokens accepted when admission = "invite"
+                                  # env: MERIDIAN_SERVER__INVITE_TOKENS (e.g. ["tok-a","tok-b"])
 allow_test_tamper = false        # TEST HOOK — only takes effect when built with `--features
                                   # test-tamper-hook` (the substitution code is compiled out
                                   # otherwise). MUST be false in production.
@@ -57,9 +60,9 @@ secret = ""                      # == coturn static-auth-secret; EMPTY ⇒ minti
                                   # Provision out of band — never commit a real value here.
                                   # env: MERIDIAN_TURN__SECRET
 realm = "localhost"              # coturn realm, echoed to the client -- env: MERIDIAN_TURN__REALM
-urls = [                         # the candidate ladder, preference order -- comma-separated,
-  "turn:127.0.0.1:3478?transport=udp",  # env: MERIDIAN_TURN__URLS
-  "turn:127.0.0.1:3478?transport=tcp",
+urls = [                         # the candidate ladder, preference order
+  "turn:127.0.0.1:3478?transport=udp",  # env: MERIDIAN_TURN__URLS, e.g.
+  "turn:127.0.0.1:3478?transport=tcp",  #   ["turn:host:3478?transport=udp","turn:host:3478?transport=tcp"]
   "turns:127.0.0.1:443?transport=tcp",
 ]
 ttl_secs = 120                   # credential lifetime (short); reuse bounded by coturn user-quota

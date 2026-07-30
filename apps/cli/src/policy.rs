@@ -10,6 +10,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use figment::providers::{Env, Format, Json};
+use figment::Figment;
 use meridian_core::identity::parse_id;
 use meridian_core::relay::{self, PolicyScope, RelayPolicy};
 use meridian_core::transport::IcePolicy;
@@ -36,15 +38,18 @@ fn policy_path() -> Result<PathBuf, String> {
     Ok(account::config_dir()?.join("policy.json"))
 }
 
+/// Loads `policy.json` (if present) merged with `MERIDIAN_POLICY__<FIELD>` environment variables
+/// (ADR 0018) — e.g. an org can push `MERIDIAN_POLICY__ORG_DEFAULT=relay-only` with no
+/// `policy.json` on disk at all, matching the "org-pushed defaults" model
+/// (docs/architecture/data-model.md). A missing file is not an error (defaults apply); a
+/// malformed one is.
 fn load_stored() -> Result<StoredPolicy, String> {
     let path = policy_path()?;
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            serde_json::from_slice(&bytes).map_err(|e| format!("parsing {}: {e}", path.display()))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StoredPolicy::default()),
-        Err(e) => Err(format!("reading {}: {e}", path.display())),
-    }
+    Figment::new()
+        .merge(Json::file(&path))
+        .merge(Env::prefixed("MERIDIAN_POLICY__").split("__"))
+        .extract()
+        .map_err(|e| format!("loading {}: {e}", path.display()))
 }
 
 fn save_stored(p: &StoredPolicy) -> Result<(), String> {

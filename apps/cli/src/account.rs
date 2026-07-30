@@ -12,6 +12,8 @@
 use std::path::{Path, PathBuf};
 
 use age::secrecy::SecretString;
+use figment::providers::{Format, Json};
+use figment::Figment;
 use meridian_core::identity::{pubkey_from_seed, to_id_string, AccountId};
 use serde::{Deserialize, Serialize};
 
@@ -113,15 +115,22 @@ impl AccountDescriptor {
         Ok(())
     }
 
+    /// Deliberately **not** given an environment-variable override layer (ADR 0018): every field
+    /// here is identity-bearing (`pubkey`, `keyfile` path, `service`, `label`), and an env var
+    /// silently redirecting which identity a command operates on is an identity-substitution
+    /// risk, not a legitimate config knob. Only the file-parsing engine moved to `figment`, for
+    /// consistency with `policy.rs`.
     pub fn load() -> Result<Self, String> {
         let path = descriptor_path()?;
-        let bytes = std::fs::read(&path).map_err(|_| {
-            format!(
+        if !path.exists() {
+            return Err(format!(
                 "no account found at {} — run `meridian id new` first",
                 path.display()
-            )
-        })?;
-        serde_json::from_slice(&bytes).map_err(|e| format!("parsing {}: {e}", path.display()))
+            ));
+        }
+        Figment::from(Json::file(&path))
+            .extract()
+            .map_err(|e| format!("parsing {}: {e}", path.display()))
     }
 }
 

@@ -11,10 +11,6 @@
 use clap::Parser;
 use meridian_rendezvous::{default_store, serve, AppState, Config};
 
-/// Conventional config path used only when `--config` is not supplied at all (best-effort,
-/// non-fatal if missing/unparseable — see the `None` arm of `main`'s config load below).
-const DEFAULT_CONFIG_PATH: &str = "rendezvous.toml";
-
 #[derive(Parser)]
 #[command(
     name = "meridian-rendezvous",
@@ -35,31 +31,19 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
-    let mut config = match &args.config {
-        // Explicitly supplied on the CLI: a load/parse failure is fatal — never silently boot
-        // with defaults, which could turn an invite-only/restricted config into open
-        // registration (threat-model goal 6, "never silently weaker").
-        Some(path) => match Config::load(path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!(
-                    "config: failed to load explicitly-supplied --config {path}: {e}; refusing to boot with defaults"
-                );
-                std::process::exit(1);
-            }
-        },
-        // No --config given: best-effort load the conventional `rendezvous.toml` from the
-        // working directory, but silently fall back to defaults if it's absent or unparseable —
-        // this is the documented "no config" default-boot path, not a user-requested load.
-        None => Config::load(DEFAULT_CONFIG_PATH).unwrap_or_default(),
+    // `Config::load` merges the TOML file (explicit `--config`, or the conventional
+    // `rendezvous.toml` when absent) with `MERIDIAN_<SECTION>__<FIELD>` env vars (ADR 0018,
+    // docs/api/rendezvous-protocol-v1.md §5). It fails closed uniformly: a missing explicit
+    // `--config`, a malformed TOML file (on either path), or a bad env var are all fatal — never
+    // silently boot with weaker-than-intended settings (threat-model goal 6, "never silently
+    // weaker"). Only a *missing* file on the implicit (no `--config`) path is non-fatal.
+    let mut config = match Config::load(args.config.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config: {e}; refusing to boot with an ambiguous config");
+            std::process::exit(1);
+        }
     };
-    // `MERIDIAN_<SECTION>__<FIELD>` env vars override whatever the file/defaults produced (see
-    // `Config::apply_env_overrides`, docs/api/rendezvous-protocol-v1.md §5). A set-but-unparseable
-    // var is fatal for the same "never silently weaker" reason as an explicit --config failure.
-    if let Err(e) = config.apply_env_overrides() {
-        eprintln!("config: {e}; refusing to boot with an ambiguous config");
-        std::process::exit(1);
-    }
     if let Some(bind) = args.bind {
         config.server.bind = bind;
     }

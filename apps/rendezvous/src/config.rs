@@ -1,6 +1,12 @@
 //! Server configuration — the small §9.2 surface subset relevant to T02.
 
+use figment::providers::{Env, Format, Toml};
+use figment::Figment;
 use serde::Deserialize;
+
+/// Conventional config path used only when no explicit `--config` path is given (see
+/// [`Config::load`]).
+const DEFAULT_CONFIG_PATH: &str = "rendezvous.toml";
 
 /// Top-level server config, parsed from TOML.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -157,155 +163,47 @@ impl Default for Limits {
 }
 
 impl Config {
-    /// Parse a config from a TOML string. Missing fields fall back to defaults.
-    pub fn from_toml_str(s: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(s)
+    /// Parse a config from a TOML string, with no env-var layer. Used directly by tests; `load`
+    /// is the real entry point.
+    #[cfg(test)]
+    fn from_toml_str(s: &str) -> Result<Self, Box<figment::Error>> {
+        Figment::from(Toml::string(s)).extract().map_err(Box::new)
     }
 
-    /// Load a config from a TOML file path.
-    pub fn load(path: &str) -> std::io::Result<Self> {
-        let text = std::fs::read_to_string(path)?;
-        Self::from_toml_str(&text)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
-    }
-
-    /// Overlay `MERIDIAN_<SECTION>__<FIELD>` environment variables onto an already-loaded config
-    /// (docker-compose / k8s Secrets can then override individual keys without templating
-    /// `rendezvous.toml` itself). Every key in the §5 config surface has a matching env var —
-    /// see `rendezvous.example.toml` for the full list next to each field.
+    /// Load the server config: an on-disk TOML file (explicit `--config <path>`, or the
+    /// conventional `rendezvous.toml` in the working directory when `explicit_path` is `None`)
+    /// merged with `MERIDIAN_<SECTION>__<FIELD>` environment variables, which take precedence
+    /// over the file. Every key in the §5 config surface has a matching env var — see
+    /// `rendezvous.example.toml` for the full list next to each field. List values use TOML/JSON
+    /// bracket syntax, e.g. `MERIDIAN_TURN__URLS=["turn:a","turn:b"]`.
     ///
-    /// Fails closed: an env var that's set but doesn't parse (bad bool/int/admission value) is a
-    /// hard error rather than a silent no-op, so a typo can't leave the server running with
-    /// weaker-than-intended settings (same principle as the `--config` load failure in `main`).
-    pub fn apply_env_overrides(&mut self) -> Result<(), EnvOverrideError> {
-        use std::env::var as env;
-
-        if let Ok(v) = env("MERIDIAN_SERVER__DOMAIN") {
-            self.server.domain = v;
+    /// Fails closed, uniformly: a bad env var (unparseable bool/int/admission), an explicitly
+    /// supplied `--config` path that doesn't exist, or **any** malformed TOML file (whether
+    /// pointed to by `--config` or the conventional `rendezvous.toml`) is a hard `Err` — never a
+    /// silent fallback to defaults. Only a **missing** `rendezvous.toml` on the implicit path is
+    /// non-fatal (ADR 0018): that's the documented "no config" default-boot path, not a
+    /// user-requested load.
+    pub fn load(explicit_path: Option<&str>) -> Result<Self, Box<figment::Error>> {
+        let mut figment = Figment::new();
+        match explicit_path {
+            Some(path) => {
+                if !std::path::Path::new(path).exists() {
+                    return Err(Box::new(format!("config file not found: {path}").into()));
+                }
+                figment = figment.merge(Toml::file(path));
+            }
+            None => {
+                // `Toml::file` silently contributes nothing if the file is simply absent — that
+                // alone gives the "no config" default-boot path its non-fatal behavior. A
+                // *malformed* file, missing or not, still surfaces as a hard error below.
+                figment = figment.merge(Toml::file(DEFAULT_CONFIG_PATH));
+            }
         }
-        if let Ok(v) = env("MERIDIAN_SERVER__BIND") {
-            self.server.bind = v;
-        }
-        if let Ok(v) = env("MERIDIAN_SERVER__ADMISSION") {
-            self.server.admission = parse_admission("MERIDIAN_SERVER__ADMISSION", &v)?;
-        }
-        if let Ok(v) = env("MERIDIAN_SERVER__INVITE_TOKENS") {
-            self.server.invite_tokens = parse_list(&v);
-        }
-        if let Ok(v) = env("MERIDIAN_SERVER__ALLOW_TEST_TAMPER") {
-            self.server.allow_test_tamper = parse_bool("MERIDIAN_SERVER__ALLOW_TEST_TAMPER", &v)?;
-        }
-        if let Ok(v) = env("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_TAMPER") {
-            self.server.allow_test_route_tamper =
-                parse_bool("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_TAMPER", &v)?;
-        }
-        if let Ok(v) = env("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_REWRITE") {
-            self.server.allow_test_route_rewrite =
-                parse_bool("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_REWRITE", &v)?;
-        }
-        if let Ok(v) = env("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_SPOOF_FROM") {
-            self.server.allow_test_route_spoof_from =
-                parse_bool("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_SPOOF_FROM", &v)?;
-        }
-        if let Ok(v) = env("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_REPLAY") {
-            self.server.allow_test_route_replay =
-                parse_bool("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_REPLAY", &v)?;
-        }
-        if let Ok(v) = env("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_DROP") {
-            self.server.allow_test_route_drop =
-                parse_bool("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_DROP", &v)?;
-        }
-        if let Ok(v) = env("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_REORDER") {
-            self.server.allow_test_route_reorder =
-                parse_bool("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_REORDER", &v)?;
-        }
-        if let Ok(v) = env("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_CROSS_DELIVER") {
-            self.server.allow_test_route_cross_deliver =
-                parse_bool("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_CROSS_DELIVER", &v)?;
-        }
-        if let Ok(v) = env("MERIDIAN_SERVER__DATABASE_URL") {
-            self.server.database_url = v;
-        }
-
-        if let Ok(v) = env("MERIDIAN_LIMITS__AUTH_PER_IP_PER_MIN") {
-            self.limits.auth_per_ip_per_min =
-                parse_u32("MERIDIAN_LIMITS__AUTH_PER_IP_PER_MIN", &v)?;
-        }
-        if let Ok(v) = env("MERIDIAN_LIMITS__FETCH_PER_ACCOUNT_PER_MIN") {
-            self.limits.fetch_per_account_per_min =
-                parse_u32("MERIDIAN_LIMITS__FETCH_PER_ACCOUNT_PER_MIN", &v)?;
-        }
-        if let Ok(v) = env("MERIDIAN_LIMITS__ROUTE_PER_ACCOUNT_PER_MIN") {
-            self.limits.route_per_account_per_min =
-                parse_u32("MERIDIAN_LIMITS__ROUTE_PER_ACCOUNT_PER_MIN", &v)?;
-        }
-        if let Ok(v) = env("MERIDIAN_LIMITS__TURN_PER_ACCOUNT_PER_MIN") {
-            self.limits.turn_per_account_per_min =
-                parse_u32("MERIDIAN_LIMITS__TURN_PER_ACCOUNT_PER_MIN", &v)?;
-        }
-
-        if let Ok(v) = env("MERIDIAN_TURN__SECRET") {
-            self.turn.secret = v;
-        }
-        if let Ok(v) = env("MERIDIAN_TURN__REALM") {
-            self.turn.realm = v;
-        }
-        if let Ok(v) = env("MERIDIAN_TURN__URLS") {
-            self.turn.urls = parse_list(&v);
-        }
-        if let Ok(v) = env("MERIDIAN_TURN__TTL_SECS") {
-            self.turn.ttl_secs = parse_u64("MERIDIAN_TURN__TTL_SECS", &v)?;
-        }
-
-        Ok(())
+        figment
+            .merge(Env::prefixed("MERIDIAN_").split("__"))
+            .extract()
+            .map_err(Box::new)
     }
-}
-
-/// A `MERIDIAN_*` environment variable was set but its value didn't parse.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct EnvOverrideError(String);
-
-fn parse_bool(key: &str, v: &str) -> Result<bool, EnvOverrideError> {
-    match v.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        other => Err(EnvOverrideError(format!(
-            "{key}: invalid boolean {other:?} (expected true/false)"
-        ))),
-    }
-}
-
-fn parse_u32(key: &str, v: &str) -> Result<u32, EnvOverrideError> {
-    v.trim()
-        .parse()
-        .map_err(|_| EnvOverrideError(format!("{key}: invalid integer {v:?}")))
-}
-
-fn parse_u64(key: &str, v: &str) -> Result<u64, EnvOverrideError> {
-    v.trim()
-        .parse()
-        .map_err(|_| EnvOverrideError(format!("{key}: invalid integer {v:?}")))
-}
-
-fn parse_admission(key: &str, v: &str) -> Result<Admission, EnvOverrideError> {
-    match v.trim().to_ascii_lowercase().as_str() {
-        "open" => Ok(Admission::Open),
-        "invite" => Ok(Admission::Invite),
-        other => Err(EnvOverrideError(format!(
-            "{key}: invalid admission {other:?} (expected open|invite)"
-        ))),
-    }
-}
-
-/// Comma-separated list, trimmed, empty elements dropped (so `FOO=` means "empty list", not
-/// `[""]`), e.g. `invite_tokens` and `turn.urls`.
-fn parse_list(v: &str) -> Vec<String> {
-    v.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect()
 }
 
 #[cfg(test)]
@@ -346,6 +244,13 @@ mod tests {
         }
     }
 
+    fn write_toml(contents: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        f
+    }
+
     #[test]
     fn env_overrides_apply_over_file_and_defaults() {
         let _guard = EnvGuard::set(
@@ -354,28 +259,30 @@ mod tests {
                 ("MERIDIAN_SERVER__DOMAIN", "org.example"),
                 ("MERIDIAN_SERVER__BIND", "0.0.0.0:9443"),
                 ("MERIDIAN_SERVER__ADMISSION", "invite"),
-                ("MERIDIAN_SERVER__INVITE_TOKENS", "tok-a, tok-b ,,tok-c"),
+                ("MERIDIAN_SERVER__INVITE_TOKENS", r#"["tok-a","tok-b"]"#),
                 ("MERIDIAN_SERVER__ALLOW_TEST_TAMPER", "true"),
                 ("MERIDIAN_LIMITS__ROUTE_PER_ACCOUNT_PER_MIN", "42"),
                 ("MERIDIAN_TURN__SECRET", "s3cr3t"),
                 (
                     "MERIDIAN_TURN__URLS",
-                    "turn:a:3478?transport=udp,turn:b:3478?transport=tcp",
+                    r#"["turn:a:3478?transport=udp","turn:b:3478?transport=tcp"]"#,
                 ),
                 ("MERIDIAN_TURN__TTL_SECS", "300"),
             ],
         );
+        let file = write_toml(
+            "[server]\ndomain = \"from-file.example\"\nbind = \"file-should-lose.example:1\"\n",
+        );
 
-        let mut config = Config::default();
-        config.apply_env_overrides().expect("valid overrides");
+        let config = Config::load(Some(file.path().to_str().unwrap())).expect("valid overrides");
 
-        assert_eq!(config.server.domain, "org.example");
+        assert_eq!(config.server.domain, "org.example"); // env wins over file
         assert_eq!(config.server.bind, "0.0.0.0:9443");
         assert_eq!(config.server.admission, Admission::Invite);
-        assert_eq!(config.server.invite_tokens, vec!["tok-a", "tok-b", "tok-c"]);
+        assert_eq!(config.server.invite_tokens, vec!["tok-a", "tok-b"]);
         assert!(config.server.allow_test_tamper);
         assert_eq!(config.limits.route_per_account_per_min, 42);
-        // Unset fields keep the file/default value.
+        // Unset fields keep the built-in default.
         assert_eq!(
             config.limits.fetch_per_account_per_min,
             Limits::default().fetch_per_account_per_min
@@ -389,21 +296,28 @@ mod tests {
     }
 
     #[test]
+    fn file_only_value_survives_when_no_env_override() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[server]\ndomain = \"from-file.example\"\n");
+
+        let config = Config::load(Some(file.path().to_str().unwrap())).unwrap();
+
+        assert_eq!(config.server.domain, "from-file.example");
+    }
+
+    #[test]
     fn env_overrides_reject_bad_bool_fail_closed() {
         let _guard = EnvGuard::set(
             ENV_LOCK.lock().unwrap(),
             &[("MERIDIAN_SERVER__ALLOW_TEST_TAMPER", "sure")],
         );
+        let file = write_toml("");
 
-        let mut config = Config::default();
-        let err = config
-            .apply_env_overrides()
+        let err = Config::load(Some(file.path().to_str().unwrap()))
             .expect_err("non-bool value must be rejected, not silently ignored");
-        assert!(err
-            .to_string()
-            .contains("MERIDIAN_SERVER__ALLOW_TEST_TAMPER"));
-        // Fails before or after other fields, but must not silently arm a test hook.
-        assert!(!config.server.allow_test_tamper);
+        // Fails closed: must not silently arm a test hook. The exact message is figment's own
+        // (type-mismatch on the offending key), not a custom one.
+        assert!(!err.to_string().is_empty());
     }
 
     #[test]
@@ -412,23 +326,55 @@ mod tests {
             ENV_LOCK.lock().unwrap(),
             &[("MERIDIAN_SERVER__ADMISSION", "sometimes")],
         );
+        let file = write_toml("");
 
-        let mut config = Config::default();
-        assert!(config.apply_env_overrides().is_err());
+        assert!(Config::load(Some(file.path().to_str().unwrap())).is_err());
+    }
+
+    #[test]
+    fn explicit_config_path_that_does_not_exist_is_fatal() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+
+        let err = Config::load(Some("/nonexistent/path/rendezvous.toml")).unwrap_err();
+
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn implicit_path_missing_file_is_non_fatal_but_malformed_file_is_now_fatal() {
+        // Exercises ADR 0018's fail-closed tightening: on the implicit (no `--config`) path, a
+        // *missing* rendezvous.toml still falls back to defaults, but a *malformed* one — which
+        // used to fall back silently too — is now a hard error, same as the explicit path.
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let dir = tempfile::tempdir().unwrap();
+        let orig_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let missing = Config::load(None);
+        std::fs::write(dir.path().join(DEFAULT_CONFIG_PATH), "not valid toml =====").unwrap();
+        let malformed = Config::load(None);
+
+        std::env::set_current_dir(&orig_cwd).unwrap();
+
+        let config = missing.expect("missing implicit rendezvous.toml is non-fatal");
+        assert_eq!(config.server.domain, Server::default().domain);
+        assert!(
+            malformed.is_err(),
+            "malformed implicit rendezvous.toml must now be fatal"
+        );
     }
 
     #[test]
     fn no_env_vars_set_leaves_config_untouched() {
         let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
 
-        let mut config = Config::from_toml_str(
+        let config = Config::from_toml_str(
             r#"
             [server]
             domain = "from-file.example"
             "#,
         )
         .unwrap();
-        config.apply_env_overrides().unwrap();
 
         assert_eq!(config.server.domain, "from-file.example");
     }

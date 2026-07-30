@@ -24,6 +24,7 @@ are the stack/repo decisions (extracted from [stack](../architecture/stack.md) �
 | [0015](./0015-ratchet-composition.md) | Double Ratchet composed in `meridian-crypto` from RustCrypto primitives (Accepted; supersedes 0011's ratchet mechanism) | T03 spike |
 | [0016](./0016-envelope-deniability.md) | Envelope **v2 drops the per-message identity-key signature** so transcripts become deniable (Accepted; implementation deferred to a build task, gates Feature 07) | Phase-1 review |
 | [0017](./0017-federation-trust-boundary.md) | Federation trust boundary: peer-cert identity pinned to the hint domain, `fed_route` carries a server-asserted `from` (Accepted; extends 0002, scope-corrects 0016 R4) | Phase-2 planning |
+| [0018](./0018-rendezvous-config-loading.md) | `figment` for rendezvous + CLI-store config loading; `account.json` gets no `Env` layer (Accepted) | PR #37 follow-up |
 
 **Previously-open decisions, now resolved at handoff:** [0011 ratchet library](./0011-ratchet-library.md)
 X3DH layer → hand-wired over RustCrypto primitives (unchanged); Double Ratchet mechanism → composed
