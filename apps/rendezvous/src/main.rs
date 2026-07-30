@@ -53,6 +53,13 @@ async fn main() {
         // this is the documented "no config" default-boot path, not a user-requested load.
         None => Config::load(DEFAULT_CONFIG_PATH).unwrap_or_default(),
     };
+    // `MERIDIAN_<SECTION>__<FIELD>` env vars override whatever the file/defaults produced (see
+    // `Config::apply_env_overrides`, docs/api/rendezvous-protocol-v1.md §5). A set-but-unparseable
+    // var is fatal for the same "never silently weaker" reason as an explicit --config failure.
+    if let Err(e) = config.apply_env_overrides() {
+        eprintln!("config: {e}; refusing to boot with an ambiguous config");
+        std::process::exit(1);
+    }
     if let Some(bind) = args.bind {
         config.server.bind = bind;
     }

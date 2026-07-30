@@ -15,7 +15,7 @@ Two containers plus a database: `meridian-rendezvous` (single Rust binary; Postg
 
 ### 9.2 Config surface (deliberately small)
 
-Domain + certs; federation policy (`open | allowlist | closed`) and the static federation map (air-gapped) or SRV (connected); registration admission (open, invite-token, or OIDC-gated per §3.2); mailbox TTL/quota; TURN secret + bandwidth caps; connection policy defaults (`direct|prefer-relay|relay-only`); rate-limit knobs. Everything else is client-side.
+Domain + certs; federation policy (`open | allowlist | closed`) and the static federation map (air-gapped) or SRV (connected); registration admission (open, invite-token, or OIDC-gated per §3.2); mailbox TTL/quota; TURN secret + bandwidth caps; connection policy defaults (`direct|prefer-relay|relay-only`); rate-limit knobs. Everything else is client-side. Every key is TOML in `rendezvous.toml` (generated from [`rendezvous.example.toml`](../../apps/rendezvous/rendezvous.example.toml)) and can be overridden per-deployment with `MERIDIAN_<SECTION>__<FIELD>` env vars (e.g. `MERIDIAN_TURN__SECRET`) — see [rendezvous-protocol-v1 §5](../api/rendezvous-protocol-v1.md#5-config-surface-the-92-subset) — so secrets never need to be baked into the generated file or image.
 
 ### 9.3 Air-gapped operation
 

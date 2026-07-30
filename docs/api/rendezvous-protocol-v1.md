@@ -112,7 +112,7 @@ coturn — sharing the *same* secret (`static-auth-secret` == rendezvous `[turn]
 
 ## 5. Config surface (the §9.2 subset)
 
-TOML; every field has a default (see [`meridian-rendezvous` `config`](../../apps/rendezvous/src/config.rs)):
+TOML; every field has a default (see [`meridian-rendezvous` `config`](../../apps/rendezvous/src/config.rs)). Every key can also be set via a `MERIDIAN_<SECTION>__<FIELD>` environment variable (e.g. `[turn] secret` → `MERIDIAN_TURN__SECRET`), which overrides whatever the file/defaults produced — see the per-key env names in [`rendezvous.example.toml`](../../apps/rendezvous/rendezvous.example.toml) and `Config::apply_env_overrides`. This is the intended way to inject secrets (`[turn].secret`) and per-deployment overrides into a container/Helm deploy without templating the TOML file itself. Lists (`invite_tokens`, `turn.urls`) are comma-separated; a set-but-unparseable var (bad bool/int/`admission`) is a fatal boot error, never a silent fallback — same "never silently weaker" rule as an explicitly-supplied `--config` that fails to load.
 
 ```toml
 [server]

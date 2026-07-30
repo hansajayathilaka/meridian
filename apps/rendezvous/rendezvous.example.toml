@@ -1,14 +1,25 @@
 # meridian-rendezvous example config (the §9.2 surface subset for T02).
 # Full reference: docs/api/rendezvous-protocol-v1.md §5.
+#
+# Copy this to rendezvous.toml and edit, or leave rendezvous.toml as-is (or absent) and override
+# individual keys with `MERIDIAN_<SECTION>__<FIELD>` environment variables instead — handy for
+# docker-compose/k8s deploys where the generated file shouldn't carry secrets. Every key below has
+# a matching env var, shown in the comment; env values always win over the file. A `MERIDIAN_*`
+# var that's set but fails to parse (bad bool/int/admission) is a fatal boot error, not a silent
+# no-op — see `Config::apply_env_overrides` in src/config.rs.
 
 [server]
 domain = "chat.example"          # this server's hint-domain; folded into the auth challenge
+                                  # env: MERIDIAN_SERVER__DOMAIN
 bind = "0.0.0.0:8443"            # WebSocket bind; TLS is terminated by the proxy/VIP (ADR-8)
-admission = "open"               # open | invite
-invite_tokens = []               # tokens accepted when admission = "invite"
+                                  # env: MERIDIAN_SERVER__BIND
+admission = "open"               # open | invite -- env: MERIDIAN_SERVER__ADMISSION
+invite_tokens = []               # tokens accepted when admission = "invite" -- comma-separated,
+                                  # env: MERIDIAN_SERVER__INVITE_TOKENS (e.g. "tok-a,tok-b")
 allow_test_tamper = false        # TEST HOOK — only takes effect when built with `--features
                                   # test-tamper-hook` (the substitution code is compiled out
                                   # otherwise). MUST be false in production.
+                                  # env: MERIDIAN_SERVER__ALLOW_TEST_TAMPER
 allow_test_route_tamper = false  # TEST HOOK (tasks 1.28 + 1.32) — UMBRELLA gate for tampering with
                                   # the ROUTED path, to prove a malicious relay cannot get anything
                                   # accepted. Same compile gate as above, and additionally requires
@@ -17,17 +28,39 @@ allow_test_route_tamper = false  # TEST HOOK (tasks 1.28 + 1.32) — UMBRELLA ga
                                   # there is NO per-request opt-in — enabling any of these affects
                                   # EVERY routed blob for EVERY user of the server. All MUST be
                                   # false in production.
+                                  # env: MERIDIAN_SERVER__ALLOW_TEST_ROUTE_TAMPER
 # One flag per attack. Each additionally requires allow_test_tamper AND allow_test_route_tamper
 # above, and none exists at all without `--features test-tamper-hook`. Intended one at a time.
 allow_test_route_rewrite = false      # 1.28: flip a byte inside a routed blob in transit
+                                       # env: MERIDIAN_SERVER__ALLOW_TEST_ROUTE_REWRITE
 allow_test_route_spoof_from = false   # 1.32: forge Deliver.from (the server asserts it itself)
+                                       # env: MERIDIAN_SERVER__ALLOW_TEST_ROUTE_SPOOF_FROM
 allow_test_route_replay = false       # 1.32: re-deliver a blob a second time, byte-identical
+                                       # env: MERIDIAN_SERVER__ALLOW_TEST_ROUTE_REPLAY
 allow_test_route_drop = false         # 1.32: swallow a blob but still reply delivered = true
+                                       # env: MERIDIAN_SERVER__ALLOW_TEST_ROUTE_DROP
 allow_test_route_reorder = false      # 1.32: release blobs out of order (a delay, generalised)
+                                       # env: MERIDIAN_SERVER__ALLOW_TEST_ROUTE_REORDER
 allow_test_route_cross_deliver = false # 1.32: hand one session's envelope to the wrong recipient
+                                       # env: MERIDIAN_SERVER__ALLOW_TEST_ROUTE_CROSS_DELIVER
 database_url = "sqlite://rendezvous.db"   # only used when built with --features sqlite
+                                  # env: MERIDIAN_SERVER__DATABASE_URL
 
 [limits]                         # anti-abuse, fixed one-minute windows
-auth_per_ip_per_min = 60
-fetch_per_account_per_min = 120
-route_per_account_per_min = 600
+auth_per_ip_per_min = 60         # env: MERIDIAN_LIMITS__AUTH_PER_IP_PER_MIN
+fetch_per_account_per_min = 120  # env: MERIDIAN_LIMITS__FETCH_PER_ACCOUNT_PER_MIN
+route_per_account_per_min = 600  # env: MERIDIAN_LIMITS__ROUTE_PER_ACCOUNT_PER_MIN
+turn_per_account_per_min = 60    # env: MERIDIAN_LIMITS__TURN_PER_ACCOUNT_PER_MIN
+
+[turn]                           # ephemeral TURN credential minting (T05, §5.4)
+secret = ""                      # == coturn static-auth-secret; EMPTY ⇒ minting disabled.
+                                  # Provision out of band — never commit a real value here.
+                                  # env: MERIDIAN_TURN__SECRET
+realm = "localhost"              # coturn realm, echoed to the client -- env: MERIDIAN_TURN__REALM
+urls = [                         # the candidate ladder, preference order -- comma-separated,
+  "turn:127.0.0.1:3478?transport=udp",  # env: MERIDIAN_TURN__URLS
+  "turn:127.0.0.1:3478?transport=tcp",
+  "turns:127.0.0.1:443?transport=tcp",
+]
+ttl_secs = 120                   # credential lifetime (short); reuse bounded by coturn user-quota
+                                  # env: MERIDIAN_TURN__TTL_SECS

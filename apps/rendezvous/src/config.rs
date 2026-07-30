@@ -168,4 +168,268 @@ impl Config {
         Self::from_toml_str(&text)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
     }
+
+    /// Overlay `MERIDIAN_<SECTION>__<FIELD>` environment variables onto an already-loaded config
+    /// (docker-compose / k8s Secrets can then override individual keys without templating
+    /// `rendezvous.toml` itself). Every key in the §5 config surface has a matching env var —
+    /// see `rendezvous.example.toml` for the full list next to each field.
+    ///
+    /// Fails closed: an env var that's set but doesn't parse (bad bool/int/admission value) is a
+    /// hard error rather than a silent no-op, so a typo can't leave the server running with
+    /// weaker-than-intended settings (same principle as the `--config` load failure in `main`).
+    pub fn apply_env_overrides(&mut self) -> Result<(), EnvOverrideError> {
+        use std::env::var as env;
+
+        if let Ok(v) = env("MERIDIAN_SERVER__DOMAIN") {
+            self.server.domain = v;
+        }
+        if let Ok(v) = env("MERIDIAN_SERVER__BIND") {
+            self.server.bind = v;
+        }
+        if let Ok(v) = env("MERIDIAN_SERVER__ADMISSION") {
+            self.server.admission = parse_admission("MERIDIAN_SERVER__ADMISSION", &v)?;
+        }
+        if let Ok(v) = env("MERIDIAN_SERVER__INVITE_TOKENS") {
+            self.server.invite_tokens = parse_list(&v);
+        }
+        if let Ok(v) = env("MERIDIAN_SERVER__ALLOW_TEST_TAMPER") {
+            self.server.allow_test_tamper = parse_bool("MERIDIAN_SERVER__ALLOW_TEST_TAMPER", &v)?;
+        }
+        if let Ok(v) = env("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_TAMPER") {
+            self.server.allow_test_route_tamper =
+                parse_bool("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_TAMPER", &v)?;
+        }
+        if let Ok(v) = env("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_REWRITE") {
+            self.server.allow_test_route_rewrite =
+                parse_bool("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_REWRITE", &v)?;
+        }
+        if let Ok(v) = env("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_SPOOF_FROM") {
+            self.server.allow_test_route_spoof_from =
+                parse_bool("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_SPOOF_FROM", &v)?;
+        }
+        if let Ok(v) = env("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_REPLAY") {
+            self.server.allow_test_route_replay =
+                parse_bool("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_REPLAY", &v)?;
+        }
+        if let Ok(v) = env("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_DROP") {
+            self.server.allow_test_route_drop =
+                parse_bool("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_DROP", &v)?;
+        }
+        if let Ok(v) = env("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_REORDER") {
+            self.server.allow_test_route_reorder =
+                parse_bool("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_REORDER", &v)?;
+        }
+        if let Ok(v) = env("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_CROSS_DELIVER") {
+            self.server.allow_test_route_cross_deliver =
+                parse_bool("MERIDIAN_SERVER__ALLOW_TEST_ROUTE_CROSS_DELIVER", &v)?;
+        }
+        if let Ok(v) = env("MERIDIAN_SERVER__DATABASE_URL") {
+            self.server.database_url = v;
+        }
+
+        if let Ok(v) = env("MERIDIAN_LIMITS__AUTH_PER_IP_PER_MIN") {
+            self.limits.auth_per_ip_per_min =
+                parse_u32("MERIDIAN_LIMITS__AUTH_PER_IP_PER_MIN", &v)?;
+        }
+        if let Ok(v) = env("MERIDIAN_LIMITS__FETCH_PER_ACCOUNT_PER_MIN") {
+            self.limits.fetch_per_account_per_min =
+                parse_u32("MERIDIAN_LIMITS__FETCH_PER_ACCOUNT_PER_MIN", &v)?;
+        }
+        if let Ok(v) = env("MERIDIAN_LIMITS__ROUTE_PER_ACCOUNT_PER_MIN") {
+            self.limits.route_per_account_per_min =
+                parse_u32("MERIDIAN_LIMITS__ROUTE_PER_ACCOUNT_PER_MIN", &v)?;
+        }
+        if let Ok(v) = env("MERIDIAN_LIMITS__TURN_PER_ACCOUNT_PER_MIN") {
+            self.limits.turn_per_account_per_min =
+                parse_u32("MERIDIAN_LIMITS__TURN_PER_ACCOUNT_PER_MIN", &v)?;
+        }
+
+        if let Ok(v) = env("MERIDIAN_TURN__SECRET") {
+            self.turn.secret = v;
+        }
+        if let Ok(v) = env("MERIDIAN_TURN__REALM") {
+            self.turn.realm = v;
+        }
+        if let Ok(v) = env("MERIDIAN_TURN__URLS") {
+            self.turn.urls = parse_list(&v);
+        }
+        if let Ok(v) = env("MERIDIAN_TURN__TTL_SECS") {
+            self.turn.ttl_secs = parse_u64("MERIDIAN_TURN__TTL_SECS", &v)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// A `MERIDIAN_*` environment variable was set but its value didn't parse.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct EnvOverrideError(String);
+
+fn parse_bool(key: &str, v: &str) -> Result<bool, EnvOverrideError> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(EnvOverrideError(format!(
+            "{key}: invalid boolean {other:?} (expected true/false)"
+        ))),
+    }
+}
+
+fn parse_u32(key: &str, v: &str) -> Result<u32, EnvOverrideError> {
+    v.trim()
+        .parse()
+        .map_err(|_| EnvOverrideError(format!("{key}: invalid integer {v:?}")))
+}
+
+fn parse_u64(key: &str, v: &str) -> Result<u64, EnvOverrideError> {
+    v.trim()
+        .parse()
+        .map_err(|_| EnvOverrideError(format!("{key}: invalid integer {v:?}")))
+}
+
+fn parse_admission(key: &str, v: &str) -> Result<Admission, EnvOverrideError> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "open" => Ok(Admission::Open),
+        "invite" => Ok(Admission::Invite),
+        other => Err(EnvOverrideError(format!(
+            "{key}: invalid admission {other:?} (expected open|invite)"
+        ))),
+    }
+}
+
+/// Comma-separated list, trimmed, empty elements dropped (so `FOO=` means "empty list", not
+/// `[""]`), e.g. `invite_tokens` and `turn.urls`.
+fn parse_list(v: &str) -> Vec<String> {
+    v.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // `std::env` is process-global; serialize every test in this module so they can't stomp on
+    // each other's vars when cargo runs them concurrently.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Sets `MERIDIAN_*` vars for the duration of the guard and clears them all on drop, even if
+    /// the test panics (so a failing assertion can't leak an override into a later test).
+    struct EnvGuard<'a> {
+        _lock: std::sync::MutexGuard<'a, ()>,
+        keys: Vec<&'static str>,
+    }
+
+    impl<'a> EnvGuard<'a> {
+        fn set(lock: std::sync::MutexGuard<'a, ()>, vars: &[(&'static str, &str)]) -> Self {
+            for (k, v) in vars {
+                // SAFETY: serialized by ENV_LOCK above; no other thread touches these vars.
+                unsafe { std::env::set_var(k, v) };
+            }
+            Self {
+                _lock: lock,
+                keys: vars.iter().map(|(k, _)| *k).collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard<'_> {
+        fn drop(&mut self) {
+            for k in &self.keys {
+                // SAFETY: same justification as `set` above.
+                unsafe { std::env::remove_var(k) };
+            }
+        }
+    }
+
+    #[test]
+    fn env_overrides_apply_over_file_and_defaults() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[
+                ("MERIDIAN_SERVER__DOMAIN", "org.example"),
+                ("MERIDIAN_SERVER__BIND", "0.0.0.0:9443"),
+                ("MERIDIAN_SERVER__ADMISSION", "invite"),
+                ("MERIDIAN_SERVER__INVITE_TOKENS", "tok-a, tok-b ,,tok-c"),
+                ("MERIDIAN_SERVER__ALLOW_TEST_TAMPER", "true"),
+                ("MERIDIAN_LIMITS__ROUTE_PER_ACCOUNT_PER_MIN", "42"),
+                ("MERIDIAN_TURN__SECRET", "s3cr3t"),
+                (
+                    "MERIDIAN_TURN__URLS",
+                    "turn:a:3478?transport=udp,turn:b:3478?transport=tcp",
+                ),
+                ("MERIDIAN_TURN__TTL_SECS", "300"),
+            ],
+        );
+
+        let mut config = Config::default();
+        config.apply_env_overrides().expect("valid overrides");
+
+        assert_eq!(config.server.domain, "org.example");
+        assert_eq!(config.server.bind, "0.0.0.0:9443");
+        assert_eq!(config.server.admission, Admission::Invite);
+        assert_eq!(config.server.invite_tokens, vec!["tok-a", "tok-b", "tok-c"]);
+        assert!(config.server.allow_test_tamper);
+        assert_eq!(config.limits.route_per_account_per_min, 42);
+        // Unset fields keep the file/default value.
+        assert_eq!(
+            config.limits.fetch_per_account_per_min,
+            Limits::default().fetch_per_account_per_min
+        );
+        assert_eq!(config.turn.secret, "s3cr3t");
+        assert_eq!(
+            config.turn.urls,
+            vec!["turn:a:3478?transport=udp", "turn:b:3478?transport=tcp"]
+        );
+        assert_eq!(config.turn.ttl_secs, 300);
+    }
+
+    #[test]
+    fn env_overrides_reject_bad_bool_fail_closed() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[("MERIDIAN_SERVER__ALLOW_TEST_TAMPER", "sure")],
+        );
+
+        let mut config = Config::default();
+        let err = config
+            .apply_env_overrides()
+            .expect_err("non-bool value must be rejected, not silently ignored");
+        assert!(err
+            .to_string()
+            .contains("MERIDIAN_SERVER__ALLOW_TEST_TAMPER"));
+        // Fails before or after other fields, but must not silently arm a test hook.
+        assert!(!config.server.allow_test_tamper);
+    }
+
+    #[test]
+    fn env_overrides_reject_bad_admission() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[("MERIDIAN_SERVER__ADMISSION", "sometimes")],
+        );
+
+        let mut config = Config::default();
+        assert!(config.apply_env_overrides().is_err());
+    }
+
+    #[test]
+    fn no_env_vars_set_leaves_config_untouched() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+
+        let mut config = Config::from_toml_str(
+            r#"
+            [server]
+            domain = "from-file.example"
+            "#,
+        )
+        .unwrap();
+        config.apply_env_overrides().unwrap();
+
+        assert_eq!(config.server.domain, "from-file.example");
+    }
 }
