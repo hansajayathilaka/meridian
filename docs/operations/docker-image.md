@@ -20,6 +20,11 @@ required [`ci.yml`](../../.github/workflows/ci.yml) to pass before a PR can merg
 `TODO: confirm` branch protection is actually configured that way on this repo — if it isn't, this
 pipeline will happily publish an image from an untested commit.
 
+The image is built with the `sqlite` cargo feature, so accounts and prekey bundles persist across
+container restarts (SQLite file, `create_if_missing` + self-migrating — no separate migration step).
+Postgres isn't wired up: `apps/rendezvous/Cargo.toml` only implements a `sqlite` backend today, so
+there's nothing for a Postgres container to talk to yet.
+
 ## 2. One-time repo setup
 
 Configure these under **Settings → Secrets and variables → Actions** before the workflow can run:
@@ -88,3 +93,45 @@ build). To also publish `linux/arm64` (Raspberry Pi / ARM home-server self-hosti
 [`docker-publish.yml`](../../.github/workflows/docker-publish.yml); expect the build step to take
 noticeably longer since `docker/build-push-action` cross-compiles the second platform under
 emulation.
+
+## 6. Running this on Dokploy
+
+[`infra/deploy/dokploy.compose.yml`](../../infra/deploy/dokploy.compose.yml) +
+[`infra/deploy/dokploy.env.example`](../../infra/deploy/dokploy.env.example) are a ready-to-deploy
+pair for [Dokploy](https://dokploy.com)'s "Docker Compose" application type (or any plain
+`docker compose` host — Dokploy has no special requirements here beyond what any compose deploy
+needs). Point a Dokploy compose app at this repo/file, copy `dokploy.env.example` into its
+Environment tab, fill in the three required values, and deploy:
+
+| Var | Required? | What it is |
+|---|---|---|
+| `RENDEZVOUS_IMAGE` | yes | The image `docker-publish.yml` pushed, e.g. `yourdockerhubuser/meridian-rendezvous:latest` — or pin a `:<short-sha>` tag (§4) for a reproducible deploy. |
+| `MERIDIAN_RENDEZVOUS_SERVER__DOMAIN` | yes | Your public signaling hostname, e.g. `chat.example.com`. |
+| `TURN_SHARED_SECRET` | yes | A long random value. Shared verbatim between the `rendezvous` and `coturn` services in the compose file — that's the whole trust mechanism for ephemeral TURN credentials (§"TURN / coturn" in [deployment.md](./deployment.md)). Generate one with `openssl rand -hex 32` and never commit it. |
+
+Everything else in the env file has a working default and only needs changing if you want to.
+Every var maps 1:1 onto a config key documented in §3 above — the compose file just plumbs each one
+through `${VAR:-default}` interpolation so Dokploy's flat env-var UI is the single place you edit
+config, with no image rebuild and no editing the compose file itself for routine changes.
+
+Two things that don't reduce to "just set an env var," both called out in comments in the compose
+file itself:
+
+- **Exposing the domain.** The compose file publishes the rendezvous container's port 8443 to the
+  host (`RENDEZVOUS_PORT`, default 8443) but does not terminate TLS — same as every other deploy of
+  this image (§2: TLS termination is the proxy/VIP's job, ADR-8). In Dokploy, add a Domain for the
+  `rendezvous` service pointing at container port 8443 with HTTPS enabled; Dokploy's built-in Traefik
+  handles the certificate and wss:// termination from there.
+- **coturn's TURNS/443 rung.** `turnserver.conf` (T05) treats `turns://` on port 443 as the
+  hostile-egress fallback rung, but on a Dokploy host port 443 is normally already owned by
+  Dokploy's own Traefik for HTTP(S) routing — binding coturn there too would conflict. The compose
+  file ships with that rung disabled by default (plain `turn://` on 3478/udp+tcp only, which needs
+  no TLS cert and works out of the box); enabling it needs a real TLS certificate for `TURN_DOMAIN`
+  provisioned out of band (never baked into this repo) plus either a host/IP where coturn can own
+  443 itself, or accepting that hostile-egress clients (networks that allow only outbound 443) won't
+  be able to relay through this deployment. `TODO: confirm` whether that trade-off is acceptable for
+  your deployment — it's a real capability loss, not a cosmetic one.
+
+coturn itself runs with `network_mode: host` (the standard way to run TURN in Docker — its relay
+port range works directly against the host network instead of needing ~16k individual Docker port
+mappings), so make sure host ports 3478/udp and 3478/tcp are free before deploying.
