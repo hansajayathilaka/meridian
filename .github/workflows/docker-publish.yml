@@ -1,0 +1,70 @@
+# Builds and pushes the meridian-rendezvous (signaling server) image to Docker Hub whenever a PR
+# merges to main. Runtime config docs: docs/operations/docker-image.md.
+#
+# Required repo configuration (Settings > Secrets and variables > Actions):
+#   Secrets:   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (a Docker Hub access token, not your password)
+#   Variables: DOCKERHUB_IMAGE_NAME (e.g. "yourdockerhubuser/meridian-rendezvous")
+name: docker-publish
+
+on:
+  push:
+    branches: [main]
+    # rendezvous depends only on meridian-proto (enforced by tools/lint-server-no-core.sh), so
+    # these paths are the complete, provably-sufficient set of inputs to its image — a docs-only
+    # or other-crate-only merge to main does not publish a new (identical) image.
+    paths:
+      - "apps/rendezvous/**"
+      - "apps/proto/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/docker-publish.yml"
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build & push meridian-rendezvous image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require DOCKERHUB_IMAGE_NAME
+        run: |
+          if [ -z "${{ vars.DOCKERHUB_IMAGE_NAME }}" ]; then
+            echo "::error::repository variable DOCKERHUB_IMAGE_NAME is not set (Settings > Secrets and variables > Actions > Variables) — e.g. yourdockerhubuser/meridian-rendezvous" >&2
+            exit 1
+          fi
+
+      - name: Docker metadata (tags + OCI labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ vars.DOCKERHUB_IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/rendezvous/Dockerfile
+          # Single-arch to start (fast, native runner build — no qemu emulation). Extending to
+          # linux/arm64 is a one-line change here; see docs/operations/docker-image.md.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

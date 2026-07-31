@@ -1,0 +1,68 @@
+# Meridian rendezvous + coturn — production stack for Dokploy (or any docker-compose host).
+# Full walkthrough: ../../docs/operations/docker-image.md#6-running-this-on-dokploy
+#
+# Everything you'll ever need to change lives in environment variables — copy dokploy.env.example
+# to the values Dokploy asks for (its "Environment" tab for a compose app, or a plain `.env` file
+# next to this one for `docker compose up`) and redeploy; no image rebuild, no editing this file.
+#
+# What this does NOT do: run Postgres. meridian-rendezvous only supports SQLite today (the `sqlite`
+# cargo feature baked into the published image, apps/rendezvous/Cargo.toml) — Postgres support is
+# tracked but unimplemented, so a Postgres container here would just sit unused. Persistence is a
+# named volume holding the SQLite file instead.
+services:
+  rendezvous:
+    image: ${RENDEZVOUS_IMAGE:?set RENDEZVOUS_IMAGE, e.g. yourdockerhubuser/meridian-rendezvous:latest — see docs/operations/docker-image.md}
+    restart: unless-stopped
+    ports:
+      - "${RENDEZVOUS_PORT:-8443}:8443"
+    volumes:
+      # Holds the SQLite file backing MERIDIAN_RENDEZVOUS_SERVER__DATABASE_URL below — survives
+      # container recreation/redeploys. In Dokploy's UI this shows up as a mountable volume too.
+      - rendezvous_data:/data
+    environment:
+      # --- [server] --------------------------------------------------------------------------
+      MERIDIAN_RENDEZVOUS_SERVER__DOMAIN: ${MERIDIAN_RENDEZVOUS_SERVER__DOMAIN:?set MERIDIAN_RENDEZVOUS_SERVER__DOMAIN, e.g. chat.example.com — the hint-domain folded into the auth challenge}
+      MERIDIAN_RENDEZVOUS_SERVER__ADMISSION: ${MERIDIAN_RENDEZVOUS_SERVER__ADMISSION:-open}
+      # Only read when ADMISSION=invite. JSON array syntax, e.g. ["tok-a","tok-b"] — NOT comma-separated.
+      MERIDIAN_RENDEZVOUS_SERVER__INVITE_TOKENS: ${MERIDIAN_RENDEZVOUS_SERVER__INVITE_TOKENS:-[]}
+      MERIDIAN_RENDEZVOUS_SERVER__DATABASE_URL: ${MERIDIAN_RENDEZVOUS_SERVER__DATABASE_URL:-sqlite:///data/rendezvous.db}
+      # --- [limits] — anti-abuse, fixed one-minute windows ------------------------------------
+      MERIDIAN_RENDEZVOUS_LIMITS__AUTH_PER_IP_PER_MIN: ${MERIDIAN_RENDEZVOUS_LIMITS__AUTH_PER_IP_PER_MIN:-60}
+      MERIDIAN_RENDEZVOUS_LIMITS__FETCH_PER_ACCOUNT_PER_MIN: ${MERIDIAN_RENDEZVOUS_LIMITS__FETCH_PER_ACCOUNT_PER_MIN:-120}
+      MERIDIAN_RENDEZVOUS_LIMITS__ROUTE_PER_ACCOUNT_PER_MIN: ${MERIDIAN_RENDEZVOUS_LIMITS__ROUTE_PER_ACCOUNT_PER_MIN:-600}
+      MERIDIAN_RENDEZVOUS_LIMITS__TURN_PER_ACCOUNT_PER_MIN: ${MERIDIAN_RENDEZVOUS_LIMITS__TURN_PER_ACCOUNT_PER_MIN:-60}
+      # --- [turn] — ephemeral TURN credential minting -----------------------------------------
+      # MUST equal coturn's --static-auth-secret below — both read the same TURN_SHARED_SECRET.
+      MERIDIAN_RENDEZVOUS_TURN__SECRET: ${TURN_SHARED_SECRET:?set TURN_SHARED_SECRET — a long random value, shared verbatim with the coturn service below, never committed}
+      MERIDIAN_RENDEZVOUS_TURN__REALM: ${MERIDIAN_RENDEZVOUS_TURN__REALM:-${TURN_DOMAIN:-turn.example.com}}
+      # Plain UDP/TCP only by default — no TLS cert required to get a working deploy. The turns://
+      # (port 443) rung needs a real cert for coturn and, on most Dokploy hosts, a free 443 that
+      # Traefik isn't already holding — see the doc link at the top before enabling it, then set
+      # this var directly to add a third entry.
+      MERIDIAN_RENDEZVOUS_TURN__URLS: ${MERIDIAN_RENDEZVOUS_TURN__URLS:-["turn:${TURN_DOMAIN:-turn.example.com}:3478?transport=udp","turn:${TURN_DOMAIN:-turn.example.com}:3478?transport=tcp"]}
+      MERIDIAN_RENDEZVOUS_TURN__TTL_SECS: ${MERIDIAN_RENDEZVOUS_TURN__TTL_SECS:-120}
+
+  coturn:
+    image: ${COTURN_IMAGE:-coturn/coturn:latest}   # pin a specific tag for reproducible prod deploys
+    restart: unless-stopped
+    # Host networking so coturn sees real client IPs and its relay port range (49152-65535/udp by
+    # default) works without publishing ~16k individual Docker ports — the standard way to run TURN
+    # in Docker (infra/deploy/docker-compose.yml has the same note). This means coturn binds
+    # directly on the host's 3478/udp+tcp — make sure nothing else on the host already uses them.
+    network_mode: host
+    volumes:
+      - ../coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+      # Uncomment once you've provisioned a real TLS cert for TURN_DOMAIN (out of band — this repo
+      # never bakes in cert material) and add tls-listening-port/alt-tls-listening-port to `command:`.
+      # - ./certs:/etc/coturn/certs:ro
+    command:
+      - "-c"
+      - "/etc/coturn/turnserver.conf"
+      - "--static-auth-secret=${TURN_SHARED_SECRET:?set TURN_SHARED_SECRET — see the rendezvous service above, must be identical}"
+      - "--realm=${TURN_DOMAIN:-turn.example.com}"
+      # Cloud hosts where the container/VM's view of its own IP differs from the public IP it's
+      # reachable on (rare on a plain VPS — leave unset there): set TURN_EXTERNAL_IP to that public IP.
+      # - "--external-ip=${TURN_EXTERNAL_IP}"
+
+volumes:
+  rendezvous_data:

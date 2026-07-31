@@ -11,7 +11,7 @@ reference deployment. The full ops-kit feature spec (with runnable install demo)
 
 ### 9.1 What an org deploys
 
-Two containers plus a database: `meridian-rendezvous` (single Rust binary; Postgres or embedded SQLite for prekeys/device records/mailbox/federation map), `coturn`, and TLS certs. Reference deploys: docker-compose (small org) and a Helm chart (K8s). Resource envelope: rendezvous is WebSocket fan-in + blob routing — a 2-vCPU node comfortably serves thousands of users; TURN sizing is bandwidth-bound (relayed calls ≈ 100–300 kbps audio / 1–3 Mbps video per leg) and is the only component with real capacity planning.
+Two containers plus a database: `meridian-rendezvous` (single Rust binary; Postgres or embedded SQLite for prekeys/device records/mailbox/federation map), `coturn`, and TLS certs. Reference deploys: docker-compose (small org) and a Helm chart (K8s). `meridian-rendezvous`'s image is built and pushed to Docker Hub automatically on every merge to `main` — see [the image doc](./docker-image.md) for the CI pipeline, tagging scheme, and required repo secrets/variables. Resource envelope: rendezvous is WebSocket fan-in + blob routing — a 2-vCPU node comfortably serves thousands of users; TURN sizing is bandwidth-bound (relayed calls ≈ 100–300 kbps audio / 1–3 Mbps video per leg) and is the only component with real capacity planning.
 
 ### 9.2 Config surface (deliberately small)
 
