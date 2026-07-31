@@ -29,6 +29,7 @@ age = { workspace = true }
 hex = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
 getrandom = { workspace = true }
+figment = { version = "0.10.19", features = ["json", "env"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

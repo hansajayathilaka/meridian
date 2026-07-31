@@ -112,7 +112,9 @@ coturn — sharing the *same* secret (`static-auth-secret` == rendezvous `[turn]
 
 ## 5. Config surface (the §9.2 subset)
 
-TOML; every field has a default (see [`meridian-rendezvous` `config`](../../apps/rendezvous/src/config.rs)):
+TOML; every field has a default (see [`meridian-rendezvous` `config`](../../apps/rendezvous/src/config.rs)). Loading goes through [`figment`](https://docs.rs/figment) (ADR [0018](../adr/0018-rendezvous-config-loading.md)): `Config::load` merges the TOML file with `MERIDIAN_RENDEZVOUS_<SECTION>__<FIELD>` environment variables (e.g. `[turn] secret` → `MERIDIAN_RENDEZVOUS_TURN__SECRET`), env taking precedence key-by-key — see the per-key env names in [`rendezvous.example.toml`](../../apps/rendezvous/rendezvous.example.toml). The prefix is scoped to this service (not bare `MERIDIAN_`) so it can't collide with other Meridian components' env vars sharing the process environment (e.g. the CLI's `MERIDIAN_HOME`/`MERIDIAN_POLICY__*`). This is the intended way to inject secrets (`[turn].secret`) and per-deployment overrides into a container/Helm deploy without templating the TOML file itself. Lists (`invite_tokens`, `turn.urls`) use figment's native TOML/JSON bracket syntax, e.g. `MERIDIAN_RENDEZVOUS_TURN__URLS=["turn:a","turn:b"]` — not comma-separated.
+
+Fails closed, uniformly: a set-but-unparseable env var (bad bool/int/`admission`/list), an explicitly-supplied `--config` path that doesn't exist, and — as of ADR 0018 — **any** malformed `rendezvous.toml`, whether pointed to by `--config` or picked up implicitly from the working directory, are all fatal boot errors, never a silent fallback. Only a **missing** file on the implicit (no `--config`) path stays non-fatal (falls back to built-in defaults) — that's the documented "no config" default-boot path, not a user-requested load.
 
 ```toml
 [server]

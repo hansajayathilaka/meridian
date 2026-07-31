@@ -1,6 +1,12 @@
 //! Server configuration — the small §9.2 surface subset relevant to T02.
 
+use figment::providers::{Env, Format, Toml};
+use figment::Figment;
 use serde::Deserialize;
+
+/// Conventional config path used only when no explicit `--config` path is given (see
+/// [`Config::load`]).
+const DEFAULT_CONFIG_PATH: &str = "rendezvous.toml";
 
 /// Top-level server config, parsed from TOML.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -157,15 +163,228 @@ impl Default for Limits {
 }
 
 impl Config {
-    /// Parse a config from a TOML string. Missing fields fall back to defaults.
-    pub fn from_toml_str(s: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(s)
+    /// Parse a config from a TOML string, with no env-var layer. Used directly by tests; `load`
+    /// is the real entry point.
+    #[cfg(test)]
+    fn from_toml_str(s: &str) -> Result<Self, Box<figment::Error>> {
+        Figment::from(Toml::string(s)).extract().map_err(Box::new)
     }
 
-    /// Load a config from a TOML file path.
-    pub fn load(path: &str) -> std::io::Result<Self> {
-        let text = std::fs::read_to_string(path)?;
-        Self::from_toml_str(&text)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    /// Load the server config: an on-disk TOML file (explicit `--config <path>`, or the
+    /// conventional `rendezvous.toml` in the working directory when `explicit_path` is `None`)
+    /// merged with `MERIDIAN_RENDEZVOUS_<SECTION>__<FIELD>` environment variables, which take
+    /// precedence over the file. The prefix is scoped to this service (not bare `MERIDIAN_`) so
+    /// it can't collide with other Meridian components' env vars sharing the process environment
+    /// (e.g. the CLI's `MERIDIAN_HOME`/`MERIDIAN_POLICY__*`). Every key in the §5 config surface
+    /// has a matching env var — see `rendezvous.example.toml` for the full list next to each
+    /// field. List values use TOML/JSON bracket syntax, e.g.
+    /// `MERIDIAN_RENDEZVOUS_TURN__URLS=["turn:a","turn:b"]`.
+    ///
+    /// Fails closed, uniformly: a bad env var (unparseable bool/int/admission), an explicitly
+    /// supplied `--config` path that doesn't exist, or **any** malformed TOML file (whether
+    /// pointed to by `--config` or the conventional `rendezvous.toml`) is a hard `Err` — never a
+    /// silent fallback to defaults. Only a **missing** `rendezvous.toml` on the implicit path is
+    /// non-fatal (ADR 0018): that's the documented "no config" default-boot path, not a
+    /// user-requested load.
+    pub fn load(explicit_path: Option<&str>) -> Result<Self, Box<figment::Error>> {
+        let mut figment = Figment::new();
+        match explicit_path {
+            Some(path) => {
+                if !std::path::Path::new(path).exists() {
+                    return Err(Box::new(format!("config file not found: {path}").into()));
+                }
+                figment = figment.merge(Toml::file(path));
+            }
+            None => {
+                // `Toml::file` silently contributes nothing if the file is simply absent — that
+                // alone gives the "no config" default-boot path its non-fatal behavior. A
+                // *malformed* file, missing or not, still surfaces as a hard error below.
+                figment = figment.merge(Toml::file(DEFAULT_CONFIG_PATH));
+            }
+        }
+        figment
+            .merge(Env::prefixed("MERIDIAN_RENDEZVOUS_").split("__"))
+            .extract()
+            .map_err(Box::new)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // `std::env` is process-global; serialize every test in this module so they can't stomp on
+    // each other's vars when cargo runs them concurrently.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Sets `MERIDIAN_*` vars for the duration of the guard and clears them all on drop, even if
+    /// the test panics (so a failing assertion can't leak an override into a later test).
+    struct EnvGuard<'a> {
+        _lock: std::sync::MutexGuard<'a, ()>,
+        keys: Vec<&'static str>,
+    }
+
+    impl<'a> EnvGuard<'a> {
+        fn set(lock: std::sync::MutexGuard<'a, ()>, vars: &[(&'static str, &str)]) -> Self {
+            for (k, v) in vars {
+                // SAFETY: serialized by ENV_LOCK above; no other thread touches these vars.
+                unsafe { std::env::set_var(k, v) };
+            }
+            Self {
+                _lock: lock,
+                keys: vars.iter().map(|(k, _)| *k).collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard<'_> {
+        fn drop(&mut self) {
+            for k in &self.keys {
+                // SAFETY: same justification as `set` above.
+                unsafe { std::env::remove_var(k) };
+            }
+        }
+    }
+
+    fn write_toml(contents: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        f
+    }
+
+    #[test]
+    fn env_overrides_apply_over_file_and_defaults() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[
+                ("MERIDIAN_RENDEZVOUS_SERVER__DOMAIN", "org.example"),
+                ("MERIDIAN_RENDEZVOUS_SERVER__BIND", "0.0.0.0:9443"),
+                ("MERIDIAN_RENDEZVOUS_SERVER__ADMISSION", "invite"),
+                (
+                    "MERIDIAN_RENDEZVOUS_SERVER__INVITE_TOKENS",
+                    r#"["tok-a","tok-b"]"#,
+                ),
+                ("MERIDIAN_RENDEZVOUS_SERVER__ALLOW_TEST_TAMPER", "true"),
+                (
+                    "MERIDIAN_RENDEZVOUS_LIMITS__ROUTE_PER_ACCOUNT_PER_MIN",
+                    "42",
+                ),
+                ("MERIDIAN_RENDEZVOUS_TURN__SECRET", "s3cr3t"),
+                (
+                    "MERIDIAN_RENDEZVOUS_TURN__URLS",
+                    r#"["turn:a:3478?transport=udp","turn:b:3478?transport=tcp"]"#,
+                ),
+                ("MERIDIAN_RENDEZVOUS_TURN__TTL_SECS", "300"),
+            ],
+        );
+        let file = write_toml(
+            "[server]\ndomain = \"from-file.example\"\nbind = \"file-should-lose.example:1\"\n",
+        );
+
+        let config = Config::load(Some(file.path().to_str().unwrap())).expect("valid overrides");
+
+        assert_eq!(config.server.domain, "org.example"); // env wins over file
+        assert_eq!(config.server.bind, "0.0.0.0:9443");
+        assert_eq!(config.server.admission, Admission::Invite);
+        assert_eq!(config.server.invite_tokens, vec!["tok-a", "tok-b"]);
+        assert!(config.server.allow_test_tamper);
+        assert_eq!(config.limits.route_per_account_per_min, 42);
+        // Unset fields keep the built-in default.
+        assert_eq!(
+            config.limits.fetch_per_account_per_min,
+            Limits::default().fetch_per_account_per_min
+        );
+        assert_eq!(config.turn.secret, "s3cr3t");
+        assert_eq!(
+            config.turn.urls,
+            vec!["turn:a:3478?transport=udp", "turn:b:3478?transport=tcp"]
+        );
+        assert_eq!(config.turn.ttl_secs, 300);
+    }
+
+    #[test]
+    fn file_only_value_survives_when_no_env_override() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[server]\ndomain = \"from-file.example\"\n");
+
+        let config = Config::load(Some(file.path().to_str().unwrap())).unwrap();
+
+        assert_eq!(config.server.domain, "from-file.example");
+    }
+
+    #[test]
+    fn env_overrides_reject_bad_bool_fail_closed() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[("MERIDIAN_RENDEZVOUS_SERVER__ALLOW_TEST_TAMPER", "sure")],
+        );
+        let file = write_toml("");
+
+        let err = Config::load(Some(file.path().to_str().unwrap()))
+            .expect_err("non-bool value must be rejected, not silently ignored");
+        // Fails closed: must not silently arm a test hook. The exact message is figment's own
+        // (type-mismatch on the offending key), not a custom one.
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn env_overrides_reject_bad_admission() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[("MERIDIAN_RENDEZVOUS_SERVER__ADMISSION", "sometimes")],
+        );
+        let file = write_toml("");
+
+        assert!(Config::load(Some(file.path().to_str().unwrap())).is_err());
+    }
+
+    #[test]
+    fn explicit_config_path_that_does_not_exist_is_fatal() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+
+        let err = Config::load(Some("/nonexistent/path/rendezvous.toml")).unwrap_err();
+
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn implicit_path_missing_file_is_non_fatal_but_malformed_file_is_now_fatal() {
+        // Exercises ADR 0018's fail-closed tightening: on the implicit (no `--config`) path, a
+        // *missing* rendezvous.toml still falls back to defaults, but a *malformed* one — which
+        // used to fall back silently too — is now a hard error, same as the explicit path.
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let dir = tempfile::tempdir().unwrap();
+        let orig_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let missing = Config::load(None);
+        std::fs::write(dir.path().join(DEFAULT_CONFIG_PATH), "not valid toml =====").unwrap();
+        let malformed = Config::load(None);
+
+        std::env::set_current_dir(&orig_cwd).unwrap();
+
+        let config = missing.expect("missing implicit rendezvous.toml is non-fatal");
+        assert_eq!(config.server.domain, Server::default().domain);
+        assert!(
+            malformed.is_err(),
+            "malformed implicit rendezvous.toml must now be fatal"
+        );
+    }
+
+    #[test]
+    fn no_env_vars_set_leaves_config_untouched() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+
+        let config = Config::from_toml_str(
+            r#"
+            [server]
+            domain = "from-file.example"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.server.domain, "from-file.example");
     }
 }
