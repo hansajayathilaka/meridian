@@ -4,7 +4,7 @@
 services:
   rendezvous-a:
     image: meridian-rendezvous:dev   # TODO: build from apps/rendezvous
-    # environment: [MERIDIAN_SERVER__DOMAIN=org-a.test]
+    # environment: [MERIDIAN_RENDEZVOUS_SERVER__DOMAIN=org-a.test]
     # volumes: [".ca:/etc/meridian/ca:ro", "./fed-map.toml:/etc/meridian/federation_map.toml:ro"]
     restart: unless-stopped
   coturn-a:
@@ -12,7 +12,7 @@ services:
     restart: unless-stopped
   rendezvous-b:
     image: meridian-rendezvous:dev
-    # environment: [MERIDIAN_SERVER__DOMAIN=org-b.test]
+    # environment: [MERIDIAN_RENDEZVOUS_SERVER__DOMAIN=org-b.test]
     restart: unless-stopped
   coturn-b:
     image: coturn/coturn:latest

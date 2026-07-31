@@ -172,10 +172,13 @@ impl Config {
 
     /// Load the server config: an on-disk TOML file (explicit `--config <path>`, or the
     /// conventional `rendezvous.toml` in the working directory when `explicit_path` is `None`)
-    /// merged with `MERIDIAN_<SECTION>__<FIELD>` environment variables, which take precedence
-    /// over the file. Every key in the §5 config surface has a matching env var — see
-    /// `rendezvous.example.toml` for the full list next to each field. List values use TOML/JSON
-    /// bracket syntax, e.g. `MERIDIAN_TURN__URLS=["turn:a","turn:b"]`.
+    /// merged with `MERIDIAN_RENDEZVOUS_<SECTION>__<FIELD>` environment variables, which take
+    /// precedence over the file. The prefix is scoped to this service (not bare `MERIDIAN_`) so
+    /// it can't collide with other Meridian components' env vars sharing the process environment
+    /// (e.g. the CLI's `MERIDIAN_HOME`/`MERIDIAN_POLICY__*`). Every key in the §5 config surface
+    /// has a matching env var — see `rendezvous.example.toml` for the full list next to each
+    /// field. List values use TOML/JSON bracket syntax, e.g.
+    /// `MERIDIAN_RENDEZVOUS_TURN__URLS=["turn:a","turn:b"]`.
     ///
     /// Fails closed, uniformly: a bad env var (unparseable bool/int/admission), an explicitly
     /// supplied `--config` path that doesn't exist, or **any** malformed TOML file (whether
@@ -200,7 +203,7 @@ impl Config {
             }
         }
         figment
-            .merge(Env::prefixed("MERIDIAN_").split("__"))
+            .merge(Env::prefixed("MERIDIAN_RENDEZVOUS_").split("__"))
             .extract()
             .map_err(Box::new)
     }
@@ -256,18 +259,24 @@ mod tests {
         let _guard = EnvGuard::set(
             ENV_LOCK.lock().unwrap(),
             &[
-                ("MERIDIAN_SERVER__DOMAIN", "org.example"),
-                ("MERIDIAN_SERVER__BIND", "0.0.0.0:9443"),
-                ("MERIDIAN_SERVER__ADMISSION", "invite"),
-                ("MERIDIAN_SERVER__INVITE_TOKENS", r#"["tok-a","tok-b"]"#),
-                ("MERIDIAN_SERVER__ALLOW_TEST_TAMPER", "true"),
-                ("MERIDIAN_LIMITS__ROUTE_PER_ACCOUNT_PER_MIN", "42"),
-                ("MERIDIAN_TURN__SECRET", "s3cr3t"),
+                ("MERIDIAN_RENDEZVOUS_SERVER__DOMAIN", "org.example"),
+                ("MERIDIAN_RENDEZVOUS_SERVER__BIND", "0.0.0.0:9443"),
+                ("MERIDIAN_RENDEZVOUS_SERVER__ADMISSION", "invite"),
                 (
-                    "MERIDIAN_TURN__URLS",
+                    "MERIDIAN_RENDEZVOUS_SERVER__INVITE_TOKENS",
+                    r#"["tok-a","tok-b"]"#,
+                ),
+                ("MERIDIAN_RENDEZVOUS_SERVER__ALLOW_TEST_TAMPER", "true"),
+                (
+                    "MERIDIAN_RENDEZVOUS_LIMITS__ROUTE_PER_ACCOUNT_PER_MIN",
+                    "42",
+                ),
+                ("MERIDIAN_RENDEZVOUS_TURN__SECRET", "s3cr3t"),
+                (
+                    "MERIDIAN_RENDEZVOUS_TURN__URLS",
                     r#"["turn:a:3478?transport=udp","turn:b:3478?transport=tcp"]"#,
                 ),
-                ("MERIDIAN_TURN__TTL_SECS", "300"),
+                ("MERIDIAN_RENDEZVOUS_TURN__TTL_SECS", "300"),
             ],
         );
         let file = write_toml(
@@ -309,7 +318,7 @@ mod tests {
     fn env_overrides_reject_bad_bool_fail_closed() {
         let _guard = EnvGuard::set(
             ENV_LOCK.lock().unwrap(),
-            &[("MERIDIAN_SERVER__ALLOW_TEST_TAMPER", "sure")],
+            &[("MERIDIAN_RENDEZVOUS_SERVER__ALLOW_TEST_TAMPER", "sure")],
         );
         let file = write_toml("");
 
@@ -324,7 +333,7 @@ mod tests {
     fn env_overrides_reject_bad_admission() {
         let _guard = EnvGuard::set(
             ENV_LOCK.lock().unwrap(),
-            &[("MERIDIAN_SERVER__ADMISSION", "sometimes")],
+            &[("MERIDIAN_RENDEZVOUS_SERVER__ADMISSION", "sometimes")],
         );
         let file = write_toml("");
 
