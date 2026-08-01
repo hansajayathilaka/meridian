@@ -15,6 +15,7 @@ pub struct Config {
     pub server: Server,
     pub limits: Limits,
     pub turn: Turn,
+    pub federation: Federation,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -126,6 +127,54 @@ impl Turn {
             realm: self.realm.clone(),
             urls: self.urls.clone(),
             ttl_secs: self.ttl_secs,
+        }
+    }
+}
+
+/// Server↔server (s2s) federation link config (task 2.4, ADR 0017). Every field defaults
+/// fail-closed: `enabled = false` means federation is entirely inert (no listener bound, no
+/// dialing) until an operator explicitly opts in and supplies real cert/key/CA material — there is
+/// no default cert/key path that could accidentally "just work" with a placeholder identity.
+///
+/// This struct is shared with [2.5](../../../docs/tasks/phase-2/2.5-federation-discovery.md),
+/// which adds discovery fields (SRV lookup toggle, `federation_map.toml` path, per-partner pinned
+/// identities) on top of this task's link-establishment surface. Only the fields task 2.4 itself
+/// needs are added here.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct Federation {
+    /// Master switch. `false` ⇒ no federation listener is bound and no outbound federation dial is
+    /// ever attempted, regardless of any other field below (fail-closed default).
+    pub enabled: bool,
+    /// Address to bind the s2s mTLS listener. TLS terminates **in-process** here — never at a
+    /// proxy/VIP upstream (ADR 0017 C7), unlike the c2s WSS listener (ADR 0008).
+    pub bind: String,
+    /// PEM path: this server's own federation identity certificate (leaf, optionally with an
+    /// intermediate chain), presented as both the mTLS server cert (accepting inbound links) and
+    /// the mTLS client cert (dialing outbound links) — one federation identity per org.
+    pub cert_path: String,
+    /// PEM path: the private key matching `cert_path`. Never committed; provisioned out of band.
+    pub key_path: String,
+    /// PEM path: a private-CA trust bundle. Empty ⇒ **WebPKI mode** (validate peer certs against
+    /// the OS/system trust store). Non-empty ⇒ **private-CA / air-gap mode**: trust *only* the CAs
+    /// in this bundle — never silently fall back to the system store (ADR 0017 (a)/C3/C4; the
+    /// whole air-gap trust model depends on this being an exclusive, not additive, trust root).
+    pub ca_bundle_path: String,
+}
+
+impl Default for Federation {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // Federation (s2s mTLS) default port: adjacent to, but distinct from, the c2s WSS
+            // default (8443) — TODO: confirm was resolved by picking 8444 (next integer) so both
+            // listeners can run on the same host with no config edit and no ambiguity about which
+            // port is which. Not an IANA-registered service port as of this writing; operators are
+            // free to override via `federation.bind` / `MERIDIAN_RENDEZVOUS_FEDERATION__BIND`.
+            bind: "127.0.0.1:8444".into(),
+            cert_path: String::new(),
+            key_path: String::new(),
+            ca_bundle_path: String::new(),
         }
     }
 }
@@ -371,6 +420,51 @@ mod tests {
             malformed.is_err(),
             "malformed implicit rendezvous.toml must now be fatal"
         );
+    }
+
+    #[test]
+    fn federation_defaults_to_disabled_with_no_cert_material() {
+        // Fail-closed: federation must be entirely inert until an operator opts in.
+        let f = Federation::default();
+        assert!(!f.enabled);
+        assert!(f.cert_path.is_empty());
+        assert!(f.key_path.is_empty());
+        assert!(f.ca_bundle_path.is_empty());
+
+        let config = Config::from_toml_str("").unwrap();
+        assert!(!config.federation.enabled);
+    }
+
+    #[test]
+    fn federation_env_overrides_apply() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[
+                ("MERIDIAN_RENDEZVOUS_FEDERATION__ENABLED", "true"),
+                ("MERIDIAN_RENDEZVOUS_FEDERATION__BIND", "0.0.0.0:8444"),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__CERT_PATH",
+                    "/etc/meridian/fed.crt",
+                ),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__KEY_PATH",
+                    "/etc/meridian/fed.key",
+                ),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__CA_BUNDLE_PATH",
+                    "/etc/meridian/fed-ca.pem",
+                ),
+            ],
+        );
+        let file = write_toml("");
+
+        let config = Config::load(Some(file.path().to_str().unwrap())).unwrap();
+
+        assert!(config.federation.enabled);
+        assert_eq!(config.federation.bind, "0.0.0.0:8444");
+        assert_eq!(config.federation.cert_path, "/etc/meridian/fed.crt");
+        assert_eq!(config.federation.key_path, "/etc/meridian/fed.key");
+        assert_eq!(config.federation.ca_bundle_path, "/etc/meridian/fed-ca.pem");
     }
 
     #[test]

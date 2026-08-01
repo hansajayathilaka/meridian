@@ -11,6 +11,9 @@
 
 pub mod auth;
 pub mod config;
+/// s2s mTLS federation link establishment (task 2.4) — in-process TLS termination, never a
+/// proxy/VIP (ADR 0017 C7). See `federation::mod` for the full scope boundary.
+pub mod federation;
 pub mod logid;
 pub mod metrics;
 pub mod ratelimit;
