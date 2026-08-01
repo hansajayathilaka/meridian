@@ -30,6 +30,10 @@ hex = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
 getrandom = { workspace = true }
 figment = { version = "0.10.19", features = ["json", "env"] }
+# rustls 0.23 no longer auto-selects a crypto backend; wss:// (meridian-signaling's
+# tokio-tungstenite, `rustls-tls-webpki-roots`) needs one explicitly installed at startup — see
+# main()'s install_default() call.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

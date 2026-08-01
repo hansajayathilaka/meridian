@@ -255,6 +255,11 @@ enum IdCommand {
 }
 
 fn main() -> ExitCode {
+    // rustls 0.23 requires an explicit process-wide crypto backend selection (it no longer
+    // auto-picks one) before any wss:// connection — every `--server wss://...` path goes through
+    // this once at startup rather than each call site guessing whether it's the first TLS use.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
     let result = match cli.command {
         TopCommand::Id { cmd } => run_id(cmd),

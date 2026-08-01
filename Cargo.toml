@@ -62,7 +62,13 @@ chacha20poly1305 = "0.10.1"
 subtle = "2.6.1"
 # Server + async client (rendezvous WSS; stack.md §3 — axum + tokio).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
-tokio-tungstenite = "0.24"
+# rustls-tls-native-roots: wss:// support for the client side (meridian-signaling/meridian-cli
+# connecting to a real rendezvous deployment), trusting the OS's own CA store rather than a
+# vendored-at-build-time snapshot (webpki-roots) that can go stale relative to a CA's current
+# intermediate/root hierarchy. rendezvous's own use of this crate is dev-dependency-only (test
+# harness); axum handles the server's WS accept path independently, so this doesn't touch the
+# production server binary.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 axum = { version = "0.7", features = ["ws"] }
 async-trait = "0.1"
