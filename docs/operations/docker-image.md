@@ -173,3 +173,19 @@ added. None of these were fatal on their own — coturn logs them and keeps goin
 why the container failed to start; if it still isn't starting, check the actual exit reason in
 Dokploy's deploy logs (a bind failure on an already-used port is the other common cause, see the
 `RENDEZVOUS_PORT=443` warning above — the same applies to coturn's 3478 ports and relay range).
+
+**Seeing a fix land in `main` but the running container doesn't change after a redeploy?** Two
+distinct causes, since `rendezvous` and `coturn` pick up new code differently:
+
+- `rendezvous`'s fix is baked into the *image*. `docker compose up`, even with `--build`, does
+  **not** re-pull an `image:`-referenced tag on its own — `--build` only rebuilds services with a
+  `build:` context, which this one doesn't have — so a host that already pulled an old `:latest`
+  once keeps reusing it on every subsequent deploy, silently, even after `docker-publish.yml`
+  pushes a new one. `dokploy.compose.yml` now sets `pull_policy: always` on both services to force
+  an actual re-pull every deploy; if you deployed before this was added, one manual `docker compose
+  pull` (or a Dokploy "force rebuild"/cache-clear, if it offers one) clears the stale local image.
+- `coturn`'s config is a **bind mount** of `turnserver.conf` straight from the git checkout, not
+  baked into any image — pulling a fresh `coturn/coturn` image never changes it. If coturn's logs
+  still show the exact old parser errors after a redeploy, the deploy is reading from a stale git
+  checkout, not a stale image: confirm Dokploy actually pulled the latest commit on `main` (check
+  its build log for the commit SHA it checked out) before assuming the fix didn't work.

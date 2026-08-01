@@ -12,6 +12,12 @@
 services:
   rendezvous:
     image: ${RENDEZVOUS_IMAGE:?set RENDEZVOUS_IMAGE, e.g. yourdockerhubuser/meridian-rendezvous:latest — see docs/operations/docker-image.md}
+    # `docker compose up`, even with `--build`, does NOT re-pull an `image:`-referenced tag on its
+    # own — `--build` only rebuilds services with a `build:` context, which this one doesn't have.
+    # Without this, a host that already has an old `:latest` cached locally keeps reusing it forever,
+    # silently ignoring every new image docker-publish.yml pushes. `pull_policy: always` forces an
+    # actual re-pull (and a no-op if the registry's digest for the tag hasn't changed) on every deploy.
+    pull_policy: always
     restart: unless-stopped
     ports:
       # Do NOT set RENDEZVOUS_PORT=443: Dokploy's own Traefik already owns host port 443 for HTTPS
@@ -48,6 +54,7 @@ services:
 
   coturn:
     image: ${COTURN_IMAGE:-coturn/coturn:latest}   # pin a specific tag for reproducible prod deploys
+    pull_policy: always   # see the same note on the rendezvous service above
     restart: unless-stopped
     # Bridge networking, not `network_mode: host`: Dokploy (and some other compose hosts) injects
     # its own `networks:` into every service it runs for routing/service-discovery, which the
