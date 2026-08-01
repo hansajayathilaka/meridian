@@ -12,12 +12,18 @@ COPY . .
 RUN cargo build --release -p meridian-rendezvous --features sqlite
 
 FROM debian:stable-slim
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+# gosu drops root privileges after docker-entrypoint.sh fixes up volume ownership below — see there
+# for why the container can't just start as `meridian` directly.
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gosu \
     && rm -rf /var/lib/apt/lists/*
-RUN useradd --system --uid 10001 meridian
+RUN groupadd --system --gid 10001 meridian && useradd --system --uid 10001 --gid meridian meridian
 COPY --from=build /src/target/release/meridian-rendezvous /usr/local/bin/meridian-rendezvous
 COPY apps/rendezvous/rendezvous.example.toml /etc/meridian/rendezvous.toml
-USER meridian
+COPY apps/rendezvous/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+# Deliberately no `USER meridian` here — the container starts as root so docker-entrypoint.sh can
+# chown a mounted /data volume, then execs the server as `meridian` itself (never runs application
+# code as root).
 EXPOSE 8443
 # Matches the [server].bind default (0.0.0.0:8443); if you override
 # MERIDIAN_RENDEZVOUS_SERVER__BIND to a different port, override this HEALTHCHECK too (e.g. via
@@ -25,4 +31,4 @@ EXPOSE 8443
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
     CMD curl -fs http://127.0.0.1:8443/healthz || exit 1
 # Config path is overridable; mount your own /etc/meridian/rendezvous.toml in production.
-ENTRYPOINT ["/usr/local/bin/meridian-rendezvous", "--config", "/etc/meridian/rendezvous.toml"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh", "/usr/local/bin/meridian-rendezvous", "--config", "/etc/meridian/rendezvous.toml"]
