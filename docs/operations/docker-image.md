@@ -25,6 +25,15 @@ container restarts (SQLite file, `create_if_missing` + self-migrating — no sep
 Postgres isn't wired up: `apps/rendezvous/Cargo.toml` only implements a `sqlite` backend today, so
 there's nothing for a Postgres container to talk to yet.
 
+The container starts as root and immediately drops to an unprivileged `meridian` user via
+[`docker-entrypoint.sh`](../../apps/rendezvous/docker-entrypoint.sh) — application code never runs
+as root. That entrypoint's only job before dropping privileges is `chown -R meridian:meridian
+/data`: a fresh Docker named volume (or a bind-mounted host directory) is created root-owned, and
+without this step the `meridian` user can't write into it, which surfaces as SQLite failing to boot
+with `open SQLite store: Backend("error returned from database: (code: 14) unable to open database
+file")` — code 14 is `SQLITE_CANTOPEN`, and permissions are the usual cause once the path itself is
+right.
+
 ## 2. One-time repo setup
 
 Configure these under **Settings → Secrets and variables → Actions** before the workflow can run:
