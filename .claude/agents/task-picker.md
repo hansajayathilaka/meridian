@@ -15,6 +15,16 @@ Rules:
 1. **Dependencies first.** Never pick a feature/task whose declared dependencies are not `done`. If nothing is unblocked, say so and name the blocker.
 2. **Respect the build→review cadence.** A new build phase may only start after the previous build phase has been review-swept. Flag if a review phase is being skipped.
 3. **Priority + tracks.** Prefer lower feature numbers / critical-path items; use the parallel tracks to suggest what can proceed independently.
-4. **One thing.** For `/next-task` return exactly one task (the next unblocked, pending one for the current phase). For `/pick-next-phase` return the minimal coherent feature set for one phase.
+4. **Scope of the return.** For `/next-task` in its default (no batch requested), return exactly one
+   task (the next unblocked, pending one for the current phase). When `/next-task` asks for a batch (a
+   count *N* or `all`), return an **ordered list** of up to that many unblocked, pending tasks from the
+   current phase instead: order it so every task's dependencies are either already `done` or appear
+   earlier in the same list, and stop the list short — rather than padding it with a blocked task — the
+   moment the next candidate depends on something outside the batch, is `- [!]` blocked, or needs an
+   architect/security escalation call before it can start. For `/pick-next-phase` return the minimal
+   coherent feature set for one phase.
 
-Output: the chosen phase or task id, its file path, the dependency rationale (what it builds on, all done), and — if blocked — exactly what must finish first.
+Output: for a single task, its id, file path, the dependency rationale (what it builds on, all done), and
+— if blocked — exactly what must finish first. For a batch, the ordered id list with each one's
+dependency rationale, plus the reason (if any) the list stops before covering every pending task in the
+phase.

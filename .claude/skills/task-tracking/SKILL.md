@@ -86,11 +86,23 @@ Each command: (a) reads the master tracker to orient, (b) does its one job, (c) 
 - Populate the phase README todo list + the master tracker checkbox tree. Move ▶ NEXT to `/next-task`.
 
 ### `/next-task`
-- Delegate to **task-picker** to return the next unblocked task (respects deps + status).
-- Mark it `- [~]`. Implement with the right dev agent: **rust-dev** (core/server) or **web-dev**
-  (browser/WASM). Follow the task file's Scope/Deliverables. Run its tests (narrowest first).
-- Satisfy the Definition of Done. Update the task file Status, mark `- [x]`, refresh ▶ NOW/NEXT.
-- Commit, then open/update the PR (draft). See §6 for the commit/push retry.
+- Default (no argument): delegate to **task-picker** to return the next unblocked task (respects deps +
+  status). A count (`/next-task 3`) or `/next-task all` instead asks task-picker for an **ordered batch**
+  of that many unblocked tasks in the current phase — it stops the list early at the first task that
+  isn't cleanly unblocked, so a short batch is expected and not an error.
+- For each task in the batch, in order: mark it `- [~]`. Implement with the right dev agent: **rust-dev**
+  (core/server) or **web-dev** (browser/WASM). Follow the task file's Scope/Deliverables. Run its tests
+  (narrowest first).
+- Get the task's `Reviews` sign-off (the reviewers its file names). That single pass **is** the
+  Definition of Done's security/architecture gate — it's grounded in the same threat-model docs `/review`
+  uses, so don't also run `/review` on the same diff here; that command is for ad-hoc scopes outside this
+  workflow. Satisfy the rest of the Definition of Done. Update the task file Status, mark `- [x]`, refresh
+  ▶ NOW/NEXT.
+- Commit **that one task** before starting the next in the batch — one commit per task keeps each
+  independently reviewable/revertable even when several land in one run. If a task turns out too large
+  for one PR, stop the whole run there rather than starting the next queued task.
+- Once the batch (or single task) is done, open/update the PR (draft) — one PR carries every commit from
+  the run. See §6 for the commit/push retry.
 
 ### `/start-review-phase`
 - Create the next-numbered phase as a **review phase** (`phase-N/README.md`, kind: review).
