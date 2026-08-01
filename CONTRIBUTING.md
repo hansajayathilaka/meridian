@@ -47,9 +47,12 @@ A change is **not done** until all of the following hold:
    and **conformance vectors regenerated** (byte-identical across CLI/WASM/mobile). See the
    [api-contracts skill](./.claude/skills/api-contracts/SKILL.md).
 4. **Security invariants intact.** For anything touching identity, keys, signaling, storage, logging, or
-   metrics, run [/review](./.claude/commands/review.md) and satisfy the
-   [anonymity-model skill](./.claude/skills/anonymity-model/SKILL.md) "must never" list. The two CI
-   enforcement lints (no-serde-on-blob, metrics-allowlist) must pass.
+   metrics, the task's required `Reviews` sign-off (typically `security-reviewer`) satisfies this gate in
+   one pass — it already checks against the same threat-model docs and the
+   [anonymity-model skill](./.claude/skills/anonymity-model/SKILL.md) "must never" list that
+   [/review](./.claude/commands/review.md) would. Don't run `/review` again on top of it inside
+   `/next-task`; that command is for ad-hoc diffs outside the tracked task flow. The two CI enforcement
+   lints (no-serde-on-blob, metrics-allowlist) must pass.
 5. **No architectural drift.** The change does not contradict an [ADR](./docs/adr/README.md). A changed
    decision is recorded via [/adr](./.claude/commands/adr.md) (supersede, don't silently edit).
 6. **Additive stream types touch the registry only** — zero core-crate edits

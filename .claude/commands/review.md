@@ -1,6 +1,10 @@
 ---
 description: Security / performance / correctness review of a diff or scope.
 ---
+Standalone, ad-hoc review — for a diff or scope outside the tracked task flow. Inside `/next-task`, the
+task's `Reviews` sign-off already applies this same checklist and satisfies the Definition of Done's
+security gate; don't run this command again on top of it there (that would just duplicate the review).
+
 Review the following change (diff, file set, or scope): **$ARGUMENTS**
 
 Ground the review in the design before commenting:

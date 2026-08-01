@@ -89,7 +89,11 @@ Each command: (a) reads the master tracker to orient, (b) does its one job, (c) 
 - Delegate to **task-picker** to return the next unblocked task (respects deps + status).
 - Mark it `- [~]`. Implement with the right dev agent: **rust-dev** (core/server) or **web-dev**
   (browser/WASM). Follow the task file's Scope/Deliverables. Run its tests (narrowest first).
-- Satisfy the Definition of Done. Update the task file Status, mark `- [x]`, refresh ▶ NOW/NEXT.
+- Get the task's `Reviews` sign-off (the reviewers its file names). That single pass **is** the
+  Definition of Done's security/architecture gate — it's grounded in the same threat-model docs `/review`
+  uses, so don't also run `/review` on the same diff here; that command is for ad-hoc scopes outside this
+  workflow. Satisfy the rest of the Definition of Done. Update the task file Status, mark `- [x]`, refresh
+  ▶ NOW/NEXT.
 - Commit, then open/update the PR (draft). See §6 for the commit/push retry.
 
 ### `/start-review-phase`
