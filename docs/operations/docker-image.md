@@ -101,13 +101,14 @@ emulation.
 pair for [Dokploy](https://dokploy.com)'s "Docker Compose" application type (or any plain
 `docker compose` host — Dokploy has no special requirements here beyond what any compose deploy
 needs). Point a Dokploy compose app at this repo/file, copy `dokploy.env.example` into its
-Environment tab, fill in the three required values, and deploy:
+Environment tab, fill in the four required values, and deploy:
 
 | Var | Required? | What it is |
 |---|---|---|
 | `RENDEZVOUS_IMAGE` | yes | The image `docker-publish.yml` pushed, e.g. `yourdockerhubuser/meridian-rendezvous:latest` — or pin a `:<short-sha>` tag (§4) for a reproducible deploy. |
 | `MERIDIAN_RENDEZVOUS_SERVER__DOMAIN` | yes | Your public signaling hostname, e.g. `chat.example.com`. |
 | `TURN_SHARED_SECRET` | yes | A long random value. Shared verbatim between the `rendezvous` and `coturn` services in the compose file — that's the whole trust mechanism for ephemeral TURN credentials (§"TURN / coturn" in [deployment.md](./deployment.md)). Generate one with `openssl rand -hex 32` and never commit it. |
+| `TURN_EXTERNAL_IP` | yes | This host's public IP. coturn runs on Docker's bridge network (see below), so without this it hands clients its private container IP as the relay candidate and every relayed call fails. |
 
 Everything else in the env file has a working default and only needs changing if you want to.
 Every var maps 1:1 onto a config key documented in §3 above — the compose file just plumbs each one
@@ -132,6 +133,19 @@ file itself:
   be able to relay through this deployment. `TODO: confirm` whether that trade-off is acceptable for
   your deployment — it's a real capability loss, not a cosmetic one.
 
-coturn itself runs with `network_mode: host` (the standard way to run TURN in Docker — its relay
-port range works directly against the host network instead of needing ~16k individual Docker port
-mappings), so make sure host ports 3478/udp and 3478/tcp are free before deploying.
+coturn runs on Docker's normal bridge network with explicit port publishing, not
+`network_mode: host` — Dokploy (and some other compose hosts) injects its own `networks:` into
+every service it runs for routing/service-discovery, and the Compose spec forbids combining that
+with `network_mode` on the same service, so a compose bringing coturn up under Dokploy with host
+networking fails outright (`service coturn declares mutually exclusive network_mode and networks`).
+Two consequences of that:
+
+- coturn's relay port range is bounded down to `TURN_RELAY_MIN_PORT`-`TURN_RELAY_MAX_PORT`
+  (default 49152-49352, 200 ports) instead of its full 49152-65535 default, so it stays one short
+  Docker port-publish range instead of ~16k individual mappings. Widen it if you expect enough
+  concurrent relayed calls to exhaust that.
+- `TURN_EXTERNAL_IP` (table above) is required, not optional — under host networking coturn would
+  see the real host IP itself; under bridge networking it only sees its private container IP unless
+  told otherwise.
+
+Make sure host ports 3478/udp, 3478/tcp, and the relay range are free before deploying.
