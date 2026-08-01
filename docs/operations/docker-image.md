@@ -122,7 +122,10 @@ file itself:
   host (`RENDEZVOUS_PORT`, default 8443) but does not terminate TLS — same as every other deploy of
   this image (§2: TLS termination is the proxy/VIP's job, ADR-8). In Dokploy, add a Domain for the
   `rendezvous` service pointing at container port 8443 with HTTPS enabled; Dokploy's built-in Traefik
-  handles the certificate and wss:// termination from there.
+  handles the certificate and wss:// termination from there. **Do not set `RENDEZVOUS_PORT=443`** —
+  Dokploy's own Traefik already owns host port 443, so this container fails to bind it too and never
+  starts. Keep `RENDEZVOUS_PORT` at a free, non-privileged port and let the Domain feature do the
+  443 exposure instead.
 - **coturn's TURNS/443 rung.** `turnserver.conf` (T05) treats `turns://` on port 443 as the
   hostile-egress fallback rung, but on a Dokploy host port 443 is normally already owned by
   Dokploy's own Traefik for HTTP(S) routing — binding coturn there too would conflict. The compose
@@ -149,3 +152,15 @@ Two consequences of that:
   told otherwise.
 
 Make sure host ports 3478/udp, 3478/tcp, and the relay range are free before deploying.
+
+If coturn's logs show `ERROR: no-cli option is deprecated`, `ERROR: Unknown boolean value: # ...`,
+or `WARNING: Bad configuration format: no-tlsv1` — that was
+[`infra/coturn/turnserver.conf`](../../infra/coturn/turnserver.conf) carrying directives that
+current coturn versions have renamed or dropped (`no-cli` and `no-tlsv1`/`no-tlsv1_1` are gone;
+`cli` is already off by default and TLSv1.2+ is already the enforced minimum) plus a genuine parser
+bug — a trailing `# comment` on the same line as `no-software-attribute` was being read as that
+directive's value. Fixed; pull the latest `turnserver.conf` if you deployed before this note was
+added. None of these were fatal on their own — coturn logs them and keeps going — so they weren't
+why the container failed to start; if it still isn't starting, check the actual exit reason in
+Dokploy's deploy logs (a bind failure on an already-used port is the other common cause, see the
+`RENDEZVOUS_PORT=443` warning above — the same applies to coturn's 3478 ports and relay range).

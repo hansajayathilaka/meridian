@@ -14,6 +14,10 @@ services:
     image: ${RENDEZVOUS_IMAGE:?set RENDEZVOUS_IMAGE, e.g. yourdockerhubuser/meridian-rendezvous:latest — see docs/operations/docker-image.md}
     restart: unless-stopped
     ports:
+      # Do NOT set RENDEZVOUS_PORT=443: Dokploy's own Traefik already owns host port 443 for HTTPS
+      # routing, and this container would fail to bind it too. Leave this at a free port and expose
+      # rendezvous.<yourdomain> over 443 via Dokploy's Domain UI pointed at container port 8443
+      # instead — see docs/operations/docker-image.md §6.
       - "${RENDEZVOUS_PORT:-8443}:8443"
     volumes:
       # Holds the SQLite file backing MERIDIAN_RENDEZVOUS_SERVER__DATABASE_URL below — survives
