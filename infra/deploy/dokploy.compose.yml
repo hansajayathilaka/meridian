@@ -45,11 +45,16 @@ services:
   coturn:
     image: ${COTURN_IMAGE:-coturn/coturn:latest}   # pin a specific tag for reproducible prod deploys
     restart: unless-stopped
-    # Host networking so coturn sees real client IPs and its relay port range (49152-65535/udp by
-    # default) works without publishing ~16k individual Docker ports — the standard way to run TURN
-    # in Docker (infra/deploy/docker-compose.yml has the same note). This means coturn binds
-    # directly on the host's 3478/udp+tcp — make sure nothing else on the host already uses them.
-    network_mode: host
+    # Bridge networking, not `network_mode: host`: Dokploy (and some other compose hosts) injects
+    # its own `networks:` into every service it runs for routing/service-discovery, which the
+    # Compose spec forbids combining with `network_mode` — a compose bringing coturn up under
+    # Dokploy with host networking fails outright ("mutually exclusive network_mode and networks").
+    # The relay port range below is bounded down from coturn's 49152-65535 default specifically so
+    # it stays a single short Docker port-publish range instead of ~16k individual mappings.
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "${TURN_RELAY_MIN_PORT:-49152}-${TURN_RELAY_MAX_PORT:-49352}:${TURN_RELAY_MIN_PORT:-49152}-${TURN_RELAY_MAX_PORT:-49352}/udp"
     volumes:
       - ../coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
       # Uncomment once you've provisioned a real TLS cert for TURN_DOMAIN (out of band — this repo
@@ -60,9 +65,13 @@ services:
       - "/etc/coturn/turnserver.conf"
       - "--static-auth-secret=${TURN_SHARED_SECRET:?set TURN_SHARED_SECRET — see the rendezvous service above, must be identical}"
       - "--realm=${TURN_DOMAIN:-turn.example.com}"
-      # Cloud hosts where the container/VM's view of its own IP differs from the public IP it's
-      # reachable on (rare on a plain VPS — leave unset there): set TURN_EXTERNAL_IP to that public IP.
-      # - "--external-ip=${TURN_EXTERNAL_IP}"
+      # Must match the `ports:` range above.
+      - "--min-port=${TURN_RELAY_MIN_PORT:-49152}"
+      - "--max-port=${TURN_RELAY_MAX_PORT:-49352}"
+      # Required under bridge networking: without it, coturn hands clients its private container IP
+      # as the relay candidate and every relayed call fails. Set to this host's public IP (the one
+      # TURN_DOMAIN resolves to).
+      - "--external-ip=${TURN_EXTERNAL_IP:?set TURN_EXTERNAL_IP to this host's public IP — see docs/operations/docker-image.md §6}"
 
 volumes:
   rendezvous_data:
