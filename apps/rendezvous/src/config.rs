@@ -275,10 +275,47 @@ impl Config {
                 figment = figment.merge(Toml::file(DEFAULT_CONFIG_PATH));
             }
         }
-        figment
+        let config: Self = figment
             .merge(Env::prefixed("MERIDIAN_RENDEZVOUS_").split("__"))
             .extract()
-            .map_err(Box::new)
+            .map_err(Box::new)?;
+        config.validate().map_err(|e| Box::new(e.into()))?;
+        Ok(config)
+    }
+
+    /// Cross-field fail-closed checks that a single field's `Deserialize` impl can't express.
+    fn validate(&self) -> Result<(), String> {
+        self.federation.validate()
+    }
+}
+
+impl Federation {
+    /// Reject configuration combinations that are individually valid per-field but collapse a
+    /// security invariant when combined.
+    ///
+    /// `discovery = "srv"` together with a non-empty `ca_bundle_path` (private-CA/air-gap mode)
+    /// is exactly that: SRV-resolved [`crate::federation::discovery::Endpoint`]s always carry
+    /// `pinned_identity: None` (SRV is unauthenticated discovery only, by design — ADR 0017
+    /// (a)), so under private-CA mode the trust check would collapse to "chains to the shared
+    /// CA + SAN matches the self-asserted DNS hint domain" — the impersonation hole ADR 0017
+    /// (a)'s rejected "Option A" describes: any org enrolled under that CA could present a valid
+    /// cert and be accepted as any other org. Rejected here, at config-load time, rather than
+    /// left for the dial path to discover at runtime.
+    fn validate(&self) -> Result<(), String> {
+        if self.discovery == DiscoveryMode::Srv && !self.ca_bundle_path.is_empty() {
+            return Err(
+                "federation.discovery = \"srv\" is incompatible with a non-empty \
+                 federation.ca_bundle_path (private-CA/air-gap mode): SRV-resolved endpoints \
+                 never carry a pinned_identity (SRV is unauthenticated discovery only, ADR 0017 \
+                 (a)), so combining the two collapses private-CA trust to an unpinned DNS-hint \
+                 check — the impersonation hole ADR 0017 (a) rejects. Use \
+                 federation.discovery = \"static\" (federation_map.toml, which mandates a \
+                 pinned_identity per partner) with a private CA, or clear ca_bundle_path to run \
+                 SRV discovery in WebPKI mode."
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -531,6 +568,53 @@ mod tests {
         assert_eq!(config.federation.bind, "0.0.0.0:8444");
         assert_eq!(config.federation.cert_path, "/etc/meridian/fed.crt");
         assert_eq!(config.federation.key_path, "/etc/meridian/fed.key");
+        assert_eq!(config.federation.ca_bundle_path, "/etc/meridian/fed-ca.pem");
+    }
+
+    #[test]
+    fn discovery_srv_with_private_ca_bundle_rejected_at_config_load() {
+        // Security-reviewer HIGH finding on task 2.5: `discovery = "srv"` combined with a
+        // non-empty `ca_bundle_path` (private-CA/air-gap mode) must fail closed at config-load
+        // time — SRV-resolved endpoints never carry a `pinned_identity`, so this combination
+        // would otherwise collapse private-CA trust to an unpinned DNS-hint check (ADR 0017
+        // (a)'s rejected "Option A" impersonation hole).
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml(
+            "[federation]\ndiscovery = \"srv\"\nca_bundle_path = \"/etc/meridian/fed-ca.pem\"\n",
+        );
+
+        let err = Config::load(Some(file.path().to_str().unwrap()))
+            .expect_err("srv discovery + private CA bundle must be rejected, not silently loaded");
+
+        assert!(err.to_string().contains("ca_bundle_path"));
+    }
+
+    #[test]
+    fn discovery_srv_without_ca_bundle_is_accepted() {
+        // The rejected combination is specifically SRV + private CA — plain SRV discovery in
+        // WebPKI mode (the common case) must still load cleanly.
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[federation]\ndiscovery = \"srv\"\n");
+
+        let config = Config::load(Some(file.path().to_str().unwrap()))
+            .expect("srv discovery without a private CA bundle must be accepted");
+
+        assert_eq!(config.federation.discovery, DiscoveryMode::Srv);
+    }
+
+    #[test]
+    fn static_discovery_with_private_ca_bundle_is_accepted() {
+        // Private-CA mode is exactly what `discovery = "static"` (federation_map.toml, mandatory
+        // per-partner `pinned_identity`) is designed for — must not be caught by the srv-specific
+        // rejection.
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml(
+            "[federation]\ndiscovery = \"static\"\nca_bundle_path = \"/etc/meridian/fed-ca.pem\"\n",
+        );
+
+        let config = Config::load(Some(file.path().to_str().unwrap()))
+            .expect("static discovery with a private CA bundle must be accepted");
+
         assert_eq!(config.federation.ca_bundle_path, "/etc/meridian/fed-ca.pem");
     }
 

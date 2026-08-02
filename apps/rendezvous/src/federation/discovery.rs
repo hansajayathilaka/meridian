@@ -62,12 +62,23 @@ use serde::Deserialize;
 /// One resolved s2s dial target for a federation partner domain.
 ///
 /// `host`/`port` are what [`link::dial`](super::link::dial) connects a TCP socket to; they are
-/// **never** the certificate-validation target — that stays the `domain` string passed to
-/// [`Discovery::resolve`], per ADR 0017 (a)/C3 ("verification target is the hint/discovery domain,
-/// never the literal SRV/static-map dial target"). Keeping the dial address and the trust anchor
-/// as separate values (never collapsing them into one "endpoint" string) is what makes a hijacked
-/// SRV record, or a typo'd `endpoint` in `federation_map.toml`, a reachability failure rather than
-/// an impersonation risk.
+/// **never** the certificate-validation target. Which field IS the trust anchor depends on mode:
+/// - **WebPKI mode** (`pinned_identity: None` — every `SrvDiscovery`-sourced `Endpoint`, and any
+///   `StaticMap` entry in a deployment that isn't running private-CA/air-gap mode): the
+///   verification target is the `domain` string passed to [`Discovery::resolve`] — the
+///   hint/discovery domain, never the literal SRV/static-map dial target (ADR 0017 (a)/C3).
+/// - **Private-CA / air-gap mode** (`pinned_identity: Some(_)` — every `StaticMap`-sourced
+///   `Endpoint`, see below): the verification target is **`pinned_identity`**, not `domain`. ADR
+///   0017 C4's whole point is that a self-asserted hint domain is not itself a trust boundary
+///   under a private CA — anyone enrolled under that CA can present a cert whose SAN matches any
+///   domain string a caller merely *hoped* to reach. A future caller (2.7's dial-out path) MUST
+///   pass `pinned_identity`, when `Some`, as [`link::dial`](super::link::dial)'s
+///   `expected_domain` — not `domain` — or private-CA mode collapses to ADR 0017 (a)'s rejected
+///   "Option A" impersonation hole.
+///
+/// Keeping the dial address and the trust anchor as separate values (never collapsing them into
+/// one "endpoint" string) is what makes a hijacked SRV record, or a typo'd `endpoint` in
+/// `federation_map.toml`, a reachability failure rather than an impersonation risk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint {
     /// Host to dial: an SRV `target` hostname, or the host half of a `federation_map.toml`
@@ -189,10 +200,17 @@ struct StaticMapFile {
 
 /// Static, air-gap-capable [`Discovery`]: every partner is named explicitly in
 /// `federation_map.toml`, loaded once at startup. Deliberately holds **no field of any DNS
-/// resolver type** — not merely "configured to skip DNS," but structurally incapable of making a
-/// DNS query, which is what the air-gap deployment mode (ADR 0002, `deployment.md`) depends on.
-/// See `tests/federation_discovery.rs`'s `static_mode_performs_zero_dns_lookups` test for the
-/// behavioral proof, and this module's own `structural_tests` for the compile-time one.
+/// resolver type** — not merely "configured to skip DNS," but structurally incapable of routing a
+/// DNS query through this crate's `SrvResolver` abstraction, which is one leg of what the air-gap
+/// deployment mode (ADR 0002, `deployment.md`) depends on. That structural claim is checked at
+/// compile time by this module's own `structural_tests`; `tests/federation_discovery.rs`'s
+/// `static_mode_performs_zero_dns_lookups` checks the dispatch-level companion claim (selecting
+/// `StaticMap` via the `Discovery` trait object never routes through a live `SrvResolver`
+/// alongside it). Neither of those proves `resolve`, below, is free of some OTHER, ad hoc network
+/// call that bypasses `SrvResolver` entirely — that's what
+/// `tests/federation_discovery.rs`'s `airgap_syscall_probe::static_map_resolve_makes_zero_getaddrinfo_calls`
+/// (a syscall-level `LD_PRELOAD` proof) exists to close; see its doc comment for why a
+/// field-shaped or trait-shaped guarantee alone isn't the whole story.
 #[derive(Clone, Debug)]
 pub struct StaticMap {
     entries: HashMap<String, Endpoint>,
@@ -242,7 +260,16 @@ impl StaticMap {
                 pinned_identity: Some(p.pinned_identity),
                 policy: p.policy,
             };
-            if entries.insert(p.domain.clone(), endpoint).is_some() {
+            // DNS domains are case-insensitive (RFC 4343). Normalize to ASCII-lowercase before
+            // both insertion and (in `resolve`, below) lookup, so a differently-cased entry for
+            // the same real domain is caught as a `DuplicateDomain` here rather than silently
+            // creating two live, potentially-conflicting `pinned_identity` trust pins for what
+            // DNS treats as a single partner — and so an operator-written mixed-case `domain`
+            // (e.g. `"Org-A.test"`) still resolves for a lookup of `"org-a.test"`. Mirrors
+            // `link::peer_identities`'s `to_ascii_lowercase`/`eq_ignore_ascii_case` handling of
+            // the same DNS case-insensitivity elsewhere in this crate.
+            let key = p.domain.to_ascii_lowercase();
+            if entries.insert(key, endpoint).is_some() {
                 return Err(DiscoveryError::DuplicateDomain(p.domain));
             }
         }
@@ -254,10 +281,22 @@ impl StaticMap {
 impl Discovery for StaticMap {
     async fn resolve(&self, domain: &str) -> Result<Vec<Endpoint>, DiscoveryError> {
         // No `.await` on anything but this fn's own signature, no I/O, no resolver field to
-        // consult — a HashMap lookup is the entire body. This IS the air-gap proof, not merely
-        // documentation of it: there is nothing in this type through which a DNS query could
-        // happen even if this method wanted to make one.
-        match self.entries.get(domain) {
+        // consult — a HashMap lookup is the entire body, TODAY. Keep it that way: `StaticMap`
+        // holding no resolver-shaped field (checked by `structural_tests`, below) means this
+        // method has nothing DNS-capable to reach *through a field* — it does NOT mean the method
+        // body itself is incapable of an ad hoc network call typed directly into it (an inline
+        // `tokio::net::lookup_host(...)`, say), which needs no field at all. That gap is real: a
+        // mutation test that inserted exactly such a call here caused zero failures in this
+        // module's then-existing tests. `tests/federation_discovery.rs`'s
+        // `airgap_syscall_probe::static_map_resolve_makes_zero_getaddrinfo_calls` is what actually
+        // proves this method makes no hostname-resolution call, at the syscall level, regardless
+        // of how one might be written into it — read its doc comment before trusting this
+        // comment's "the entire body" claim on faith.
+        //
+        // Lowercase the query key to match how `from_toml_str` normalizes entries — DNS domains
+        // are case-insensitive, so `resolve("ORG-A.TEST")` must hit the same entry as
+        // `resolve("org-a.test")`.
+        match self.entries.get(&domain.to_ascii_lowercase()) {
             Some(endpoint) => Ok(vec![endpoint.clone()]),
             None => Err(DiscoveryError::NotFound(domain.to_string())),
         }
@@ -338,7 +377,14 @@ impl<R: SrvResolver> Discovery for SrvDiscovery<R> {
     async fn resolve(&self, domain: &str) -> Result<Vec<Endpoint>, DiscoveryError> {
         let query = format!("_meridian-fed._tcp.{domain}");
         let mut records = self.resolver.lookup_srv(&query).await?;
-        if records.is_empty() {
+        if records.is_empty() || records.iter().all(|r| r.target == ".") {
+            // RFC 2782: a single SRV RR with `Target == "."` is the standard way to explicitly
+            // declare "service not available at this domain" — distinct from publishing no
+            // record at all, but equivalent for this fail-closed discovery layer's purposes.
+            // Without this check a lone `Target = "."` record would survive the empty-vec check
+            // above, get sorted, and be returned as a bogus `Ok(vec![Endpoint{host: ".", port:
+            // 0, ..}])` instead of the `NoSrvRecord` refusal every other "not available" case
+            // produces.
             return Err(DiscoveryError::NoSrvRecord(domain.to_string()));
         }
 
@@ -425,9 +471,16 @@ impl SrvResolver for HickoryResolver {
 
 #[cfg(test)]
 mod structural_tests {
-    //! Compile-time/structural proof, complementing `tests/federation_discovery.rs`'s behavioral
-    //! `static_mode_performs_zero_dns_lookups` test, that [`StaticMap`] cannot invoke a DNS
-    //! resolver — not merely that it doesn't happen to, today (task 2.5's "air-gap assertion").
+    //! Compile-time/structural proof that [`StaticMap`] never implements or holds this module's
+    //! own `SrvResolver` abstraction — one leg of task 2.5's "air-gap assertion", complementing
+    //! `tests/federation_discovery.rs`'s dispatch-level `static_mode_performs_zero_dns_lookups`
+    //! test and its syscall-level
+    //! `airgap_syscall_probe::static_map_resolve_makes_zero_getaddrinfo_calls`. None of the three
+    //! alone is the whole proof — see each test's own doc comment for exactly what it does and
+    //! does not cover; in particular, this module proves `StaticMap` cannot reach a DNS resolver
+    //! *through this crate's own resolver abstraction*, not that its `resolve` method body is
+    //! incapable of an ad hoc network call written directly into it (that's the syscall-level
+    //! test's job).
     use super::*;
 
     #[test]
