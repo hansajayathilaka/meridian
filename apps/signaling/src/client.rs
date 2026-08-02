@@ -141,9 +141,25 @@ impl SignalingClient {
     /// Route an opaque, client-signed envelope to an online peer. Returns whether it was delivered
     /// (offline delivery / mailbox is T07).
     pub async fn route(&mut self, to: [u8; 32], blob: Vec<u8>) -> Result<bool> {
+        self.route_with_hint(to, None, blob).await
+    }
+
+    /// Route an opaque, client-signed envelope to `to`, optionally naming a foreign-domain
+    /// `hint` (task 2.8, `docs/api/wire-protocol.md` §2) — the wire-level routing hint that tells
+    /// this client's own server to forward the envelope across a federation boundary
+    /// (`FedRoute`, docs/api/federation-protocol-v1.md) rather than deliver locally. Same
+    /// "this client never dials `hint` itself" caveat as
+    /// [`fetch_bundle`](Self::fetch_bundle)'s identical parameter: only the server this client is
+    /// `connect`ed to ever federates a request onward.
+    pub async fn route_with_hint(
+        &mut self,
+        to: [u8; 32],
+        hint: Option<String>,
+        blob: Vec<u8>,
+    ) -> Result<bool> {
         let body = RouteBody {
             to,
-            to_hint: None,
+            to_hint: hint,
             blob: OpaqueBlob::new(blob),
         };
         let reply = self

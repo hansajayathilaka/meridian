@@ -46,12 +46,16 @@
 
 use std::sync::Arc;
 
-use meridian_proto::{fed_error_codes, FedBundle, FedErr, FedFetchBundle, FedFrame, FedOp};
+use axum::extract::ws::Message;
+use meridian_proto::{
+    fed_error_codes, Deliver, FedBundle, FedErr, FedFetchBundle, FedFrame, FedOp, FedReachability,
+    FedReachable, FedRoute, Frame, Op,
+};
 
-use crate::federation::link::LinkError;
+use crate::federation::link::{LinkError, MAX_FRAME_LEN};
 use crate::federation::policy::{Decision, FederationLimits, FederationPolicy};
 use crate::federation::{FederationLink, FederationListener};
-use crate::state::AppState;
+use crate::state::{AppState, Registry};
 use crate::store::Store;
 
 /// Server B's inbound `fed_fetch_bundle` handler: origin admission (2.6), then the
@@ -94,11 +98,130 @@ pub async fn handle_fed_fetch(
     }
 }
 
+/// Server B's inbound `fed_route` handler (task 2.8): origin admission, then the per-origin/
+/// per-origin-account rate limits keyed on `req.from` — the field ADR 0017 C5 names as the
+/// "origin account" axis's source, unlike `FedFetchBundle` which carries none (see this module's
+/// doc comment on `handle_fed_fetch`'s different reading of that same underspecified shape) —
+/// then a defense-in-depth oversized check, then delivery into B's own local [`Registry`].
+///
+/// **`req.from` is relayed verbatim, never inspected.** Per [`FedRoute`]'s own doc comment and
+/// `apps/proto/src/fed.rs`'s module docs (ADR 0017 C1/C2), `from` is routing metadata asserted by
+/// the sending (origin) server — this function passes it straight through as the `Deliver.from`
+/// pushed to B's own client, exactly as a purely local route already does. `req.envelope`'s bytes
+/// are moved into `Deliver.blob` the same way: never decoded, parsed, or otherwise inspected —
+/// that would need `meridian-envelope`, which this crate must never depend on
+/// (`tools/lint-no-serde-on-blob.sh`). The client-side `SenderMismatch` check
+/// (`apps/core/src/chat.rs`) remains the load-bearing defence against a forged `from`; a hostile
+/// foreign server asserting someone else's key is a client-side detection, not something this
+/// server can or should verify.
+///
+/// **Fire-and-forget on success** (federation-protocol-v1.md §2): this function's `Ok(())` means
+/// [`serve_link`] sends NO reply frame at all — not even one signalling that the local recipient
+/// was actually connected. `Registry::send_to`'s own return value (`bool`, whether it found a live
+/// connection and enqueued onto it) is deliberately discarded below, not just in the disconnect-race
+/// sense: this also silently swallows an outbound-side delivery failure at B (e.g. a full mpsc
+/// channel to a slow client) exactly as it swallows a target that disconnected between
+/// `route_foreign`'s `reachable_foreign` pre-check (architect decision #3) and this call. Neither
+/// path is reported back across the federation boundary — `route_foreign`'s pre-check is what a
+/// caller relies on for target liveness, not this call's outcome. Both are the same accepted
+/// residual, not a new error this function invents a code for: see this task's "Out: offline
+/// queuing" scope boundary (a defined error at fed_route time, never a queue).
+pub async fn handle_fed_route(
+    registry: &Registry,
+    policy: &FederationPolicy,
+    limits: &FederationLimits,
+    origin_domain: &str,
+    req: &FedRoute,
+) -> Result<(), FedErr> {
+    if let Decision::Reject(_reason) = policy.admit(origin_domain) {
+        return Err(FedErr {
+            code: fed_error_codes::POLICY_DENIED.to_string(),
+            msg: "federation is closed for this origin".to_string(),
+        });
+    }
+    if let Decision::Reject(_reason) = limits.check_route(origin_domain, req.from.as_slice()) {
+        return Err(FedErr {
+            code: fed_error_codes::RATE_LIMITED.to_string(),
+            msg: "too many federated route requests".to_string(),
+        });
+    }
+    // Architect decision #1, defense-in-depth: a `req` that arrived through `serve_link`'s normal
+    // wire path already passed through `link::read_frame`'s own `MAX_FRAME_LEN` cap before it was
+    // ever decoded into a `FedRoute` at all, so this branch is structurally unreachable via that
+    // path today — it exists for a non-compliant peer (or a caller that built `req` some other
+    // way, e.g. a direct unit test) rather than the wire itself.
+    let out = FedFrame::new(FedOp::Route, 0, req).map_err(|_| FedErr {
+        code: fed_error_codes::BAD_REQUEST.to_string(),
+        msg: "malformed fed_route body".to_string(),
+    })?;
+    let encoded_len = out
+        .to_bytes()
+        .map_err(|_| FedErr {
+            code: fed_error_codes::BAD_REQUEST.to_string(),
+            msg: "malformed fed_route body".to_string(),
+        })?
+        .len();
+    if encoded_len > MAX_FRAME_LEN {
+        return Err(FedErr {
+            code: fed_error_codes::BAD_REQUEST.to_string(),
+            msg: "envelope too large to route".to_string(),
+        });
+    }
+
+    let deliver = Deliver {
+        from: req.from,
+        blob: req.envelope.clone(),
+    };
+    let bytes = Frame::new(Op::Deliver, 0, &deliver)
+        .and_then(|f| f.to_bytes())
+        .map_err(|_| FedErr {
+            code: fed_error_codes::BAD_REQUEST.to_string(),
+            msg: "encode failed".to_string(),
+        })?;
+    // Result intentionally discarded (see doc comment above): whether the target was connected is
+    // not reported back across the federation boundary.
+    let _ = registry.send_to(&req.to, Message::Binary(bytes));
+    Ok(())
+}
+
+/// Server B's inbound `fed_reachability` handler (task 2.8): origin admission, then the same
+/// rate-limit machinery as [`handle_fed_route`] but keyed on `req.target` (architect decision #3
+/// — `FedReachability` carries no `from` field, the same deliberate reading
+/// `handle_fed_fetch` already established for `FedFetchBundle`), then EXACTLY
+/// `FedReachable{connected}` — no other branch, ever. `Registry::is_connected` already returns
+/// `false` identically whether `target` never registered or registered-then-disconnected (see
+/// [`Registry`]'s own doc comment); there is no separate existence check here to leak, and this
+/// function must never grow one. Nothing on this path is logged or persisted: `registry` is an
+/// in-memory `Registry` lookup only, and this module (like `federation::policy`) adds no
+/// `tracing`/`println!`-style logging at all.
+pub async fn handle_fed_reachability(
+    registry: &Registry,
+    policy: &FederationPolicy,
+    limits: &FederationLimits,
+    origin_domain: &str,
+    req: &FedReachability,
+) -> Result<FedReachable, FedErr> {
+    if let Decision::Reject(_reason) = policy.admit(origin_domain) {
+        return Err(FedErr {
+            code: fed_error_codes::POLICY_DENIED.to_string(),
+            msg: "federation is closed for this origin".to_string(),
+        });
+    }
+    if let Decision::Reject(_reason) = limits.check_route(origin_domain, req.target.as_slice()) {
+        return Err(FedErr {
+            code: fed_error_codes::RATE_LIMITED.to_string(),
+            msg: "too many federated reachability requests".to_string(),
+        });
+    }
+    Ok(FedReachable {
+        connected: registry.is_connected(&req.target),
+    })
+}
+
 /// Serve one already-established inbound [`FederationLink`] until it closes or errors: read
-/// frames, dispatch by [`FedOp`], reply. Only `FedOp::FetchBundle` is handled in this task (2.7);
-/// every other op (`Route`, `Reachability` — `Hello` is already consumed by link establishment)
-/// replies `FedErr{bad_request}` for now — task 2.8 replaces that fallback arm with real handling,
-/// it does not change this function's `FetchBundle` arm.
+/// frames, dispatch by [`FedOp`], reply. `FedOp::FetchBundle` (2.7), `FedOp::Route` and
+/// `FedOp::Reachability` (2.8 — `Hello` is already consumed by link establishment) are handled;
+/// every other/unknown op still replies `FedErr{bad_request}`.
 pub async fn serve_link(mut link: FederationLink, state: Arc<AppState>) {
     // `link.peer_domain` is the mTLS-authenticated identity (see this module's doc comment) —
     // captured once, used for every request on this link, never re-derived from a request body.
@@ -144,15 +267,80 @@ pub async fn serve_link(mut link: FederationLink, state: Arc<AppState>) {
                     }
                 }
             }
+            FedOp::Route => {
+                let req: FedRoute = match frame.decode() {
+                    Ok(r) => r,
+                    Err(_) => {
+                        let _ = reply_fed_err(
+                            &mut link,
+                            frame.id,
+                            fed_error_codes::BAD_REQUEST,
+                            "malformed fed_route body",
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let result = handle_fed_route(
+                    &state.registry,
+                    &state.federation.policy,
+                    &state.federation.limits,
+                    &origin_domain,
+                    &req,
+                )
+                .await;
+                // `FedOp::Route` is fire-and-forget on success (federation-protocol-v1.md §2,
+                // "there is no FedRouteOk" — do not add one): only the error case replies at all.
+                if let Err(err) = result {
+                    if let Ok(out) = FedFrame::new(FedOp::Err, frame.id, &err) {
+                        let _ = link.send_frame(&out).await;
+                    }
+                }
+            }
+            FedOp::Reachability => {
+                let req: FedReachability = match frame.decode() {
+                    Ok(r) => r,
+                    Err(_) => {
+                        let _ = reply_fed_err(
+                            &mut link,
+                            frame.id,
+                            fed_error_codes::BAD_REQUEST,
+                            "malformed fed_reachability body",
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let result = handle_fed_reachability(
+                    &state.registry,
+                    &state.federation.policy,
+                    &state.federation.limits,
+                    &origin_domain,
+                    &req,
+                )
+                .await;
+                match result {
+                    Ok(reachable) => {
+                        if let Ok(out) = FedFrame::new(FedOp::Reachable, frame.id, &reachable) {
+                            let _ = link.send_frame(&out).await;
+                        }
+                    }
+                    Err(err) => {
+                        if let Ok(out) = FedFrame::new(FedOp::Err, frame.id, &err) {
+                            let _ = link.send_frame(&out).await;
+                        }
+                    }
+                }
+            }
             _ => {
-                // FedOp::Route / FedOp::Reachability (2.8) and any other/unknown op: not yet
-                // implemented at this layer. Fail closed with a structured error rather than
-                // silently dropping the frame — the peer's request gets a defined reply either way.
+                // Any other/unknown op (`Hello` mid-stream, a future op this server doesn't know
+                // about yet): fail closed with a structured error rather than silently dropping
+                // the frame — the peer's request gets a defined reply either way.
                 let _ = reply_fed_err(
                     &mut link,
                     frame.id,
                     fed_error_codes::BAD_REQUEST,
-                    "operation not supported by this server yet",
+                    "operation not supported by this server",
                 )
                 .await;
             }

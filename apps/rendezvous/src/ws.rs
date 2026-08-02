@@ -17,7 +17,9 @@ use tokio::sync::mpsc;
 #[cfg(feature = "test-tamper-hook")]
 use crate::auth::substitute_bundle;
 use crate::auth::verify_auth;
-use crate::federation::outbound::{fetch_foreign_bundle, FetchForeignError};
+use crate::federation::outbound::{
+    fetch_foreign_bundle, route_foreign, FetchForeignError, RouteForeignError,
+};
 use crate::state::AppState;
 
 fn now_secs() -> u64 {
@@ -370,6 +372,29 @@ async fn handle_route(
         Ok(b) => b,
         Err(_) => return send_err(tx, frame.id, error_codes::BAD_REQUEST, "malformed").await,
     };
+
+    // Routing invariant (system-design.md §3.3 steps 2-4, mirrors `handle_fetch`'s identical
+    // branch, task 2.7): `body.to_hint` absent, or equal to this server's OWN domain, is a local
+    // route (unchanged path below). Any other hint means `body.to` names an account this server
+    // is not authoritative for — federate the request to the hinted server (task 2.8) rather than
+    // deliver (or fail) locally. Same `if let Some(hint) = ...` structure `handle_fetch` uses
+    // (not a separate `is_foreign: bool` + `unwrap_or_default`) so "a foreign branch only exists
+    // when there's an actual hint string" is a fact the type system carries.
+    if let Some(hint) = &body.to_hint {
+        if !hint.eq_ignore_ascii_case(&state.config.server.domain) {
+            return handle_federated_route(
+                state,
+                tx,
+                frame,
+                hint,
+                body.to,
+                *account_pub,
+                body.blob.0,
+            )
+            .await;
+        }
+    }
+
     // The honest path, and the ONLY path compiled into a default/release build: exactly one
     // `Deliver`, to the requested recipient, carrying the client's bytes unaltered, with `from` set
     // to the key this connection authenticated as. The blob is never *inspected* — it stays opaque.
@@ -421,6 +446,94 @@ async fn handle_route(
             "recipient offline",
         )
         .await;
+    }
+}
+
+/// The federated branch of `handle_route` (task 2.8, system-design.md §3.3 step 5): this server
+/// (A) dials the hinted foreign server (B) via `federation::outbound::route_foreign` — which
+/// itself pre-checks target liveness via `reachable_foreign` before attempting the actual
+/// `fed_route` round trip (architect decision #3) — and replies to the client with the *same*
+/// `Op::RouteOk`/`Op::Err` shape a local route would use. The client never dials `hint` itself;
+/// this function, running only on server A, is the sole place a federated route dial happens.
+async fn handle_federated_route(
+    state: &Arc<AppState>,
+    tx: &mpsc::Sender<Message>,
+    frame: &Frame,
+    hint: &str,
+    to: [u8; 32],
+    from: [u8; 32],
+    blob: Vec<u8>,
+) {
+    match route_foreign(state, hint, to, from, blob).await {
+        Ok(()) => {
+            send(tx, Op::RouteOk, frame.id, &RouteOk { delivered: true }).await;
+        }
+        Err(e) => {
+            let (code, msg) = federated_route_error_reply(hint, &e);
+            send_err(tx, frame.id, code, &msg).await;
+        }
+    }
+}
+
+/// Translate a [`RouteForeignError`] into the client-visible `(code, msg)` pair (architect
+/// decisions #1 and #3 on this task). Same "only `hint` may appear in the message text" rule as
+/// [`federated_fetch_error_reply`] — `RouteForeignError`'s own fields can carry server A's
+/// internal federation configuration (an `Endpoint::host` service name, a private-CA
+/// `pinned_identity`), which must never leak to a client on a dial failure.
+fn federated_route_error_reply(hint: &str, e: &RouteForeignError) -> (&'static str, String) {
+    match e {
+        // We never even reached a foreign server for the ACTUAL route attempt — a connectivity
+        // axis, distinct from the target-liveness axis below (architect decision #3: "Genuine
+        // failure to reach server B at all stays fed_unreachable").
+        RouteForeignError::NotConfigured => (
+            error_codes::FED_UNREACHABLE,
+            "federation is not enabled on this server".to_string(),
+        ),
+        RouteForeignError::Discovery { .. } => (
+            error_codes::FED_UNREACHABLE,
+            format!("could not resolve federation partner {hint:?}"),
+        ),
+        RouteForeignError::AddrResolution { .. } => (
+            error_codes::FED_UNREACHABLE,
+            format!("could not resolve a dial address for federation partner {hint:?}"),
+        ),
+        RouteForeignError::Dial { .. } => (
+            error_codes::FED_UNREACHABLE,
+            format!("could not reach federation partner {hint:?}"),
+        ),
+        RouteForeignError::Protocol(_) => (
+            error_codes::FED_UNREACHABLE,
+            "federated route protocol error".to_string(),
+        ),
+        // Architect decision #1: a clean, pre-dial rejection — never reaches the wire at all.
+        RouteForeignError::EnvelopeTooLarge { .. } => (
+            error_codes::BAD_REQUEST,
+            "envelope too large to route".to_string(),
+        ),
+        // Architect decision #3: the ENTIRE target-liveness axis — "target unknown," "target
+        // known-offline," and "the reachability pre-check itself failed" — collapses to the same
+        // code a local offline recipient already produces. Never a distinct "foreign offline"
+        // code: that would be a fresh existence oracle this task must not introduce.
+        RouteForeignError::TargetUnreachable => {
+            (error_codes::NOT_CONNECTED, "recipient offline".to_string())
+        }
+        // The foreign server DID answer — translate its structured `FedErr` into the closest
+        // existing local code (never a new one — see this function's doc comment), reusing
+        // `federated_fetch_error_reply`'s exact mapping (task 2.7 precedent).
+        RouteForeignError::Fed(fed_err) => {
+            use meridian_proto::fed_error_codes;
+            let code = if fed_err.code == fed_error_codes::POLICY_DENIED {
+                error_codes::FED_DENIED
+            } else if fed_err.code == fed_error_codes::RATE_LIMITED {
+                error_codes::RATE_LIMITED
+            } else {
+                // `bad_request` from the peer, or any future/unknown fed error code: no existing
+                // local code fits precisely, so fail closed to the generic connectivity/protocol
+                // outcome rather than inventing a new client-visible code (2.9's job).
+                error_codes::FED_UNREACHABLE
+            };
+            (code, format!("federated route declined: {}", fed_err.msg))
+        }
     }
 }
 
