@@ -211,8 +211,21 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   (RUSTSEC-2025-0134, unmaintained, no safe upgrade) — added in task 2.4. Replaced with
   `rustls-pki-types`'s own `PemObject` trait (what `rustls-pemfile` now just wraps), dropping the
   dependency entirely; `apps/rendezvous/src/federation/link.rs` and its test file both updated.
-- **NEXT:** `/next-task`. Continuing the batch: **2.10** next, then **2.13**, **2.6**, **2.7**,
-  **2.8**, **2.9**, **2.11**, **2.12** in dependency order.
+- **ALSO NOW:** **2.10 is done.** First-contact message-request gate, entirely client-side
+  (`apps/core/src/chat.rs`'s `open_inbound`): a first envelope from an unrecognized peer key lands
+  in `pending_requests` instead of delivering; a second pre-accept envelope is refused, not merged;
+  gating happens after signature verification/session establishment so a rejected first contact
+  still costs the OTK it consumed (same accepted-behavior class as 1.33). architect confirmed
+  client-side-only is *binding* (not just asserted) per anonymity-and-retention.md must-never #2.
+  All three reviewers independently found and required tracking the same real gap: the gate is
+  structurally inert on the P2P session-signaling path (`session connect` bypasses it — the crypto
+  session installs before any chat content flows) — tracked as **2.14** rather than left implicit,
+  with `threat-mitigation-matrix.md`'s claim corrected and a regression test pinning today's
+  behavior. security-reviewer APPROVE-WITH-CHANGES (both required fixes applied); test-engineer
+  PASS, no required fixes (mutation-tested the new suite and the four pre-existing tests' shims).
+- **NEXT:** `/next-task`. Continuing the batch: **2.13** next, then **2.6**, **2.7**, **2.8**,
+  **2.9**, **2.11**, **2.12** in dependency order. **2.14** (new, from 2.10's review) queues up
+  after 2.10's own dependents since it depends on 2.10.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -311,7 +324,7 @@ cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery 
 
 **Client**
 - [ ] **2.9** Client federation error taxonomy: clean `closed` error + stale-hint case — [file](./phase-2/2.9-client-federation-errors.md)
-- [~] **2.10** First-contact message-request gate (client-side, §3.5) — [file](./phase-2/2.10-message-request-gate.md)
+- [x] **2.10** First-contact message-request gate (client-side, §3.5) — [file](./phase-2/2.10-message-request-gate.md)
 
 **Demo + exit gate**
 - [ ] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./phase-2/2.11-demo-two-orgs.md)
