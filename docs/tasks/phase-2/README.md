@@ -144,7 +144,7 @@ rather than a normalized schema — *"TODO: confirm normalized schema + Postgres
 
 **Client**
 - [ ] **2.9** Client federation error taxonomy: clean `closed` error + stale-hint case — [file](./2.9-client-federation-errors.md)
-- [ ] **2.10** First-contact message-request gate (client-side, §3.5) — [file](./2.10-message-request-gate.md)
+- [~] **2.10** First-contact message-request gate (client-side, §3.5) — [file](./2.10-message-request-gate.md)
 
 **Demo + exit gate**
 - [ ] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./2.11-demo-two-orgs.md)
