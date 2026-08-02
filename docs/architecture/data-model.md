@@ -28,11 +28,23 @@ mailbox(           -- ADR-7. A7 learns: count, sizes, timestamps. Nothing else.
   -- purge job on expires_at; delete on ack; quota trigger per recipient
   -- TTL=0 config ⇒ inserts disabled entirely (pure-P2P mode)
 
-federation_map(    -- air-gapped static mode; SRV used when absent
-  domain TEXT PK, endpoint TEXT, ca_pin BLOB NULL, policy TEXT /*open|allow|closed*/)
-
 rate_counters(scope TEXT, key_hash BLOB, window_start, count)  -- salted hashes only
 ```
+
+**`federation_map` is a config file, not a table (superseded).** An earlier draft of this doc
+listed `federation_map(domain PK, endpoint, ca_pin, policy)` as a rendezvous DB table. That was
+never built and is **not the design**: [task 2.3](../tasks/phase-2/2.3-c2s-federation-extension.md)
+re-deferred "normalized schema + Postgres" to T07 with "Feature 06 adds no new persisted state,"
+and [ADR 0002](../adr/0002-federation-mechanism.md)'s air-gap case depends on federation partners
+being named in a static **file**, not queryable server state, with no shared/DB-backed lookup at
+all. The actual shape — resolved and implemented by
+[task 2.5](../tasks/phase-2/2.5-federation-discovery.md) — is `federation_map.toml`, an
+operator-edited config file parsed by `meridian_rendezvous::federation::discovery::StaticMap`
+(schema documented in that module and in the reference fixture,
+[`demo/two-orgs/federation_map.toml`](../../demo/two-orgs/federation_map.toml)): per-partner
+`domain`, `endpoint` (`host:port`), a mandatory `pinned_identity` (SAN/CN, [ADR 0017](../adr/0017-federation-trust-boundary.md)
+C4 — not a certificate/key fingerprint, hence not named `ca_pin`), and an optional `policy` carried
+through for [task 2.6](../tasks/phase-2/2.6-federation-policy-limits.md) to define.
 
 Deliberately absent: contact lists, message metadata beyond the mailbox row, display names, sender columns on mailbox rows (sender is inside the sealed envelope). Backup/restore stance (§10): losing this DB costs *reachability* (clients republish bundles on reconnect), never confidentiality or identity.
 

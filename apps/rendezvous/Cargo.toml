@@ -76,6 +76,12 @@ rustls-native-certs = "0.8"
 # SAN/CN origin-domain extraction from a peer's already-validated leaf certificate (ADR 0017
 # (a)/C3) — rustls's verifier proves chain+hostname match but does not hand back parsed fields.
 x509-parser = "0.18"
+# DNS SRV discovery (task 2.5, ADR 0002): `_meridian-fed._tcp.<domain>` lookups for `SrvDiscovery`.
+# `default-features = false` + explicit `system-config` (read `/etc/resolv.conf`) + `tokio`: no TLS
+# feature (`__tls`/`https-*`/`quic-*`) is enabled — plain DNS only, the same posture as every other
+# primitive dependency here. `StaticMap`, this task's air-gap-mode implementation, does not use
+# this crate (or any resolver type) at all — see `federation::discovery` module docs.
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["system-config", "tokio"] }
 
 [dev-dependencies]
 meridian-signaling = { path = "../signaling" }
@@ -89,3 +95,4 @@ tempfile = { workspace = true }
 # Mint ephemeral test certs (private CA + leaf) for the mTLS conformance tests (task 2.4). Dev-only
 # per the task's risk note — never linked into the production server binary.
 rcgen = "0.13"
+static_assertions = "1.1.0"

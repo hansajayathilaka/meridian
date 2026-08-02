@@ -131,20 +131,18 @@ impl Turn {
     }
 }
 
-/// Server↔server (s2s) federation link config (task 2.4, ADR 0017). Every field defaults
-/// fail-closed: `enabled = false` means federation is entirely inert (no listener bound, no
-/// dialing) until an operator explicitly opts in and supplies real cert/key/CA material — there is
-/// no default cert/key path that could accidentally "just work" with a placeholder identity.
-///
-/// This struct is shared with [2.5](../../../docs/tasks/phase-2/2.5-federation-discovery.md),
-/// which adds discovery fields (SRV lookup toggle, `federation_map.toml` path, per-partner pinned
-/// identities) on top of this task's link-establishment surface. Only the fields task 2.4 itself
-/// needs are added here.
+/// Server↔server (s2s) federation link config (task 2.4, ADR 0017) plus discovery config (task
+/// 2.5, ADR 0002). Every field defaults fail-closed: `enabled = false` means federation is
+/// entirely inert (no listener bound, no dialing, no DNS lookup) until an operator explicitly opts
+/// in and supplies real cert/key/CA material — there is no default cert/key path that could
+/// accidentally "just work" with a placeholder identity, and no default discovery behavior that
+/// could accidentally make a DNS query the operator didn't ask for.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct Federation {
-    /// Master switch. `false` ⇒ no federation listener is bound and no outbound federation dial is
-    /// ever attempted, regardless of any other field below (fail-closed default).
+    /// Master switch. `false` ⇒ no federation listener is bound, no outbound federation dial is
+    /// ever attempted, and no discovery lookup (SRV or static-map) is ever performed, regardless
+    /// of any other field below (fail-closed default).
     pub enabled: bool,
     /// Address to bind the s2s mTLS listener. TLS terminates **in-process** here — never at a
     /// proxy/VIP upstream (ADR 0017 C7), unlike the c2s WSS listener (ADR 0008).
@@ -160,6 +158,30 @@ pub struct Federation {
     /// in this bundle — never silently fall back to the system store (ADR 0017 (a)/C3/C4; the
     /// whole air-gap trust model depends on this being an exclusive, not additive, trust root).
     pub ca_bundle_path: String,
+    /// Discovery mode (task 2.5, [`federation::discovery`](crate::federation::discovery)):
+    /// `"static"` resolves partner domains exclusively through `map_path`'s `federation_map.toml`
+    /// (no DNS involved at all — the air-gap mode); `"srv"` resolves them via
+    /// `_meridian-fed._tcp.<domain>` DNS SRV records, refusing (never falling back to A/AAAA) when
+    /// no SRV record exists. Defaults to `"static"`: the fail-closed choice, since it is the mode
+    /// that can never *originate* a DNS query on its own — an operator who wants SRV must opt in
+    /// explicitly, mirroring `ca_bundle_path`'s "empty means don't do the riskier/networked thing
+    /// by default" posture.
+    pub discovery: DiscoveryMode,
+    /// Path to `federation_map.toml`, read by [`crate::federation::discovery::StaticMap`] when
+    /// `discovery = "static"`. Empty by default (no path that could accidentally load a stray file
+    /// of the conventional name); ignored when `discovery = "srv"`.
+    pub map_path: String,
+}
+
+/// Federation discovery mode (task 2.5, ADR 0002 "DNS-SRV/static-map discovery"). See
+/// [`Federation::discovery`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiscoveryMode {
+    /// `federation_map.toml` only — no DNS lookup is ever made (air-gap mode).
+    Static,
+    /// `_meridian-fed._tcp.<domain>` DNS SRV records; refuses (fails closed) if none exist.
+    Srv,
 }
 
 impl Default for Federation {
@@ -175,6 +197,8 @@ impl Default for Federation {
             cert_path: String::new(),
             key_path: String::new(),
             ca_bundle_path: String::new(),
+            discovery: DiscoveryMode::Static,
+            map_path: String::new(),
         }
     }
 }
@@ -430,9 +454,52 @@ mod tests {
         assert!(f.cert_path.is_empty());
         assert!(f.key_path.is_empty());
         assert!(f.ca_bundle_path.is_empty());
+        // Discovery defaults to `static`, the mode that can never originate a DNS query on its
+        // own (task 2.5) — mirrors `ca_bundle_path`'s "empty means don't do the networked thing
+        // by default" posture.
+        assert_eq!(f.discovery, DiscoveryMode::Static);
+        assert!(f.map_path.is_empty());
 
         let config = Config::from_toml_str("").unwrap();
         assert!(!config.federation.enabled);
+        assert_eq!(config.federation.discovery, DiscoveryMode::Static);
+    }
+
+    #[test]
+    fn federation_discovery_env_overrides_apply() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[
+                ("MERIDIAN_RENDEZVOUS_FEDERATION__DISCOVERY", "srv"),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__MAP_PATH",
+                    "/etc/meridian/federation_map.toml",
+                ),
+            ],
+        );
+        let file = write_toml("");
+
+        let config = Config::load(Some(file.path().to_str().unwrap())).unwrap();
+
+        assert_eq!(config.federation.discovery, DiscoveryMode::Srv);
+        assert_eq!(
+            config.federation.map_path,
+            "/etc/meridian/federation_map.toml"
+        );
+    }
+
+    #[test]
+    fn federation_discovery_rejects_unknown_mode_fail_closed() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[(
+                "MERIDIAN_RENDEZVOUS_FEDERATION__DISCOVERY",
+                "dns-over-carrier-pigeon",
+            )],
+        );
+        let file = write_toml("");
+
+        assert!(Config::load(Some(file.path().to_str().unwrap())).is_err());
     }
 
     #[test]

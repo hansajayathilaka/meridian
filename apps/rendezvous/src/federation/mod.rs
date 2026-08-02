@@ -1,4 +1,4 @@
-//! Server↔server (s2s) federation link establishment (task 2.4).
+//! Server↔server (s2s) federation link establishment (task 2.4) and domain discovery (task 2.5).
 //!
 //! Implements the parts of [ADR 0017](../../../../docs/adr/0017-federation-trust-boundary.md)
 //! this task owns:
@@ -18,15 +18,24 @@
 //! (`config::Federation::ca_bundle_path` empty ⇒ OS/system trust store; non-empty ⇒ that bundle,
 //! exclusively).
 //!
-//! **Out of scope** (see the task file): discovery
-//! ([2.5](../../../../docs/tasks/phase-2/2.5-federation-discovery.md)), policy/rate-limits
+//! The [`discovery`] submodule (task 2.5) resolves a partner domain to dial-target `Endpoint`s —
+//! via `_meridian-fed._tcp` SRV records or a `federation_map.toml` static/air-gap map — but
+//! performs no dialling itself; `link::dial` above still takes an explicit address and
+//! `expected_domain`, with discovery as one (not the only) way a caller might obtain them.
+//!
+//! **Out of scope** (see the task files): policy/rate-limits
 //! ([2.6](../../../../docs/tasks/phase-2/2.6-federation-policy-limits.md)), and every `fed_*`
 //! request handler beyond the link-establishing `FedHello` exchange
 //! ([2.7](../../../../docs/tasks/phase-2/2.7-federated-prekey-fetch.md)/
 //! [2.8](../../../../docs/tasks/phase-2/2.8-federated-route-reachability.md)). In particular:
-//! nothing here decides *whether* to federate with a given domain, or dials it automatically — a
-//! caller (a later task) supplies the address and the expected/pinned domain explicitly.
+//! nothing here decides *whether* to federate with a given domain — a resolved `Endpoint` is a
+//! discovery answer, not a policy allowance.
 
+pub mod discovery;
 pub mod link;
 
+pub use discovery::{
+    Discovery, DiscoveryError, Endpoint, HickoryResolver, RawSrv, SrvDiscovery, SrvResolver,
+    StaticMap,
+};
 pub use link::{dial, FederationLink, FederationListener, FederationTlsPaths, LinkError};
