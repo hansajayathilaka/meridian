@@ -367,6 +367,57 @@ async fn relay_path_connects_healthily() {
     assert_eq!(b_local, a_remote);
 }
 
+/// (2.10 follow-up, tracked as 2.14) Pins TODAY's actual, known-gap behavior: a first-ever P2P
+/// session's chat content is delivered ungated, unlike the relay/mailbox path task 2.10 gates via
+/// `ChatState::open_inbound`. By the time `dial`/`answer` can run at all, the crypto session for the
+/// peer must already exist (`establish_ratchet`, mirroring the real flow where X3DH completes before
+/// `session_connect` dials) — so `ChatState`'s "is this a first contact" check is already `false`
+/// before any chat content ever reaches `pump`'s `open_inbound` call. This is not a security
+/// assertion — it's a regression pin, so a future change to `session.rs` (e.g. task 2.14 wiring a
+/// gate into this path) changes this test's expectation deliberately, not silently. See
+/// `docs/tasks/phase-2/2.14-p2p-message-request-gate.md` and the doc comment on
+/// `ChatState::open_inbound` (`apps/core/src/chat.rs`) for the full context.
+#[tokio::test]
+async fn p2p_first_chat_content_is_not_yet_gated_known_gap_tracked_as_2_14() {
+    let mut alice = Peer::new("chat.a");
+    let mut bob = Peer::new("chat.b");
+    establish_ratchet(&mut alice, &mut bob);
+
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(LoopbackTransport::new(fabric.clone()));
+    let tb = Arc::new(LoopbackTransport::new(fabric.clone()));
+
+    let (ra, rb) = connect(
+        ta,
+        tb,
+        &mut alice,
+        &mut bob,
+        Arc::new(StreamRegistry::with_builtins()),
+        Arc::new(StreamRegistry::with_builtins()),
+    )
+    .await;
+    let mut asess = ra.expect("established");
+    let mut bsess = rb.expect("established");
+
+    let ahandle = alice.handle();
+    let bhandle = bob.handle();
+    asess
+        .send_chat(&alice.store, &ahandle, &mut alice.chat, "hello over p2p")
+        .await
+        .unwrap();
+
+    // If this starts failing with Err(SessionError::Chat(ChatError::MessageRequest)) instead of
+    // delivering, that means 2.14 landed and gated this path — update this test to assert the gate
+    // fires and accept/reject before content delivery, matching apps/core/tests/message_request_gate.rs's
+    // pattern, rather than loosening this assertion.
+    match bsess.pump(&bob.store, &bhandle, &mut bob.chat).await {
+        Ok(Some(SessionEvent::Chat(ChatContent::Text { body, .. }))) => {
+            assert_eq!(body, "hello over p2p");
+        }
+        other => panic!("expected ungated delivery (today's known gap, 2.14), got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn unknown_mandatory_capability_rejected_gracefully() {
     struct Exotic;

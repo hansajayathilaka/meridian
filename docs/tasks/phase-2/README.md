@@ -156,6 +156,11 @@ here because it needs fixing, not because Feature 06 depends on it. It is indepe
 above and can run at any point in the phase.
 - [ ] **2.13** A replayed envelope permanently wedges the receiving ratchet — [file](./2.13-ratchet-replay-dos.md)
 
+**Follow-up surfaced by 2.10's review** — architect + security-reviewer both required this be
+tracked explicitly rather than silently deferred to Feature 08.
+- [ ] **2.14** Wire the message-request gate into the P2P session substrate (`session connect`
+  currently bypasses 2.10's gate entirely) — [file](./2.14-p2p-message-request-gate.md)
+
 ### Dependency order
 ```
 1.32 ─┬─► 2.1 ─► 2.2 ─┬─► 2.3 ─┐

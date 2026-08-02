@@ -19,7 +19,12 @@ Companion to design §1. Every adversary maps to concrete mitigations *and* to t
 ## Enumeration / spam (cross-cutting, §3.5)
 - 256-bit key namespace → nothing to walk; `fetch_bundle` exact-key only (T02).
 - Federation rate limits per (origin server, account); allowlist/closed policies (T06).
-- First-contact message-request gate (T06/T08); optional contact tokens + PoW stamp (T14).
+- First-contact message-request gate (T06/T08; landed 2.10) — **covers the relay/mailbox delivery
+  path (`ChatState::open_inbound`) only.** A direct P2P dial (`meridian session connect`) currently
+  bypasses it entirely: the crypto session is already installed by the SDP offer/answer exchange
+  (`chat.open_bytes`, not `open_inbound`) before any chat content flows, so `is_first_contact` is
+  structurally always false on that path. Tracked as [2.14](../tasks/phase-2/2.14-p2p-message-request-gate.md).
+  Optional contact tokens + PoW stamp (T14).
 - OTK depletion bounded per-source; signed-prekey fallback weakens only first-message deniability, never confidentiality (T02). (Moot for envelope v1, which is not deniable at all — every ciphertext is identity-signed; see [ADR 0016](../adr/0016-envelope-deniability.md).)
 
 ## Explicitly accepted residual risk (design §1.3 — restated so nobody "fixes" it silently)

@@ -319,6 +319,7 @@ cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery 
 
 **Carried in from Phase 1** (production defect surfaced by 1.32; not part of T06)
 - [ ] **2.13** A replayed envelope permanently wedges the receiving ratchet (`Ratchet::decrypt` commits `ckr`/`nr` before `aead_open` and never rolls back — unauthenticated permanent session DoS) — [file](./phase-2/2.13-ratchet-replay-dos.md)
+- [ ] **2.14** Wire the message-request gate into the P2P session substrate (from 2.10's review; `session connect` currently bypasses the gate entirely) — [file](./phase-2/2.14-p2p-message-request-gate.md)
 
 ---
 
