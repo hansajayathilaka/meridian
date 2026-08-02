@@ -168,6 +168,11 @@ impl Peer {
 
     /// Await the next delivery and try to open it *exactly as a real client would*: with the
     /// routing origin the SERVER claimed, which under `spoof_from` is a lie.
+    ///
+    /// This file exercises routing-layer attacks, not the task-2.10 request-queue UX (see
+    /// `apps/core/tests/message_request_gate.rs` for that): a first contact is transparently
+    /// auto-accepted so a genuine first envelope still reads as `Opened`, matching the pre-2.10
+    /// behaviour every assertion below was written against.
     async fn recv(&mut self) -> Received {
         let deliver = match tokio::time::timeout(DELIVER_TIMEOUT, self.client.next_deliver()).await
         {
@@ -186,6 +191,14 @@ impl Peer {
         );
         match outcome {
             Ok(content) => Received::Opened { content, blob },
+            Err(ChatError::MessageRequest) => {
+                let content = self
+                    .chat
+                    .accept_request(&deliver.from)
+                    .expect("just gated by open_inbound")
+                    .intro;
+                Received::Opened { content, blob }
+            }
             Err(e) => Received::Rejected(e),
         }
     }

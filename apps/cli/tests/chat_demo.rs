@@ -178,8 +178,40 @@ fn chat_relayed_both_ways_with_receipts_and_restart() {
     let mut b = bob.spawn_chat(&server, &alice_id);
     std::thread::sleep(Duration::from_millis(800)); // let both connect + publish
 
-    // Drive delivery with bounded resends (robust to startup ordering). The initiator's messages
-    // send immediately; the responder buffers until the opening message establishes its session.
+    // Type each side's opening line exactly once: the initiator's session already exists (so its
+    // send goes out immediately), the responder has none yet (so its typed line is buffered
+    // locally — `apps/cli/src/chat.rs`'s `pending` — until a session exists).
+    a.send("hello from alice");
+    b.send("hi alice, bob here");
+
+    // Whichever side ends up the crypto *responder* (deterministic by key order, so it varies per
+    // run — see `apps/cli/src/chat.rs`'s role-decision comment) sees a first-contact
+    // message-request gate on the other's opening envelope before anything is delivered (task
+    // 2.10, §3.5). Accept it on whichever side shows the prompt; the initiator never sees one — a
+    // session it started itself is never gated (`ChatState::open_inbound`).
+    let mut a_accepted = false;
+    let mut b_accepted = false;
+    let accepted = wait_until(Duration::from_secs(20), || {
+        if !a_accepted && a.out().contains("\"event\":\"message_request\"") {
+            a.send("y");
+            a_accepted = true;
+        }
+        if !b_accepted && b.out().contains("\"event\":\"message_request\"") {
+            b.send("y");
+            b_accepted = true;
+        }
+        a_accepted || b_accepted
+    });
+    assert!(
+        accepted,
+        "neither side ever saw a message-request prompt for the opening envelope.\nA stdout: {}\nB stdout: {}",
+        a.out(),
+        b.out()
+    );
+
+    // Drive delivery with bounded resends (robust to startup ordering / relay timing). Both sides
+    // have now answered any message-request prompt, so re-sending the same lines is safe — no
+    // typed line can be mistaken for an unanswered accept/reject.
     let ok = wait_until(Duration::from_secs(20), || {
         a.send("hello from alice");
         b.send("hi alice, bob here");

@@ -55,11 +55,24 @@ impl Party {
             .seal_outbound(&self.store, &self.handle(), &ik, peer, content)
             .expect("seal")
     }
+    /// Opacity is orthogonal to the task-2.10 request-queue UX: a first contact is transparently
+    /// auto-accepted here so the scripted ping-pong (and its byte-level assertions) reads exactly
+    /// as it did before the gate existed.
     fn open(&mut self, from: &[u8; 32], blob: &[u8]) -> ChatContent {
         let ik = self.ik();
-        self.state
+        match self
+            .state
             .open_inbound(&self.store, &self.handle(), &ik, from, blob)
-            .expect("open")
+        {
+            Ok(content) => content,
+            Err(meridian_core::chat::ChatError::MessageRequest) => {
+                self.state
+                    .accept_request(from)
+                    .expect("just gated by open_inbound")
+                    .intro
+            }
+            Err(e) => panic!("open: {e}"),
+        }
     }
 }
 

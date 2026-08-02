@@ -50,6 +50,21 @@ pub enum ChatError {
     /// that knows it lost state; see `docs/api/messaging-envelope-v1.md` §3 "Desync recovery".
     #[error("ratchet desync: header undecryptable under either header key")]
     Desync,
+    /// (task 2.10) A first-contact envelope from a sender [`ChatState`] has never seen before was
+    /// verified and decrypted successfully, but is being held in the segregated message-request
+    /// state ([`ChatState::pending_requests`]) rather than delivered — system-design.md §3.5. Not a
+    /// failure: reused `Result`'s error channel the same way [`Desync`](ChatError::Desync) does, so
+    /// `open_inbound`'s signature doesn't have to widen for a non-fatal, but distinguishable,
+    /// routing outcome. Callers should look up the held [`MessageRequest`] via
+    /// [`ChatState::pending_request`] rather than treat this like an ordinary rejection.
+    #[error("first contact from this sender is now a pending message request")]
+    MessageRequest,
+    /// (task 2.10) An envelope arrived from a sender who already has an undecided pending message
+    /// request. It is refused outright — **never** merged into the existing request — until the
+    /// user calls [`ChatState::accept_request`] or [`ChatState::reject_request`]. The original
+    /// intro captured by the first envelope is untouched.
+    #[error("sender has a pending message request awaiting accept/reject")]
+    RequestPending,
 }
 
 /// How long a *superseded* prekey generation stays usable after a republish, in seconds (task 1.31).
@@ -251,11 +266,44 @@ fn take_otk(otks: &mut Vec<Otk>, opk_public: &[u8; 32]) -> Option<[u8; 32]> {
     found
 }
 
-/// The full persistable chat state: the prekey vault + all live sessions, keyed by peer identity.
+/// A first-contact envelope held in the segregated "message request" state (task 2.10,
+/// system-design.md §3.5) instead of being delivered as an ordinary message, pending the user's
+/// accept/reject decision.
+///
+/// **What "gated" means here, precisely.** By the time a [`MessageRequest`] exists, the crypto
+/// underneath it is *done*: the envelope's signature verified, X3DH ran (or the existing ratchet
+/// advanced), and a live [`Session`] is already installed in [`ChatState`]'s session map — see the
+/// gate in [`ChatState::open_inbound`]. What is held back is *delivery/display*, not
+/// authentication: the sender really does hold the private key behind `sender_ik`. The user is
+/// simply being asked whether they want to talk to that (now cryptographically confirmed) key.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MessageRequest {
+    /// The sender's account identity key. Duplicated here (it is also the key in
+    /// [`ChatState::pending_requests`]) so a [`MessageRequest`] handed to a caller by value/ref
+    /// remains self-describing.
+    #[serde(with = "b32")]
+    pub sender_ik: [u8; 32],
+    /// The safety number for the (already-established, not-yet-trusted) session, computed exactly
+    /// as an accepted contact's would be (§4.4) — shown next to the intro so the user can eyeball
+    /// it *before* deciding, not after.
+    pub safety_number: String,
+    /// The decrypted first payload — system-design.md §3.5's "a short encrypted intro".
+    pub intro: ChatContent,
+}
+
+/// The full persistable chat state: the prekey vault + all live sessions, keyed by peer identity,
+/// plus (task 2.10) the segregated message-request queue for senders not yet accepted.
 #[derive(Default, Serialize, Deserialize)]
 pub struct ChatState {
     pub vault: PrekeyVault,
     sessions: BTreeMap<[u8; 32], Session>,
+    /// First-contact envelopes awaiting an accept/reject decision (task 2.10), keyed by sender
+    /// identity key. Part of the same struct (rather than a separate store) specifically so it
+    /// rides `seal_at_rest`/`open_at_rest` unchanged — the task's "persistence inside the
+    /// sealed-at-rest `ChatState`" requirement. `#[serde(default)]` so state sealed before this
+    /// task still opens (mirrors `PrekeyVault::previous`'s precedent, task 1.31).
+    #[serde(default)]
+    pending_requests: BTreeMap<[u8; 32], MessageRequest>,
 }
 
 impl ChatState {
@@ -294,6 +342,57 @@ impl ChatState {
     /// Safety number for a peer session, if present.
     pub fn safety_number(&self, our_ik: &[u8; 32], peer_ik: &[u8; 32]) -> Option<String> {
         self.sessions.get(peer_ik).map(|s| s.safety_number(our_ik))
+    }
+
+    // -- task 2.10: message-request queue ------------------------------------------------------
+
+    /// Iterate the pending message requests (sender key first, `BTreeMap` order — stable, not
+    /// arrival order, which this crate has no clock to record).
+    pub fn pending_requests(&self) -> impl Iterator<Item = &MessageRequest> {
+        self.pending_requests.values()
+    }
+
+    /// The pending request from `sender_ik`, if any.
+    pub fn pending_request(&self, sender_ik: &[u8; 32]) -> Option<&MessageRequest> {
+        self.pending_requests.get(sender_ik)
+    }
+
+    /// Accept a pending message request: removes it from the gate so subsequent envelopes from
+    /// `sender_ik` deliver as ordinary messages (see the gate in [`open_inbound`](Self::open_inbound)),
+    /// and returns the [`MessageRequest`] that was being held — including its `intro`, which the
+    /// caller should now present exactly like any other freshly-received [`ChatContent`].
+    ///
+    /// The crypto session behind the request was already fully established when it was gated
+    /// (signature verified, X3DH complete); accepting is pure local bookkeeping and re-verifies
+    /// nothing.
+    pub fn accept_request(&mut self, sender_ik: &[u8; 32]) -> Option<MessageRequest> {
+        self.pending_requests.remove(sender_ik)
+    }
+
+    /// Reject a pending message request: discards it *and* the (already-established) session
+    /// behind it, without sending anything back to the sender. Returns whether a request actually
+    /// existed for `sender_ik` (so callers can tell a real rejection from a no-op).
+    ///
+    /// **Security note (does not leak whether the key is known).** This method is pure local
+    /// bookkeeping: it never sends an envelope, receipt, or any other wire-visible signal, so a
+    /// sender who gets rejected observes nothing different from a sender whose envelope was lost,
+    /// dropped by a relay, or never delivered for any other reason — there is no protocol-level
+    /// "rejected" message for a probing sender to fingerprint. That is a *client-side* answer to
+    /// the task's "does not leak" requirement; it says nothing about server-side traffic-analysis
+    /// resistance, which is out of this task's scope (§3.5 rate limits / contact tokens are T08/T14).
+    ///
+    /// The session is dropped (not just the request), zeroizing its ratchet/X3DH key material — an
+    /// unaccepted contact's session secrets are not worth retaining. Consequence: if this sender is
+    /// heard from again, their next envelope either re-runs X3DH from scratch (if it still carries
+    /// a usable prekey preamble) and lands back in `pending_requests` as a new first-contact
+    /// request, or — if it was a bare ratchet continuation with no preamble, or referenced an
+    /// already-consumed one-time prekey — fails closed with [`ChatError::NoSession`] /
+    /// [`ChatError::UnknownPrekey`]. Either way this is "not now", not a distinguishable permanent
+    /// block, which is exactly what keeps rejection from being an oracle.
+    pub fn reject_request(&mut self, sender_ik: &[u8; 32]) -> bool {
+        let had = self.pending_requests.remove(sender_ik).is_some();
+        self.sessions.remove(sender_ik);
+        had
     }
 
     /// Build a signed, ratchet-encrypted envelope for `content` to `peer_ik`. See [`seal_bytes`] for
@@ -348,7 +447,33 @@ impl ChatState {
     }
 
     /// Verify + decrypt an inbound opaque blob delivered from `from`, establishing a responder
-    /// session if this is a prekey message. Returns the decoded chat payload.
+    /// session if this is a prekey message. Returns the decoded chat payload — unless `from` is
+    /// gated by the task 2.10 message-request queue, in which case it is held in
+    /// [`pending_requests`](Self::pending_requests) instead and this returns
+    /// [`ChatError::MessageRequest`] (first contact) or [`ChatError::RequestPending`] (a still-gated
+    /// sender's follow-up envelope, refused rather than merged).
+    ///
+    /// **Gate placement, and why it does not touch [`open_bytes`].** This wraps the *content*
+    /// entry point only — [`open_bytes`] (the crypto/verification primitive) is also called
+    /// directly by the P2P session substrate (`apps/core/src/session.rs`) for `mrd.ctrl/1`
+    /// SDP/ICE signaling on the *same* ratchet, and that traffic must never be gated: a call
+    /// establishing a P2P session is not a "message" the user is being asked to accept/reject.
+    /// Because signaling always runs before any chat content flows over a resulting P2P data
+    /// channel, a session (and therefore `is_first_contact` below) is already installed by the
+    /// time `open_inbound` first sees that peer via the substrate — so this gate is, in practice,
+    /// specific to the relay-first-contact path §3.5's demo targets. See `docs/architecture/
+    /// features/06-cross-org-federation.md` for that flow; flagged for architect/security-reviewer
+    /// as a residual gap (a direct P2P dial is not itself gated) rather than fixed here, since
+    /// closing it would mean restructuring the session substrate, out of this task's scope.
+    ///
+    /// **Hard invariant (task 2.10): gating happens after signature verification and session
+    /// establishment.** The check below runs *after* [`open_bytes`] has already verified the
+    /// envelope's signature and (on a first contact) completed X3DH — so a first contact that is
+    /// ultimately rejected still cost the sender's one-time prekey. This is the same class of
+    /// already-accepted OTK-consumption behavior recorded in `apps/core/src/session.rs`'s
+    /// `ANSWER_TIMEOUT` doc comment (task 1.33) and is not "fixed" here; restructuring the
+    /// handshake to avoid it would reintroduce the handshake-order problems those notes exist to
+    /// avoid.
     pub fn open_inbound(
         &mut self,
         store: &dyn SecretStore,
@@ -357,8 +482,41 @@ impl ChatState {
         from: &[u8; 32],
         blob: &[u8],
     ) -> Result<ChatContent, ChatError> {
+        // A sender with an undecided pending request is refused outright, before touching crypto
+        // state at all: their first envelope already ran X3DH and installed the session (and the
+        // OTK-consumption cost above), so there is nothing further to establish, and refusing here
+        // means a still-gated sender cannot force extra ratchet-skipped-key churn by re-sending
+        // while awaiting a decision. Never merges into the existing request (task 2.10 deliverable).
+        if self.pending_requests.contains_key(from) {
+            return Err(ChatError::RequestPending);
+        }
+
+        // Snapshot *before* `open_bytes`, which — on a genuine first contact — installs the
+        // responder session as a side effect. Capturing this first is what lets us tell "this
+        // envelope is what just created the session" from "the session already existed".
+        let is_first_contact = !self.sessions.contains_key(from);
+
         let plaintext = self.open_bytes(store, handle, our_ik, from, blob)?;
-        Ok(ChatContent::decode(&plaintext)?)
+        let content = ChatContent::decode(&plaintext)?;
+
+        if is_first_contact {
+            // system-design.md §3.5: land it in the segregated message-request state instead of
+            // delivering it. `unwrap_or_default` only guards a same-call race that cannot actually
+            // happen (the session was just installed by `open_bytes`, above, under this same `&mut
+            // self` borrow) — never a silent downgrade of a real safety-number mismatch.
+            let safety_number = self.safety_number(our_ik, from).unwrap_or_default();
+            self.pending_requests.insert(
+                *from,
+                MessageRequest {
+                    sender_ik: *from,
+                    safety_number,
+                    intro: content,
+                },
+            );
+            return Err(ChatError::MessageRequest);
+        }
+
+        Ok(content)
     }
 
     /// Verify + decrypt an inbound blob to its raw ratchet plaintext, establishing a responder
