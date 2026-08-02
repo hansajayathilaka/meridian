@@ -166,10 +166,21 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   reviewers signed off clean: architect — consistent, no revision; security-reviewer — APPROVE, no
   changes required; code-reviewer — APPROVE, no blocking findings (one doc nit fixed inline, one left
   as a non-blocking informational note).
-- **NEXT:** `/next-task`. **2.4** (s2s mTLS link) is now unblocked — it depends on 2.2 (done) and,
-  per the phase's Track-S sequencing, follows 2.3 (now also done). In parallel, still unblocked with
-  no dependencies: **1.33**, **2.5** (discovery), **2.10** (message-request gate) and **2.13** (the
-  ratchet defect below).
+- **ALSO NOW:** **2.4 is done** — s2s mTLS link (`apps/rendezvous/src/federation/{mod,link}.rs`),
+  WebPKI + private-CA modes, domain-pinned verification (ADR 0017 C3), in-process TLS termination
+  (ADR 0017 C7), fail-closed `config::Federation` defaults, `meridian_federation_link_up` as an
+  aggregate gauge with **no** `peer_domain` label (security-reviewer: a per-partner label would
+  materialize the cross-org contact graph, forbidden by anonymity-and-retention.md must-never #2).
+  Default federation port **8444** (`TODO: confirm`, not IANA-registered). architect: consistent, no
+  revision. security-reviewer: APPROVE-WITH-CHANGES — required fail-closed cert-loading regression
+  tests (empty/nonexistent/zero-cert paths) added in a follow-up commit; also flagged, non-blocking,
+  that the accept side doesn't yet pin inbound peer identity to a specific expected partner — that's
+  2.5/2.6 policy territory, not a 2.4 gap. code-reviewer: approve-with-nits — `missing_client_cert_is_rejected`
+  didn't isolate the mechanism it claimed to test (a coincidental app-level check would also catch a
+  *fully* disabled mandatory-client-auth requirement, in a state that in fact rejects every connection);
+  fixed with a doc comment pointing at the happy-path tests as the real proof mTLS is mandatory.
+- **NEXT:** `/next-task`. Continuing the batch: **2.5** (discovery) next, then **1.33**, **2.10**,
+  **2.13**, **2.6**, **2.7**, **2.8**, **2.9**, **2.11**, **2.12** in dependency order.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -260,7 +271,7 @@ cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery 
 - [x] **2.3** c2s extension for federation (hint fields, error codes, vectors; re-defers the §8 schema `TODO` to T07) — [file](./phase-2/2.3-c2s-federation-extension.md)
 
 **Server spine**
-- [~] **2.4** s2s mTLS link: listener + dialer (WebPKI and private-CA) — [file](./phase-2/2.4-s2s-mtls-link.md)
+- [x] **2.4** s2s mTLS link: listener + dialer (WebPKI and private-CA) — [file](./phase-2/2.4-s2s-mtls-link.md)
 - [ ] **2.5** Discovery: DNS SRV `_meridian-fed._tcp` + `federation_map.toml` static mode — [file](./phase-2/2.5-federation-discovery.md)
 - [ ] **2.6** Federation policy (`open | allowlist | closed`) + edge rate limits — [file](./phase-2/2.6-federation-policy-limits.md)
 - [ ] **2.7** Federated prekey fetch, both sides (§3.3 steps 2–4) — [file](./phase-2/2.7-federated-prekey-fetch.md)
