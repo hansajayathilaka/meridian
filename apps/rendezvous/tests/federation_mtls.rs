@@ -8,12 +8,14 @@
 //! - untrusted CA rejected
 //! - valid cert for the wrong domain rejected (ADR 0017 (a)/C3's whole point)
 //! - missing client cert rejected
+//! - fail-closed cert/key/CA-bundle loading (security-reviewer follow-up on task 2.4)
 
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
 use meridian_proto::{FedFrame, FedOp, FedReachability};
+use meridian_rendezvous::federation::link::{build_client_tls_config, build_server_tls_config};
 use meridian_rendezvous::federation::{dial, FederationListener, FederationTlsPaths, LinkError};
 use meridian_rendezvous::metrics::Metrics;
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
@@ -309,6 +311,24 @@ async fn valid_cert_for_wrong_domain_is_rejected() {
 
 // -- missing client cert rejected ---------------------------------------------
 
+/// NOTE (code-reviewer follow-up on task 2.4): this test on its own only proves "no client cert
+/// ⇒ no usable link" — it does NOT, by itself, isolate *why* the connection fails. Empirically, it
+/// still passes even if `build_server_tls_config` were regressed to `with_no_client_auth` (i.e.
+/// mTLS made optional at the TLS layer), because `FederationListener::accept`'s own
+/// `conn.peer_certificates().ok_or(LinkError::NoPeerIdentity)` app-level check coincidentally also
+/// rejects a certless peer. And in that broken configuration it would in fact reject EVERY
+/// connection, not just this deliberately certless one — a regression that this test alone would
+/// NOT distinguish from a healthy server.
+///
+/// What actually proves mTLS is mandatory (i.e. that `WebPkiClientVerifier`/
+/// `with_client_cert_verifier` is wired into `build_server_tls_config`, not `with_no_client_auth`)
+/// is the happy-path tests above (`happy_path_private_ca_mode`/`happy_path_webpki_mode`): under
+/// `with_no_client_auth`, the server never sends a `CertificateRequest`, so the dialer — even
+/// though `federation::dial`'s `ClientConfig` is always configured with a client cert via
+/// `with_client_auth_cert` — never presents one, and `accept()`'s `peer_certificates()` check then
+/// finds nothing and errors. So the happy-path tests would start failing under that regression,
+/// which is what actually pins mandatory client auth to the TLS-layer verifier rather than to this
+/// test's app-level fallback check.
 #[tokio::test]
 async fn missing_client_cert_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
@@ -359,5 +379,105 @@ async fn missing_client_cert_is_rejected() {
     assert!(
         accept_result.is_err(),
         "accept() must reject a peer that never presented a client certificate"
+    );
+}
+
+// -- fail-closed cert/key/CA-bundle loading (security-reviewer follow-up) -----
+//
+// The happy-path/rejection tests above only exercise `load_cert_chain`/`load_private_key`/
+// `load_root_store` indirectly, via a `dial`/`accept` that always has valid on-disk material —
+// the "missing/empty/bogus material fails closed" property was previously only implicit in
+// `std::fs::read`'s own error behavior, with no test asserting it. These tests call
+// `build_client_tls_config`/`build_server_tls_config` directly (no need to go through a full
+// `FederationListener`/`dial`) to prove each way that material can be missing or malformed is
+// rejected with `Err`, never silently downgraded to a permissive/empty config.
+
+/// One otherwise-valid identity (leaf cert + key + the CA bundle it was signed under), for the
+/// fail-closed tests below to selectively swap one path out to something broken.
+fn valid_identity(dir: &Path) -> Identity {
+    let ca = make_ca("Meridian Test Federation CA (fail-closed fixtures)");
+    mint_identity(dir, "fail-closed", "fail-closed.federation.test", &ca)
+}
+
+#[test]
+fn empty_cert_path_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = valid_identity(dir.path());
+    let paths = FederationTlsPaths {
+        cert_path: "",
+        key_path: id.paths().key_path,
+        ca_bundle_path: id.paths().ca_bundle_path,
+    };
+    assert!(
+        build_client_tls_config(&paths).is_err(),
+        "build_client_tls_config must fail closed on an empty cert_path"
+    );
+    assert!(
+        build_server_tls_config(&paths).is_err(),
+        "build_server_tls_config must fail closed on an empty cert_path"
+    );
+}
+
+#[test]
+fn empty_key_path_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = valid_identity(dir.path());
+    let paths = FederationTlsPaths {
+        cert_path: id.paths().cert_path,
+        key_path: "",
+        ca_bundle_path: id.paths().ca_bundle_path,
+    };
+    assert!(
+        build_client_tls_config(&paths).is_err(),
+        "build_client_tls_config must fail closed on an empty key_path"
+    );
+    assert!(
+        build_server_tls_config(&paths).is_err(),
+        "build_server_tls_config must fail closed on an empty key_path"
+    );
+}
+
+#[test]
+fn nonexistent_ca_bundle_path_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = valid_identity(dir.path());
+    // Never actually written — `ca_bundle_path` non-empty selects private-CA mode, and this path
+    // simply doesn't exist on disk.
+    let missing = dir.path().join("does-not-exist.pem");
+    let paths = FederationTlsPaths {
+        cert_path: id.paths().cert_path,
+        key_path: id.paths().key_path,
+        ca_bundle_path: missing.to_str().unwrap(),
+    };
+    assert!(
+        build_client_tls_config(&paths).is_err(),
+        "build_client_tls_config must fail closed on a nonexistent ca_bundle_path"
+    );
+    assert!(
+        build_server_tls_config(&paths).is_err(),
+        "build_server_tls_config must fail closed on a nonexistent ca_bundle_path"
+    );
+}
+
+#[test]
+fn ca_bundle_with_zero_certs_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = valid_identity(dir.path());
+    // Exists and reads fine, but contains no PEM certificate — `rustls_pemfile::certs` parses
+    // zero entries out of this, exactly as it would for e.g. an accidentally-truncated file or one
+    // that was never actually a certificate bundle.
+    let bogus_bundle = write(dir.path(), "empty.ca.pem", "not a pem file at all\n");
+    let paths = FederationTlsPaths {
+        cert_path: id.paths().cert_path,
+        key_path: id.paths().key_path,
+        ca_bundle_path: bogus_bundle.to_str().unwrap(),
+    };
+    assert!(
+        build_client_tls_config(&paths).is_err(),
+        "build_client_tls_config must fail closed on a ca_bundle_path that parses to zero certs"
+    );
+    assert!(
+        build_server_tls_config(&paths).is_err(),
+        "build_server_tls_config must fail closed on a ca_bundle_path that parses to zero certs"
     );
 }
