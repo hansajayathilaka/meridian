@@ -236,9 +236,22 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   `threat-mitigation-matrix.md`'s A3 row (unimplemented in v1 per `wire-protocol.md`). test-engineer
   independently reproduced the fail-before/pass-after evidence and confirmed the compound-case test
   is non-vacuous.
-- **NEXT:** `/next-task`. Continuing the batch: **2.6** next, then **2.7**, **2.8**, **2.9**,
-  **2.11**, **2.12** in dependency order. **2.14** (new, from 2.10's review) queues up after 2.10's
-  own dependents since it depends on 2.10.
+- **ALSO NOW:** **2.6 is done.** Pure federation admission/rate-limit decision layer
+  (`apps/rendezvous/src/federation/policy.rs`): `FederationPolicy` (closed structurally cannot
+  consult allowlist state; allowlist is exact-match), `FederationLimits` reusing task 1.20's
+  amortised-sweep `RateLimiter` for per-origin-fetch/per-origin-route/per-origin-account budgets.
+  Deliberately unwired from any handler (2.7/2.8) and builds no client-visible copy (2.9).
+  architect: consistent — confirmed the pure-decision-layer boundary was planned at `/plan-phase`
+  time, not improvised. security-reviewer: APPROVE-WITH-CHANGES — traced all six required checks
+  against code; found `lint-no-raw-id-logging.sh`'s pattern didn't actually cover
+  `origin_domain`/`origin_account` despite the module doc claiming it did (fixed). code-reviewer:
+  request-changes — found and reproduced a real bug: checking the shared per-origin budget before
+  the per-account one meant an already-over-budget account's rejected retries could still drain the
+  shared pool and starve every other account behind the same origin, exactly the failure mode the
+  per-account budget exists to prevent. Reordered account-first; pinning test added.
+- **NEXT:** `/next-task`. Continuing the batch: **2.7** next, then **2.8**, **2.9**, **2.11**,
+  **2.12** in dependency order. **2.14** (new, from 2.10's review) queues up after 2.10's own
+  dependents since it depends on 2.10.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -331,7 +344,7 @@ cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery 
 **Server spine**
 - [x] **2.4** s2s mTLS link: listener + dialer (WebPKI and private-CA) — [file](./phase-2/2.4-s2s-mtls-link.md)
 - [x] **2.5** Discovery: DNS SRV `_meridian-fed._tcp` + `federation_map.toml` static mode — [file](./phase-2/2.5-federation-discovery.md)
-- [~] **2.6** Federation policy (`open | allowlist | closed`) + edge rate limits — [file](./phase-2/2.6-federation-policy-limits.md)
+- [x] **2.6** Federation policy (`open | allowlist | closed`) + edge rate limits — [file](./phase-2/2.6-federation-policy-limits.md)
 - [ ] **2.7** Federated prekey fetch, both sides (§3.3 steps 2–4) — [file](./phase-2/2.7-federated-prekey-fetch.md)
 - [ ] **2.8** Federated envelope forwarding + per-request reachability (§3.3 step 5, §3.4) — [file](./phase-2/2.8-federated-route-reachability.md)
 
