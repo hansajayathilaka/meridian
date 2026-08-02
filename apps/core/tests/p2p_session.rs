@@ -10,7 +10,10 @@
 //!     *outer* routing cannot read or forge it (an active relay-rewrite attack against a real
 //!     backend is not yet exercised here — tracked for 1.28, flagged during 1.23's split);
 //!   * **capability exchange rejects unknown mandatory stream types gracefully**;
-//!   * **ICE restart** on a network change keeps the session and ratchet alive (<5 s, invariant 5).
+//!   * **ICE restart** on a network change keeps the session and ratchet alive (<5 s, invariant 5);
+//!   * (1.33) the dialer's wait for an answer is **bounded**: a peer that never answers (offline, or
+//!     a hostile relay that lets the responder reject without ever producing one — 1.28) times out
+//!     with a distinct, diagnosable `SessionError::AnswerTimeout` rather than hanging forever.
 
 use std::sync::Arc;
 
@@ -258,6 +261,72 @@ async fn fingerprint_mismatch_tears_down() {
         Err(e) => panic!("answer: expected fp mismatch, got {e}"),
         Ok(_) => panic!("answer must fail closed on fingerprint mismatch"),
     }
+}
+
+/// 1.33: `recv_sdp`'s wait for the answer is bounded. Reproduces the reachable-with-no-adversary
+/// case named in the task — a peer that simply never answers — with the minimum setup that proves
+/// it: only Bob's *receiving* half of the relay pair exists; nothing ever sends a reply down it, so
+/// `dial`'s wait for an answer would hang forever without 1.33's bound. `answer`/Bob's side is never
+/// even run, which is the point: this isolates the dialer's own bound from any responder behavior
+/// (in scope for 1.33) rather than re-driving the full 1.28 relay-rewrite scenario (out of scope).
+// `start_paused = true`: 1.33 raised `ANSWER_TIMEOUT` to 30s (architect review — it must exceed the
+// responder's own ~20s-bounded ICE gather, not undercut it), which would otherwise make this test
+// really wait 30 real seconds. Tokio's paused virtual clock auto-advances to the next pending timer
+// once every other task is blocked, so `dial`'s internal `tokio::time::timeout(ANSWER_TIMEOUT, ..)`
+// still fires for real, just without the test burning 30 real seconds. `tokio::time::Instant` (not
+// `std::time::Instant`) is used for the elapsed-time assertions below so they measure the same
+// virtual clock the timeout itself runs on.
+#[tokio::test(start_paused = true)]
+async fn dial_times_out_when_the_peer_never_answers() {
+    let mut alice = Peer::new("dialer");
+    let mut bob = Peer::new("silent");
+    establish_ratchet(&mut alice, &mut bob);
+
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(LoopbackTransport::new(fabric));
+    let registry = Arc::new(StreamRegistry::with_builtins());
+
+    // `relay_a` can send (Bob's queue just accumulates, undrained) but nothing ever writes back
+    // into it, so `relay_a.recv()` — what `recv_sdp` awaits — never resolves on its own.
+    let (mut relay_a, _relay_b_unused) = MemRelay::pair(alice.ik(), bob.ik());
+
+    let start = tokio::time::Instant::now();
+    let result = dial(
+        ta,
+        &alice.store,
+        &alice.handle(),
+        alice.ik(),
+        bob.ik(),
+        &mut alice.chat,
+        &mut relay_a,
+        registry,
+    )
+    .await;
+    let elapsed = start.elapsed();
+
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("dial must not succeed when the peer never answers"),
+    };
+    // Distinguishable from tampering (`Chat(ChatError::BadSignature)`) and every other
+    // `SessionError` variant — that's the whole diagnosability point of this task.
+    assert!(
+        matches!(err, SessionError::AnswerTimeout(_)),
+        "expected SessionError::AnswerTimeout, got a different variant: {err}"
+    );
+    // Actually bounded — waited out (approximately) the configured window, not an unrelated
+    // near-instant failure that would make the "distinct variant" assertion above vacuous.
+    assert!(
+        elapsed >= meridian_core::session::ANSWER_TIMEOUT,
+        "returned after {elapsed:?}, before the {:?} bound elapsed",
+        meridian_core::session::ANSWER_TIMEOUT
+    );
+    assert!(
+        elapsed < meridian_core::session::ANSWER_TIMEOUT + std::time::Duration::from_secs(5),
+        "returned after {elapsed:?}, far past the configured {:?} bound — some other, much longer \
+         wait fired instead of the answer-timeout",
+        meridian_core::session::ANSWER_TIMEOUT
+    );
 }
 
 // TODO(1.28, flagged during 1.23's split): replace with an active relay-rewrite attack

@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use meridian_core::chat::ChatState;
 use meridian_core::identity::{generate_account, AccountId, MemorySecretStore};
-use meridian_core::session::{answer, dial, SessionError};
+use meridian_core::session::{answer, dial, SessionError, ANSWER_TIMEOUT};
 use meridian_core::signal_relay::RendezvousRelay;
 use meridian_core::signaling::{SignalingClient, DEFAULT_OTK_COUNT};
 use meridian_core::streams::StreamRegistry;
@@ -131,8 +131,10 @@ enum Outcome {
     Established,
     /// Explicitly rejected — the *detection* the task asks for, when the class is right.
     Rejected(SessionError),
-    /// Neither established nor rejected: this side is still waiting. Fail-closed (no session), but
-    /// undiagnosed — see the residual on the adversarial test.
+    /// Neither established nor rejected within `SIDE_TIMEOUT`. Before 1.33 this was the dialer's
+    /// expected (if undiagnosed) fate on this test; since 1.33 bounds `dial`'s own wait well inside
+    /// `SIDE_TIMEOUT`, seeing this here means the *production* bound failed to fire — a regression,
+    /// not a benign residual.
     StillWaiting,
 }
 
@@ -145,16 +147,30 @@ impl Outcome {
     fn is_envelope_rejection(&self) -> bool {
         matches!(self, Outcome::Rejected(SessionError::Chat(_)))
     }
+
+    /// (1.33) Did this side hit the dialer's bounded answer-wait specifically? Distinct from
+    /// [`Outcome::is_envelope_rejection`] — this is "the peer never answered" (here, because the
+    /// responder rejected and so never produced one), not "the envelope itself was tampered".
+    fn is_answer_timeout(&self) -> bool {
+        matches!(self, Outcome::Rejected(SessionError::AnswerTimeout(_)))
+    }
 }
 
-/// How long a side may wait before we call it `StillWaiting`. Generous relative to loopback
-/// establishment (sub-second in the control case), so this only ever bites the stalled path.
-const SIDE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a side may wait before we call it `StillWaiting`. Before 1.33 this was the *only* thing
+/// bounding the dialer's wait at all (production `recv_sdp` had no timeout of its own), so it had to
+/// be picked independently and generously. Now that `dial` bounds itself internally
+/// ([`ANSWER_TIMEOUT`]), this only needs enough headroom above that real bound to let it fire and be
+/// observed as `SessionError::AnswerTimeout` rather than being preempted by this outer test-only
+/// cutoff — comfortably smaller than the old fixed 10s, and it tracks the production constant instead
+/// of duplicating a number that could silently drift out of sync with it.
+const SIDE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5).saturating_add(ANSWER_TIMEOUT);
 
 /// Drive a full dial/answer through the given server, timing out **each side independently** so the
 /// two outcomes stay distinguishable. Joining them under a single timeout hides detection: the
-/// responder rejects a rewritten offer immediately, but the dialer then waits for an answer that
-/// never arrives, so a combined timeout reports only the stall and the rejection goes unobserved.
+/// responder rejects a rewritten offer immediately, and (since 1.33) the dialer now reliably reports
+/// its own `AnswerTimeout` rather than the pair being reduced to "the responder rejected and the
+/// dialer's outcome is unknown".
 async fn establish_through(url: &str) -> (Outcome, Outcome) {
     let mut alice = Peer::new("relay.a");
     let mut bob = Peer::new("relay.b");
@@ -269,14 +285,19 @@ async fn relay_rewriting_routed_blobs_is_detected_and_fails_closed() {
          Got: {bob:?}"
     );
 
-    // The dialer's only legitimate outcomes: it waits forever for an answer that never comes (the
-    // documented residual), or it too rejects at the envelope layer. A bare Relay/SignalingEnded here
-    // is the signature of the vacuous-pass scenario above, so it is rejected explicitly.
+    // (3) Detected on the dialer's side too, now that 1.33 bounds its wait: it must report
+    // `SessionError::AnswerTimeout` — never a silent, undiagnosed stall (`StillWaiting`, which would
+    // mean `SIDE_TIMEOUT` fired instead of the production bound) and never an unrelated
+    // Relay/SignalingEnded/Transport error, which would mean this test is measuring something other
+    // than the rewrite. `is_envelope_rejection` remains an accepted alternative only in case a future
+    // change makes the dialer itself observe the tampering directly rather than merely outliving an
+    // answer that never arrives — either is a real, explicit detection; a bare stall is not.
     assert!(
-        matches!(alice, Outcome::StillWaiting) || alice.is_envelope_rejection(),
-        "the dialer must either stall awaiting an answer (the documented residual) or reject at the \
-         envelope layer — never fail with an unrelated relay/transport error, which would mean this \
-         test is measuring something other than the rewrite. Got: {alice:?}"
+        alice.is_answer_timeout() || alice.is_envelope_rejection(),
+        "the dialer must explicitly detect this — either its bounded answer-wait expires \
+         (SessionError::AnswerTimeout, the expected outcome since 1.33) or it rejects at the \
+         envelope layer — never an unrelated relay/transport error or an undiagnosed stall. \
+         Got: {alice:?}"
     );
 }
 

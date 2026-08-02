@@ -33,7 +33,9 @@ default = []
 webrtc = ["meridian-transport/webrtc"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+# `test-util` is needed for `#[tokio::test(start_paused = true)]` (task 1.33's answer-timeout test:
+# ANSWER_TIMEOUT is 30s and this avoids actually burning 30 real seconds per test run).
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
 # Lets the desync test (task 1.18) serialize ChatState and assert it is byte-identical before and
 # after a rejected envelope — the check that stops a future contributor adding a reset-on-desync
 # oracle.
