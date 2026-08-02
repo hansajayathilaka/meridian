@@ -33,6 +33,11 @@ pub struct ChatArgs<'a> {
     pub account_pub: [u8; 32],
     pub peer_ik: [u8; 32],
     pub peer_label: String,
+    /// The peer id's `@domain` hint (task 2.7 wire plumbing): passed through to `fetch_bundle` so
+    /// a cross-org peer's bundle is fetched via this server's federated path
+    /// (system-design.md §3.3) rather than only ever looked up locally. This client still only
+    /// ever dials `server` above — never `peer_hint` directly (the routing invariant).
+    pub peer_hint: String,
     pub json: bool,
 }
 
@@ -44,6 +49,7 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
         account_pub,
         peer_ik,
         peer_label,
+        peer_hint,
         json,
     } = args;
 
@@ -77,7 +83,7 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
     // opening prekey message, so it just waits (avoiding a mutual fetch deadlock at startup).
     let initiator = account_pub.as_slice() <= peer_ik.as_slice();
     if initiator && !state.has_session(&peer_ik) {
-        let peer_bundle = fetch_with_retry(&mut client, peer_ik, &peer_label).await?;
+        let peer_bundle = fetch_with_retry(&mut client, peer_ik, &peer_hint, &peer_label).await?;
         state
             .start_initiator_session(
                 store,
@@ -155,13 +161,24 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
 async fn fetch_with_retry(
     client: &mut SignalingClient,
     peer_ik: [u8; 32],
+    peer_hint: &str,
     peer_label: &str,
 ) -> Result<meridian_core::proto::PrekeyBundle, String> {
     use meridian_core::signaling::SignalError;
     for attempt in 0..40u32 {
-        match client.fetch_bundle(peer_ik, false).await {
+        match client
+            .fetch_bundle(peer_ik, Some(peer_hint.to_string()), false)
+            .await
+        {
             Ok(bundle) => return Ok(bundle),
-            Err(SignalError::Server(e)) if e.code == "not_found" => {
+            // "not_found" (local) and "not_found_at_hint" (cross-org, task 2.7) both mean "no
+            // bundle there yet" from this retry loop's point of view — retry either way. A
+            // permanently stale hint (peer re-registered elsewhere) still eventually surfaces as
+            // this same retry exhausting, same as a peer that never publishes locally; refining
+            // that distinction further is 2.9's job, not this loop's.
+            Err(SignalError::Server(e))
+                if e.code == "not_found" || e.code == "not_found_at_hint" =>
+            {
                 if attempt == 0 {
                     eprintln!("waiting for {peer_label} to come online…");
                 }

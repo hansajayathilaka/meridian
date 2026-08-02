@@ -447,13 +447,18 @@ fn cmd_fetch_bundle(id: &str, server: &str, tamper: bool) -> Result<ExitCode, St
     let account_pub = account_pub_bytes(&descriptor)?;
     let peer = parse_id(id).map_err(|e| e.to_string())?;
     let target = *peer.pubkey();
+    // The id's `@domain` hint (task 2.7): passed through to `fetch_bundle` so `--id mrd1:…@org-b`
+    // fetches via this server's federated path when `org-b` isn't this server's own domain — this
+    // command still only ever dials `server` above, never the hinted domain directly (the routing
+    // invariant, system-design.md §3.3).
+    let hint = peer.hint().to_string();
     let store = load_store(&descriptor)?;
     let handle = KeyHandle::from_label(&descriptor.label);
 
     let outcome = runtime()?.block_on(async {
         let mut client =
             SignalingClient::connect(server, store.as_ref(), &handle, account_pub, None, 1).await?;
-        let bundle = client.fetch_bundle(target, tamper).await;
+        let bundle = client.fetch_bundle(target, Some(hint), tamper).await;
         let _ = client.close().await;
         bundle
     });
@@ -495,6 +500,7 @@ fn cmd_chat(id: &str, server: &str, json: bool) -> Result<ExitCode, String> {
         account_pub,
         peer_ik,
         peer_label: peer.to_id_string(),
+        peer_hint: peer.hint().to_string(),
         json,
     }))?;
     Ok(ExitCode::SUCCESS)
@@ -544,6 +550,7 @@ fn run_session(cmd: SessionCommand) -> Result<ExitCode, String> {
                 account_pub,
                 peer_ik,
                 peer_label: peer.to_id_string(),
+                peer_hint: peer.hint().to_string(),
                 transport,
                 json,
             }))?;

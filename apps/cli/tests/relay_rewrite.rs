@@ -181,7 +181,7 @@ async fn establish_through(url: &str) -> (Outcome, Outcome) {
 
     // Alice initiates: fetch + verify Bob's bundle, then X3DH.
     let bob_bundle = alice_client
-        .fetch_bundle(bob_ik, false)
+        .fetch_bundle(bob_ik, None, false)
         .await
         .expect("fetch bob's bundle");
     alice

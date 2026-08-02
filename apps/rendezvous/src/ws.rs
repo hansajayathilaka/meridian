@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 #[cfg(feature = "test-tamper-hook")]
 use crate::auth::substitute_bundle;
 use crate::auth::verify_auth;
+use crate::federation::outbound::{fetch_foreign_bundle, FetchForeignError};
 use crate::state::AppState;
 
 fn now_secs() -> u64 {
@@ -223,6 +224,21 @@ async fn handle_fetch(
         Ok(f) => f,
         Err(_) => return send_err(tx, frame.id, error_codes::BAD_REQUEST, "malformed").await,
     };
+
+    // Routing invariant (system-design.md §3.3 steps 2-4): `fetch.hint` absent, or equal to this
+    // server's OWN domain, is a local fetch (unchanged path below). Any other hint means `target`
+    // names an account this server is not authoritative for — federate the request to the hinted
+    // server (task 2.7) rather than serving (or failing) locally. Comparison is case-insensitive
+    // (DNS domains, RFC 4343), mirroring every other domain comparison in this crate. Structuring
+    // this as an `if let Some(hint) = ...` (rather than a separate `is_foreign: bool` plus an
+    // `unwrap_or_default` to recover `hint`) makes "a foreign branch only exists when there's an
+    // actual hint string" a fact the type system carries, not just a comment.
+    if let Some(hint) = &fetch.hint {
+        if !hint.eq_ignore_ascii_case(&state.config.server.domain) {
+            return handle_federated_fetch(state, tx, frame, hint, fetch.target).await;
+        }
+    }
+
     // Exact-key lookup only — there is no prefix/search path (anti-enumeration §3.5).
     let bundle = match state.store.get_bundle(&fetch.target).await {
         Ok(Some(b)) => b,
@@ -242,6 +258,103 @@ async fn handle_fetch(
     #[cfg(not(feature = "test-tamper-hook"))]
     let _ = fetch.tamper;
     send(tx, Op::Bundle, frame.id, &Bundle { bundle }).await;
+}
+
+/// The federated branch of `handle_fetch` (task 2.7, system-design.md §3.3 steps 2-4): this
+/// server (A) dials the hinted foreign server (B) via `federation::outbound::fetch_foreign_bundle`
+/// and relays the result back to the client as the *same* `Op::Bundle`/`Op::Err` shape a local
+/// fetch would use — the client cannot tell, from the frame shape alone, whether its bundle came
+/// from local storage or across a federation boundary. Its OWN `verify_bundle` check (client-side,
+/// unaffected by this task) is what actually anchors trust either way.
+///
+/// The client never dials `hint` itself — this function, running only on server A, is the sole
+/// place a federated dial happens for a fetch. `tx`/`account_pub`'s connection is the client's
+/// link to *this* server only.
+async fn handle_federated_fetch(
+    state: &Arc<AppState>,
+    tx: &mpsc::Sender<Message>,
+    frame: &Frame,
+    hint: &str,
+    target: [u8; 32],
+) {
+    match fetch_foreign_bundle(state, hint, target).await {
+        Ok(fed_bundle) => {
+            send(
+                tx,
+                Op::Bundle,
+                frame.id,
+                &Bundle {
+                    bundle: fed_bundle.bundle,
+                },
+            )
+            .await;
+        }
+        Err(e) => {
+            let (code, msg) = federated_fetch_error_reply(hint, &e);
+            send_err(tx, frame.id, code, &msg).await;
+        }
+    }
+}
+
+/// Translate a [`FetchForeignError`] into the client-visible `(code, msg)` pair, reusing the
+/// `error_codes` this crate already defined for exactly this purpose rather than inventing new
+/// client-visible codes here (2.9's job is copy/taxonomy polish, not this task's).
+///
+/// **Only `hint` — the domain the client itself already supplied — may appear in the returned
+/// message text.** `FetchForeignError`'s own fields (`Discovery::domain`, `AddrResolution::host`,
+/// `Dial::domain`) can carry server A's internal federation configuration instead: an
+/// `Endpoint::host` may be an internal-DNS/service name never meant to be client-facing
+/// (`federation::discovery::Endpoint`'s own doc comment), and `Dial::domain` is
+/// `expected_domain` — in private-CA mode that's the operator's configured `pinned_identity`,
+/// which by design can differ from `hint` (security-reviewer + code-reviewer finding on task
+/// 2.7: an ordinary transient outage at the foreign server, no attack needed, would otherwise
+/// leak that internal string to any of A's authenticated users on a dial failure).
+fn federated_fetch_error_reply(hint: &str, e: &FetchForeignError) -> (&'static str, String) {
+    match e {
+        // We never even reached a foreign server — a connectivity/configuration outcome, distinct
+        // from a foreign server actively refusing us (`fed_denied`, below).
+        FetchForeignError::NotConfigured => (
+            error_codes::FED_UNREACHABLE,
+            "federation is not enabled on this server".to_string(),
+        ),
+        FetchForeignError::Discovery { .. } => (
+            error_codes::FED_UNREACHABLE,
+            format!("could not resolve federation partner {hint:?}"),
+        ),
+        FetchForeignError::AddrResolution { .. } => (
+            error_codes::FED_UNREACHABLE,
+            format!("could not resolve a dial address for federation partner {hint:?}"),
+        ),
+        FetchForeignError::Dial { .. } => (
+            error_codes::FED_UNREACHABLE,
+            format!("could not reach federation partner {hint:?}"),
+        ),
+        FetchForeignError::Protocol(_) => (
+            error_codes::FED_UNREACHABLE,
+            "federated fetch protocol error".to_string(),
+        ),
+        // The foreign server DID answer — translate its structured `FedErr` into the closest
+        // existing local code (never a new one — see this function's doc comment).
+        FetchForeignError::Fed(fed_err) => {
+            use meridian_proto::fed_error_codes;
+            let code = if fed_err.code == fed_error_codes::POLICY_DENIED {
+                error_codes::FED_DENIED
+            } else if fed_err.code == fed_error_codes::RATE_LIMITED {
+                error_codes::RATE_LIMITED
+            } else if fed_err.code == fed_error_codes::NOT_FOUND {
+                // The federated analogue of `not_found`: kept distinct so a client can tell "no
+                // such account on this server" from "no such account at the org the hint named"
+                // (the stale-hint case) — see `error_codes::NOT_FOUND_AT_HINT`'s own doc comment.
+                error_codes::NOT_FOUND_AT_HINT
+            } else {
+                // `bad_request` from the peer, or any future/unknown fed error code: no existing
+                // local code fits precisely, so fail closed to the generic connectivity/protocol
+                // outcome rather than inventing a new client-visible code (2.9's job).
+                error_codes::FED_UNREACHABLE
+            };
+            (code, format!("federated fetch declined: {}", fed_err.msg))
+        }
+    }
 }
 
 async fn handle_route(

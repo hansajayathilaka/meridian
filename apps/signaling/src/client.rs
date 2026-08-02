@@ -110,10 +110,24 @@ impl SignalingClient {
     /// Fetch a peer's bundle by **exact** account key and verify every signature under that key.
     /// A bundle that fails verification (including one claiming a different key) is a hard error —
     /// the client refuses to proceed rather than downgrading.
-    pub async fn fetch_bundle(&mut self, target: [u8; 32], tamper: bool) -> Result<PrekeyBundle> {
+    ///
+    /// `hint` is the wire-level routing hint (task 2.7, `docs/api/wire-protocol.md` §2): a plain
+    /// domain string, `None` for a same-server (local) fetch, `Some(domain)` when `target` names an
+    /// account this client believes lives at a *foreign* org's server. This client never dials
+    /// `domain` itself — it only ever talks to the server it `connect`ed to (`self`'s own
+    /// WebSocket); that server is solely responsible for deciding, from `hint`, whether to answer
+    /// locally or federate the request onward (system-design.md §3.3 steps 2-4, ADR 0001: the hint
+    /// is advisory routing information, never a trust input). The verification below is identical
+    /// either way — it is the only trust anchor regardless of which path the bundle took.
+    pub async fn fetch_bundle(
+        &mut self,
+        target: [u8; 32],
+        hint: Option<String>,
+        tamper: bool,
+    ) -> Result<PrekeyBundle> {
         let fetch = Fetch {
             target,
-            hint: None,
+            hint,
             tamper,
         };
         let reply = self

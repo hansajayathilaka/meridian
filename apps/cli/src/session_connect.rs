@@ -35,6 +35,10 @@ pub struct ConnectArgs<'a> {
     pub account_pub: [u8; 32],
     pub peer_ik: [u8; 32],
     pub peer_label: String,
+    /// The peer id's `@domain` hint (task 2.7 wire plumbing), threaded to `fetch_bundle` so a
+    /// cross-org peer's bundle is fetched via this server's federated path (system-design.md
+    /// §3.3) — mirrors `chat::ChatArgs::peer_hint`.
+    pub peer_hint: String,
     pub transport: TransportArg,
     pub json: bool,
 }
@@ -85,6 +89,7 @@ async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
         account_pub,
         peer_ik,
         peer_label,
+        peer_hint,
         transport: _,
         json,
     } = args;
@@ -158,7 +163,7 @@ async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
     // one dialer without racing (mirrors chat.rs).
     let initiator = account_pub.as_slice() <= peer_ik.as_slice();
     if initiator {
-        let peer_bundle = fetch_with_retry(&mut client, peer_ik, &peer_label).await?;
+        let peer_bundle = fetch_with_retry(&mut client, peer_ik, &peer_hint, &peer_label).await?;
         chat.start_initiator_session(
             store,
             handle,
@@ -289,13 +294,21 @@ async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
 async fn fetch_with_retry(
     client: &mut meridian_core::signaling::SignalingClient,
     peer_ik: [u8; 32],
+    peer_hint: &str,
     peer_label: &str,
 ) -> Result<meridian_core::proto::PrekeyBundle, String> {
     use meridian_core::signaling::SignalError;
     for attempt in 0..40u32 {
-        match client.fetch_bundle(peer_ik, false).await {
+        match client
+            .fetch_bundle(peer_ik, Some(peer_hint.to_string()), false)
+            .await
+        {
             Ok(bundle) => return Ok(bundle),
-            Err(SignalError::Server(e)) if e.code == "not_found" => {
+            // See `chat::fetch_with_retry`'s matching comment: `not_found` and the cross-org
+            // `not_found_at_hint` (task 2.7) both retry here.
+            Err(SignalError::Server(e))
+                if e.code == "not_found" || e.code == "not_found_at_hint" =>
+            {
                 if attempt == 0 {
                     eprintln!("waiting for {peer_label} to come online…");
                 }

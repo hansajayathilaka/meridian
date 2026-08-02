@@ -35,7 +35,17 @@
 //! discovery answer, not a policy allowance; that allowance is [`policy::FederationPolicy`].
 
 pub mod discovery;
+/// Server B's inbound handling of `fed_*` requests arriving over an already-established
+/// [`FederationLink`] (task 2.7 adds `handle_fed_fetch` + the `FetchBundle` case of
+/// [`inbound::serve_link`]'s dispatch loop; task 2.8 extends the same loop with `Route`/
+/// `Reachability`).
+pub mod inbound;
 pub mod link;
+/// Server A's outbound dial-out path: resolve a hint domain via [`Discovery`], dial via
+/// [`dial`] (pinning to `Endpoint::pinned_identity` when private-CA/air-gap mode supplies one —
+/// see [`outbound::fetch_foreign_bundle`]'s doc comment), and speak one `fed_*` request/reply
+/// (task 2.7: `FetchBundle`/`Bundle`; task 2.8 adds `Route`/`Reachability`).
+pub mod outbound;
 pub mod policy;
 
 pub use discovery::{

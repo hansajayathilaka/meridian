@@ -8,7 +8,8 @@ use axum::extract::ws::Message;
 use tokio::sync::mpsc;
 
 use crate::auth::AdmissionPolicy;
-use crate::config::Config;
+use crate::config::{Config, DiscoveryMode};
+use crate::federation;
 use crate::metrics::Metrics;
 use crate::ratelimit::RateLimiter;
 use crate::store::Store;
@@ -90,7 +91,93 @@ pub struct AppState {
     /// exist in a default/release build (F17).
     #[cfg(feature = "test-tamper-hook")]
     pub route_tamper: crate::route_tamper::RouteTamper,
+    /// Federation runtime (task 2.7): resolved [`federation::Discovery`]/[`federation::FederationPolicy`]/
+    /// [`federation::FederationLimits`] plus this server's own outbound TLS identity — what
+    /// `federation::outbound::fetch_foreign_bundle` (server A's dial-out path) and
+    /// `federation::inbound::serve_link` (server B's accept-loop dispatch) both read from. See
+    /// [`FederationRuntime`]'s own doc comment for the disabled-by-default contract.
+    pub federation: FederationRuntime,
     conn_seq: AtomicU64,
+}
+
+/// Owned (not borrowed) copy of the federation TLS material paths, so [`AppState`] can hold this
+/// without a lifetime parameter. [`Self::as_paths`] builds the borrowed
+/// `federation::FederationTlsPaths` that `federation::link::dial`/`FederationListener::bind`
+/// actually take, on demand, at each call site.
+#[derive(Clone, Debug, Default)]
+pub struct FederationTlsOwned {
+    pub cert_path: String,
+    pub key_path: String,
+    pub ca_bundle_path: String,
+}
+
+impl FederationTlsOwned {
+    pub fn as_paths(&self) -> federation::FederationTlsPaths<'_> {
+        federation::FederationTlsPaths {
+            cert_path: &self.cert_path,
+            key_path: &self.key_path,
+            ca_bundle_path: &self.ca_bundle_path,
+        }
+    }
+}
+
+/// Federation runtime state, built once at startup from `config::Federation` (task 2.7 — tasks
+/// 2.4/2.5/2.6 built the pieces this assembles, but left them unwired into any running server).
+///
+/// `discovery` is `None` whenever `config.federation.enabled` is `false` — the outbound fetch path
+/// (`federation::outbound::fetch_foreign_bundle`) MUST check this and refuse (`fed_unreachable`)
+/// BEFORE ever calling `Discovery::resolve`, matching `config::Federation`'s own fail-closed
+/// contract that a disabled federation surface makes no DNS lookup and no dial, regardless of what
+/// a client asks for.
+pub struct FederationRuntime {
+    pub own_domain: String,
+    pub tls: FederationTlsOwned,
+    pub discovery: Option<Arc<dyn federation::Discovery>>,
+    pub policy: federation::FederationPolicy,
+    pub limits: federation::FederationLimits,
+}
+
+/// Build the [`FederationRuntime`] this config describes. Fails closed and loudly (`panic!`,
+/// mirroring `main.rs`'s existing "an explicit misconfiguration is fatal, never a silent
+/// downgrade" posture — see `Config::load`'s doc comment) rather than silently degrading to
+/// `discovery: None` when `enabled = true` but the discovery backend can't actually be built (a
+/// missing/malformed `federation_map.toml`, or no usable system DNS resolver for SRV mode) — an
+/// operator who turned federation on gets a clear boot-time error, not a server that silently
+/// never federates. When `enabled = false` this performs no I/O and no DNS lookup at all.
+fn build_federation_runtime(config: &Config) -> FederationRuntime {
+    let tls = FederationTlsOwned {
+        cert_path: config.federation.cert_path.clone(),
+        key_path: config.federation.key_path.clone(),
+        ca_bundle_path: config.federation.ca_bundle_path.clone(),
+    };
+    let discovery: Option<Arc<dyn federation::Discovery>> = if config.federation.enabled {
+        Some(match config.federation.discovery {
+            DiscoveryMode::Static => Arc::new(
+                federation::StaticMap::load(&config.federation.map_path).unwrap_or_else(|e| {
+                    panic!(
+                        "federation: loading {:?}: {e} — refusing to boot with federation \
+                         enabled but no usable discovery source",
+                        config.federation.map_path
+                    )
+                }),
+            ) as Arc<dyn federation::Discovery>,
+            DiscoveryMode::Srv => Arc::new(federation::SrvDiscovery::new().unwrap_or_else(|e| {
+                panic!(
+                    "federation: constructing the SRV resolver: {e} — refusing to boot with \
+                     federation enabled but no usable discovery source"
+                )
+            })) as Arc<dyn federation::Discovery>,
+        })
+    } else {
+        None
+    };
+    FederationRuntime {
+        own_domain: config.server.domain.clone(),
+        tls,
+        discovery,
+        policy: config.federation.to_policy(),
+        limits: config.federation.to_limits(),
+    }
 }
 
 impl AppState {
@@ -104,6 +191,7 @@ impl AppState {
         let route_limiter = RateLimiter::per_minute(config.limits.route_per_account_per_min);
         let turn_limiter = RateLimiter::per_minute(config.limits.turn_per_account_per_min);
         let turn = config.turn.to_turn_config();
+        let federation = build_federation_runtime(&config);
         Arc::new(Self {
             config,
             store,
@@ -117,6 +205,7 @@ impl AppState {
             turn,
             #[cfg(feature = "test-tamper-hook")]
             route_tamper: crate::route_tamper::RouteTamper::default(),
+            federation,
             conn_seq: AtomicU64::new(1),
         })
     }

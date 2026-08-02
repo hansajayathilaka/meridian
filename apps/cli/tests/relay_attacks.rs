@@ -126,7 +126,7 @@ impl Peer {
     async fn start_session_with(&mut self, peer_ik: [u8; 32]) {
         let bundle = self
             .client
-            .fetch_bundle(peer_ik, false)
+            .fetch_bundle(peer_ik, None, false)
             .await
             .expect("fetch peer bundle");
         let ik = self.ik();
