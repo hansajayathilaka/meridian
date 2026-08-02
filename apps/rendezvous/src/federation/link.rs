@@ -36,6 +36,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use meridian_proto::{FedFrame, FedHello, FedOp, FED_VERSION};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -102,11 +103,14 @@ fn ensure_crypto_provider() {
 }
 
 /// Read `path` and parse every PEM certificate in it (leaf + any intermediates, in file order).
+///
+/// Uses `rustls-pki-types`'s own `PemObject` trait rather than `rustls-pemfile`: the latter is
+/// unmaintained (RUSTSEC-2025-0134, no safe upgrade) and is now just a thin wrapper around this
+/// same parsing code, which `rustls-pki-types` has shipped directly since 1.9.0.
 fn load_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>, LinkError> {
     let bytes =
         std::fs::read(Path::new(path)).map_err(|e| LinkError::Cert(format!("{path}: {e}")))?;
-    let mut rd: &[u8] = bytes.as_slice();
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut rd)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&bytes)
         .collect::<Result<_, _>>()
         .map_err(|e| LinkError::Cert(format!("{path}: {e}")))?;
     if certs.is_empty() {
@@ -121,10 +125,7 @@ fn load_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>, LinkError
 fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, LinkError> {
     let bytes =
         std::fs::read(Path::new(path)).map_err(|e| LinkError::Cert(format!("{path}: {e}")))?;
-    let mut rd: &[u8] = bytes.as_slice();
-    rustls_pemfile::private_key(&mut rd)
-        .map_err(|e| LinkError::Cert(format!("{path}: {e}")))?
-        .ok_or_else(|| LinkError::Cert(format!("{path}: no PEM private key found")))
+    PrivateKeyDer::from_pem_slice(&bytes).map_err(|e| LinkError::Cert(format!("{path}: {e}")))
 }
 
 /// Build the trust root: the OS/system store (`ca_bundle_path` empty) or exclusively the

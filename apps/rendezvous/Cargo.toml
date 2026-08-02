@@ -68,8 +68,11 @@ figment = { version = "0.10.19", features = ["toml", "env"] }
 # rustls's own default provider.
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-# PEM parsing for our own cert/key files and the private-CA bundle.
-rustls-pemfile = "2"
+# PEM parsing for our own cert/key files and the private-CA bundle, via rustls-pki-types's own
+# `PemObject` trait (re-exported as `rustls::pki_types::pem`) rather than the `rustls-pemfile`
+# crate: the latter is unmaintained (RUSTSEC-2025-0134, no safe upgrade) and is now just a thin
+# wrapper around this same parsing code, which rustls-pki-types has shipped directly since 1.9.0.
+# No separate Cargo.toml entry needed — it's a transitive dependency of `rustls` itself.
 # WebPKI-mode trust root: the OS/system certificate store (ADR 0017 (a) "standard hostname
 # verification against the OS/system trust root"), NOT a build-time-vendored root bundle.
 rustls-native-certs = "0.8"

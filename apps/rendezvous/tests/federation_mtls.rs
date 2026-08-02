@@ -19,6 +19,8 @@ use meridian_rendezvous::federation::link::{build_client_tls_config, build_serve
 use meridian_rendezvous::federation::{dial, FederationListener, FederationTlsPaths, LinkError};
 use meridian_rendezvous::metrics::Metrics;
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::CertificateDer;
 
 // -- PKI test harness ---------------------------------------------------------
 
@@ -341,7 +343,8 @@ async fn missing_client_cert_is_rejected() {
     // Bypass `federation::dial` (which always attaches a client cert) and connect with a bare
     // rustls client that presents NO client certificate at all.
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut std::fs::read(&b.ca_bundle_path).unwrap().as_slice())
+    let ca_bundle_bytes = std::fs::read(&b.ca_bundle_path).unwrap();
+    for cert in CertificateDer::pem_slice_iter(&ca_bundle_bytes)
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
     {
@@ -463,9 +466,9 @@ fn nonexistent_ca_bundle_path_is_rejected() {
 fn ca_bundle_with_zero_certs_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let id = valid_identity(dir.path());
-    // Exists and reads fine, but contains no PEM certificate — `rustls_pemfile::certs` parses
-    // zero entries out of this, exactly as it would for e.g. an accidentally-truncated file or one
-    // that was never actually a certificate bundle.
+    // Exists and reads fine, but contains no PEM certificate — `CertificateDer::pem_slice_iter`
+    // parses zero entries out of this, exactly as it would for e.g. an accidentally-truncated file
+    // or one that was never actually a certificate bundle.
     let bogus_bundle = write(dir.path(), "empty.ca.pem", "not a pem file at all\n");
     let paths = FederationTlsPaths {
         cert_path: id.paths().cert_path,
