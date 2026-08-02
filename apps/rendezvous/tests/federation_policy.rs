@@ -206,6 +206,41 @@ fn different_origins_claiming_the_same_account_bytes_have_independent_budgets() 
     );
 }
 
+#[test]
+fn an_already_exhausted_accounts_retries_do_not_drain_the_shared_origin_budget() {
+    // Pins a code-reviewer finding on task 2.6: `FederationLimits::check` originally spent the
+    // *shared* per-origin budget on every call, including calls from an account already over its
+    // own per-account limit — so one claimed account's repeated (rejected) retries could still
+    // starve every other account behind the same origin. The fix checks the per-account budget
+    // FIRST, so a caller already over its own limit never touches the shared pool. This test would
+    // fail under the old (origin-checked-first) ordering: alice's second and third calls would each
+    // still consume one of the origin's only 2 units even though both are rejected on account
+    // grounds, leaving nothing for bob.
+    let limits = FederationLimits::new(
+        /* fetch */ 2, /* route */ 100, /* account */ 1,
+    );
+
+    assert_eq!(limits.check_fetch("org-a.test", b"alice"), Decision::Admit);
+    // alice's account budget (1/min) is now exhausted. Retry several times — none of this may
+    // touch the shared origin budget (still 1 of 2 remaining after alice's one successful call).
+    for _ in 0..5 {
+        assert_eq!(
+            limits.check_fetch("org-a.test", b"alice"),
+            Decision::Reject(RejectReason::RateLimited(RateLimitScope::OriginAccount)),
+            "alice's retries must be rejected on her own account budget, not the shared origin one"
+        );
+    }
+    // bob — a brand-new claimed account who has never made a request — must still be admitted: the
+    // origin budget has only ever been spent once (by alice's single successful call), never by any
+    // of her five rejected retries above.
+    assert_eq!(
+        limits.check_fetch("org-a.test", b"bob"),
+        Decision::Admit,
+        "bob must not be denied service by alice's already-rejected retries draining the shared \
+         origin pool"
+    );
+}
+
 // -- Rate-limit keys never reach a log line unhashed (task 1.20's LogId mechanism) --------------
 
 /// Task 2.6 deliberately adds **no logging at all** to `federation::policy` — see that module's

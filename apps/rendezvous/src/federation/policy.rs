@@ -260,35 +260,40 @@ impl FederationLimits {
     }
 
     /// Is a prekey-fetch request (2.7) from `origin_account`, claimed by `origin_domain`, within
-    /// budget? Checks the per-origin fetch budget, then the shared per-origin-account budget — and
-    /// crucially the two are **independent**: exhausting one never consumes or resets the other.
+    /// budget? Checks the per-origin-account budget, then the shared per-origin budget.
     pub fn check_fetch(&self, origin_domain: &str, origin_account: &[u8]) -> Decision {
         self.check(Operation::Fetch, origin_domain, origin_account)
     }
 
     /// Is a route-reachability request (2.8) from `origin_account`, claimed by `origin_domain`,
-    /// within budget? Same independence guarantee as [`check_fetch`](Self::check_fetch).
+    /// within budget? Same ordering guarantee as [`check_fetch`](Self::check_fetch).
     pub fn check_route(&self, origin_domain: &str, origin_account: &[u8]) -> Decision {
         self.check(Operation::Route, origin_domain, origin_account)
     }
 
+    /// Per-account budget first, **then** the shared per-origin budget — deliberately not the other
+    /// order (code-reviewer finding on task 2.6). Checking `per_origin` first meant every call spent
+    /// a unit of the *shared* pool even for a caller already over its own account limit, so one
+    /// claimed account's repeated (rejected) retries could still starve every other account behind
+    /// the same origin — exactly the failure mode the per-account budget exists to prevent. With
+    /// account-first ordering, a caller already over its own budget is rejected before ever touching
+    /// the shared pool, so its retries cost it nothing beyond its own counter. This does not
+    /// reintroduce the symmetric problem: an origin that's collectively over budget across many
+    /// distinct, individually-within-budget accounts still correctly hits the origin limit, and each
+    /// such rejection only costs that account's own private counter — never another account's.
     fn check(&self, op: Operation, origin_domain: &str, origin_account: &[u8]) -> Decision {
         let per_origin = match op {
             Operation::Fetch => &self.fetch_per_origin,
             Operation::Route => &self.route_per_origin,
         };
-        // Per-origin budget first: an origin-level rejection short-circuits before touching (and
-        // thus before spending any of) the per-account budget below, keeping the two observably
-        // independent in the direction that matters most — a noisy-but-allowed origin cannot burn
-        // through one particular account's separate budget just by being checked first.
-        if !per_origin.check(origin_key(origin_domain).as_slice()) {
-            return Decision::Reject(RejectReason::RateLimited(RateLimitScope::Origin));
-        }
         if !self
             .per_origin_account
             .check(origin_account_key(origin_domain, origin_account).as_slice())
         {
             return Decision::Reject(RejectReason::RateLimited(RateLimitScope::OriginAccount));
+        }
+        if !per_origin.check(origin_key(origin_domain).as_slice()) {
+            return Decision::Reject(RejectReason::RateLimited(RateLimitScope::Origin));
         }
         Decision::Admit
     }

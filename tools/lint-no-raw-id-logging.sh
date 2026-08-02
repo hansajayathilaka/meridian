@@ -29,7 +29,7 @@ set -euo pipefail
 
 # Identifier-bearing names that actually exist in this crate (checked against the real source, not
 # imagined): account keys, routing targets, challenge nonces, opaque payloads, peer addresses.
-SENSITIVE='account_pub|target|peer_addr|remote_addr|nonce|blob|spk|otk|credential|invite|challenge'
+SENSITIVE='account_pub|target|peer_addr|remote_addr|nonce|blob|spk|otk|credential|invite|challenge|origin_domain|origin_account'
 
 # Macros whose output lands in a log or on a console.
 LOGGING='(trace|debug|info|warn|error)!|tracing::[a-z_]+!|(e)?print(ln)?!|panic!|dbg!'
