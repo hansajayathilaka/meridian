@@ -23,19 +23,24 @@
 //! performs no dialling itself; `link::dial` above still takes an explicit address and
 //! `expected_domain`, with discovery as one (not the only) way a caller might obtain them.
 //!
-//! **Out of scope** (see the task files): policy/rate-limits
-//! ([2.6](../../../../docs/tasks/phase-2/2.6-federation-policy-limits.md)), and every `fed_*`
-//! request handler beyond the link-establishing `FedHello` exchange
+//! Policy/rate-limits are [2.6](../../../../docs/tasks/phase-2/2.6-federation-policy-limits.md)'s
+//! [`policy`] submodule — a pure decision layer, not wired into any handler here. **Still out of
+//! scope for this crate module as a whole**: every `fed_*` request handler beyond the
+//! link-establishing `FedHello` exchange
 //! ([2.7](../../../../docs/tasks/phase-2/2.7-federated-prekey-fetch.md)/
-//! [2.8](../../../../docs/tasks/phase-2/2.8-federated-route-reachability.md)). In particular:
-//! nothing here decides *whether* to federate with a given domain — a resolved `Endpoint` is a
-//! discovery answer, not a policy allowance.
+//! [2.8](../../../../docs/tasks/phase-2/2.8-federated-route-reachability.md)), and any
+//! client-visible error copy
+//! ([2.9](../../../../docs/tasks/phase-2/2.9-federation-error-copy.md)). In particular: nothing
+//! in [`discovery`] decides *whether* to federate with a given domain — a resolved `Endpoint` is a
+//! discovery answer, not a policy allowance; that allowance is [`policy::FederationPolicy`].
 
 pub mod discovery;
 pub mod link;
+pub mod policy;
 
 pub use discovery::{
     Discovery, DiscoveryError, Endpoint, HickoryResolver, RawSrv, SrvDiscovery, SrvResolver,
     StaticMap,
 };
 pub use link::{dial, FederationLink, FederationListener, FederationTlsPaths, LinkError};
+pub use policy::{Decision, FederationLimits, FederationPolicy, RateLimitScope, RejectReason};

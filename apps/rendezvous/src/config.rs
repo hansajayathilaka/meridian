@@ -171,6 +171,45 @@ pub struct Federation {
     /// `discovery = "static"`. Empty by default (no path that could accidentally load a stray file
     /// of the conventional name); ignored when `discovery = "srv"`.
     pub map_path: String,
+    /// Admission policy (task 2.6, [`crate::federation::policy::FederationPolicy`]): `open`
+    /// federates with any origin domain, `allowlist` only with the exact domains in
+    /// [`Federation::allowlist`], `closed` with nobody. Defaults to `closed` — the most
+    /// restrictive option, not `open` — matching this struct's existing fail-closed convention:
+    /// federation is a brand-new, untrusted-by-default surface, and an operator must explicitly
+    /// widen it rather than have it default open.
+    pub policy: FederationPolicyMode,
+    /// Exact-match domain allowlist consulted when `policy = "allowlist"`; ignored otherwise
+    /// (including when `policy = "closed"` — the allowlist does not widen a closed policy, see
+    /// [`crate::federation::policy::FederationPolicy::admit`]). Matching is case-insensitive exact
+    /// match only, never substring/suffix — `evil-org-b.test` does not match an allowlisted
+    /// `org-b.test`.
+    pub allowlist: Vec<String>,
+    /// Per-origin-server budget for prekey-fetch requests (task 2.7), fixed one-minute window. See
+    /// [`Federation::default`] for the chosen starting value and its reasoning.
+    pub fed_fetch_per_origin_per_min: u32,
+    /// Per-origin-server budget for route-reachability requests (task 2.8), fixed one-minute
+    /// window. See [`Federation::default`] for the chosen starting value and its reasoning.
+    pub fed_route_per_origin_per_min: u32,
+    /// Per-`(origin_domain, origin_account)` budget, shared across both fetch and route requests
+    /// (task 2.6/2.7/2.8), fixed one-minute window. The `origin_account` half of this key is
+    /// self-asserted by the partner server and not independently verifiable by us (ADR 0017) — see
+    /// [`crate::federation::policy`]'s module doc for why that is accepted, not a gap this field
+    /// closes. See [`Federation::default`] for the chosen starting value and its reasoning.
+    pub fed_per_origin_account_per_min: u32,
+}
+
+/// Federation admission policy mode (task 2.6). See [`Federation::policy`]. Kept as its own
+/// `Deserialize`-able enum, distinct from
+/// [`crate::federation::policy::FederationPolicy`] (which additionally carries the allowlist set
+/// itself, and has no `Deserialize` impl) — mirrors this module's existing `Turn`/`TurnConfig`
+/// split: config owns parsing, the domain module owns the runtime type built from it (see
+/// [`Federation::to_policy`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FederationPolicyMode {
+    Open,
+    Allowlist,
+    Closed,
 }
 
 /// Federation discovery mode (task 2.5, ADR 0002 "DNS-SRV/static-map discovery"). See
@@ -199,7 +238,67 @@ impl Default for Federation {
             ca_bundle_path: String::new(),
             discovery: DiscoveryMode::Static,
             map_path: String::new(),
+            // Fail-closed default: federate with nobody until an operator opts in, same posture
+            // as `enabled`/`cert_path`/`ca_bundle_path` above.
+            policy: FederationPolicyMode::Closed,
+            allowlist: Vec::new(),
+            // `TODO: confirm` (task 2.6): default federation rate-limit values. monitoring.md
+            // records these as unspecified in the source documents; picked here, conservatively,
+            // as a new and untrusted-by-default surface (ADR 0002: abuse handled bilaterally, not
+            // centrally — these are this server's own first line of defense against a misbehaving
+            // or compromised partner, not a substitute for that bilateral relationship).
+            //
+            // Reasoning, relative to the existing local per-account defaults just above
+            // (`Limits::default`: fetch_per_account_per_min = 120, route_per_account_per_min =
+            // 600 — generous, anti-enumeration budgets for one cryptographically authenticated
+            // local account):
+            // - `fed_fetch_per_origin_per_min = 300`: a partner ORIGIN aggregates fetch traffic
+            //   from potentially many local accounts on its side, so its whole-origin budget is
+            //   set above a single local account's fetch budget (2.5x) — enough headroom for a
+            //   handful of legitimate simultaneous fetches from a real partner org (ADR 0002's
+            //   primary deployment shape is 2-200 small-to-medium orgs, not one huge origin), while
+            //   still bounding the worst case a single malicious/compromised partner can impose.
+            // - `fed_route_per_origin_per_min = 600`: message routing is the highest-volume
+            //   ordinary traffic type, so the whole-origin budget matches (not multiplies) the
+            //   local per-account route budget — low enough to err conservative on a new surface,
+            //   high enough that ordinary cross-org chat between a few users doesn't trip it.
+            // - `fed_per_origin_account_per_min = 30`: the `origin_account` half of this key is
+            //   self-asserted by the partner server, not verified by us (ADR 0017 — see
+            //   `federation::policy`'s module doc), so it is deliberately the most conservative of
+            //   the three — a quarter of the local per-account fetch budget and a twentieth of the
+            //   local per-account route budget — so that no single claimed remote account can eat
+            //   more than a modest slice of its origin's own budget above.
+            // Operators can raise all three; the failure mode of picking too low is a false-closed
+            // rejection an operator notices and raises, not a silent abuse hole.
+            fed_fetch_per_origin_per_min: 300,
+            fed_route_per_origin_per_min: 600,
+            fed_per_origin_account_per_min: 30,
         }
+    }
+}
+
+impl Federation {
+    /// Build the [`crate::federation::policy::FederationPolicy`] this config describes. Kept here
+    /// (config assembly), not in `federation::policy`, so that module stays free of any dependency
+    /// on `crate::config` beyond what its caller hands it explicitly — mirrors
+    /// `Turn::to_turn_config`'s existing split in this same file.
+    pub fn to_policy(&self) -> crate::federation::policy::FederationPolicy {
+        match self.policy {
+            FederationPolicyMode::Open => crate::federation::policy::FederationPolicy::Open,
+            FederationPolicyMode::Closed => crate::federation::policy::FederationPolicy::Closed,
+            FederationPolicyMode::Allowlist => {
+                crate::federation::policy::FederationPolicy::allowlist(&self.allowlist)
+            }
+        }
+    }
+
+    /// Build the [`crate::federation::policy::FederationLimits`] this config describes.
+    pub fn to_limits(&self) -> crate::federation::policy::FederationLimits {
+        crate::federation::policy::FederationLimits::new(
+            self.fed_fetch_per_origin_per_min,
+            self.fed_route_per_origin_per_min,
+            self.fed_per_origin_account_per_min,
+        )
     }
 }
 
@@ -496,10 +595,63 @@ mod tests {
         // by default" posture.
         assert_eq!(f.discovery, DiscoveryMode::Static);
         assert!(f.map_path.is_empty());
+        // Task 2.6: policy defaults to the most restrictive option (`closed`), not `open`.
+        assert_eq!(f.policy, FederationPolicyMode::Closed);
+        assert!(f.allowlist.is_empty());
 
         let config = Config::from_toml_str("").unwrap();
         assert!(!config.federation.enabled);
         assert_eq!(config.federation.discovery, DiscoveryMode::Static);
+        assert_eq!(config.federation.policy, FederationPolicyMode::Closed);
+    }
+
+    #[test]
+    fn federation_policy_env_overrides_apply() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[
+                ("MERIDIAN_RENDEZVOUS_FEDERATION__POLICY", "allowlist"),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__ALLOWLIST",
+                    r#"["org-a.test","org-b.test"]"#,
+                ),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__FED_FETCH_PER_ORIGIN_PER_MIN",
+                    "10",
+                ),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__FED_ROUTE_PER_ORIGIN_PER_MIN",
+                    "20",
+                ),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__FED_PER_ORIGIN_ACCOUNT_PER_MIN",
+                    "5",
+                ),
+            ],
+        );
+        let file = write_toml("");
+
+        let config = Config::load(Some(file.path().to_str().unwrap())).unwrap();
+
+        assert_eq!(config.federation.policy, FederationPolicyMode::Allowlist);
+        assert_eq!(
+            config.federation.allowlist,
+            vec!["org-a.test", "org-b.test"]
+        );
+        assert_eq!(config.federation.fed_fetch_per_origin_per_min, 10);
+        assert_eq!(config.federation.fed_route_per_origin_per_min, 20);
+        assert_eq!(config.federation.fed_per_origin_account_per_min, 5);
+    }
+
+    #[test]
+    fn federation_policy_rejects_unknown_mode_fail_closed() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[("MERIDIAN_RENDEZVOUS_FEDERATION__POLICY", "mostly-open")],
+        );
+        let file = write_toml("");
+
+        assert!(Config::load(Some(file.path().to_str().unwrap())).is_err());
     }
 
     #[test]
