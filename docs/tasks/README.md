@@ -262,9 +262,28 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   config was interpolated into client-visible failure text — fixed to use only the client's own
   hint); test-engineer mutation-tested both critical tests (single-websocket routing invariant,
   pinned-identity rejection) and confirmed neither is vacuous.
-- **NEXT:** `/next-task`. Continuing the batch: **2.8** next, then **2.9**, **2.11**, **2.12** in
-  dependency order. **2.14** (new, from 2.10's review) queues up after 2.10's own dependents since
-  it depends on 2.10.
+- **ALSO NOW:** **2.8 is done.** Federated envelope forwarding + per-request reachability — the
+  last piece of Feature 06's server spine. Before implementing, resolved three open architect
+  decisions in the task file: oversized envelopes reuse `MAX_FRAME_LEN` (no new constant); zero
+  s2s replay/dedup, deferred entirely to envelope v2's `eid` per ADR 0016 C7 (task 2.13 already
+  bounds a replay's harm to one failed decrypt); `fed_reachability` is s2s-internal only, no new
+  client-visible c2s trigger, must collapse to the exact same `not_connected` outcome local routing
+  already produces — no existence oracle. Implementer self-caught a real bug mid-build: the
+  reachability pre-check's own policy answers were initially masking a `closed`-policy origin as
+  merely offline, caught by the task's own test failing. architect: consistent, confirmed §3.4
+  per-request-only presence and the ADR 0007 boundary, flagged an incomplete residual-doc gap on
+  `ROUTE_REPLY_GRACE` (fixed). security-reviewer: APPROVE-WITH-CHANGES, procedural only.
+  test-engineer: PASS, mutation-tested everything including the bug-fix itself, and recovered
+  cleanly from a `git checkout --` near-miss mid-review. code-reviewer: approve-with-nits, found
+  real duplicated pinning-dial logic between `fetch_foreign_bundle` and the new `dial_foreign`
+  helper (fixed — now shared) and converged with the other two reviewers on the same
+  `ROUTE_REPLY_GRACE` finding (fixed via honest residual documentation, no number was guessed).
+  Non-blocking follow-ups noted, not fixed: federated deliveries aren't counted in
+  `envelopes_routed_total`; the third near-duplicate test-harness copy means a `tests/common/mod.rs`
+  extraction is now overdue.
+- **NEXT:** `/next-task`. Continuing the batch: **2.9** next, then **2.11**, **2.12** in dependency
+  order. **2.14** (new, from 2.10's review) queues up after 2.10's own dependents since it depends
+  on 2.10.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -359,7 +378,7 @@ cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery 
 - [x] **2.5** Discovery: DNS SRV `_meridian-fed._tcp` + `federation_map.toml` static mode — [file](./phase-2/2.5-federation-discovery.md)
 - [x] **2.6** Federation policy (`open | allowlist | closed`) + edge rate limits — [file](./phase-2/2.6-federation-policy-limits.md)
 - [x] **2.7** Federated prekey fetch, both sides (§3.3 steps 2–4) — [file](./phase-2/2.7-federated-prekey-fetch.md)
-- [ ] **2.8** Federated envelope forwarding + per-request reachability (§3.3 step 5, §3.4) — [file](./phase-2/2.8-federated-route-reachability.md)
+- [x] **2.8** Federated envelope forwarding + per-request reachability (§3.3 step 5, §3.4) — [file](./phase-2/2.8-federated-route-reachability.md)
 
 **Client**
 - [ ] **2.9** Client federation error taxonomy: clean `closed` error + stale-hint case — [file](./phase-2/2.9-client-federation-errors.md)
