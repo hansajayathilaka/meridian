@@ -48,7 +48,12 @@ struct Skipped {
 ///
 /// Secret-bearing fields are zeroized on drop. The whole struct is `Serialize`/`Deserialize` for
 /// the encrypted session store — never write it out unsealed.
-#[derive(Serialize, Deserialize)]
+///
+/// `Clone` exists solely so [`Self::decrypt`] can stage its mutations on a scratch copy and commit
+/// them only after authentication succeeds (task 2.13) — every clone is either committed back into
+/// the live session or dropped (which zeroizes it, same as any other `DoubleRatchet`). Do not use it
+/// to fan a session out to multiple long-lived owners.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DoubleRatchet {
     rk: [u8; 32],
     dhs_priv: [u8; 32],
@@ -209,6 +214,15 @@ impl DoubleRatchet {
 
     /// Ratchet-decrypt a framed ratchet message, advancing the ratchet (DH step / skipped keys) as
     /// needed. Out-of-order and lost messages are handled via retained skipped keys.
+    ///
+    /// **Failure-atomic** per the Double Ratchet spec's "discard changes to the state object on
+    /// failure": every mutation this call would make — the receiving-chain advance (`ckr`/`nr`),
+    /// a DH-ratchet step, and any `skipped` entries populated while catching up to `n` — happens on
+    /// a scratch clone of `self` and is committed back only after `aead_open` actually succeeds. A
+    /// failed decrypt (bad ciphertext, or a byte-identical replay re-deriving a chain key that no
+    /// longer matches) therefore leaves `self` byte-for-byte as it was, so a duplicate or forged
+    /// envelope degrades exactly the one message instead of permanently wedging the chain against
+    /// the sender (task 2.13).
     pub fn decrypt(&mut self, message: &[u8]) -> Result<Vec<u8>> {
         let (enc_header, ct) = unframe(message).ok_or(CryptoError::Malformed)?;
 
@@ -219,19 +233,28 @@ impl DoubleRatchet {
         let (header, is_dh_ratchet) = self.decrypt_header(enc_header)?;
         let (dh_pub, pn, n) = header;
 
+        // From here on every mutation lands on `scratch`, not `self` — see the doc comment above.
+        let mut scratch = self.clone();
+
         if is_dh_ratchet {
-            self.skip_message_keys(pn)?;
-            self.dh_ratchet(dh_pub);
+            scratch.skip_message_keys(pn)?;
+            scratch.dh_ratchet(dh_pub);
         }
-        self.skip_message_keys(n)?;
+        scratch.skip_message_keys(n)?;
 
-        let ckr = self.ckr.ok_or(CryptoError::UndecryptableHeader)?;
+        let ckr = scratch.ckr.ok_or(CryptoError::UndecryptableHeader)?;
         let (next_ck, mk) = kdf_ck(&ckr);
-        self.ckr = Some(next_ck);
-        self.nr += 1;
+        scratch.ckr = Some(next_ck);
+        scratch.nr += 1;
 
-        let aad = self.message_aad(enc_header);
-        aead_open(&mk, ct, &aad)
+        let aad = scratch.message_aad(enc_header);
+        let pt = aead_open(&mk, ct, &aad)?;
+
+        // Only now, with authentication proven, does the advanced state become real. `scratch`'s
+        // predecessor (the old `self`) is dropped in place by this assignment, which zeroizes its
+        // secrets exactly as `Drop` normally would.
+        *self = scratch;
+        Ok(pt)
     }
 
     /// The peer's identity keys as bound at X3DH (`IK_initiator ‖ IK_responder`) — surfaced so the
