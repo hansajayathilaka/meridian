@@ -192,8 +192,27 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   explicit deliverable + required test on **2.7**'s task file, not a 2.5 gap (2.7 doesn't dial yet).
   All four reviewers (architect, test-engineer, code-reviewer, security-reviewer — the last added
   mid-task since this touches ADR 0017 C4's trust pin) signed off after fixes.
-- **NEXT:** `/next-task`. Continuing the batch: **1.33** next, then **2.10**, **2.13**, **2.6**,
-  **2.7**, **2.8**, **2.9**, **2.11**, **2.12** in dependency order.
+- **ALSO NOW:** **1.33 is done — and with it, Phase 1 is fully closed.** Bounded the dialer's
+  previously-infinite wait for an answer in `recv_sdp` (`apps/core/src/session.rs`): new
+  `SessionError::AnswerTimeout`, existing cleanup path already closed the transport on any `Err`, no
+  leak. architect caught that the first implementation (5s) was backwards — trickle ICE isn't
+  supported yet, so both sides gather full ICE candidates before sending SDP, and the real backend's
+  own gather is bounded at up to 20s (`GATHER_TIMEOUT`); a 5s dialer bound sat *inside* that and
+  would have spuriously aborted honest-but-slow handshakes. Raised to 30s. security-reviewer
+  APPROVE, no blocking changes — confirmed fail-closed holds (no session is ever partially
+  constructed) and the OTK-depletion-amplifier note doesn't get worse (the server-side per-source
+  fetch limiter is independent of this client-side wait, and nothing retries on timeout). 1.28's
+  `relay_rewrite.rs` tightened to assert the specific new error instead of a `StillWaiting`
+  catch-all; its multi-threaded test couldn't use tokio's paused-clock trick the way the new unit
+  test could, so it now takes ~31s real time — an accepted tradeoff, not chased further.
+  Phase 1's last open item (1.32 closed earlier) is now closed too: every task in the Phase-1 review
+  report (F1–F22) plus all on-the-fly decisions is `[x]`. Phase 1 marked **done**.
+  **Also fixed mid-batch:** PR #44's CI (`License / advisory gate`) failed on `rustls-pemfile`
+  (RUSTSEC-2025-0134, unmaintained, no safe upgrade) — added in task 2.4. Replaced with
+  `rustls-pki-types`'s own `PemObject` trait (what `rustls-pemfile` now just wraps), dropping the
+  dependency entirely; `apps/rendezvous/src/federation/link.rs` and its test file both updated.
+- **NEXT:** `/next-task`. Continuing the batch: **2.10** next, then **2.13**, **2.6**, **2.7**,
+  **2.8**, **2.9**, **2.11**, **2.12** in dependency order.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -217,7 +236,7 @@ Trust-critical substrate: identity, E2EE messaging, P2P session, NAT traversal. 
 - [x] **0.4** P2P Session Substrate (T04) — [file](./phase-0/0.4-p2p-session-substrate.md)
 - [x] **0.5** NAT Traversal & Relay Policy (T05) — [file](./phase-0/0.5-nat-traversal-relay.md)
 
-### Phase 1 — Review of Phase 0 · **in progress** · [details](./phase-1/README.md)
+### Phase 1 — Review of Phase 0 · **done** · [details](./phase-1/README.md)
 Review of Phase 0 (Features 1–5). [Report](./phase-1/review-report.md) findings F1–F22 → 21 fix-tasks,
 ordered blocking-first per the Verdict (doc/ADR truth → freeze crypto → real gates → close Features 4/5 →
 design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
@@ -265,7 +284,7 @@ design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 
 **Group E follow-ups — surfaced by Group E's own reviews** (not in the original Group E set)
 - [x] **1.32** Relay attacks that PASS the envelope signature check (from-spoof / replay / reorder / cross-delivery; from 1.28's security review, fold into [ADR 0016](../adr/0016-envelope-deniability.md)'s test obligations) — [file](./phase-1/1.32-relay-attacks-past-signature.md)
-- [ ] **1.33** Bound the dialer's wait for an answer in `recv_sdp` (availability/diagnostics; from 1.28) — [file](./phase-1/1.33-bound-answer-wait.md)
+- [x] **1.33** Bound the dialer's wait for an answer in `recv_sdp` (availability/diagnostics; from 1.28) — [file](./phase-1/1.33-bound-answer-wait.md)
 
 ### Phase 2 — Cross-Org Federation · **in progress** · [details](./phase-2/README.md)
 Build phase. **[T06 — Cross-Org Federation](../architecture/features/06-cross-org-federation.md)**

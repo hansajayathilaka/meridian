@@ -126,7 +126,7 @@ rather than a normalized schema — *"TODO: confirm normalized schema + Postgres
 
 **Gate — Phase-1 follow-ups that must land first** (they stay numbered under Phase 1)
 - [x] **1.32** Relay attacks that pass the envelope signature check — [file](../phase-1/1.32-relay-attacks-past-signature.md)
-- [ ] **1.33** Bound the dialer's wait for an answer in `recv_sdp` — [file](../phase-1/1.33-bound-answer-wait.md)
+- [x] **1.33** Bound the dialer's wait for an answer in `recv_sdp` — [file](../phase-1/1.33-bound-answer-wait.md)
 
 **Decide before any byte is shaped**
 - [x] **2.1** ADR 0017 — federation trust boundary (peer auth + cross-org `from` attestation) — [file](./2.1-adr-federation-trust-boundary.md)
