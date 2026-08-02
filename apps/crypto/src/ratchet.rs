@@ -49,11 +49,13 @@ struct Skipped {
 /// Secret-bearing fields are zeroized on drop. The whole struct is `Serialize`/`Deserialize` for
 /// the encrypted session store — never write it out unsealed.
 ///
-/// `Clone` exists solely so [`Self::decrypt`] can stage its mutations on a scratch copy and commit
-/// them only after authentication succeeds (task 2.13) — every clone is either committed back into
-/// the live session or dropped (which zeroizes it, same as any other `DoubleRatchet`). Do not use it
-/// to fan a session out to multiple long-lived owners.
-#[derive(Clone, Serialize, Deserialize)]
+/// Deliberately **not** `Clone`: [`aead_seal`]/[`aead_open`] derive both the AEAD key and nonce
+/// solely from the single-use message key `mk`, safe only if each `mk` is consumed exactly once. A
+/// public `Clone` on this type would let any external holder fork a live session and, if either fork
+/// later encrypted or decrypted at the same counter, reuse a key+nonce pair — catastrophic, not
+/// merely availability-degrading (security-reviewer finding on task 2.13). [`Self::decrypt`] instead
+/// stages its mutations via the crate-private [`Self::checkpoint`] below, confined to this module.
+#[derive(Serialize, Deserialize)]
 pub struct DoubleRatchet {
     rk: [u8; 32],
     dhs_priv: [u8; 32],
@@ -95,6 +97,31 @@ impl DoubleRatchet {
         self.nhkr.zeroize();
         for s in &mut self.skipped {
             s.mk.zeroize();
+        }
+    }
+
+    /// Field-for-field copy, crate-module-private on purpose (see the struct's doc comment on why
+    /// `DoubleRatchet` does not implement the public `Clone` trait). Used exclusively by
+    /// [`Self::decrypt`] to stage mutations before authentication succeeds. The returned copy is
+    /// either committed back into the live session (`*self = scratch`) or dropped — either way it
+    /// goes through the same [`Drop`]/zeroization path as any other `DoubleRatchet`.
+    fn checkpoint(&self) -> Self {
+        Self {
+            rk: self.rk,
+            dhs_priv: self.dhs_priv,
+            dhs_pub: self.dhs_pub,
+            dhr: self.dhr,
+            cks: self.cks,
+            ckr: self.ckr,
+            ns: self.ns,
+            nr: self.nr,
+            pn: self.pn,
+            hks: self.hks,
+            hkr: self.hkr,
+            nhks: self.nhks,
+            nhkr: self.nhkr,
+            skipped: self.skipped.clone(),
+            ad: self.ad.clone(),
         }
     }
 }
@@ -218,11 +245,11 @@ impl DoubleRatchet {
     /// **Failure-atomic** per the Double Ratchet spec's "discard changes to the state object on
     /// failure": every mutation this call would make — the receiving-chain advance (`ckr`/`nr`),
     /// a DH-ratchet step, and any `skipped` entries populated while catching up to `n` — happens on
-    /// a scratch clone of `self` and is committed back only after `aead_open` actually succeeds. A
-    /// failed decrypt (bad ciphertext, or a byte-identical replay re-deriving a chain key that no
-    /// longer matches) therefore leaves `self` byte-for-byte as it was, so a duplicate or forged
-    /// envelope degrades exactly the one message instead of permanently wedging the chain against
-    /// the sender (task 2.13).
+    /// a private [`Self::checkpoint`] of `self` and is committed back only after `aead_open` actually
+    /// succeeds. A failed decrypt (bad ciphertext, or a byte-identical replay re-deriving a chain key
+    /// that no longer matches) therefore leaves `self` byte-for-byte as it was, so a duplicate or
+    /// forged envelope degrades exactly the one message instead of permanently wedging the chain
+    /// against the sender (task 2.13).
     pub fn decrypt(&mut self, message: &[u8]) -> Result<Vec<u8>> {
         let (enc_header, ct) = unframe(message).ok_or(CryptoError::Malformed)?;
 
@@ -234,7 +261,7 @@ impl DoubleRatchet {
         let (dh_pub, pn, n) = header;
 
         // From here on every mutation lands on `scratch`, not `self` — see the doc comment above.
-        let mut scratch = self.clone();
+        let mut scratch = self.checkpoint();
 
         if is_dh_ratchet {
             scratch.skip_message_keys(pn)?;
