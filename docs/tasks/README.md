@@ -249,9 +249,22 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   the per-account one meant an already-over-budget account's rejected retries could still drain the
   shared pool and starve every other account behind the same origin, exactly the failure mode the
   per-account budget exists to prevent. Reordered account-first; pinning test added.
-- **NEXT:** `/next-task`. Continuing the batch: **2.7** next, then **2.8**, **2.9**, **2.11**,
-  **2.12** in dependency order. **2.14** (new, from 2.10's review) queues up after 2.10's own
-  dependents since it depends on 2.10.
+- **ALSO NOW:** **2.7 is done.** Federated prekey fetch, both directions — the first task to run
+  tasks 2.4/2.5's previously-inert s2s listener/dialer in a live server. Server A's
+  `outbound::fetch_foreign_bundle` pins to `Endpoint::pinned_identity` (2.5's inherited
+  requirement); server B's `inbound::handle_fed_fetch` binds `origin_domain` to the
+  mTLS-authenticated `link.peer_domain` and is task 2.6's policy/limits' first real caller. No
+  bundle verification server-side either direction (client-side `verify_bundle` stays the sole
+  trust anchor, §3.3 step 4) — confirmed by all four reviewers that `meridian-signaling` is never
+  imported into the server crate. architect required fixing an incoherent boot-failure split (s2s
+  bind failure now fatal, matching this codebase's established fail-loud posture); security-reviewer
+  and code-reviewer independently caught the same error-message leak (server A's internal dial
+  config was interpolated into client-visible failure text — fixed to use only the client's own
+  hint); test-engineer mutation-tested both critical tests (single-websocket routing invariant,
+  pinned-identity rejection) and confirmed neither is vacuous.
+- **NEXT:** `/next-task`. Continuing the batch: **2.8** next, then **2.9**, **2.11**, **2.12** in
+  dependency order. **2.14** (new, from 2.10's review) queues up after 2.10's own dependents since
+  it depends on 2.10.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -345,7 +358,7 @@ cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery 
 - [x] **2.4** s2s mTLS link: listener + dialer (WebPKI and private-CA) — [file](./phase-2/2.4-s2s-mtls-link.md)
 - [x] **2.5** Discovery: DNS SRV `_meridian-fed._tcp` + `federation_map.toml` static mode — [file](./phase-2/2.5-federation-discovery.md)
 - [x] **2.6** Federation policy (`open | allowlist | closed`) + edge rate limits — [file](./phase-2/2.6-federation-policy-limits.md)
-- [~] **2.7** Federated prekey fetch, both sides (§3.3 steps 2–4) — [file](./phase-2/2.7-federated-prekey-fetch.md)
+- [x] **2.7** Federated prekey fetch, both sides (§3.3 steps 2–4) — [file](./phase-2/2.7-federated-prekey-fetch.md)
 - [ ] **2.8** Federated envelope forwarding + per-request reachability (§3.3 step 5, §3.4) — [file](./phase-2/2.8-federated-route-reachability.md)
 
 **Client**

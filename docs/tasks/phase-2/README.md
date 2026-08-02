@@ -139,7 +139,7 @@ rather than a normalized schema — *"TODO: confirm normalized schema + Postgres
 - [x] **2.4** s2s mTLS link: listener + dialer (WebPKI and private-CA) — [file](./2.4-s2s-mtls-link.md)
 - [x] **2.5** Discovery: DNS SRV + `federation_map.toml` static mode — [file](./2.5-federation-discovery.md)
 - [x] **2.6** Federation policy (`open | allowlist | closed`) + edge rate limits — [file](./2.6-federation-policy-limits.md)
-- [~] **2.7** Federated prekey fetch, both sides (§3.3 steps 2–4) — [file](./2.7-federated-prekey-fetch.md)
+- [x] **2.7** Federated prekey fetch, both sides (§3.3 steps 2–4) — [file](./2.7-federated-prekey-fetch.md)
 - [ ] **2.8** Federated envelope forwarding + per-request reachability (§3.3 step 5, §3.4) — [file](./2.8-federated-route-reachability.md)
 
 **Client**
