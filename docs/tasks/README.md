@@ -179,8 +179,21 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   didn't isolate the mechanism it claimed to test (a coincidental app-level check would also catch a
   *fully* disabled mandatory-client-auth requirement, in a state that in fact rejects every connection);
   fixed with a doc comment pointing at the happy-path tests as the real proof mTLS is mandatory.
-- **NEXT:** `/next-task`. Continuing the batch: **2.5** (discovery) next, then **1.33**, **2.10**,
-  **2.13**, **2.6**, **2.7**, **2.8**, **2.9**, **2.11**, **2.12** in dependency order.
+- **ALSO NOW:** **2.5 is done** — federation discovery (`apps/rendezvous/src/federation/discovery.rs`):
+  `Discovery` trait, `StaticMap` (`federation_map.toml`, fail-closed `pinned_identity`, case-folded
+  domains), `SrvDiscovery` (RFC 2782 ordering, `Target == "."` → no-record). `Federation::validate()`
+  now rejects `discovery = "srv"` + a non-empty `ca_bundle_path` — that combination reopened ADR 0017
+  (a)'s rejected "Option A" impersonation hole. Resolved the `federation_map` config-file-vs-DB-table
+  contradiction (two docs had it, both fixed). test-engineer's most notable finding: the original
+  air-gap "zero DNS lookups" test was vacuous (a `TripwireResolver` never actually reachable from
+  `StaticMap::resolve`'s code path) — replaced with an `LD_PRELOAD getaddrinfo(3)` syscall-interposition
+  test, verified against the exact mutation that broke the old one. security-reviewer flagged that
+  `pinned_identity` isn't wired into `link::dial()`'s identity check yet — carried forward as an
+  explicit deliverable + required test on **2.7**'s task file, not a 2.5 gap (2.7 doesn't dial yet).
+  All four reviewers (architect, test-engineer, code-reviewer, security-reviewer — the last added
+  mid-task since this touches ADR 0017 C4's trust pin) signed off after fixes.
+- **NEXT:** `/next-task`. Continuing the batch: **1.33** next, then **2.10**, **2.13**, **2.6**,
+  **2.7**, **2.8**, **2.9**, **2.11**, **2.12** in dependency order.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -272,7 +285,7 @@ cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery 
 
 **Server spine**
 - [x] **2.4** s2s mTLS link: listener + dialer (WebPKI and private-CA) — [file](./phase-2/2.4-s2s-mtls-link.md)
-- [~] **2.5** Discovery: DNS SRV `_meridian-fed._tcp` + `federation_map.toml` static mode — [file](./phase-2/2.5-federation-discovery.md)
+- [x] **2.5** Discovery: DNS SRV `_meridian-fed._tcp` + `federation_map.toml` static mode — [file](./phase-2/2.5-federation-discovery.md)
 - [ ] **2.6** Federation policy (`open | allowlist | closed`) + edge rate limits — [file](./phase-2/2.6-federation-policy-limits.md)
 - [ ] **2.7** Federated prekey fetch, both sides (§3.3 steps 2–4) — [file](./phase-2/2.7-federated-prekey-fetch.md)
 - [ ] **2.8** Federated envelope forwarding + per-request reachability (§3.3 step 5, §3.4) — [file](./phase-2/2.8-federated-route-reachability.md)
