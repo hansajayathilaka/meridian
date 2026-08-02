@@ -154,7 +154,7 @@ rather than a normalized schema — *"TODO: confirm normalized schema + Postgres
 [1.32](../phase-1/1.32-relay-attacks-past-signature.md) and confirmed by its security review: it lands
 here because it needs fixing, not because Feature 06 depends on it. It is independent of every task
 above and can run at any point in the phase.
-- [~] **2.13** A replayed envelope permanently wedges the receiving ratchet — [file](./2.13-ratchet-replay-dos.md)
+- [x] **2.13** A replayed envelope permanently wedges the receiving ratchet — [file](./2.13-ratchet-replay-dos.md)
 
 **Follow-up surfaced by 2.10's review** — architect + security-reviewer both required this be
 tracked explicitly rather than silently deferred to Feature 08.

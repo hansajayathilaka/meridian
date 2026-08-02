@@ -223,9 +223,22 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   with `threat-mitigation-matrix.md`'s claim corrected and a regression test pinning today's
   behavior. security-reviewer APPROVE-WITH-CHANGES (both required fixes applied); test-engineer
   PASS, no required fixes (mutation-tested the new suite and the four pre-existing tests' shims).
-- **NEXT:** `/next-task`. Continuing the batch: **2.13** next, then **2.6**, **2.7**, **2.8**,
-  **2.9**, **2.11**, **2.12** in dependency order. **2.14** (new, from 2.10's review) queues up
-  after 2.10's own dependents since it depends on 2.10.
+- **ALSO NOW:** **2.13 is done.** `DoubleRatchet::decrypt`'s receiving-chain advance is now
+  failure-atomic: mutations stage on a checkpoint copy and commit only after `aead_open` succeeds, so
+  a replayed/tampered envelope degrades exactly one message instead of permanently wedging the
+  chain. Regression tests were shown to fail against the pre-fix code first (the task's own required
+  process gate), including the compound DH-ratchet-catch-up path. Conformance vectors unchanged.
+  security-reviewer APPROVE-WITH-CHANGES caught a real issue the fix's first draft introduced: making
+  `DoubleRatchet` derive the public `Clone` trait (to stage the scratch copy) would have let any
+  external holder fork a live session and reuse an AEAD key+nonce pair on a later encrypt/decrypt —
+  catastrophic, since both are derived solely from the single-use message key. Fixed with a
+  crate-private `checkpoint()` method instead. Also corrected a false "replay dedup by eid" claim in
+  `threat-mitigation-matrix.md`'s A3 row (unimplemented in v1 per `wire-protocol.md`). test-engineer
+  independently reproduced the fail-before/pass-after evidence and confirmed the compound-case test
+  is non-vacuous.
+- **NEXT:** `/next-task`. Continuing the batch: **2.6** next, then **2.7**, **2.8**, **2.9**,
+  **2.11**, **2.12** in dependency order. **2.14** (new, from 2.10's review) queues up after 2.10's
+  own dependents since it depends on 2.10.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -331,7 +344,7 @@ cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery 
 - [ ] **2.12** Cross-org abuse + acceptance suite (the phase exit gate) — [file](./phase-2/2.12-cross-org-abuse-acceptance.md)
 
 **Carried in from Phase 1** (production defect surfaced by 1.32; not part of T06)
-- [~] **2.13** A replayed envelope permanently wedges the receiving ratchet (`Ratchet::decrypt` commits `ckr`/`nr` before `aead_open` and never rolls back — unauthenticated permanent session DoS) — [file](./phase-2/2.13-ratchet-replay-dos.md)
+- [x] **2.13** A replayed envelope permanently wedges the receiving ratchet (`Ratchet::decrypt` commits `ckr`/`nr` before `aead_open` and never rolls back — unauthenticated permanent session DoS) — [file](./phase-2/2.13-ratchet-replay-dos.md)
 - [ ] **2.14** Wire the message-request gate into the P2P session substrate (from 2.10's review; `session connect` currently bypasses the gate entirely) — [file](./phase-2/2.14-p2p-message-request-gate.md)
 
 ---
