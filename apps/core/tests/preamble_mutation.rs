@@ -110,10 +110,23 @@ impl Party {
             )
             .unwrap()
     }
+    /// This file exercises ADR 0016 preamble-mutation defences, not the task-2.10 request-queue UX
+    /// (see `apps/core/tests/message_request_gate.rs` for that): a first contact is transparently
+    /// auto-accepted here so "the genuine envelope still opens" reads exactly as it did before the
+    /// gate existed.
     fn recv(&mut self, from: &[u8; 32], blob: &[u8]) -> Result<ChatContent, ChatError> {
         let ik = self.ik();
-        self.state
+        match self
+            .state
             .open_inbound(&self.store, self.account.handle(), &ik, from, blob)
+        {
+            Err(ChatError::MessageRequest) => Ok(self
+                .state
+                .accept_request(from)
+                .expect("just gated by open_inbound")
+                .intro),
+            other => other,
+        }
     }
 }
 

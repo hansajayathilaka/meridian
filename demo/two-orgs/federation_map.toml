@@ -1,0 +1,39 @@
+# Reference `federation_map.toml` for the two-org air-gap federation demo (feature 06).
+#
+# This file is task 2.5's schema fixture, consumed as-is by task 2.11 ("demo/two-orgs/: two full
+# stacks, private CA, both discovery modes") — it is NOT itself the full demo stack (no
+# docker-compose.yml/Dockerfile here yet; that's 2.11's job).
+#
+# Parsed by `meridian_rendezvous::federation::discovery::StaticMap` when a rendezvous is
+# configured with `federation.discovery = "static"` and
+# `federation.map_path = ".../federation_map.toml"` (see apps/rendezvous/src/config.rs).
+#
+# Schema (one `[[partner]]` table per federation partner):
+#   domain           the partner's discovery/hint domain — this is the certificate-validation
+#                    target (ADR 0017 (a)/C3), NEVER `endpoint` below. Also the key clients' IDs
+#                    hint at (ADR 0001).
+#   endpoint         "host:port" to actually dial. Deliberately a *different* value from `domain`
+#                    in this fixture (an internal-DNS/service name, not the public hint domain) to
+#                    make the split concrete: a wrong or hijacked `endpoint` only breaks
+#                    reachability, never trust — see `Endpoint`'s doc comment in
+#                    apps/rendezvous/src/federation/discovery.rs.
+#   pinned_identity  REQUIRED. The peer certificate's SAN/CN this partner is pinned to in
+#                    private-CA/air-gap mode (ADR 0017 C4). A missing/empty pin is a fail-closed
+#                    config-load error — see `StaticMap::load`. Matches the CN
+#                    `infra/deploy/bootstrap-ca.sh` issues for each org (`CN=org-a.test`, no SAN),
+#                    NOT `endpoint`'s host.
+#   policy           optional; carried through unparsed/uninterpreted by task 2.5.
+#                    Semantics (`open | allowlist | closed`) are task 2.6's ("federation policy
+#                    limits") to define and enforce — this file only reserves the field.
+
+[[partner]]
+domain = "org-a.test"
+endpoint = "fed.org-a.test:8444"
+pinned_identity = "org-a.test"
+policy = "allowlist"
+
+[[partner]]
+domain = "org-b.test"
+endpoint = "fed.org-b.test:8444"
+pinned_identity = "org-b.test"
+policy = "allowlist"

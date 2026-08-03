@@ -2,7 +2,7 @@
 //! receipt) driven entirely through opaque blobs, plus tamper rejection and sealed persistence.
 //! No network: the "relay" is just handing blob bytes between two [`ChatState`]s.
 
-use meridian_core::chat::{ChatState, PREV_GENERATION_GRACE_SECS};
+use meridian_core::chat::{ChatError, ChatState, PREV_GENERATION_GRACE_SECS};
 use meridian_envelope::{ChatContent, MessageEnvelope};
 use meridian_identity::{generate_account, AccountId, MemorySecretStore};
 use meridian_signaling::{generate_bundle, GeneratedBundle};
@@ -61,11 +61,23 @@ impl Party {
             .seal_outbound(&self.store, self.account.handle(), &ik, peer, content)
             .unwrap()
     }
+    /// This file exercises session/ratchet correctness, not the task-2.10 request-queue UX (see
+    /// `apps/core/tests/message_request_gate.rs` for that): a first contact is transparently
+    /// auto-accepted here so "the opening envelope opens" reads exactly as it did before the gate
+    /// existed.
     fn recv(&mut self, from: &[u8; 32], blob: &[u8]) -> Result<ChatContent, ChatErr> {
         let ik = self.ik();
-        self.state
+        match self
+            .state
             .open_inbound(&self.store, self.account.handle(), &ik, from, blob)
-            .map_err(|_| ChatErr)
+        {
+            Err(ChatError::MessageRequest) => Ok(self
+                .state
+                .accept_request(from)
+                .expect("just gated by open_inbound")
+                .intro),
+            other => other.map_err(|_| ChatErr),
+        }
     }
     /// Retire a superseded prekey generation whose grace window has passed, exactly as the CLI's
     /// inbound path does before opening a delivered blob (task 1.31).

@@ -72,7 +72,7 @@ async fn register_publish_and_fetch_verifies() {
     register(&bob, &url).await;
 
     let mut ac = alice.connect(&url).await.unwrap();
-    let bundle = ac.fetch_bundle(bob.pubkey, false).await.unwrap();
+    let bundle = ac.fetch_bundle(bob.pubkey, None, false).await.unwrap();
     assert_eq!(bundle.account_pub, bob.pubkey);
     assert_eq!(bundle.otk_count(), DEFAULT_OTK_COUNT);
 }
@@ -96,7 +96,7 @@ async fn tampered_bundle_is_rejected() {
     register(&bob, &url).await;
 
     let mut ac = alice.connect(&url).await.unwrap();
-    let err = ac.fetch_bundle(bob.pubkey, true).await.unwrap_err();
+    let err = ac.fetch_bundle(bob.pubkey, None, true).await.unwrap_err();
     assert!(
         matches!(err, SignalError::BundleVerification(_)),
         "expected hard verification failure, got {err:?}"
@@ -121,7 +121,7 @@ async fn tamper_flag_is_inert_without_feature() {
     let mut ac = alice.connect(&url).await.unwrap();
     // ...requesting tamper=true still gets bob's real bundle back — the hook doesn't exist in
     // this build at all.
-    let bundle = ac.fetch_bundle(bob.pubkey, true).await.unwrap();
+    let bundle = ac.fetch_bundle(bob.pubkey, None, true).await.unwrap();
     assert_eq!(bundle.account_pub, bob.pubkey);
 }
 
@@ -361,7 +361,7 @@ async fn fetch_is_exact_key_only() {
     // A one-byte-off key is a different principal — no fuzzy/prefix match exists.
     let mut near_miss = bob.pubkey;
     near_miss[0] ^= 0x01;
-    let err = ac.fetch_bundle(near_miss, false).await.unwrap_err();
+    let err = ac.fetch_bundle(near_miss, None, false).await.unwrap_err();
     match err {
         SignalError::Server(ErrBody { code, .. }) => assert_eq!(code, error_codes::NOT_FOUND),
         other => panic!("expected not_found, got {other:?}"),
@@ -646,10 +646,10 @@ async fn fetch_rate_limit_trips() {
 
     let mut ac = alice.connect(&url).await.unwrap();
     for _ in 0..3 {
-        ac.fetch_bundle(bob.pubkey, false).await.unwrap();
+        ac.fetch_bundle(bob.pubkey, None, false).await.unwrap();
     }
     // The 4th fetch this window is refused.
-    let err = ac.fetch_bundle(bob.pubkey, false).await.unwrap_err();
+    let err = ac.fetch_bundle(bob.pubkey, None, false).await.unwrap_err();
     match err {
         SignalError::Server(ErrBody { code, .. }) => assert_eq!(code, error_codes::RATE_LIMITED),
         other => panic!("expected rate_limited, got {other:?}"),

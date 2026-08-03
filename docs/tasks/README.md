@@ -166,10 +166,124 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   reviewers signed off clean: architect — consistent, no revision; security-reviewer — APPROVE, no
   changes required; code-reviewer — APPROVE, no blocking findings (one doc nit fixed inline, one left
   as a non-blocking informational note).
-- **NEXT:** `/next-task`. **2.4** (s2s mTLS link) is now unblocked — it depends on 2.2 (done) and,
-  per the phase's Track-S sequencing, follows 2.3 (now also done). In parallel, still unblocked with
-  no dependencies: **1.33**, **2.5** (discovery), **2.10** (message-request gate) and **2.13** (the
-  ratchet defect below).
+- **ALSO NOW:** **2.4 is done** — s2s mTLS link (`apps/rendezvous/src/federation/{mod,link}.rs`),
+  WebPKI + private-CA modes, domain-pinned verification (ADR 0017 C3), in-process TLS termination
+  (ADR 0017 C7), fail-closed `config::Federation` defaults, `meridian_federation_link_up` as an
+  aggregate gauge with **no** `peer_domain` label (security-reviewer: a per-partner label would
+  materialize the cross-org contact graph, forbidden by anonymity-and-retention.md must-never #2).
+  Default federation port **8444** (`TODO: confirm`, not IANA-registered). architect: consistent, no
+  revision. security-reviewer: APPROVE-WITH-CHANGES — required fail-closed cert-loading regression
+  tests (empty/nonexistent/zero-cert paths) added in a follow-up commit; also flagged, non-blocking,
+  that the accept side doesn't yet pin inbound peer identity to a specific expected partner — that's
+  2.5/2.6 policy territory, not a 2.4 gap. code-reviewer: approve-with-nits — `missing_client_cert_is_rejected`
+  didn't isolate the mechanism it claimed to test (a coincidental app-level check would also catch a
+  *fully* disabled mandatory-client-auth requirement, in a state that in fact rejects every connection);
+  fixed with a doc comment pointing at the happy-path tests as the real proof mTLS is mandatory.
+- **ALSO NOW:** **2.5 is done** — federation discovery (`apps/rendezvous/src/federation/discovery.rs`):
+  `Discovery` trait, `StaticMap` (`federation_map.toml`, fail-closed `pinned_identity`, case-folded
+  domains), `SrvDiscovery` (RFC 2782 ordering, `Target == "."` → no-record). `Federation::validate()`
+  now rejects `discovery = "srv"` + a non-empty `ca_bundle_path` — that combination reopened ADR 0017
+  (a)'s rejected "Option A" impersonation hole. Resolved the `federation_map` config-file-vs-DB-table
+  contradiction (two docs had it, both fixed). test-engineer's most notable finding: the original
+  air-gap "zero DNS lookups" test was vacuous (a `TripwireResolver` never actually reachable from
+  `StaticMap::resolve`'s code path) — replaced with an `LD_PRELOAD getaddrinfo(3)` syscall-interposition
+  test, verified against the exact mutation that broke the old one. security-reviewer flagged that
+  `pinned_identity` isn't wired into `link::dial()`'s identity check yet — carried forward as an
+  explicit deliverable + required test on **2.7**'s task file, not a 2.5 gap (2.7 doesn't dial yet).
+  All four reviewers (architect, test-engineer, code-reviewer, security-reviewer — the last added
+  mid-task since this touches ADR 0017 C4's trust pin) signed off after fixes.
+- **ALSO NOW:** **1.33 is done — and with it, Phase 1 is fully closed.** Bounded the dialer's
+  previously-infinite wait for an answer in `recv_sdp` (`apps/core/src/session.rs`): new
+  `SessionError::AnswerTimeout`, existing cleanup path already closed the transport on any `Err`, no
+  leak. architect caught that the first implementation (5s) was backwards — trickle ICE isn't
+  supported yet, so both sides gather full ICE candidates before sending SDP, and the real backend's
+  own gather is bounded at up to 20s (`GATHER_TIMEOUT`); a 5s dialer bound sat *inside* that and
+  would have spuriously aborted honest-but-slow handshakes. Raised to 30s. security-reviewer
+  APPROVE, no blocking changes — confirmed fail-closed holds (no session is ever partially
+  constructed) and the OTK-depletion-amplifier note doesn't get worse (the server-side per-source
+  fetch limiter is independent of this client-side wait, and nothing retries on timeout). 1.28's
+  `relay_rewrite.rs` tightened to assert the specific new error instead of a `StillWaiting`
+  catch-all; its multi-threaded test couldn't use tokio's paused-clock trick the way the new unit
+  test could, so it now takes ~31s real time — an accepted tradeoff, not chased further.
+  Phase 1's last open item (1.32 closed earlier) is now closed too: every task in the Phase-1 review
+  report (F1–F22) plus all on-the-fly decisions is `[x]`. Phase 1 marked **done**.
+  **Also fixed mid-batch:** PR #44's CI (`License / advisory gate`) failed on `rustls-pemfile`
+  (RUSTSEC-2025-0134, unmaintained, no safe upgrade) — added in task 2.4. Replaced with
+  `rustls-pki-types`'s own `PemObject` trait (what `rustls-pemfile` now just wraps), dropping the
+  dependency entirely; `apps/rendezvous/src/federation/link.rs` and its test file both updated.
+- **ALSO NOW:** **2.10 is done.** First-contact message-request gate, entirely client-side
+  (`apps/core/src/chat.rs`'s `open_inbound`): a first envelope from an unrecognized peer key lands
+  in `pending_requests` instead of delivering; a second pre-accept envelope is refused, not merged;
+  gating happens after signature verification/session establishment so a rejected first contact
+  still costs the OTK it consumed (same accepted-behavior class as 1.33). architect confirmed
+  client-side-only is *binding* (not just asserted) per anonymity-and-retention.md must-never #2.
+  All three reviewers independently found and required tracking the same real gap: the gate is
+  structurally inert on the P2P session-signaling path (`session connect` bypasses it — the crypto
+  session installs before any chat content flows) — tracked as **2.14** rather than left implicit,
+  with `threat-mitigation-matrix.md`'s claim corrected and a regression test pinning today's
+  behavior. security-reviewer APPROVE-WITH-CHANGES (both required fixes applied); test-engineer
+  PASS, no required fixes (mutation-tested the new suite and the four pre-existing tests' shims).
+- **ALSO NOW:** **2.13 is done.** `DoubleRatchet::decrypt`'s receiving-chain advance is now
+  failure-atomic: mutations stage on a checkpoint copy and commit only after `aead_open` succeeds, so
+  a replayed/tampered envelope degrades exactly one message instead of permanently wedging the
+  chain. Regression tests were shown to fail against the pre-fix code first (the task's own required
+  process gate), including the compound DH-ratchet-catch-up path. Conformance vectors unchanged.
+  security-reviewer APPROVE-WITH-CHANGES caught a real issue the fix's first draft introduced: making
+  `DoubleRatchet` derive the public `Clone` trait (to stage the scratch copy) would have let any
+  external holder fork a live session and reuse an AEAD key+nonce pair on a later encrypt/decrypt —
+  catastrophic, since both are derived solely from the single-use message key. Fixed with a
+  crate-private `checkpoint()` method instead. Also corrected a false "replay dedup by eid" claim in
+  `threat-mitigation-matrix.md`'s A3 row (unimplemented in v1 per `wire-protocol.md`). test-engineer
+  independently reproduced the fail-before/pass-after evidence and confirmed the compound-case test
+  is non-vacuous.
+- **ALSO NOW:** **2.6 is done.** Pure federation admission/rate-limit decision layer
+  (`apps/rendezvous/src/federation/policy.rs`): `FederationPolicy` (closed structurally cannot
+  consult allowlist state; allowlist is exact-match), `FederationLimits` reusing task 1.20's
+  amortised-sweep `RateLimiter` for per-origin-fetch/per-origin-route/per-origin-account budgets.
+  Deliberately unwired from any handler (2.7/2.8) and builds no client-visible copy (2.9).
+  architect: consistent — confirmed the pure-decision-layer boundary was planned at `/plan-phase`
+  time, not improvised. security-reviewer: APPROVE-WITH-CHANGES — traced all six required checks
+  against code; found `lint-no-raw-id-logging.sh`'s pattern didn't actually cover
+  `origin_domain`/`origin_account` despite the module doc claiming it did (fixed). code-reviewer:
+  request-changes — found and reproduced a real bug: checking the shared per-origin budget before
+  the per-account one meant an already-over-budget account's rejected retries could still drain the
+  shared pool and starve every other account behind the same origin, exactly the failure mode the
+  per-account budget exists to prevent. Reordered account-first; pinning test added.
+- **ALSO NOW:** **2.7 is done.** Federated prekey fetch, both directions — the first task to run
+  tasks 2.4/2.5's previously-inert s2s listener/dialer in a live server. Server A's
+  `outbound::fetch_foreign_bundle` pins to `Endpoint::pinned_identity` (2.5's inherited
+  requirement); server B's `inbound::handle_fed_fetch` binds `origin_domain` to the
+  mTLS-authenticated `link.peer_domain` and is task 2.6's policy/limits' first real caller. No
+  bundle verification server-side either direction (client-side `verify_bundle` stays the sole
+  trust anchor, §3.3 step 4) — confirmed by all four reviewers that `meridian-signaling` is never
+  imported into the server crate. architect required fixing an incoherent boot-failure split (s2s
+  bind failure now fatal, matching this codebase's established fail-loud posture); security-reviewer
+  and code-reviewer independently caught the same error-message leak (server A's internal dial
+  config was interpolated into client-visible failure text — fixed to use only the client's own
+  hint); test-engineer mutation-tested both critical tests (single-websocket routing invariant,
+  pinned-identity rejection) and confirmed neither is vacuous.
+- **ALSO NOW:** **2.8 is done.** Federated envelope forwarding + per-request reachability — the
+  last piece of Feature 06's server spine. Before implementing, resolved three open architect
+  decisions in the task file: oversized envelopes reuse `MAX_FRAME_LEN` (no new constant); zero
+  s2s replay/dedup, deferred entirely to envelope v2's `eid` per ADR 0016 C7 (task 2.13 already
+  bounds a replay's harm to one failed decrypt); `fed_reachability` is s2s-internal only, no new
+  client-visible c2s trigger, must collapse to the exact same `not_connected` outcome local routing
+  already produces — no existence oracle. Implementer self-caught a real bug mid-build: the
+  reachability pre-check's own policy answers were initially masking a `closed`-policy origin as
+  merely offline, caught by the task's own test failing. architect: consistent, confirmed §3.4
+  per-request-only presence and the ADR 0007 boundary, flagged an incomplete residual-doc gap on
+  `ROUTE_REPLY_GRACE` (fixed). security-reviewer: APPROVE-WITH-CHANGES, procedural only.
+  test-engineer: PASS, mutation-tested everything including the bug-fix itself, and recovered
+  cleanly from a `git checkout --` near-miss mid-review. code-reviewer: approve-with-nits, found
+  real duplicated pinning-dial logic between `fetch_foreign_bundle` and the new `dial_foreign`
+  helper (fixed — now shared) and converged with the other two reviewers on the same
+  `ROUTE_REPLY_GRACE` finding (fixed via honest residual documentation, no number was guessed).
+  Non-blocking follow-ups noted, not fixed: federated deliveries aren't counted in
+  `envelopes_routed_total`; the third near-duplicate test-harness copy means a `tests/common/mod.rs`
+  extraction is now overdue.
+- **NEXT:** `/next-task`. Continuing the batch: **2.9** next, then **2.11**, **2.12** in dependency
+  order. **2.14** (new, from 2.10's review) queues up after 2.10's own dependents since it depends
+  on 2.10.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -193,7 +307,7 @@ Trust-critical substrate: identity, E2EE messaging, P2P session, NAT traversal. 
 - [x] **0.4** P2P Session Substrate (T04) — [file](./phase-0/0.4-p2p-session-substrate.md)
 - [x] **0.5** NAT Traversal & Relay Policy (T05) — [file](./phase-0/0.5-nat-traversal-relay.md)
 
-### Phase 1 — Review of Phase 0 · **in progress** · [details](./phase-1/README.md)
+### Phase 1 — Review of Phase 0 · **done** · [details](./phase-1/README.md)
 Review of Phase 0 (Features 1–5). [Report](./phase-1/review-report.md) findings F1–F22 → 21 fix-tasks,
 ordered blocking-first per the Verdict (doc/ADR truth → freeze crypto → real gates → close Features 4/5 →
 design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
@@ -241,7 +355,7 @@ design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 
 **Group E follow-ups — surfaced by Group E's own reviews** (not in the original Group E set)
 - [x] **1.32** Relay attacks that PASS the envelope signature check (from-spoof / replay / reorder / cross-delivery; from 1.28's security review, fold into [ADR 0016](../adr/0016-envelope-deniability.md)'s test obligations) — [file](./phase-1/1.32-relay-attacks-past-signature.md)
-- [ ] **1.33** Bound the dialer's wait for an answer in `recv_sdp` (availability/diagnostics; from 1.28) — [file](./phase-1/1.33-bound-answer-wait.md)
+- [x] **1.33** Bound the dialer's wait for an answer in `recv_sdp` (availability/diagnostics; from 1.28) — [file](./phase-1/1.33-bound-answer-wait.md)
 
 ### Phase 2 — Cross-Org Federation · **in progress** · [details](./phase-2/README.md)
 Build phase. **[T06 — Cross-Org Federation](../architecture/features/06-cross-org-federation.md)**
@@ -260,22 +374,23 @@ cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery 
 - [x] **2.3** c2s extension for federation (hint fields, error codes, vectors; re-defers the §8 schema `TODO` to T07) — [file](./phase-2/2.3-c2s-federation-extension.md)
 
 **Server spine**
-- [ ] **2.4** s2s mTLS link: listener + dialer (WebPKI and private-CA) — [file](./phase-2/2.4-s2s-mtls-link.md)
-- [ ] **2.5** Discovery: DNS SRV `_meridian-fed._tcp` + `federation_map.toml` static mode — [file](./phase-2/2.5-federation-discovery.md)
-- [ ] **2.6** Federation policy (`open | allowlist | closed`) + edge rate limits — [file](./phase-2/2.6-federation-policy-limits.md)
-- [ ] **2.7** Federated prekey fetch, both sides (§3.3 steps 2–4) — [file](./phase-2/2.7-federated-prekey-fetch.md)
-- [ ] **2.8** Federated envelope forwarding + per-request reachability (§3.3 step 5, §3.4) — [file](./phase-2/2.8-federated-route-reachability.md)
+- [x] **2.4** s2s mTLS link: listener + dialer (WebPKI and private-CA) — [file](./phase-2/2.4-s2s-mtls-link.md)
+- [x] **2.5** Discovery: DNS SRV `_meridian-fed._tcp` + `federation_map.toml` static mode — [file](./phase-2/2.5-federation-discovery.md)
+- [x] **2.6** Federation policy (`open | allowlist | closed`) + edge rate limits — [file](./phase-2/2.6-federation-policy-limits.md)
+- [x] **2.7** Federated prekey fetch, both sides (§3.3 steps 2–4) — [file](./phase-2/2.7-federated-prekey-fetch.md)
+- [x] **2.8** Federated envelope forwarding + per-request reachability (§3.3 step 5, §3.4) — [file](./phase-2/2.8-federated-route-reachability.md)
 
 **Client**
 - [ ] **2.9** Client federation error taxonomy: clean `closed` error + stale-hint case — [file](./phase-2/2.9-client-federation-errors.md)
-- [ ] **2.10** First-contact message-request gate (client-side, §3.5) — [file](./phase-2/2.10-message-request-gate.md)
+- [x] **2.10** First-contact message-request gate (client-side, §3.5) — [file](./phase-2/2.10-message-request-gate.md)
 
 **Demo + exit gate**
 - [ ] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./phase-2/2.11-demo-two-orgs.md)
 - [ ] **2.12** Cross-org abuse + acceptance suite (the phase exit gate) — [file](./phase-2/2.12-cross-org-abuse-acceptance.md)
 
 **Carried in from Phase 1** (production defect surfaced by 1.32; not part of T06)
-- [ ] **2.13** A replayed envelope permanently wedges the receiving ratchet (`Ratchet::decrypt` commits `ckr`/`nr` before `aead_open` and never rolls back — unauthenticated permanent session DoS) — [file](./phase-2/2.13-ratchet-replay-dos.md)
+- [x] **2.13** A replayed envelope permanently wedges the receiving ratchet (`Ratchet::decrypt` commits `ckr`/`nr` before `aead_open` and never rolls back — unauthenticated permanent session DoS) — [file](./phase-2/2.13-ratchet-replay-dos.md)
+- [ ] **2.14** Wire the message-request gate into the P2P session substrate (from 2.10's review; `session connect` currently bypasses the gate entirely) — [file](./phase-2/2.14-p2p-message-request-gate.md)
 
 ---
 

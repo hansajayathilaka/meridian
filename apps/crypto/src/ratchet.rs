@@ -48,6 +48,13 @@ struct Skipped {
 ///
 /// Secret-bearing fields are zeroized on drop. The whole struct is `Serialize`/`Deserialize` for
 /// the encrypted session store — never write it out unsealed.
+///
+/// Deliberately **not** `Clone`: [`aead_seal`]/[`aead_open`] derive both the AEAD key and nonce
+/// solely from the single-use message key `mk`, safe only if each `mk` is consumed exactly once. A
+/// public `Clone` on this type would let any external holder fork a live session and, if either fork
+/// later encrypted or decrypted at the same counter, reuse a key+nonce pair — catastrophic, not
+/// merely availability-degrading (security-reviewer finding on task 2.13). [`Self::decrypt`] instead
+/// stages its mutations via the crate-private [`Self::checkpoint`] below, confined to this module.
 #[derive(Serialize, Deserialize)]
 pub struct DoubleRatchet {
     rk: [u8; 32],
@@ -90,6 +97,31 @@ impl DoubleRatchet {
         self.nhkr.zeroize();
         for s in &mut self.skipped {
             s.mk.zeroize();
+        }
+    }
+
+    /// Field-for-field copy, crate-module-private on purpose (see the struct's doc comment on why
+    /// `DoubleRatchet` does not implement the public `Clone` trait). Used exclusively by
+    /// [`Self::decrypt`] to stage mutations before authentication succeeds. The returned copy is
+    /// either committed back into the live session (`*self = scratch`) or dropped — either way it
+    /// goes through the same [`Drop`]/zeroization path as any other `DoubleRatchet`.
+    fn checkpoint(&self) -> Self {
+        Self {
+            rk: self.rk,
+            dhs_priv: self.dhs_priv,
+            dhs_pub: self.dhs_pub,
+            dhr: self.dhr,
+            cks: self.cks,
+            ckr: self.ckr,
+            ns: self.ns,
+            nr: self.nr,
+            pn: self.pn,
+            hks: self.hks,
+            hkr: self.hkr,
+            nhks: self.nhks,
+            nhkr: self.nhkr,
+            skipped: self.skipped.clone(),
+            ad: self.ad.clone(),
         }
     }
 }
@@ -209,6 +241,15 @@ impl DoubleRatchet {
 
     /// Ratchet-decrypt a framed ratchet message, advancing the ratchet (DH step / skipped keys) as
     /// needed. Out-of-order and lost messages are handled via retained skipped keys.
+    ///
+    /// **Failure-atomic** per the Double Ratchet spec's "discard changes to the state object on
+    /// failure": every mutation this call would make — the receiving-chain advance (`ckr`/`nr`),
+    /// a DH-ratchet step, and any `skipped` entries populated while catching up to `n` — happens on
+    /// a private [`Self::checkpoint`] of `self` and is committed back only after `aead_open` actually
+    /// succeeds. A failed decrypt (bad ciphertext, or a byte-identical replay re-deriving a chain key
+    /// that no longer matches) therefore leaves `self` byte-for-byte as it was, so a duplicate or
+    /// forged envelope degrades exactly the one message instead of permanently wedging the chain
+    /// against the sender (task 2.13).
     pub fn decrypt(&mut self, message: &[u8]) -> Result<Vec<u8>> {
         let (enc_header, ct) = unframe(message).ok_or(CryptoError::Malformed)?;
 
@@ -219,19 +260,28 @@ impl DoubleRatchet {
         let (header, is_dh_ratchet) = self.decrypt_header(enc_header)?;
         let (dh_pub, pn, n) = header;
 
+        // From here on every mutation lands on `scratch`, not `self` — see the doc comment above.
+        let mut scratch = self.checkpoint();
+
         if is_dh_ratchet {
-            self.skip_message_keys(pn)?;
-            self.dh_ratchet(dh_pub);
+            scratch.skip_message_keys(pn)?;
+            scratch.dh_ratchet(dh_pub);
         }
-        self.skip_message_keys(n)?;
+        scratch.skip_message_keys(n)?;
 
-        let ckr = self.ckr.ok_or(CryptoError::UndecryptableHeader)?;
+        let ckr = scratch.ckr.ok_or(CryptoError::UndecryptableHeader)?;
         let (next_ck, mk) = kdf_ck(&ckr);
-        self.ckr = Some(next_ck);
-        self.nr += 1;
+        scratch.ckr = Some(next_ck);
+        scratch.nr += 1;
 
-        let aad = self.message_aad(enc_header);
-        aead_open(&mk, ct, &aad)
+        let aad = scratch.message_aad(enc_header);
+        let pt = aead_open(&mk, ct, &aad)?;
+
+        // Only now, with authentication proven, does the advanced state become real. `scratch`'s
+        // predecessor (the old `self`) is dropped in place by this assignment, which zeroizes its
+        // secrets exactly as `Drop` normally would.
+        *self = scratch;
+        Ok(pt)
     }
 
     /// The peer's identity keys as bound at X3DH (`IK_initiator ‖ IK_responder`) — surfaced so the

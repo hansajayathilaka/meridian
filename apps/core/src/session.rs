@@ -21,9 +21,12 @@
 //!
 //! One honest residual that test surfaced: the *responder* rejects a rewritten offer immediately,
 //! but the **dialer** then waits indefinitely for an answer that never comes — a hostile relay can
-//! hang it with no diagnostic. Fail-closed (no session, nothing downgraded) and squarely inside
-//! threat-model goal 6's conceded "a malicious server can deny service", but poor diagnostics. Not
-//! fixed in 1.28, whose scope is adversarial test infrastructure; see that task's file.
+//! hang it with no diagnostic, and the same hang is reachable with no adversary at all (a peer that
+//! is simply offline). Fail-closed (no session, nothing downgraded) and squarely inside threat-model
+//! goal 6's conceded "a malicious server can deny service", but poor diagnostics. Not fixed in 1.28,
+//! whose scope is adversarial test infrastructure — bounded in 1.33 (see [`recv_sdp`] and
+//! [`SessionError::AnswerTimeout`]), mirroring the [`Transport::selected_path`] bounded wait this
+//! same module already relied on.
 //!
 //! ## Transport independence
 //! Once connected, chat and ctrl ride data channels peer-to-peer; the relay is only used for
@@ -33,7 +36,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use meridian_envelope::ctrl::ChanCfgWire;
 use meridian_envelope::{ChatContent, CtrlFrame, MessageId, SignalContent, StreamAdvert};
@@ -54,6 +57,37 @@ pub const CTRL_LABEL: &str = "mrd.ctrl/1";
 pub const CHAT_LABEL: &str = "mrd.chat/1";
 const CTRL_SID: u64 = 0;
 const CHAT_SID: u64 = 1;
+
+/// (1.33) How long [`dial_established`] will wait for the peer's answer before giving up. Bounds
+/// the *dialer's* wait specifically — the responder's wait for the offer is unchanged (it already
+/// fails fast on a malformed/tampered envelope; see `recv_sdp`'s `chat.open_bytes` call).
+///
+/// Mirrors [`Transport::selected_path`]'s own bounded wait (see its call sites' comments below) in
+/// mechanism and spirit rather than inventing a new one: without a bound here, a peer that never
+/// answers — offline, or a hostile relay that lets the responder reject without ever producing an
+/// answer (1.28's adversarial relay-rewrite test) — hangs `dial` forever with no diagnostic, holding
+/// a live transport session/ICE agent/UDP sockets the whole time.
+///
+/// **This bound sits downstream of, not alongside, the responder's own ICE-gather bound — it must
+/// exceed it, not undercut it.** Trickle ICE isn't supported yet (inbound `IceTrickle` envelopes are
+/// ignored pre-connection), so both sides gather their *full* candidate set before sealing and
+/// sending SDP. On the real WebRTC backend that gather is itself bounded at up to 20s
+/// (`GATHER_TIMEOUT` in `apps/transport/src/webrtc_backend.rs`, deliberately generous because real
+/// STUN/TURN round trips legitimately take that long). So the wait this constant bounds actually
+/// covers: relay latency (offer) + responder session setup + the responder's own up-to-~20s gather +
+/// relay latency (answer) — a value anywhere near that inner 20s bound would spuriously abort a
+/// handshake that was proceeding correctly on an honest-but-slow peer, reintroducing for that case
+/// exactly the failure mode this task exists to fix for the adversarial one. 30s gives that full
+/// chain room plus margin for two relay hops. The exact value is still a tuning knob, not a security
+/// boundary — firing early only costs a spurious `AnswerTimeout` on an unusually slow-but-honest
+/// peer, never a weaker session (fail-closed is unaffected either way).
+///
+/// Note for the record (not a new invariant): by the time `dial` reaches this wait, X3DH has already
+/// consumed one of the peer's one-time prekeys from the fetched bundle. A hostile relay that repeats
+/// this rewrite-and-drop pattern on every dial attempt is therefore an OTK-depletion amplifier — the
+/// server-side per-source bound on OTK issuance (§3.5) already caps that, so this is not a new hole,
+/// just worth being on record now that the failure mode is diagnosable instead of silent.
+pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Errors from the P2P substrate.
 #[derive(Debug, thiserror::Error)]
@@ -97,6 +131,13 @@ pub enum SessionError {
     /// construction alone to have honored the policy.
     #[error("relay-only violated: observed non-relay candidate ({candidate})")]
     RelayOnlyViolation { candidate: String },
+    /// (1.33) The dialer's bounded wait (see [`ANSWER_TIMEOUT`]) for the peer's answer expired. The
+    /// connection is torn down when this fires (no session, never a degraded one) — distinguishable
+    /// from `Chat(ChatError::BadSignature)` (tampering detected) and from `Relay`/`SignalingEnded`
+    /// (the relay itself misbehaved/vanished): this specifically means "the peer never answered",
+    /// whether because it's offline or because a hostile relay silently dropped/rewrote the offer.
+    #[error("timed out after {0:?} waiting for the peer's answer")]
+    AnswerTimeout(Duration),
 }
 
 /// A signaling carrier for the offer/answer/ICE exchange — the rendezvous relay in production, an
@@ -799,9 +840,20 @@ async fn dial_established<T: Transport>(
     let blob = chat.seal_bytes(store, handle, &our_ik, &peer_ik, &offer_content.encode()?)?;
     relay.send(&peer_ik, blob).await?;
 
-    // Await the answer.
-    let (answer_sdp, asserted_fp, answer_ice) =
-        recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, false).await?;
+    // Await the answer, bounded (1.33 — see `ANSWER_TIMEOUT`'s doc for the full rationale): an
+    // offline peer, or a hostile relay that lets the responder reject without ever producing an
+    // answer, must not hang `dial` forever. On timeout the connection is closed by our caller
+    // (`dial_with_config`'s catch-all `Err(e)` arm), the same cleanup path every other failure here
+    // already goes through — no session leaks, and this is never a degraded session, just no session.
+    let (answer_sdp, asserted_fp, answer_ice) = match tokio::time::timeout(
+        ANSWER_TIMEOUT,
+        recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, false),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => return Err(SessionError::AnswerTimeout(ANSWER_TIMEOUT)),
+    };
     transport
         .set_remote_description(&conn, Sdp(answer_sdp))
         .await?;

@@ -50,8 +50,30 @@ async fn main() {
 
     let bind = config.server.bind.clone();
     let domain = config.server.domain.clone();
+    let federation_enabled = config.federation.enabled;
+    let federation_bind = config.federation.bind.clone();
     let store = default_store(&config).await;
     let state = AppState::new(config, store);
+
+    // Server-to-server federation listener (task 2.7, ADR 0017 C7: TLS terminates in-process,
+    // never a proxy/VIP — a separate accept loop from the c2s WSS listener below). Bound
+    // synchronously, before the c2s listener, and fatal on failure — the same posture as
+    // `Config::load` and the c2s bind just below (threat-model goal 6, "never silently weaker"):
+    // an operator who explicitly enabled federation and gets a bind failure (bad cert/key/CA
+    // material, a port conflict) must see a server that refuses to start, not one that boots
+    // "successfully," serves c2s normally, and silently never federates — discoverable only by
+    // grepping stderr (architect finding, task 2.7). Once bound, the accept loop itself runs in
+    // the background; a link-level error on one connection there is not fatal (a single hostile
+    // or dropped peer must not take down the whole listener — see `run_federation`'s doc comment).
+    if federation_enabled {
+        let listener = meridian_rendezvous::federation::inbound::bind_federation(&state)
+            .await
+            .unwrap_or_else(|e| panic!("federation: bind {federation_bind}: {e}"));
+        let fed_state = state.clone();
+        tokio::spawn(async move {
+            meridian_rendezvous::federation::inbound::run_federation(listener, fed_state).await;
+        });
+    }
 
     let listener = tokio::net::TcpListener::bind(&bind)
         .await

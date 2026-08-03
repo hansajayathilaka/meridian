@@ -10,7 +10,10 @@
 //!     *outer* routing cannot read or forge it (an active relay-rewrite attack against a real
 //!     backend is not yet exercised here — tracked for 1.28, flagged during 1.23's split);
 //!   * **capability exchange rejects unknown mandatory stream types gracefully**;
-//!   * **ICE restart** on a network change keeps the session and ratchet alive (<5 s, invariant 5).
+//!   * **ICE restart** on a network change keeps the session and ratchet alive (<5 s, invariant 5);
+//!   * (1.33) the dialer's wait for an answer is **bounded**: a peer that never answers (offline, or
+//!     a hostile relay that lets the responder reject without ever producing one — 1.28) times out
+//!     with a distinct, diagnosable `SessionError::AnswerTimeout` rather than hanging forever.
 
 use std::sync::Arc;
 
@@ -260,6 +263,72 @@ async fn fingerprint_mismatch_tears_down() {
     }
 }
 
+/// 1.33: `recv_sdp`'s wait for the answer is bounded. Reproduces the reachable-with-no-adversary
+/// case named in the task — a peer that simply never answers — with the minimum setup that proves
+/// it: only Bob's *receiving* half of the relay pair exists; nothing ever sends a reply down it, so
+/// `dial`'s wait for an answer would hang forever without 1.33's bound. `answer`/Bob's side is never
+/// even run, which is the point: this isolates the dialer's own bound from any responder behavior
+/// (in scope for 1.33) rather than re-driving the full 1.28 relay-rewrite scenario (out of scope).
+// `start_paused = true`: 1.33 raised `ANSWER_TIMEOUT` to 30s (architect review — it must exceed the
+// responder's own ~20s-bounded ICE gather, not undercut it), which would otherwise make this test
+// really wait 30 real seconds. Tokio's paused virtual clock auto-advances to the next pending timer
+// once every other task is blocked, so `dial`'s internal `tokio::time::timeout(ANSWER_TIMEOUT, ..)`
+// still fires for real, just without the test burning 30 real seconds. `tokio::time::Instant` (not
+// `std::time::Instant`) is used for the elapsed-time assertions below so they measure the same
+// virtual clock the timeout itself runs on.
+#[tokio::test(start_paused = true)]
+async fn dial_times_out_when_the_peer_never_answers() {
+    let mut alice = Peer::new("dialer");
+    let mut bob = Peer::new("silent");
+    establish_ratchet(&mut alice, &mut bob);
+
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(LoopbackTransport::new(fabric));
+    let registry = Arc::new(StreamRegistry::with_builtins());
+
+    // `relay_a` can send (Bob's queue just accumulates, undrained) but nothing ever writes back
+    // into it, so `relay_a.recv()` — what `recv_sdp` awaits — never resolves on its own.
+    let (mut relay_a, _relay_b_unused) = MemRelay::pair(alice.ik(), bob.ik());
+
+    let start = tokio::time::Instant::now();
+    let result = dial(
+        ta,
+        &alice.store,
+        &alice.handle(),
+        alice.ik(),
+        bob.ik(),
+        &mut alice.chat,
+        &mut relay_a,
+        registry,
+    )
+    .await;
+    let elapsed = start.elapsed();
+
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("dial must not succeed when the peer never answers"),
+    };
+    // Distinguishable from tampering (`Chat(ChatError::BadSignature)`) and every other
+    // `SessionError` variant — that's the whole diagnosability point of this task.
+    assert!(
+        matches!(err, SessionError::AnswerTimeout(_)),
+        "expected SessionError::AnswerTimeout, got a different variant: {err}"
+    );
+    // Actually bounded — waited out (approximately) the configured window, not an unrelated
+    // near-instant failure that would make the "distinct variant" assertion above vacuous.
+    assert!(
+        elapsed >= meridian_core::session::ANSWER_TIMEOUT,
+        "returned after {elapsed:?}, before the {:?} bound elapsed",
+        meridian_core::session::ANSWER_TIMEOUT
+    );
+    assert!(
+        elapsed < meridian_core::session::ANSWER_TIMEOUT + std::time::Duration::from_secs(5),
+        "returned after {elapsed:?}, far past the configured {:?} bound — some other, much longer \
+         wait fired instead of the answer-timeout",
+        meridian_core::session::ANSWER_TIMEOUT
+    );
+}
+
 // TODO(1.28, flagged during 1.23's split): replace with an active relay-rewrite attack
 // test once the real transport backend lands.
 #[tokio::test]
@@ -296,6 +365,57 @@ async fn relay_path_connects_healthily() {
     let (b_local, b_remote) = bsess.fingerprints();
     assert_eq!(a_local, b_remote);
     assert_eq!(b_local, a_remote);
+}
+
+/// (2.10 follow-up, tracked as 2.14) Pins TODAY's actual, known-gap behavior: a first-ever P2P
+/// session's chat content is delivered ungated, unlike the relay/mailbox path task 2.10 gates via
+/// `ChatState::open_inbound`. By the time `dial`/`answer` can run at all, the crypto session for the
+/// peer must already exist (`establish_ratchet`, mirroring the real flow where X3DH completes before
+/// `session_connect` dials) — so `ChatState`'s "is this a first contact" check is already `false`
+/// before any chat content ever reaches `pump`'s `open_inbound` call. This is not a security
+/// assertion — it's a regression pin, so a future change to `session.rs` (e.g. task 2.14 wiring a
+/// gate into this path) changes this test's expectation deliberately, not silently. See
+/// `docs/tasks/phase-2/2.14-p2p-message-request-gate.md` and the doc comment on
+/// `ChatState::open_inbound` (`apps/core/src/chat.rs`) for the full context.
+#[tokio::test]
+async fn p2p_first_chat_content_is_not_yet_gated_known_gap_tracked_as_2_14() {
+    let mut alice = Peer::new("chat.a");
+    let mut bob = Peer::new("chat.b");
+    establish_ratchet(&mut alice, &mut bob);
+
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(LoopbackTransport::new(fabric.clone()));
+    let tb = Arc::new(LoopbackTransport::new(fabric.clone()));
+
+    let (ra, rb) = connect(
+        ta,
+        tb,
+        &mut alice,
+        &mut bob,
+        Arc::new(StreamRegistry::with_builtins()),
+        Arc::new(StreamRegistry::with_builtins()),
+    )
+    .await;
+    let mut asess = ra.expect("established");
+    let mut bsess = rb.expect("established");
+
+    let ahandle = alice.handle();
+    let bhandle = bob.handle();
+    asess
+        .send_chat(&alice.store, &ahandle, &mut alice.chat, "hello over p2p")
+        .await
+        .unwrap();
+
+    // If this starts failing with Err(SessionError::Chat(ChatError::MessageRequest)) instead of
+    // delivering, that means 2.14 landed and gated this path — update this test to assert the gate
+    // fires and accept/reject before content delivery, matching apps/core/tests/message_request_gate.rs's
+    // pattern, rather than loosening this assertion.
+    match bsess.pump(&bob.store, &bhandle, &mut bob.chat).await {
+        Ok(Some(SessionEvent::Chat(ChatContent::Text { body, .. }))) => {
+            assert_eq!(body, "hello over p2p");
+        }
+        other => panic!("expected ungated delivery (today's known gap, 2.14), got {other:?}"),
+    }
 }
 
 #[tokio::test]

@@ -15,6 +15,7 @@ pub struct Config {
     pub server: Server,
     pub limits: Limits,
     pub turn: Turn,
+    pub federation: Federation,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -130,6 +131,177 @@ impl Turn {
     }
 }
 
+/// Server↔server (s2s) federation link config (task 2.4, ADR 0017) plus discovery config (task
+/// 2.5, ADR 0002). Every field defaults fail-closed: `enabled = false` means federation is
+/// entirely inert (no listener bound, no dialing, no DNS lookup) until an operator explicitly opts
+/// in and supplies real cert/key/CA material — there is no default cert/key path that could
+/// accidentally "just work" with a placeholder identity, and no default discovery behavior that
+/// could accidentally make a DNS query the operator didn't ask for.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct Federation {
+    /// Master switch. `false` ⇒ no federation listener is bound, no outbound federation dial is
+    /// ever attempted, and no discovery lookup (SRV or static-map) is ever performed, regardless
+    /// of any other field below (fail-closed default).
+    pub enabled: bool,
+    /// Address to bind the s2s mTLS listener. TLS terminates **in-process** here — never at a
+    /// proxy/VIP upstream (ADR 0017 C7), unlike the c2s WSS listener (ADR 0008).
+    pub bind: String,
+    /// PEM path: this server's own federation identity certificate (leaf, optionally with an
+    /// intermediate chain), presented as both the mTLS server cert (accepting inbound links) and
+    /// the mTLS client cert (dialing outbound links) — one federation identity per org.
+    pub cert_path: String,
+    /// PEM path: the private key matching `cert_path`. Never committed; provisioned out of band.
+    pub key_path: String,
+    /// PEM path: a private-CA trust bundle. Empty ⇒ **WebPKI mode** (validate peer certs against
+    /// the OS/system trust store). Non-empty ⇒ **private-CA / air-gap mode**: trust *only* the CAs
+    /// in this bundle — never silently fall back to the system store (ADR 0017 (a)/C3/C4; the
+    /// whole air-gap trust model depends on this being an exclusive, not additive, trust root).
+    pub ca_bundle_path: String,
+    /// Discovery mode (task 2.5, [`federation::discovery`](crate::federation::discovery)):
+    /// `"static"` resolves partner domains exclusively through `map_path`'s `federation_map.toml`
+    /// (no DNS involved at all — the air-gap mode); `"srv"` resolves them via
+    /// `_meridian-fed._tcp.<domain>` DNS SRV records, refusing (never falling back to A/AAAA) when
+    /// no SRV record exists. Defaults to `"static"`: the fail-closed choice, since it is the mode
+    /// that can never *originate* a DNS query on its own — an operator who wants SRV must opt in
+    /// explicitly, mirroring `ca_bundle_path`'s "empty means don't do the riskier/networked thing
+    /// by default" posture.
+    pub discovery: DiscoveryMode,
+    /// Path to `federation_map.toml`, read by [`crate::federation::discovery::StaticMap`] when
+    /// `discovery = "static"`. Empty by default (no path that could accidentally load a stray file
+    /// of the conventional name); ignored when `discovery = "srv"`.
+    pub map_path: String,
+    /// Admission policy (task 2.6, [`crate::federation::policy::FederationPolicy`]): `open`
+    /// federates with any origin domain, `allowlist` only with the exact domains in
+    /// [`Federation::allowlist`], `closed` with nobody. Defaults to `closed` — the most
+    /// restrictive option, not `open` — matching this struct's existing fail-closed convention:
+    /// federation is a brand-new, untrusted-by-default surface, and an operator must explicitly
+    /// widen it rather than have it default open.
+    pub policy: FederationPolicyMode,
+    /// Exact-match domain allowlist consulted when `policy = "allowlist"`; ignored otherwise
+    /// (including when `policy = "closed"` — the allowlist does not widen a closed policy, see
+    /// [`crate::federation::policy::FederationPolicy::admit`]). Matching is case-insensitive exact
+    /// match only, never substring/suffix — `evil-org-b.test` does not match an allowlisted
+    /// `org-b.test`.
+    pub allowlist: Vec<String>,
+    /// Per-origin-server budget for prekey-fetch requests (task 2.7), fixed one-minute window. See
+    /// [`Federation::default`] for the chosen starting value and its reasoning.
+    pub fed_fetch_per_origin_per_min: u32,
+    /// Per-origin-server budget for route-reachability requests (task 2.8), fixed one-minute
+    /// window. See [`Federation::default`] for the chosen starting value and its reasoning.
+    pub fed_route_per_origin_per_min: u32,
+    /// Per-`(origin_domain, origin_account)` budget, shared across both fetch and route requests
+    /// (task 2.6/2.7/2.8), fixed one-minute window. The `origin_account` half of this key is
+    /// self-asserted by the partner server and not independently verifiable by us (ADR 0017) — see
+    /// [`crate::federation::policy`]'s module doc for why that is accepted, not a gap this field
+    /// closes. See [`Federation::default`] for the chosen starting value and its reasoning.
+    pub fed_per_origin_account_per_min: u32,
+}
+
+/// Federation admission policy mode (task 2.6). See [`Federation::policy`]. Kept as its own
+/// `Deserialize`-able enum, distinct from
+/// [`crate::federation::policy::FederationPolicy`] (which additionally carries the allowlist set
+/// itself, and has no `Deserialize` impl) — mirrors this module's existing `Turn`/`TurnConfig`
+/// split: config owns parsing, the domain module owns the runtime type built from it (see
+/// [`Federation::to_policy`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FederationPolicyMode {
+    Open,
+    Allowlist,
+    Closed,
+}
+
+/// Federation discovery mode (task 2.5, ADR 0002 "DNS-SRV/static-map discovery"). See
+/// [`Federation::discovery`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiscoveryMode {
+    /// `federation_map.toml` only — no DNS lookup is ever made (air-gap mode).
+    Static,
+    /// `_meridian-fed._tcp.<domain>` DNS SRV records; refuses (fails closed) if none exist.
+    Srv,
+}
+
+impl Default for Federation {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // Federation (s2s mTLS) default port: adjacent to, but distinct from, the c2s WSS
+            // default (8443) — TODO: confirm was resolved by picking 8444 (next integer) so both
+            // listeners can run on the same host with no config edit and no ambiguity about which
+            // port is which. Not an IANA-registered service port as of this writing; operators are
+            // free to override via `federation.bind` / `MERIDIAN_RENDEZVOUS_FEDERATION__BIND`.
+            bind: "127.0.0.1:8444".into(),
+            cert_path: String::new(),
+            key_path: String::new(),
+            ca_bundle_path: String::new(),
+            discovery: DiscoveryMode::Static,
+            map_path: String::new(),
+            // Fail-closed default: federate with nobody until an operator opts in, same posture
+            // as `enabled`/`cert_path`/`ca_bundle_path` above.
+            policy: FederationPolicyMode::Closed,
+            allowlist: Vec::new(),
+            // `TODO: confirm` (task 2.6): default federation rate-limit values. monitoring.md
+            // records these as unspecified in the source documents; picked here, conservatively,
+            // as a new and untrusted-by-default surface (ADR 0002: abuse handled bilaterally, not
+            // centrally — these are this server's own first line of defense against a misbehaving
+            // or compromised partner, not a substitute for that bilateral relationship).
+            //
+            // Reasoning, relative to the existing local per-account defaults just above
+            // (`Limits::default`: fetch_per_account_per_min = 120, route_per_account_per_min =
+            // 600 — generous, anti-enumeration budgets for one cryptographically authenticated
+            // local account):
+            // - `fed_fetch_per_origin_per_min = 300`: a partner ORIGIN aggregates fetch traffic
+            //   from potentially many local accounts on its side, so its whole-origin budget is
+            //   set above a single local account's fetch budget (2.5x) — enough headroom for a
+            //   handful of legitimate simultaneous fetches from a real partner org (ADR 0002's
+            //   primary deployment shape is 2-200 small-to-medium orgs, not one huge origin), while
+            //   still bounding the worst case a single malicious/compromised partner can impose.
+            // - `fed_route_per_origin_per_min = 600`: message routing is the highest-volume
+            //   ordinary traffic type, so the whole-origin budget matches (not multiplies) the
+            //   local per-account route budget — low enough to err conservative on a new surface,
+            //   high enough that ordinary cross-org chat between a few users doesn't trip it.
+            // - `fed_per_origin_account_per_min = 30`: the `origin_account` half of this key is
+            //   self-asserted by the partner server, not verified by us (ADR 0017 — see
+            //   `federation::policy`'s module doc), so it is deliberately the most conservative of
+            //   the three — a quarter of the local per-account fetch budget and a twentieth of the
+            //   local per-account route budget — so that no single claimed remote account can eat
+            //   more than a modest slice of its origin's own budget above.
+            // Operators can raise all three; the failure mode of picking too low is a false-closed
+            // rejection an operator notices and raises, not a silent abuse hole.
+            fed_fetch_per_origin_per_min: 300,
+            fed_route_per_origin_per_min: 600,
+            fed_per_origin_account_per_min: 30,
+        }
+    }
+}
+
+impl Federation {
+    /// Build the [`crate::federation::policy::FederationPolicy`] this config describes. Kept here
+    /// (config assembly), not in `federation::policy`, so that module stays free of any dependency
+    /// on `crate::config` beyond what its caller hands it explicitly — mirrors
+    /// `Turn::to_turn_config`'s existing split in this same file.
+    pub fn to_policy(&self) -> crate::federation::policy::FederationPolicy {
+        match self.policy {
+            FederationPolicyMode::Open => crate::federation::policy::FederationPolicy::Open,
+            FederationPolicyMode::Closed => crate::federation::policy::FederationPolicy::Closed,
+            FederationPolicyMode::Allowlist => {
+                crate::federation::policy::FederationPolicy::allowlist(&self.allowlist)
+            }
+        }
+    }
+
+    /// Build the [`crate::federation::policy::FederationLimits`] this config describes.
+    pub fn to_limits(&self) -> crate::federation::policy::FederationLimits {
+        crate::federation::policy::FederationLimits::new(
+            self.fed_fetch_per_origin_per_min,
+            self.fed_route_per_origin_per_min,
+            self.fed_per_origin_account_per_min,
+        )
+    }
+}
+
 impl Default for Server {
     fn default() -> Self {
         Self {
@@ -202,10 +374,47 @@ impl Config {
                 figment = figment.merge(Toml::file(DEFAULT_CONFIG_PATH));
             }
         }
-        figment
+        let config: Self = figment
             .merge(Env::prefixed("MERIDIAN_RENDEZVOUS_").split("__"))
             .extract()
-            .map_err(Box::new)
+            .map_err(Box::new)?;
+        config.validate().map_err(|e| Box::new(e.into()))?;
+        Ok(config)
+    }
+
+    /// Cross-field fail-closed checks that a single field's `Deserialize` impl can't express.
+    fn validate(&self) -> Result<(), String> {
+        self.federation.validate()
+    }
+}
+
+impl Federation {
+    /// Reject configuration combinations that are individually valid per-field but collapse a
+    /// security invariant when combined.
+    ///
+    /// `discovery = "srv"` together with a non-empty `ca_bundle_path` (private-CA/air-gap mode)
+    /// is exactly that: SRV-resolved [`crate::federation::discovery::Endpoint`]s always carry
+    /// `pinned_identity: None` (SRV is unauthenticated discovery only, by design — ADR 0017
+    /// (a)), so under private-CA mode the trust check would collapse to "chains to the shared
+    /// CA + SAN matches the self-asserted DNS hint domain" — the impersonation hole ADR 0017
+    /// (a)'s rejected "Option A" describes: any org enrolled under that CA could present a valid
+    /// cert and be accepted as any other org. Rejected here, at config-load time, rather than
+    /// left for the dial path to discover at runtime.
+    fn validate(&self) -> Result<(), String> {
+        if self.discovery == DiscoveryMode::Srv && !self.ca_bundle_path.is_empty() {
+            return Err(
+                "federation.discovery = \"srv\" is incompatible with a non-empty \
+                 federation.ca_bundle_path (private-CA/air-gap mode): SRV-resolved endpoints \
+                 never carry a pinned_identity (SRV is unauthenticated discovery only, ADR 0017 \
+                 (a)), so combining the two collapses private-CA trust to an unpinned DNS-hint \
+                 check — the impersonation hole ADR 0017 (a) rejects. Use \
+                 federation.discovery = \"static\" (federation_map.toml, which mandates a \
+                 pinned_identity per partner) with a private CA, or clear ca_bundle_path to run \
+                 SRV discovery in WebPKI mode."
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -371,6 +580,194 @@ mod tests {
             malformed.is_err(),
             "malformed implicit rendezvous.toml must now be fatal"
         );
+    }
+
+    #[test]
+    fn federation_defaults_to_disabled_with_no_cert_material() {
+        // Fail-closed: federation must be entirely inert until an operator opts in.
+        let f = Federation::default();
+        assert!(!f.enabled);
+        assert!(f.cert_path.is_empty());
+        assert!(f.key_path.is_empty());
+        assert!(f.ca_bundle_path.is_empty());
+        // Discovery defaults to `static`, the mode that can never originate a DNS query on its
+        // own (task 2.5) — mirrors `ca_bundle_path`'s "empty means don't do the networked thing
+        // by default" posture.
+        assert_eq!(f.discovery, DiscoveryMode::Static);
+        assert!(f.map_path.is_empty());
+        // Task 2.6: policy defaults to the most restrictive option (`closed`), not `open`.
+        assert_eq!(f.policy, FederationPolicyMode::Closed);
+        assert!(f.allowlist.is_empty());
+
+        let config = Config::from_toml_str("").unwrap();
+        assert!(!config.federation.enabled);
+        assert_eq!(config.federation.discovery, DiscoveryMode::Static);
+        assert_eq!(config.federation.policy, FederationPolicyMode::Closed);
+    }
+
+    #[test]
+    fn federation_policy_env_overrides_apply() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[
+                ("MERIDIAN_RENDEZVOUS_FEDERATION__POLICY", "allowlist"),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__ALLOWLIST",
+                    r#"["org-a.test","org-b.test"]"#,
+                ),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__FED_FETCH_PER_ORIGIN_PER_MIN",
+                    "10",
+                ),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__FED_ROUTE_PER_ORIGIN_PER_MIN",
+                    "20",
+                ),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__FED_PER_ORIGIN_ACCOUNT_PER_MIN",
+                    "5",
+                ),
+            ],
+        );
+        let file = write_toml("");
+
+        let config = Config::load(Some(file.path().to_str().unwrap())).unwrap();
+
+        assert_eq!(config.federation.policy, FederationPolicyMode::Allowlist);
+        assert_eq!(
+            config.federation.allowlist,
+            vec!["org-a.test", "org-b.test"]
+        );
+        assert_eq!(config.federation.fed_fetch_per_origin_per_min, 10);
+        assert_eq!(config.federation.fed_route_per_origin_per_min, 20);
+        assert_eq!(config.federation.fed_per_origin_account_per_min, 5);
+    }
+
+    #[test]
+    fn federation_policy_rejects_unknown_mode_fail_closed() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[("MERIDIAN_RENDEZVOUS_FEDERATION__POLICY", "mostly-open")],
+        );
+        let file = write_toml("");
+
+        assert!(Config::load(Some(file.path().to_str().unwrap())).is_err());
+    }
+
+    #[test]
+    fn federation_discovery_env_overrides_apply() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[
+                ("MERIDIAN_RENDEZVOUS_FEDERATION__DISCOVERY", "srv"),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__MAP_PATH",
+                    "/etc/meridian/federation_map.toml",
+                ),
+            ],
+        );
+        let file = write_toml("");
+
+        let config = Config::load(Some(file.path().to_str().unwrap())).unwrap();
+
+        assert_eq!(config.federation.discovery, DiscoveryMode::Srv);
+        assert_eq!(
+            config.federation.map_path,
+            "/etc/meridian/federation_map.toml"
+        );
+    }
+
+    #[test]
+    fn federation_discovery_rejects_unknown_mode_fail_closed() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[(
+                "MERIDIAN_RENDEZVOUS_FEDERATION__DISCOVERY",
+                "dns-over-carrier-pigeon",
+            )],
+        );
+        let file = write_toml("");
+
+        assert!(Config::load(Some(file.path().to_str().unwrap())).is_err());
+    }
+
+    #[test]
+    fn federation_env_overrides_apply() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[
+                ("MERIDIAN_RENDEZVOUS_FEDERATION__ENABLED", "true"),
+                ("MERIDIAN_RENDEZVOUS_FEDERATION__BIND", "0.0.0.0:8444"),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__CERT_PATH",
+                    "/etc/meridian/fed.crt",
+                ),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__KEY_PATH",
+                    "/etc/meridian/fed.key",
+                ),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__CA_BUNDLE_PATH",
+                    "/etc/meridian/fed-ca.pem",
+                ),
+            ],
+        );
+        let file = write_toml("");
+
+        let config = Config::load(Some(file.path().to_str().unwrap())).unwrap();
+
+        assert!(config.federation.enabled);
+        assert_eq!(config.federation.bind, "0.0.0.0:8444");
+        assert_eq!(config.federation.cert_path, "/etc/meridian/fed.crt");
+        assert_eq!(config.federation.key_path, "/etc/meridian/fed.key");
+        assert_eq!(config.federation.ca_bundle_path, "/etc/meridian/fed-ca.pem");
+    }
+
+    #[test]
+    fn discovery_srv_with_private_ca_bundle_rejected_at_config_load() {
+        // Security-reviewer HIGH finding on task 2.5: `discovery = "srv"` combined with a
+        // non-empty `ca_bundle_path` (private-CA/air-gap mode) must fail closed at config-load
+        // time — SRV-resolved endpoints never carry a `pinned_identity`, so this combination
+        // would otherwise collapse private-CA trust to an unpinned DNS-hint check (ADR 0017
+        // (a)'s rejected "Option A" impersonation hole).
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml(
+            "[federation]\ndiscovery = \"srv\"\nca_bundle_path = \"/etc/meridian/fed-ca.pem\"\n",
+        );
+
+        let err = Config::load(Some(file.path().to_str().unwrap()))
+            .expect_err("srv discovery + private CA bundle must be rejected, not silently loaded");
+
+        assert!(err.to_string().contains("ca_bundle_path"));
+    }
+
+    #[test]
+    fn discovery_srv_without_ca_bundle_is_accepted() {
+        // The rejected combination is specifically SRV + private CA — plain SRV discovery in
+        // WebPKI mode (the common case) must still load cleanly.
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[federation]\ndiscovery = \"srv\"\n");
+
+        let config = Config::load(Some(file.path().to_str().unwrap()))
+            .expect("srv discovery without a private CA bundle must be accepted");
+
+        assert_eq!(config.federation.discovery, DiscoveryMode::Srv);
+    }
+
+    #[test]
+    fn static_discovery_with_private_ca_bundle_is_accepted() {
+        // Private-CA mode is exactly what `discovery = "static"` (federation_map.toml, mandatory
+        // per-partner `pinned_identity`) is designed for — must not be caught by the srv-specific
+        // rejection.
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml(
+            "[federation]\ndiscovery = \"static\"\nca_bundle_path = \"/etc/meridian/fed-ca.pem\"\n",
+        );
+
+        let config = Config::load(Some(file.path().to_str().unwrap()))
+            .expect("static discovery with a private CA bundle must be accepted");
+
+        assert_eq!(config.federation.ca_bundle_path, "/etc/meridian/fed-ca.pem");
     }
 
     #[test]

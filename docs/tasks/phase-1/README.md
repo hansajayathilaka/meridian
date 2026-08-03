@@ -4,7 +4,7 @@
 
 # Phase 1 — Review of Phase 0
 
-**Kind:** review · **Status:** in progress · **Reviews phase(s):** Phase 0 (Features 1–5, T01–T05)
+**Kind:** review · **Status:** done · **Reviews phase(s):** Phase 0 (Features 1–5, T01–T05)
 
 ## Goal
 Sweep everything built in Phase 0 for bugs, gaps, loopholes, and on-the-fly decisions, then close the

@@ -126,7 +126,7 @@ impl Peer {
     async fn start_session_with(&mut self, peer_ik: [u8; 32]) {
         let bundle = self
             .client
-            .fetch_bundle(peer_ik, false)
+            .fetch_bundle(peer_ik, None, false)
             .await
             .expect("fetch peer bundle");
         let ik = self.ik();
@@ -168,6 +168,11 @@ impl Peer {
 
     /// Await the next delivery and try to open it *exactly as a real client would*: with the
     /// routing origin the SERVER claimed, which under `spoof_from` is a lie.
+    ///
+    /// This file exercises routing-layer attacks, not the task-2.10 request-queue UX (see
+    /// `apps/core/tests/message_request_gate.rs` for that): a first contact is transparently
+    /// auto-accepted so a genuine first envelope still reads as `Opened`, matching the pre-2.10
+    /// behaviour every assertion below was written against.
     async fn recv(&mut self) -> Received {
         let deliver = match tokio::time::timeout(DELIVER_TIMEOUT, self.client.next_deliver()).await
         {
@@ -186,6 +191,14 @@ impl Peer {
         );
         match outcome {
             Ok(content) => Received::Opened { content, blob },
+            Err(ChatError::MessageRequest) => {
+                let content = self
+                    .chat
+                    .accept_request(&deliver.from)
+                    .expect("just gated by open_inbound")
+                    .intro;
+                Received::Opened { content, blob }
+            }
             Err(e) => Received::Rejected(e),
         }
     }
@@ -329,23 +342,22 @@ async fn forged_deliver_from_is_rejected_as_sender_mismatch() {
 /// protection has to live; a `SenderMismatch`/`BadSignature` here would mean the duplicate was not
 /// actually byte-identical and the cell is vacuous.
 ///
-/// **UNRESOLVED FINDING — do not read this cell as "replay is fully handled".** It asserts only the
-/// confidentiality/authenticity property (nothing is accepted twice). Measured separately, a single
-/// replay ALSO leaves the receiving ratchet permanently unusable: `Ratchet::decrypt`
-/// (`apps/crypto/src/ratchet.rs`) advances `ckr`/`nr` *before* `aead_open` and does not roll them
-/// back on failure, so after one duplicate every subsequent genuine message from that sender fails
-/// with `Crypto(Crypto)`. That is an unauthenticated, key-material-free, permanent session DoS
-/// mountable by any relay — and it also breaks a benign duplicate delivery. It is a **production**
-/// defect, out of scope for 1.32 (adversarial test infrastructure only), so it is reported rather
-/// than silently fixed or asserted here: asserting today's behaviour would entrench it.
-/// TODO: confirm — pending triage as a production fix (roll back ratchet state on AEAD failure,
-/// per the Double Ratchet spec's "discard changes to the state object") or a recorded residual.
+/// **Session survival (task 2.13).** A single replay must degrade exactly the one duplicate
+/// message, not the session: `DoubleRatchet::decrypt` (`apps/crypto/src/ratchet.rs`) is now
+/// failure-atomic (stages its mutations on a scratch clone and only commits them once `aead_open`
+/// succeeds), so a rejected duplicate leaves `ckr`/`nr` untouched and a genuine subsequent message
+/// from the same sender still opens. Before that fix `ckr`/`nr` were advanced before `aead_open`
+/// ran and never rolled back on failure, permanently wedging the chain one step ahead of the
+/// sender — an unauthenticated, key-material-free, permanent session DoS mountable by any relay
+/// (and by benign duplicate delivery too). See `apps/crypto/tests/ratchet_replay.rs` for the
+/// ratchet-level regression coverage of that property; this cell is the end-to-end proof through a
+/// real relay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replayed_delivery_is_not_accepted_twice() {
     let url = spawn_server(|c| arm_route(c, |s| s.allow_test_route_replay = true));
     let mut alice = Peer::join("replay.a", &url).await;
     let mut bob = Peer::join("replay.b", &url).await;
-    let bob_ik = bob.ik();
+    let (alice_ik, bob_ik) = (alice.ik(), bob.ik());
     alice.start_session_with(bob_ik).await;
 
     let (sent_blob, _) = alice.send(bob_ik, 1, "only once").await;
@@ -379,6 +391,23 @@ async fn replayed_delivery_is_not_accepted_twice() {
              would mean the duplicate was not byte-identical, making this cell vacuous. Got: {other:?}"
         ),
     }
+
+    // SESSION SURVIVAL (task 2.13): the rejected duplicate must not have wedged the ratchet. A
+    // genuine subsequent message from alice must still open normally.
+    assert!(
+        bob.chat.has_session(&alice_ik),
+        "a rejected replay must not tear down the session"
+    );
+    alice.send(bob_ik, 2, "still works").await;
+    let third = bob.recv().await;
+    assert_eq!(
+        third.body(),
+        Some("still works"),
+        "a genuine message after a rejected replay must still decrypt — before task 2.13's fix, \
+         the ratchet's `ckr`/`nr` were left advanced past what the sender actually rides, and every \
+         subsequent genuine message from that sender failed with ChatError::Crypto forever. \
+         Got: {third:?}"
+    );
 }
 
 // -- 3. reorder ---------------------------------------------------------------
@@ -441,10 +470,12 @@ async fn reordered_delivery_is_tolerated_without_forgery() {
     // ...and must not WEDGE the session. The swap leaves msg 1 opened from the skipped-key store —
     // the only cell in this suite that exercises that path — so the receiving chain's head is now
     // ahead of a message that was opened out of band. A SECOND round proves the ratchet recovered
-    // rather than merely survived the two it was handed. This is deliberately pinned here because
-    // the replay cell measured the adjacent NEGATIVE result (see its UNRESOLVED FINDING: one
-    // duplicate permanently poisons the chain), and the contrast is the point — reorder is
-    // tolerated, replay currently is not.
+    // rather than merely survived the two it was handed. This is deliberately pinned here for
+    // contrast with the adjacent replay cell: reorder is a permutation of authentic messages and is
+    // tolerated outright (nothing is ever rejected); replay is a duplicate and its second copy IS
+    // rejected — but (task 2.13) rejecting it no longer wedges the session either, so both cells now
+    // prove "session survives", just via different mechanisms (skipped-key recovery vs. a
+    // failure-atomic `decrypt` that discards its would-be state changes on the rejected copy).
     //
     // It takes a *pair*, not a single message: the mode holds one blob and releases it behind the
     // next, so a lone msg 3 would sit in the hook's buffer and this would assert a hook property,

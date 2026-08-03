@@ -11,6 +11,13 @@ pub struct Metrics {
     connections_active: AtomicI64,
     envelopes_routed_total: AtomicU64,
     turn_credentials_minted_total: AtomicU64,
+    /// Currently-established s2s federation links, aggregate across ALL partners (task 2.4).
+    /// Deliberately **no per-partner label**: a per-partner counter would materialize the
+    /// cross-org contact graph this server talks to, which
+    /// docs/security/anonymity-and-retention.md's must-never list forbids. See that task's report
+    /// for the open security-reviewer question on whether a `peer_domain` label would ever be
+    /// acceptable — until that's answered, this stays a single aggregate gauge.
+    federation_links_up: AtomicI64,
 }
 
 impl Metrics {
@@ -37,6 +44,23 @@ impl Metrics {
 
     pub fn connections_active(&self) -> i64 {
         self.connections_active.load(Ordering::Relaxed)
+    }
+
+    /// Record a newly-established, mutually authenticated federation link (task 2.4). No
+    /// `peer_domain` (or any other per-partner) label — see the field doc on
+    /// [`Self::federation_links_up`].
+    pub fn federation_link_up(&self) {
+        self.federation_links_up.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a federation link going down (peer disconnect, error, or graceful close).
+    pub fn federation_link_down(&self) {
+        self.federation_links_up.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Currently-established federation link count (test hook / direct read).
+    pub fn federation_links_up(&self) -> i64 {
+        self.federation_links_up.load(Ordering::Relaxed)
     }
 
     /// Render the Prometheus text exposition. `prekey_pool_depth` is passed in (read from the
@@ -73,6 +97,14 @@ impl Metrics {
             "counter",
             "Ephemeral TURN credentials minted since start (relay-demand signal, §9.4).",
             turn_minted as i64,
+        );
+        metric(
+            &mut out,
+            "meridian_federation_link_up",
+            "gauge",
+            "Established (mutually authenticated) s2s federation links currently up, aggregate \
+             across all partners — no per-partner label (anonymity-and-retention.md must-never #2).",
+            self.federation_links_up.load(Ordering::Relaxed),
         );
         out
     }

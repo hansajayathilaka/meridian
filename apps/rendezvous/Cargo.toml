@@ -57,6 +57,35 @@ sha2 = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"], optional = true }
 figment = { version = "0.10.19", features = ["toml", "env"] }
 
+# s2s mTLS federation link (task 2.4, ADR 0017 C7): TLS terminates IN-PROCESS via rustls, never at
+# a proxy/VIP — deliberately distinct from the c2s WSS accept path (axum, proxy-terminated per ADR
+# 0008). All non-`meridian-*`, so structurally safe under tools/lint-server-no-core.sh, but this is
+# the PR where the dependency graph changes most (see that lint's --selftest).
+#
+# `default-features = false` + explicit `ring` on both rustls and tokio-rustls: pins a single
+# crypto backend (ring, already resolved elsewhere in this workspace's lock via this crate's own
+# tokio-tungstenite `rustls-tls-native-roots` dev-dependency) instead of also pulling in aws-lc-rs,
+# rustls's own default provider.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# PEM parsing for our own cert/key files and the private-CA bundle, via rustls-pki-types's own
+# `PemObject` trait (re-exported as `rustls::pki_types::pem`) rather than the `rustls-pemfile`
+# crate: the latter is unmaintained (RUSTSEC-2025-0134, no safe upgrade) and is now just a thin
+# wrapper around this same parsing code, which rustls-pki-types has shipped directly since 1.9.0.
+# No separate Cargo.toml entry needed — it's a transitive dependency of `rustls` itself.
+# WebPKI-mode trust root: the OS/system certificate store (ADR 0017 (a) "standard hostname
+# verification against the OS/system trust root"), NOT a build-time-vendored root bundle.
+rustls-native-certs = "0.8"
+# SAN/CN origin-domain extraction from a peer's already-validated leaf certificate (ADR 0017
+# (a)/C3) — rustls's verifier proves chain+hostname match but does not hand back parsed fields.
+x509-parser = "0.18"
+# DNS SRV discovery (task 2.5, ADR 0002): `_meridian-fed._tcp.<domain>` lookups for `SrvDiscovery`.
+# `default-features = false` + explicit `system-config` (read `/etc/resolv.conf`) + `tokio`: no TLS
+# feature (`__tls`/`https-*`/`quic-*`) is enabled — plain DNS only, the same posture as every other
+# primitive dependency here. `StaticMap`, this task's air-gap-mode implementation, does not use
+# this crate (or any resolver type) at all — see `federation::discovery` module docs.
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["system-config", "tokio"] }
+
 [dev-dependencies]
 meridian-signaling = { path = "../signaling" }
 meridian-identity = { path = "../identity" }
@@ -66,3 +95,7 @@ tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
 tempfile = { workspace = true }
+# Mint ephemeral test certs (private CA + leaf) for the mTLS conformance tests (task 2.4). Dev-only
+# per the task's risk note — never linked into the production server binary.
+rcgen = "0.13"
+static_assertions = "1.1.0"

@@ -126,7 +126,7 @@ rather than a normalized schema — *"TODO: confirm normalized schema + Postgres
 
 **Gate — Phase-1 follow-ups that must land first** (they stay numbered under Phase 1)
 - [x] **1.32** Relay attacks that pass the envelope signature check — [file](../phase-1/1.32-relay-attacks-past-signature.md)
-- [ ] **1.33** Bound the dialer's wait for an answer in `recv_sdp` — [file](../phase-1/1.33-bound-answer-wait.md)
+- [x] **1.33** Bound the dialer's wait for an answer in `recv_sdp` — [file](../phase-1/1.33-bound-answer-wait.md)
 
 **Decide before any byte is shaped**
 - [x] **2.1** ADR 0017 — federation trust boundary (peer auth + cross-org `from` attestation) — [file](./2.1-adr-federation-trust-boundary.md)
@@ -136,15 +136,15 @@ rather than a normalized schema — *"TODO: confirm normalized schema + Postgres
 - [x] **2.3** c2s extension for federation (hint fields, error codes, vectors) — [file](./2.3-c2s-federation-extension.md)
 
 **Server spine**
-- [ ] **2.4** s2s mTLS link: listener + dialer (WebPKI and private-CA) — [file](./2.4-s2s-mtls-link.md)
-- [ ] **2.5** Discovery: DNS SRV + `federation_map.toml` static mode — [file](./2.5-federation-discovery.md)
-- [ ] **2.6** Federation policy (`open | allowlist | closed`) + edge rate limits — [file](./2.6-federation-policy-limits.md)
-- [ ] **2.7** Federated prekey fetch, both sides (§3.3 steps 2–4) — [file](./2.7-federated-prekey-fetch.md)
-- [ ] **2.8** Federated envelope forwarding + per-request reachability (§3.3 step 5, §3.4) — [file](./2.8-federated-route-reachability.md)
+- [x] **2.4** s2s mTLS link: listener + dialer (WebPKI and private-CA) — [file](./2.4-s2s-mtls-link.md)
+- [x] **2.5** Discovery: DNS SRV + `federation_map.toml` static mode — [file](./2.5-federation-discovery.md)
+- [x] **2.6** Federation policy (`open | allowlist | closed`) + edge rate limits — [file](./2.6-federation-policy-limits.md)
+- [x] **2.7** Federated prekey fetch, both sides (§3.3 steps 2–4) — [file](./2.7-federated-prekey-fetch.md)
+- [x] **2.8** Federated envelope forwarding + per-request reachability (§3.3 step 5, §3.4) — [file](./2.8-federated-route-reachability.md)
 
 **Client**
 - [ ] **2.9** Client federation error taxonomy: clean `closed` error + stale-hint case — [file](./2.9-client-federation-errors.md)
-- [ ] **2.10** First-contact message-request gate (client-side, §3.5) — [file](./2.10-message-request-gate.md)
+- [x] **2.10** First-contact message-request gate (client-side, §3.5) — [file](./2.10-message-request-gate.md)
 
 **Demo + exit gate**
 - [ ] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./2.11-demo-two-orgs.md)
@@ -154,7 +154,12 @@ rather than a normalized schema — *"TODO: confirm normalized schema + Postgres
 [1.32](../phase-1/1.32-relay-attacks-past-signature.md) and confirmed by its security review: it lands
 here because it needs fixing, not because Feature 06 depends on it. It is independent of every task
 above and can run at any point in the phase.
-- [ ] **2.13** A replayed envelope permanently wedges the receiving ratchet — [file](./2.13-ratchet-replay-dos.md)
+- [x] **2.13** A replayed envelope permanently wedges the receiving ratchet — [file](./2.13-ratchet-replay-dos.md)
+
+**Follow-up surfaced by 2.10's review** — architect + security-reviewer both required this be
+tracked explicitly rather than silently deferred to Feature 08.
+- [ ] **2.14** Wire the message-request gate into the P2P session substrate (`session connect`
+  currently bypasses 2.10's gate entirely) — [file](./2.14-p2p-message-request-gate.md)
 
 ### Dependency order
 ```
