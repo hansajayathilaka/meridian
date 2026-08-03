@@ -400,7 +400,7 @@ cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery 
 
 **Follow-up surfaced by 2.9's review** — architect required a new task rather than folding the fix
 into 2.9 or 2.11.
-- [ ] **2.15** Thread the peer's org hint into live signaling/chat routing (blocks 2.11, 2.12) — [file](./phase-2/2.15-thread-route-hint.md)
+- [~] **2.15** Thread the peer's org hint into live signaling/chat routing (blocks 2.11, 2.12) — [file](./phase-2/2.15-thread-route-hint.md)
 
 **Demo + exit gate**
 - [ ] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./phase-2/2.11-demo-two-orgs.md)
