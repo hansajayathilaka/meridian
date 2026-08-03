@@ -127,12 +127,13 @@ impl SignalingClient {
     ) -> Result<PrekeyBundle> {
         let fetch = Fetch {
             target,
-            hint,
+            hint: hint.clone(),
             tamper,
         };
         let reply = self
             .request(Op::Fetch, &fetch, Op::Bundle, "bundle")
-            .await?;
+            .await
+            .map_err(|e| crate::error::classify_federation_error(e, hint.as_deref()))?;
         let bundle: Bundle = reply.decode()?;
         verify_bundle(&target, &bundle.bundle)?;
         Ok(bundle.bundle)
@@ -159,12 +160,13 @@ impl SignalingClient {
     ) -> Result<bool> {
         let body = RouteBody {
             to,
-            to_hint: hint,
+            to_hint: hint.clone(),
             blob: OpaqueBlob::new(blob),
         };
         let reply = self
             .request(Op::Route, &body, Op::RouteOk, "route_ok")
-            .await?;
+            .await
+            .map_err(|e| crate::error::classify_federation_error(e, hint.as_deref()))?;
         let ok: RouteOk = reply.decode()?;
         Ok(ok.delivered)
     }

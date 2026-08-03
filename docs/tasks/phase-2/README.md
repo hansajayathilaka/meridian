@@ -143,8 +143,12 @@ rather than a normalized schema — *"TODO: confirm normalized schema + Postgres
 - [x] **2.8** Federated envelope forwarding + per-request reachability (§3.3 step 5, §3.4) — [file](./2.8-federated-route-reachability.md)
 
 **Client**
-- [ ] **2.9** Client federation error taxonomy: clean `closed` error + stale-hint case — [file](./2.9-client-federation-errors.md)
+- [x] **2.9** Client federation error taxonomy: clean `closed` error + stale-hint case — [file](./2.9-client-federation-errors.md)
 - [x] **2.10** First-contact message-request gate (client-side, §3.5) — [file](./2.10-message-request-gate.md)
+
+**Follow-up surfaced by 2.9's review** — architect required a new task rather than folding the fix
+into 2.9 (would reopen an already-narrow review) or into 2.11 (wrong agent/reviewer lineup).
+- [ ] **2.15** Thread the peer's org hint into live signaling/chat routing (blocks 2.11, 2.12) — [file](./2.15-thread-route-hint.md)
 
 **Demo + exit gate**
 - [ ] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./2.11-demo-two-orgs.md)
@@ -165,16 +169,17 @@ tracked explicitly rather than silently deferred to Feature 08.
 ```
 1.32 ─┬─► 2.1 ─► 2.2 ─┬─► 2.3 ─┐
       │                └─► 2.4 ─► 2.6 ─┤
-      └────────────────────────────────┼─► 2.7 ─► 2.8 ─► 2.9 ─┐
-                            2.5 ───────┘         ▲            │
-                                                 │            ├─► 2.12
-                            1.33 ────────────────┴────────────┘
-                            2.10 ─────────────────────────────┘
-                            2.4,2.5,2.7,2.8 ─► 2.11 ──────────┘
+      └────────────────────────────────┼─► 2.7 ─► 2.8 ─► 2.9 ─► 2.15 ─┐
+                            2.5 ───────┘         ▲                   │
+                                                 │                   ├─► 2.12
+                            1.33 ────────────────┴───────────────────┘
+                            2.10 ────────────────────────────────────┘
+                            2.4,2.5,2.7,2.8 ─► 2.15 ─► 2.11 ──────────┘
 ```
 **Parallel tracks.** Track P (no dependencies, start immediately): **2.5**, **2.10**, **1.33**.
-Track S (server spine, serialized): 1.32 → 2.1 → 2.2 → 2.3 → 2.4 → 2.6 → 2.7 → 2.8.
-2.9 ∥ 2.11 once 2.8 lands. **2.12 is the join point.**
+Track S (server spine, serialized): 1.32 → 2.1 → 2.2 → 2.3 → 2.4 → 2.6 → 2.7 → 2.8 → 2.9 → 2.15.
+**2.15 surfaced by 2.9's review** (client never sends a real hint on the routing path, only on
+fetch) — it now gates 2.11 and 2.12, since both need real cross-org routing to run at all.
 2.4 and 2.5 both touch `config::Federation` — sequence them if one developer.
 
 ## Exit criteria

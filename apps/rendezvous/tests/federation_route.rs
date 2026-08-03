@@ -378,9 +378,12 @@ async fn closed_policy_at_b_is_reported_as_fed_denied() {
         .route_with_hint(target, Some("org-b.test".to_string()), b"hi bob".to_vec())
         .await
         .unwrap_err();
+    // (task 2.9) `route_with_hint` now reclassifies `fed_denied` into its own distinct
+    // `SignalError` variant rather than the generic `Server(ErrBody)` — see
+    // `meridian_signaling::error`.
     match err {
-        SignalError::Server(body) => assert_eq!(body.code, error_codes::FED_DENIED),
-        other => panic!("expected fed_denied, got {other:?}"),
+        SignalError::FedDenied { hint, .. } => assert_eq!(hint, "org-b.test"),
+        other => panic!("expected FedDenied, got {other:?}"),
     }
 }
 

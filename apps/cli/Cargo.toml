@@ -42,3 +42,6 @@ tempfile = { workspace = true }
 # rejection; it's a dev-only feature, never enabled in the release meridian-rendezvous binary.
 meridian-rendezvous = { path = "../rendezvous", features = ["test-tamper-hook"] }
 tokio = { workspace = true, features = ["rt", "macros", "net", "sync", "time", "io-util"] }
+# Task 2.9: two-org in-process s2s mTLS harness for the federation-error acceptance test
+# (mirrors apps/rendezvous/tests/federation_fetch.rs's PKI fixture).
+rcgen = "0.13"

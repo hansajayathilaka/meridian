@@ -156,8 +156,9 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
     Ok(())
 }
 
-/// Fetch + verify the peer's bundle, retrying while the peer has not published yet (`not_found`).
-/// A signature mismatch is still a hard, immediate failure (never a downgrade).
+/// Fetch + verify the peer's bundle, retrying while the peer has not published yet (`not_found`,
+/// or the federated `not_found_at_hint` — task 2.7/2.9). A signature mismatch, a policy denial, or
+/// an unreachable hint is still a hard, immediate failure (never a downgrade, never retried).
 async fn fetch_with_retry(
     client: &mut SignalingClient,
     peer_ik: [u8; 32],
@@ -165,29 +166,70 @@ async fn fetch_with_retry(
     peer_label: &str,
 ) -> Result<meridian_core::proto::PrekeyBundle, String> {
     use meridian_core::signaling::SignalError;
+    // Set once a `not_found_at_hint` (task 2.9) is observed, so the final message — if every
+    // attempt exhausts — can name the reachability-specific outcome instead of the generic
+    // "did not publish" text used for a purely local `not_found`.
+    let mut stale_hint = false;
     for attempt in 0..40u32 {
         match client
             .fetch_bundle(peer_ik, Some(peer_hint.to_string()), false)
             .await
         {
             Ok(bundle) => return Ok(bundle),
-            // "not_found" (local) and "not_found_at_hint" (cross-org, task 2.7) both mean "no
-            // bundle there yet" from this retry loop's point of view — retry either way. A
-            // permanently stale hint (peer re-registered elsewhere) still eventually surfaces as
-            // this same retry exhausting, same as a peer that never publishes locally; refining
-            // that distinction further is 2.9's job, not this loop's.
-            Err(SignalError::Server(e))
-                if e.code == "not_found" || e.code == "not_found_at_hint" =>
-            {
+            // "not_found" (local): no bundle here yet — retry, the peer may publish soon.
+            Err(SignalError::Server(e)) if e.code == "not_found" => {
+                stale_hint = false;
                 if attempt == 0 {
                     eprintln!("waiting for {peer_label} to come online…");
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
-            Err(e) => return Err(format!("fetching {peer_label}: {e}")),
+            // `not_found_at_hint` (task 2.7/2.9): the hinted org doesn't hold this account. From a
+            // single response this is indistinguishable from "hasn't published there yet" and
+            // "the hint is permanently stale" (e.g. the peer re-registered at a different org) —
+            // retry the same bounded number of times as the local case, but if every attempt
+            // exhausts this way, report the distinct "unreachable at hint" outcome below (never a
+            // security warning: ADR 0001, docs/security/verification-ux.md).
+            Err(SignalError::NotFoundAtHint { .. }) => {
+                stale_hint = true;
+                if attempt == 0 {
+                    eprintln!("waiting for {peer_label} to come online at {peer_hint}…");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            // `fed_denied`/`fed_unreachable` (and anything else): definitive policy/connectivity
+            // outcomes, never retried — see `federation_error_line` for the distinct copy.
+            Err(e) => return Err(federation_error_line(&e, peer_label)),
         }
     }
-    Err(format!("{peer_label} did not publish a bundle in time"))
+    if stale_hint {
+        Err(format!(
+            "{peer_label} unreachable at hint {peer_hint}: no account found there after \
+             retrying — the hint may be stale (the peer may have re-registered elsewhere); this \
+             is a reachability issue, never a security warning"
+        ))
+    } else {
+        Err(format!("{peer_label} did not publish a bundle in time"))
+    }
+}
+
+/// Render a definitive (non-retried) fetch failure as one diagnosable line, keeping the
+/// reachability-vs-policy-vs-security distinction visible in the copy itself (task 2.9).
+/// `BundleVerification` falls through to the generic arm below, which prefixes context but never
+/// rewords its canonical, un-softenable wording (docs/security/verification-ux.md) — only
+/// `FedDenied`/`FedUnreachable` get bespoke, reachability/policy-flavored copy here.
+fn federation_error_line(e: &meridian_core::signaling::SignalError, peer_label: &str) -> String {
+    use meridian_core::signaling::SignalError;
+    match e {
+        SignalError::FedDenied { hint, detail } => format!(
+            "federation denied: {hint} is not accepting requests for {peer_label} ({detail}) — \
+             a policy outcome, not a security warning"
+        ),
+        SignalError::FedUnreachable { hint, detail } => format!(
+            "{peer_label} unreachable at hint {hint}: could not reach that server ({detail})"
+        ),
+        other => format!("fetching {peer_label}: {other}"),
+    }
 }
 
 /// Route a blob, treating a `not_connected` server reply as "not delivered" rather than a fatal

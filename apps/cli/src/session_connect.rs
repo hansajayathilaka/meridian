@@ -287,8 +287,9 @@ async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
     Ok(())
 }
 
-/// Fetch + verify the peer's bundle, retrying while the peer has not published yet (`not_found`).
-/// A signature mismatch is still a hard, immediate failure (never a downgrade) — mirrors
+/// Fetch + verify the peer's bundle, retrying while the peer has not published yet (`not_found`,
+/// or the federated `not_found_at_hint` — task 2.7/2.9). A signature mismatch, a policy denial, or
+/// an unreachable hint is still a hard, immediate failure (never a downgrade) — mirrors
 /// `chat.rs::fetch_with_retry`.
 #[cfg(feature = "webrtc")]
 async fn fetch_with_retry(
@@ -298,26 +299,60 @@ async fn fetch_with_retry(
     peer_label: &str,
 ) -> Result<meridian_core::proto::PrekeyBundle, String> {
     use meridian_core::signaling::SignalError;
+    // See `chat::fetch_with_retry`'s matching comment: set once a `not_found_at_hint` (task 2.9)
+    // is observed, so the final message — if every attempt exhausts — names the
+    // reachability-specific outcome instead of the generic "did not publish" text.
+    let mut stale_hint = false;
     for attempt in 0..40u32 {
         match client
             .fetch_bundle(peer_ik, Some(peer_hint.to_string()), false)
             .await
         {
             Ok(bundle) => return Ok(bundle),
-            // See `chat::fetch_with_retry`'s matching comment: `not_found` and the cross-org
-            // `not_found_at_hint` (task 2.7) both retry here.
-            Err(SignalError::Server(e))
-                if e.code == "not_found" || e.code == "not_found_at_hint" =>
-            {
+            Err(SignalError::Server(e)) if e.code == "not_found" => {
+                stale_hint = false;
                 if attempt == 0 {
                     eprintln!("waiting for {peer_label} to come online…");
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
-            Err(e) => return Err(format!("fetching {peer_label}: {e}")),
+            Err(SignalError::NotFoundAtHint { .. }) => {
+                stale_hint = true;
+                if attempt == 0 {
+                    eprintln!("waiting for {peer_label} to come online at {peer_hint}…");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(e) => return Err(federation_error_line(&e, peer_label)),
         }
     }
-    Err(format!("{peer_label} did not publish a bundle in time"))
+    if stale_hint {
+        Err(format!(
+            "{peer_label} unreachable at hint {peer_hint}: no account found there after \
+             retrying — the hint may be stale (the peer may have re-registered elsewhere); this \
+             is a reachability issue, never a security warning"
+        ))
+    } else {
+        Err(format!("{peer_label} did not publish a bundle in time"))
+    }
+}
+
+/// Mirrors `chat.rs::federation_error_line`: renders a definitive (non-retried) fetch failure as
+/// one diagnosable line, keeping the reachability-vs-policy-vs-security distinction visible in the
+/// copy itself (task 2.9).
+#[cfg(feature = "webrtc")]
+fn federation_error_line(e: &meridian_core::signaling::SignalError, peer_label: &str) -> String {
+    use meridian_core::signaling::SignalError;
+    match e {
+        SignalError::FedDenied { hint, detail } => format!(
+            "federation denied: {hint} is not accepting requests for {peer_label} ({detail}) — \
+             a policy outcome, not a security warning"
+        ),
+        SignalError::FedUnreachable { hint, detail } => format!(
+            "{peer_label} unreachable at hint {hint}: could not reach that server ({detail})"
+        ),
+        other => format!("fetching {peer_label}: {other}"),
+    }
 }
 
 /// Minimal JSON string escaping (bodies/labels can contain quotes/backslashes) — mirrors

@@ -281,9 +281,23 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   Non-blocking follow-ups noted, not fixed: federated deliveries aren't counted in
   `envelopes_routed_total`; the third near-duplicate test-harness copy means a `tests/common/mod.rs`
   extraction is now overdue.
-- **NEXT:** `/next-task`. Continuing the batch: **2.9** next, then **2.11**, **2.12** in dependency
-  order. **2.14** (new, from 2.10's review) queues up after 2.10's own dependents since it depends
-  on 2.10.
+- **ALSO NOW:** **2.9 is done.** New `SignalError`/`SessionError` variants `FedDenied`/
+  `FedUnreachable`/`NotFoundAtHint`, kept structurally distinct from `BundleVerification`/
+  `FingerprintMismatch` (a `classify_federation_error` helper reclassifies wire codes without ever
+  leaking server-internal detail); CLI copy + a bounded retry that never retries a policy denial or
+  unreachable peer; a real subprocess-driven acceptance test (`apps/cli/tests/federation_errors.rs`)
+  with a wall-clock kill-on-hang guard proving both "no hang" and "no security-copy leak" are real,
+  falsifiable properties (test-engineer mutation-tested every claim). security-reviewer APPROVE;
+  test-engineer PASS; code-reviewer approve-with-nits surfaced a real architectural gap — **no live
+  CLI path ever calls `route_with_hint` with an actual hint** (`RendezvousRelay::send` and
+  `chat::route_tolerant` hardcode `None`), so cross-org **routing** doesn't work end-to-end yet even
+  though cross-org **bundle fetch** does. architect confirmed (binding per `system-design.md` §3.3
+  step 2 / §3.4, not a new decision) and required a new task rather than folding the fix into 2.9 or
+  2.11: **2.15**, inserted before 2.11 since 2.11's demo and 2.12's abuse suite both need real
+  cross-org routing to run at all.
+- **NEXT:** `/next-task`. Continuing the batch: **2.15** next (new, blocks the rest of the batch),
+  then **2.11**, **2.12** in dependency order. **2.14** (new, from 2.10's review) queues up after
+  2.10's own dependents since it depends on 2.10.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -381,8 +395,12 @@ cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery 
 - [x] **2.8** Federated envelope forwarding + per-request reachability (§3.3 step 5, §3.4) — [file](./phase-2/2.8-federated-route-reachability.md)
 
 **Client**
-- [ ] **2.9** Client federation error taxonomy: clean `closed` error + stale-hint case — [file](./phase-2/2.9-client-federation-errors.md)
+- [x] **2.9** Client federation error taxonomy: clean `closed` error + stale-hint case — [file](./phase-2/2.9-client-federation-errors.md)
 - [x] **2.10** First-contact message-request gate (client-side, §3.5) — [file](./phase-2/2.10-message-request-gate.md)
+
+**Follow-up surfaced by 2.9's review** — architect required a new task rather than folding the fix
+into 2.9 or 2.11.
+- [ ] **2.15** Thread the peer's org hint into live signaling/chat routing (blocks 2.11, 2.12) — [file](./phase-2/2.15-thread-route-hint.md)
 
 **Demo + exit gate**
 - [ ] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./phase-2/2.11-demo-two-orgs.md)

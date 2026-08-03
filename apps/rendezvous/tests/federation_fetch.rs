@@ -382,9 +382,11 @@ async fn closed_policy_at_b_is_reported_as_fed_denied() {
         .fetch_bundle(target, Some("org-b.test".to_string()), false)
         .await
         .unwrap_err();
+    // (task 2.9) `fetch_bundle` now reclassifies `fed_denied` into its own distinct SignalError
+    // variant rather than the generic `Server(ErrBody)` — see `meridian_signaling::error`.
     match err {
-        SignalError::Server(body) => assert_eq!(body.code, error_codes::FED_DENIED),
-        other => panic!("expected fed_denied, got {other:?}"),
+        SignalError::FedDenied { hint, .. } => assert_eq!(hint, "org-b.test"),
+        other => panic!("expected FedDenied, got {other:?}"),
     }
 }
 
@@ -420,9 +422,11 @@ async fn unknown_key_at_b_is_reported_as_not_found_at_hint() {
         .fetch_bundle(never_published, Some("org-b.test".to_string()), false)
         .await
         .unwrap_err();
+    // (task 2.9) reclassified into `SignalError::NotFoundAtHint`, the stale-hint case's own
+    // distinct type — see `meridian_signaling::error`.
     match err {
-        SignalError::Server(body) => assert_eq!(body.code, error_codes::NOT_FOUND_AT_HINT),
-        other => panic!("expected not_found_at_hint, got {other:?}"),
+        SignalError::NotFoundAtHint { hint, .. } => assert_eq!(hint, "org-b.test"),
+        other => panic!("expected NotFoundAtHint, got {other:?}"),
     }
 }
 
@@ -467,8 +471,8 @@ async fn bs_federation_edge_rate_limit_trips_through_the_real_path() {
         // is still spent on a rejected-for-other-reasons request, matching task 2.6's design
         // (only the per-*account* dimension is checked ahead of the shared origin one).
         match err {
-            SignalError::Server(body) => assert_eq!(body.code, error_codes::NOT_FOUND_AT_HINT),
-            other => panic!("expected not_found_at_hint, got {other:?}"),
+            SignalError::NotFoundAtHint { .. } => {}
+            other => panic!("expected NotFoundAtHint, got {other:?}"),
         }
     }
     let third = [0xFFu8; 32];
@@ -526,30 +530,26 @@ async fn dial_rejects_a_peer_cert_matching_the_hint_domain_but_not_the_pinned_id
         .fetch_bundle(target, Some("org-b.test".to_string()), false)
         .await
         .unwrap_err();
+    // (task 2.9) `fed_unreachable` is now reclassified into `SignalError::FedUnreachable { hint,
+    // detail }` — `detail` carries the same server `msg` text this test's leak assertions were
+    // always checking (a dial that fails TLS identity verification must surface as
+    // `fed_unreachable`, since we never even completed the s2s handshake — never silently succeed).
     match err {
-        SignalError::Server(body) => {
-            assert_eq!(
-                body.code,
-                error_codes::FED_UNREACHABLE,
-                "a dial that fails TLS identity verification must surface as fed_unreachable \
-                 (we never even completed the s2s handshake), not silently succeed"
-            );
+        SignalError::FedUnreachable { hint, detail } => {
             // security-reviewer + code-reviewer finding on task 2.7: the error message must
             // never leak A's internal federation configuration — specifically the configured
             // `pinned_identity` string ("wrong-identity.test"), which by design can differ from
             // the hint the client supplied and is exactly the kind of operator-internal detail
             // this dial failure must not expose. Only the client-supplied hint may appear.
             assert!(
-                !body.msg.contains("wrong-identity.test"),
-                "error message must not leak the internally-configured pinned_identity: {:?}",
-                body.msg
+                !detail.contains("wrong-identity.test"),
+                "error message must not leak the internally-configured pinned_identity: {detail:?}"
             );
-            assert!(
-                body.msg.contains("org-b.test"),
-                "error message should still name the hint the client itself supplied: {:?}",
-                body.msg
+            assert_eq!(
+                hint, "org-b.test",
+                "error should still name the hint the client itself supplied"
             );
         }
-        other => panic!("expected fed_unreachable (dial must fail closed), got {other:?}"),
+        other => panic!("expected FedUnreachable (dial must fail closed), got {other:?}"),
     }
 }

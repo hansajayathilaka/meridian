@@ -138,6 +138,27 @@ pub enum SessionError {
     /// whether because it's offline or because a hostile relay silently dropped/rewrote the offer.
     #[error("timed out after {0:?} waiting for the peer's answer")]
     AnswerTimeout(Duration),
+    /// (2.9) A federated signaling request was refused by the peer org's own admission policy —
+    /// mirrors [`meridian_signaling::SignalError::FedDenied`] (`fed_denied`, task 2.6). A **policy**
+    /// outcome, structurally distinct from [`SessionError::FingerprintMismatch`] and
+    /// [`SessionError::Chat`]'s actual security checks below — never a security warning (ADR 0001;
+    /// docs/security/verification-ux.md's canonical copy is reserved for real key substitution).
+    #[error("federation denied by {hint}'s policy: {detail}")]
+    FedDenied { hint: String, detail: String },
+    /// (2.9) The hinted peer org could not be reached at all — mirrors
+    /// [`meridian_signaling::SignalError::FedUnreachable`] (`fed_unreachable`, tasks 2.7/2.8). A
+    /// **connectivity** outcome, orthogonal to [`SessionError::FedDenied`]'s policy outcome and to
+    /// the fingerprint/envelope security checks.
+    #[error("{hint} is unreachable at hint: {detail}")]
+    FedUnreachable { hint: String, detail: String },
+    /// (2.9) The hinted peer org was reached but doesn't hold this peer — mirrors
+    /// [`meridian_signaling::SignalError::NotFoundAtHint`] (`not_found_at_hint`, task 2.7), the
+    /// stale-hint case (ADR 0001: the hint is advisory, never a trust input). A **reachability**
+    /// outcome only — never, under any circumstance, a security warning, and structurally distinct
+    /// from [`SessionError::FingerprintMismatch`]/[`SessionError::Chat`]'s key-substitution/tamper
+    /// checks (conflating the two is exactly the failure mode this task exists to prevent).
+    #[error("unreachable at hint {hint}: no such account there ({detail})")]
+    NotFoundAtHint { hint: String, detail: String },
 }
 
 /// A signaling carrier for the offer/answer/ICE exchange — the rendezvous relay in production, an
