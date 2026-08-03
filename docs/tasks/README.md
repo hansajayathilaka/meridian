@@ -305,8 +305,28 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   pre-existing gap (dating to 1.24): `cargo test -p meridian-cli --features webrtc` was never wired
   into `Justfile`/CI, so this task's own new regression tests would have silently never run — fixed
   in both files.
-- **NEXT:** `/next-task`. Continuing the batch: **2.11** next, then **2.12** in dependency order.
-  **2.14** (new, from 2.10's review) queues up after 2.10's own dependents since it depends on 2.10.
+- **ALSO NOW:** **2.11 is done.** `demo/two-orgs/` (base compose + static/srv discovery overrides,
+  rendezvous/coturn/edge images, a DNS service for real SRV resolution, `README.md`,
+  `run-walkthrough.sh`) verified with real `docker compose up` runs, both discovery modes: cross-org
+  chat federates, 2.10's message-request gate fires, delivery succeeds once accepted, real P2P/DTLS
+  establishes, and zero plaintext ever appears in either server's logs. Two real bugs found and
+  fixed by actually running the stack, not by inspection: `bootstrap-ca.sh`'s leaf keys were `0600`,
+  unreadable by the rendezvous container's non-root user after it drops privilege — `chmod 644`
+  scoped to the two leaf keys only (CA key untouched); no root `.dockerignore` existed, so every
+  image's `COPY . .` was shipping the multi-GB `/target` cache into the build context. Resolved the
+  task's own `infra/deploy/two-orgs.compose.yml` `TODO: confirm`: that file was a pre-2.11 scaffold
+  stub, not a maintained production reference — `demo/two-orgs/` supersedes it outright.
+  security-reviewer APPROVE (two low-severity non-blocking notes: shared-host leaf-key readability,
+  TURN secret via CLI arg vs. env var); architect consistent (ADR 0008/0017 C7 topology confirmed
+  wired for real, not just claimed in comments); code-reviewer approve-with-nits, one should-fix
+  taken seriously and fixed — `run-walkthrough.sh` had declared a bash array literally named `HOME`,
+  silently clobbering the real `$HOME` env var for every subsequent `docker compose` call in the
+  script (renamed to `HOMES`).
+- **NEXT:** `/next-task`. Continuing the batch: **2.12** next (the phase exit gate). **2.14** (new,
+  from 2.10's review) queues up after 2.10's own dependents since it depends on 2.10. **2.16** (new,
+  a carried-in CI-flakiness defect surfaced while closing 2.15/2.11 — `session_connect_webrtc.rs`'s
+  TURN-grant test hangs in real CI for reasons this sandbox cannot reproduce, `#[ignore]`d rather
+  than guessed at) is independent and can land whenever it's picked up.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -412,7 +432,7 @@ into 2.9 or 2.11.
 - [x] **2.15** Thread the peer's org hint into live signaling/chat routing (blocks 2.11, 2.12) — [file](./phase-2/2.15-thread-route-hint.md)
 
 **Demo + exit gate**
-- [~] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./phase-2/2.11-demo-two-orgs.md)
+- [x] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./phase-2/2.11-demo-two-orgs.md)
 - [ ] **2.12** Cross-org abuse + acceptance suite (the phase exit gate) — [file](./phase-2/2.12-cross-org-abuse-acceptance.md)
 
 **Carried in from Phase 1** (production defect surfaced by 1.32; not part of T06)

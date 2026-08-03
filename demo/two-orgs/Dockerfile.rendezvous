@@ -1,0 +1,45 @@
+# demo/two-orgs/Dockerfile.rendezvous — the two-org federation demo's image (task 2.11).
+#
+# Reuses apps/rendezvous/Dockerfile's own build recipe verbatim for the `meridian-rendezvous`
+# binary (same base images, same `--features sqlite` build) rather than reinventing it, and adds
+# ONE thing that image doesn't need: the `meridian` CLI binary (`--features webrtc`), so
+# run-walkthrough.sh can drive the whole demo — register/chat/session-connect — from a container on
+# this compose network (the `client` service — see docker-compose.yml; its entrypoint stays this
+# image's own demo-entrypoint.sh, idling on `sleep infinity`, and `meridian` is invoked per-call via
+# `docker compose exec`, not as a container entrypoint/command) without installing anything on the
+# host or touching the host's own trust store/DNS. This is a demo-only image; the production image
+# is still built and published exactly as documented in docs/operations/docker-image.md, from
+# apps/rendezvous/Dockerfile alone.
+#
+# demo-entrypoint.sh (this directory) is the other addition: it installs this demo's private CA
+# into the OS trust store (idempotent no-op unless one is mounted) before exec-ing the real
+# entrypoint apps/rendezvous/docker-entrypoint.sh already ships — needed for
+# `federation.discovery = "srv"` (ADR 0017/task 2.5: SRV mode is incompatible with a non-empty
+# `ca_bundle_path`, so its trust root can only ever be the OS/system store, see
+# apps/rendezvous/src/config.rs's `Federation::validate`) and for this same image's `meridian`
+# binary validating each org's wss:// edge certificate (ADR 0008: TLS terminates at the
+# proxy/VIP in front of c2s, never in-process — see docker-compose.yml's `edge-a`/`edge-b`).
+
+FROM rust:1-slim AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p meridian-rendezvous --features sqlite
+RUN cargo build --release -p meridian-cli --features webrtc
+
+FROM debian:stable-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ca-certificates gosu dnsutils iputils-ping bash \
+    && rm -rf /var/lib/apt/lists/*
+RUN groupadd --system --gid 10001 meridian && useradd --system --uid 10001 --gid meridian meridian
+COPY --from=build /src/target/release/meridian-rendezvous /usr/local/bin/meridian-rendezvous
+COPY --from=build /src/target/release/meridian /usr/local/bin/meridian
+COPY apps/rendezvous/docker-entrypoint.sh /usr/local/bin/rendezvous-entrypoint.sh
+COPY demo/two-orgs/demo-entrypoint.sh /usr/local/bin/demo-entrypoint.sh
+RUN chmod +x /usr/local/bin/rendezvous-entrypoint.sh /usr/local/bin/demo-entrypoint.sh
+
+EXPOSE 8443 8444
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
+    CMD curl -fs http://127.0.0.1:8443/healthz || exit 1
+
+ENTRYPOINT ["/usr/local/bin/demo-entrypoint.sh"]
+CMD ["/usr/local/bin/meridian-rendezvous", "--config", "/etc/meridian/rendezvous.toml"]

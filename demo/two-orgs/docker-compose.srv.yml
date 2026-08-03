@@ -1,0 +1,41 @@
+# DNS SRV discovery override — task 2.11 deliverable 2: a real internal DNS service serving
+# `_meridian-fed._tcp.<domain>` (see dns/dnsmasq.conf) so SRV mode is genuinely exercised, not
+# faked. Use with the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.srv.yml up --build
+#
+# (run-walkthrough.sh srv drives this for you.)
+#
+# `federation.discovery = "srv"` is rejected at config load if `ca_bundle_path` is non-empty
+# (apps/rendezvous/src/config.rs's `Federation::validate` — ADR 0017 C4/task 2.5's security-review
+# finding), so this override deliberately does NOT set `MERIDIAN_RENDEZVOUS_FEDERATION__CA_BUNDLE_PATH`
+# (the default is already empty) — trust falls back to the OS/system store (WebPKI mode), which is
+# why `rendezvous-a`/`rendezvous-b` get this demo's private CA installed via the
+# `meridian-demo-ca` volume + demo-entrypoint.sh's `update-ca-certificates` step below.
+services:
+  dns:
+    build: ./dns
+    networks:
+      meridian-demo:
+        ipv4_address: 172.28.0.53
+    restart: unless-stopped
+
+  rendezvous-a:
+    dns: [172.28.0.53]
+    volumes:
+      - ./.ca:/usr/local/share/ca-certificates/meridian-demo:ro
+    environment:
+      MERIDIAN_RENDEZVOUS_FEDERATION__DISCOVERY: srv
+    depends_on: [dns]
+
+  rendezvous-b:
+    dns: [172.28.0.53]
+    volumes:
+      - ./.ca:/usr/local/share/ca-certificates/meridian-demo:ro
+    environment:
+      MERIDIAN_RENDEZVOUS_FEDERATION__DISCOVERY: srv
+    depends_on: [dns]
+
+  client:
+    dns: [172.28.0.53]
+    depends_on: [dns]

@@ -1,0 +1,26 @@
+# Static-map (air-gap) discovery override — task 2.11 deliverable 2's "compose profile/override so
+# static mode can also be run". No DNS server needed at all: `federation_map.toml` names each
+# partner's dial endpoint directly (ADR 0002 — the whole point of the air-gap mode is that nothing
+# here depends on DNS). Use with the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.static.yml up --build
+#
+# (run-walkthrough.sh static drives this for you, including the CA bootstrap.)
+services:
+  rendezvous-a:
+    volumes:
+      - ./federation_map.toml:/etc/meridian/federation_map.toml:ro
+      - ./.ca/ca.crt:/etc/meridian/ca/ca.crt:ro
+    environment:
+      MERIDIAN_RENDEZVOUS_FEDERATION__DISCOVERY: static
+      MERIDIAN_RENDEZVOUS_FEDERATION__MAP_PATH: /etc/meridian/federation_map.toml
+      MERIDIAN_RENDEZVOUS_FEDERATION__CA_BUNDLE_PATH: /etc/meridian/ca/ca.crt
+
+  rendezvous-b:
+    volumes:
+      - ./federation_map.toml:/etc/meridian/federation_map.toml:ro
+      - ./.ca/ca.crt:/etc/meridian/ca/ca.crt:ro
+    environment:
+      MERIDIAN_RENDEZVOUS_FEDERATION__DISCOVERY: static
+      MERIDIAN_RENDEZVOUS_FEDERATION__MAP_PATH: /etc/meridian/federation_map.toml
+      MERIDIAN_RENDEZVOUS_FEDERATION__CA_BUNDLE_PATH: /etc/meridian/ca/ca.crt

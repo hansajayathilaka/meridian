@@ -151,7 +151,7 @@ into 2.9 (would reopen an already-narrow review) or into 2.11 (wrong agent/revie
 - [x] **2.15** Thread the peer's org hint into live signaling/chat routing (blocks 2.11, 2.12) — [file](./2.15-thread-route-hint.md)
 
 **Demo + exit gate**
-- [~] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./2.11-demo-two-orgs.md)
+- [x] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./2.11-demo-two-orgs.md)
 - [ ] **2.12** Cross-org abuse + acceptance suite (the phase exit gate) — [file](./2.12-cross-org-abuse-acceptance.md)
 
 **Carried in from Phase 1** — not T06 work, and not on the DAG below. A production defect surfaced by

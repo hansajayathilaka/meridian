@@ -1,0 +1,27 @@
+# demo/two-orgs org-a.test rendezvous config (task 2.11, feature 06's two-org demo).
+#
+# Mode-agnostic on purpose: only [server]/[limits]/[turn] live here. Everything under
+# [federation] is supplied by the compose environment
+# (`MERIDIAN_RENDEZVOUS_FEDERATION__*` — see docker-compose.static.yml / docker-compose.srv.yml)
+# so switching discovery mode never means editing this file, mirroring the exact convention
+# apps/rendezvous/rendezvous.example.toml documents for this reason (§9.2, ADR 0018/figment):
+# "handy for docker-compose/k8s deploys where the generated file shouldn't carry secrets."
+[server]
+domain = "org-a.test"
+bind = "0.0.0.0:8443"
+admission = "open"
+database_url = "sqlite:///data/rendezvous.db"
+
+[limits]
+auth_per_ip_per_min = 60
+fetch_per_account_per_min = 120
+route_per_account_per_min = 600
+turn_per_account_per_min = 60
+
+[turn]
+# secret comes from MERIDIAN_RENDEZVOUS_TURN__SECRET (compose `environment:`, exported into the
+# process environment by run-walkthrough.sh as a fresh random value each run — never written to
+# disk, never committed, infra/CLAUDE.md).
+realm = "turn.org-a.test"
+urls = ["turn:coturn-a:3478?transport=udp", "turn:coturn-a:3478?transport=tcp"]
+ttl_secs = 120
