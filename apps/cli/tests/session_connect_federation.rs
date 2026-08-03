@@ -56,6 +56,12 @@ use tokio::net::TcpListener;
 
 const BIN: &str = env!("CARGO_BIN_EXE_meridian");
 
+/// Bound for waiting on a child `session connect` process to exit. Must stay strictly greater
+/// than `meridian_core::session::ANSWER_TIMEOUT` (30s) — see `session_connect_webrtc.rs`'s
+/// identical constant for why a harness deadline equal to that internal timeout is a
+/// zero-margin race that a loaded CI runner can lose.
+const PROCESS_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
 // -- PKI test harness (mirrors apps/cli/tests/federation_route_hint.rs /
 //    apps/rendezvous/tests/federation_route.rs) -------------------------------------------------
 
@@ -402,8 +408,8 @@ fn two_processes_on_two_federated_orgs_establish_a_real_p2p_session() {
     let a = alice.spawn_connect(&a_c2s_url, &bob_id);
     let b = bob.spawn_connect(&b_c2s_url, &alice_id);
 
-    let (a_ok, a_out, a_err) = a.wait(Duration::from_secs(30));
-    let (b_ok, b_out, b_err) = b.wait(Duration::from_secs(30));
+    let (a_ok, a_out, a_err) = a.wait(PROCESS_WAIT_TIMEOUT);
+    let (b_ok, b_out, b_err) = b.wait(PROCESS_WAIT_TIMEOUT);
 
     // The wire-level, non-vacuity-proving assertion: without `session_connect.rs`'s hint fix,
     // whichever side dials first gets an immediate hard failure the moment its home server can't

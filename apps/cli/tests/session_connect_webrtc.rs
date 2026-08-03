@@ -21,6 +21,14 @@ use meridian_rendezvous::{serve, AppState, Config, MemoryStore};
 
 const BIN: &str = env!("CARGO_BIN_EXE_meridian");
 
+/// Bound for waiting on a child `session connect` process to exit. Must stay strictly greater
+/// than `meridian_core::session::ANSWER_TIMEOUT` (30s): that internal timeout is what's supposed
+/// to fire and let the process exit cleanly on a genuinely stuck dial, so a test-harness deadline
+/// equal to it is a race with zero margin — under any scheduling slowness (a loaded CI runner) the
+/// harness's own hard kill can fire at/before the internal timeout, turning a clean
+/// `AnswerTimeout` exit into this file's own "timed out waiting for process to exit" instead.
+const PROCESS_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn spawn_server_with_config(config: Config) -> String {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -255,8 +263,8 @@ fn two_processes_establish_a_real_p2p_session_over_the_rendezvous() {
     let a = alice.spawn_connect(&server, &bob_id);
     let b = bob.spawn_connect(&server, &alice_id);
 
-    let (a_ok, a_out, a_err) = a.wait(Duration::from_secs(30));
-    let (b_ok, b_out, b_err) = b.wait(Duration::from_secs(30));
+    let (a_ok, a_out, a_err) = a.wait(PROCESS_WAIT_TIMEOUT);
+    let (b_ok, b_out, b_err) = b.wait(PROCESS_WAIT_TIMEOUT);
 
     assert!(
         a_ok,
@@ -317,8 +325,8 @@ fn two_processes_establish_a_real_p2p_session_when_a_turn_grant_is_minted() {
     let a = alice.spawn_connect(&server, &bob_id);
     let b = bob.spawn_connect(&server, &alice_id);
 
-    let (a_ok, a_out, a_err) = a.wait(Duration::from_secs(30));
-    let (b_ok, b_out, b_err) = b.wait(Duration::from_secs(30));
+    let (a_ok, a_out, a_err) = a.wait(PROCESS_WAIT_TIMEOUT);
+    let (b_ok, b_out, b_err) = b.wait(PROCESS_WAIT_TIMEOUT);
 
     assert!(
         a_ok,
