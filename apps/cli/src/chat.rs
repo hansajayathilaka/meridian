@@ -127,12 +127,12 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
                 match maybe_line {
                     Some(text) if text.trim().is_empty() => {}
                     Some(text) if awaiting_request => {
-                        answer_request(&mut client, &mut state, store, handle, &account_pub, &peer_ik, &peer_label, &text, json, &mut pending).await?;
+                        answer_request(&mut client, &mut state, store, handle, &account_pub, &peer_ik, &peer_hint, &peer_label, &text, json, &mut pending).await?;
                         awaiting_request = false;
                     }
                     Some(text) => {
                         if state.has_session(&peer_ik) {
-                            send_text(&mut client, &mut state, store, handle, &account_pub, &peer_ik, &text, json).await?;
+                            send_text(&mut client, &mut state, store, handle, &account_pub, &peer_ik, &peer_hint, &peer_label, &text, json).await?;
                         } else {
                             pending.push(text);
                             if !json {
@@ -145,7 +145,7 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
             }
             delivered = client.next_deliver() => {
                 let deliver = delivered.map_err(|e| format!("receiving: {e}"))?;
-                handle_inbound(&mut client, &mut state, store, handle, &account_pub, &deliver, &peer_label, json, &mut pending, &mut awaiting_request).await?;
+                handle_inbound(&mut client, &mut state, store, handle, &account_pub, &deliver, &peer_hint, &peer_label, json, &mut pending, &mut awaiting_request).await?;
             }
         }
         save_state(&state, store, handle)?;
@@ -199,7 +199,7 @@ async fn fetch_with_retry(
             }
             // `fed_denied`/`fed_unreachable` (and anything else): definitive policy/connectivity
             // outcomes, never retried — see `federation_error_line` for the distinct copy.
-            Err(e) => return Err(federation_error_line(&e, peer_label)),
+            Err(e) => return Err(federation_error_line(&e, peer_label, "fetching")),
         }
     }
     if stale_hint {
@@ -213,12 +213,19 @@ async fn fetch_with_retry(
     }
 }
 
-/// Render a definitive (non-retried) fetch failure as one diagnosable line, keeping the
-/// reachability-vs-policy-vs-security distinction visible in the copy itself (task 2.9).
-/// `BundleVerification` falls through to the generic arm below, which prefixes context but never
-/// rewords its canonical, un-softenable wording (docs/security/verification-ux.md) — only
-/// `FedDenied`/`FedUnreachable` get bespoke, reachability/policy-flavored copy here.
-fn federation_error_line(e: &meridian_core::signaling::SignalError, peer_label: &str) -> String {
+/// Render a definitive (non-retried) fetch/route failure as one diagnosable line, keeping the
+/// reachability-vs-policy-vs-security distinction visible in the copy itself (task 2.9, extended
+/// to the routing path by task 2.15). `BundleVerification` falls through to the generic arm below,
+/// which prefixes context but never rewords its canonical, un-softenable wording
+/// (docs/security/verification-ux.md) — only `FedDenied`/`FedUnreachable` get bespoke,
+/// reachability/policy-flavored copy here. `action` names the operation in the generic arm's
+/// prefix (`"fetching"` for the bundle path, `"routing message to"` for the ongoing-chat path) so
+/// one shared match doesn't misdescribe which call failed.
+fn federation_error_line(
+    e: &meridian_core::signaling::SignalError,
+    peer_label: &str,
+    action: &str,
+) -> String {
     use meridian_core::signaling::SignalError;
     match e {
         SignalError::FedDenied { hint, detail } => format!(
@@ -228,24 +235,36 @@ fn federation_error_line(e: &meridian_core::signaling::SignalError, peer_label: 
         SignalError::FedUnreachable { hint, detail } => format!(
             "{peer_label} unreachable at hint {hint}: could not reach that server ({detail})"
         ),
-        other => format!("fetching {peer_label}: {other}"),
+        other => format!("{action} {peer_label}: {other}"),
     }
 }
 
 /// Route a blob, treating a `not_connected` server reply as "not delivered" rather than a fatal
 /// error: a momentarily-offline peer must not tear down the chat session (offline delivery is the
 /// T07 mailbox). Other transport/server errors still propagate.
+///
+/// `hint` (task 2.15) is the peer's `@domain` routing hint — the same value already threaded into
+/// `fetch_with_retry` — passed on every routed call (not just the initial bundle fetch) so an
+/// ongoing chat with a cross-org peer actually reaches the federation path instead of the server
+/// treating an absent hint as local-only (system-design.md §3.3 step 2, §3.4). A definitive
+/// `FedDenied`/`FedUnreachable` surfaces through the same non-security-flavored copy the fetch path
+/// already gets (`federation_error_line`), rather than collapsing into a generic string.
 async fn route_tolerant(
     client: &mut SignalingClient,
     to: [u8; 32],
+    hint: &str,
     blob: Vec<u8>,
+    peer_label: &str,
 ) -> Result<bool, String> {
     use meridian_core::proto::error_codes::NOT_CONNECTED;
     use meridian_core::signaling::SignalError;
-    match client.route(to, blob).await {
+    match client
+        .route_with_hint(to, Some(hint.to_string()), blob)
+        .await
+    {
         Ok(delivered) => Ok(delivered),
         Err(SignalError::Server(e)) if e.code == NOT_CONNECTED => Ok(false),
-        Err(e) => Err(format!("routing message: {e}")),
+        Err(e) => Err(federation_error_line(&e, peer_label, "routing message to")),
     }
 }
 
@@ -257,6 +276,8 @@ async fn send_text(
     handle: &KeyHandle,
     account_pub: &[u8; 32],
     peer_ik: &[u8; 32],
+    peer_hint: &str,
+    peer_label: &str,
     text: &str,
     json: bool,
 ) -> Result<(), String> {
@@ -274,7 +295,7 @@ async fn send_text(
             },
         )
         .map_err(|e| format!("sealing message: {e}"))?;
-    let delivered = route_tolerant(client, *peer_ik, blob).await?;
+    let delivered = route_tolerant(client, *peer_ik, peer_hint, blob, peer_label).await?;
     if json {
         println!(
             "{{\"event\":\"sent\",\"id\":\"{}\",\"delivered\":{}}}",
@@ -297,6 +318,7 @@ async fn handle_inbound(
     handle: &KeyHandle,
     account_pub: &[u8; 32],
     deliver: &meridian_core::proto::Deliver,
+    peer_hint: &str,
     peer_label: &str,
     json: bool,
     pending: &mut Vec<String>,
@@ -323,6 +345,7 @@ async fn handle_inbound(
                 handle,
                 account_pub,
                 &deliver.from,
+                peer_hint,
                 peer_label,
                 json,
                 pending,
@@ -385,6 +408,7 @@ async fn deliver_content(
     handle: &KeyHandle,
     account_pub: &[u8; 32],
     from: &[u8; 32],
+    peer_hint: &str,
     peer_label: &str,
     json: bool,
     pending: &mut Vec<String>,
@@ -411,12 +435,24 @@ async fn deliver_content(
                     &ChatContent::Receipt { ack: id },
                 )
                 .map_err(|e| format!("sealing receipt: {e}"))?;
-            let _ = route_tolerant(client, *from, receipt).await?;
+            let _ = route_tolerant(client, *from, peer_hint, receipt, peer_label).await?;
 
             // Session is now live (or newly accepted) — flush anything typed early.
             let queued = std::mem::take(pending);
             for text in queued {
-                send_text(client, state, store, handle, account_pub, from, &text, json).await?;
+                send_text(
+                    client,
+                    state,
+                    store,
+                    handle,
+                    account_pub,
+                    from,
+                    peer_hint,
+                    peer_label,
+                    &text,
+                    json,
+                )
+                .await?;
             }
         }
         ChatContent::Receipt { ack } => {
@@ -442,6 +478,7 @@ async fn answer_request(
     handle: &KeyHandle,
     account_pub: &[u8; 32],
     peer_ik: &[u8; 32],
+    peer_hint: &str,
     peer_label: &str,
     answer: &str,
     json: bool,
@@ -465,6 +502,7 @@ async fn answer_request(
                 handle,
                 account_pub,
                 peer_ik,
+                peer_hint,
                 peer_label,
                 json,
                 pending,

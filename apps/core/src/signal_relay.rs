@@ -34,19 +34,33 @@ use crate::session::{SessionError, SignalRelay};
 /// property over a real socket.
 pub struct RendezvousRelay<'a> {
     client: &'a mut SignalingClient,
+    /// (2.15) The peer's `@domain` routing hint — the same wire-level hint already threaded into
+    /// `fetch_bundle` (task 2.7/2.9), now also carried on every `send()`. `None` for a same-server
+    /// peer, `Some(domain)` when this relay's one fixed peer is believed to live at a foreign
+    /// org's server. One `RendezvousRelay` always wraps one client for one fixed peer relationship
+    /// (see the module docs), so a single hint fixed at construction is sufficient — there is no
+    /// per-call hint to thread separately.
+    hint: Option<String>,
 }
 
 impl<'a> RendezvousRelay<'a> {
-    /// Wrap an already-connected, already-authenticated `SignalingClient`.
-    pub fn new(client: &'a mut SignalingClient) -> Self {
-        Self { client }
+    /// Wrap an already-connected, already-authenticated `SignalingClient`. `hint` is the peer's
+    /// `@domain` routing hint (task 2.7/2.8's wire-level hint), passed on every `send()` so
+    /// cross-org routing — not just the initial bundle fetch — reaches the federation path
+    /// (task 2.15, system-design.md §3.3 step 2's "subsequent signaling envelopes" requirement).
+    pub fn new(client: &'a mut SignalingClient, hint: Option<String>) -> Self {
+        Self { client, hint }
     }
 }
 
 #[async_trait::async_trait]
 impl SignalRelay for RendezvousRelay<'_> {
     async fn send(&mut self, to: &[u8; 32], blob: Vec<u8>) -> Result<(), SessionError> {
-        map_route_result(self.client.route(*to, blob).await)
+        map_route_result(
+            self.client
+                .route_with_hint(*to, self.hint.clone(), blob)
+                .await,
+        )
     }
 
     async fn recv(&mut self) -> Result<([u8; 32], Vec<u8>), SessionError> {

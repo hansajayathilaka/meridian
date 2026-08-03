@@ -40,6 +40,7 @@ test: build harnesses
     # default builds/CI-without-this-step stay pure-Rust and network-free.
     cargo test -p meridian-transport --features webrtc
     cargo test -p meridian-core --features webrtc
+    cargo test -p meridian-cli --features webrtc
     @echo "TODO: migrate to cargo nextest run --workspace"
     @echo "TODO: conformance vectors — docs/testing/strategy.md §1"
 

@@ -183,7 +183,10 @@ async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
     let cfg = relay::ice_config(resolved_policy, ice_servers, Vec::new());
 
     let mut session = {
-        let mut adapter = RendezvousRelay::new(&mut client);
+        // (2.15) Extend the same peer hint already used for `fetch_with_retry` two lines above to
+        // the signaling relay itself, so a route to a peer at a different org actually federates
+        // instead of the server treating an absent hint as local-only.
+        let mut adapter = RendezvousRelay::new(&mut client, Some(peer_hint.clone()));
         if initiator {
             dial_with_config(
                 transport,

@@ -295,9 +295,18 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   step 2 / §3.4, not a new decision) and required a new task rather than folding the fix into 2.9 or
   2.11: **2.15**, inserted before 2.11 since 2.11's demo and 2.12's abuse suite both need real
   cross-org routing to run at all.
-- **NEXT:** `/next-task`. Continuing the batch: **2.15** next (new, blocks the rest of the batch),
-  then **2.11**, **2.12** in dependency order. **2.14** (new, from 2.10's review) queues up after
-  2.10's own dependents since it depends on 2.10.
+- **ALSO NOW:** **2.15 is done.** `RendezvousRelay` (apps/core/src/signal_relay.rs) and
+  `chat.rs`'s `route_tolerant` now thread the peer's real org hint into every routed call, not just
+  the bundle fetch — closing the gap 2.9's review found. security-reviewer APPROVE; test-engineer
+  PASS (mutation-tested twice, including 8 clean flakiness-check runs of the new WebRTC-handshake
+  test). code-reviewer's one contingent finding — the `session_connect.rs`/`RendezvousRelay` half had
+  zero regression coverage — closed with a new bidirectional two-org `session connect` test
+  (`apps/cli/tests/session_connect_federation.rs`). That verification pass also caught a real
+  pre-existing gap (dating to 1.24): `cargo test -p meridian-cli --features webrtc` was never wired
+  into `Justfile`/CI, so this task's own new regression tests would have silently never run — fixed
+  in both files.
+- **NEXT:** `/next-task`. Continuing the batch: **2.11** next, then **2.12** in dependency order.
+  **2.14** (new, from 2.10's review) queues up after 2.10's own dependents since it depends on 2.10.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -400,7 +409,7 @@ cross-org walkthrough as a runnable `demo/two-orgs` script under both discovery 
 
 **Follow-up surfaced by 2.9's review** — architect required a new task rather than folding the fix
 into 2.9 or 2.11.
-- [~] **2.15** Thread the peer's org hint into live signaling/chat routing (blocks 2.11, 2.12) — [file](./phase-2/2.15-thread-route-hint.md)
+- [x] **2.15** Thread the peer's org hint into live signaling/chat routing (blocks 2.11, 2.12) — [file](./phase-2/2.15-thread-route-hint.md)
 
 **Demo + exit gate**
 - [ ] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./phase-2/2.11-demo-two-orgs.md)

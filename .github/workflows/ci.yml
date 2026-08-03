@@ -111,6 +111,7 @@ jobs:
         run: |
           cargo test -p meridian-transport --features webrtc
           cargo test -p meridian-core --features webrtc
+          cargo test -p meridian-cli --features webrtc
       - name: Adversarial harnesses
         run: |
           bash harnesses/opacity-audit/run.sh
