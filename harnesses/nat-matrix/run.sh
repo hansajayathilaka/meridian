@@ -41,8 +41,32 @@ echo "[nat-matrix] building meridian-cli with the webrtc feature for the netns r
 # to still be present from an earlier, unrelated build.
 cargo build -q -p meridian-cli --features webrtc
 
-echo "[nat-matrix] netns wire-level rig + pcap assertions (skips without NET_ADMIN)…"
-bash tools/netns-nat-matrix.sh matrix
+echo "[nat-matrix] netns wire-level rig + pcap assertions (needs root + a real coturn — see below)…"
+# The netns rig (tools/netns-nat-matrix.sh) needs two things a plain CI runner user doesn't have:
+#   1. root, for NET_ADMIN (ip netns/veth/bridge/iptables) — without it, need_root's own check inside
+#      the script prints its "skipping" message and exits 0, which is what has always happened here
+#      (this step has never actually exercised the netns rig in CI before now).
+#   2. a real coturn install (turnserver + its turnutils_peer/turnutils_uclient companions, all one
+#      package) — the TURN-reachability probes in wire_smoke_cell drive these directly. Unlike
+#      tcpdump/jq (ensure_wire_tools's own best-effort apt-get fallback inside the script), coturn is
+#      not installed anywhere today — not in this repo's CI, not in .devcontainer/Dockerfile — so
+#      granting root alone would trade today's graceful skip for a hard "turnserver: command not
+#      found" failure. Installed here, once, right before the one invocation that needs it.
+#
+# Sudo is scoped to ONLY this apt-get + the final `matrix` invocation — never the cargo build/test
+# steps above, which must keep running (and writing target/) as the normal CI user so later steps in
+# this job don't inherit root-owned build artifacts. Falls back to the previous unprivileged call
+# verbatim when sudo isn't available (e.g. this repo's own sandboxed dev environments) — in that case
+# tools/netns-nat-matrix.sh's own need_root check still applies and skips exactly as before; this
+# changes nothing about what the rig tests or how it decides to skip, only whether CI now actually
+# gives it the privilege + dependency it has always declared it needs.
+if command -v sudo >/dev/null 2>&1; then
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y coturn
+  sudo bash tools/netns-nat-matrix.sh matrix
+else
+  bash tools/netns-nat-matrix.sh matrix
+fi
 
 echo "[nat-matrix] OK: 3/4 cells connect via relay with pcap-verified zero address leak (relay-only" \
      "cell) and DTLS-ciphertext-only on the wire; udp-blocked fails fast and cleanly by design;" \
