@@ -13,7 +13,11 @@
 //!   * **ICE restart** on a network change keeps the session and ratchet alive (<5 s, invariant 5);
 //!   * (1.33) the dialer's wait for an answer is **bounded**: a peer that never answers (offline, or
 //!     a hostile relay that lets the responder reject without ever producing one — 1.28) times out
-//!     with a distinct, diagnosable `SessionError::AnswerTimeout` rather than hanging forever.
+//!     with a distinct, diagnosable `SessionError::AnswerTimeout` rather than hanging forever;
+//!   * (2.17) the mirror on the answerer's side: `answer`'s wait for an offer is **bounded** too — a
+//!     dialer that never offers (offline, or, since federation, a route rejected server-side before
+//!     any offer reaches the answering side at all) times out with a distinct, diagnosable
+//!     `SessionError::OfferTimeout` rather than hanging forever.
 
 use std::sync::Arc;
 
@@ -365,6 +369,67 @@ async fn dial_times_out_when_the_peer_never_answers() {
         "returned after {elapsed:?}, far past the configured {:?} bound — some other, much longer \
          wait fired instead of the answer-timeout",
         meridian_core::session::ANSWER_TIMEOUT
+    );
+}
+
+/// 2.17: `recv_sdp`'s wait for the offer, on the *answerer* side, is bounded too — the mirror of
+/// 1.33's `dial_times_out_when_the_peer_never_answers` above, but for `answer`. Reproduces the
+/// federation-era failure mode named in the task: a route can be rejected server-side (closed
+/// policy, allowlist miss, rate limit) before any offer ever reaches the answering side, so nothing
+/// is ever going to arrive on Bob's relay half — only Bob's *receiving* half of the relay pair
+/// exists; nothing ever sends anything down it, so `answer`'s wait for an offer would hang forever
+/// without 2.17's bound. Alice/the dialer side is never even run, isolating the answerer's own bound
+/// exactly as 1.33's test isolated the dialer's.
+#[tokio::test(start_paused = true)]
+async fn answer_times_out_when_no_offer_ever_arrives() {
+    let mut bob = Peer::new("silent-answerer");
+
+    let fabric = LoopbackFabric::new();
+    let tb = Arc::new(LoopbackTransport::new(fabric));
+    let registry = Arc::new(StreamRegistry::with_builtins());
+
+    // `_relay_a_unused` could send, but we never call `.send()` on it, so `relay_b.recv()` — what
+    // `recv_sdp` awaits inside `answer` — never resolves on its own.
+    let alice_ik = *generate_account(&MemorySecretStore::new(), "dialer-never-shows")
+        .expect("account")
+        .public_key()
+        .as_bytes();
+    let (_relay_a_unused, mut relay_b) = MemRelay::pair(alice_ik, bob.ik());
+
+    let start = tokio::time::Instant::now();
+    let result = answer(
+        tb,
+        &bob.store,
+        &bob.handle(),
+        bob.ik(),
+        alice_ik,
+        &mut bob.chat,
+        &mut relay_b,
+        registry,
+    )
+    .await;
+    let elapsed = start.elapsed();
+
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("answer must not succeed when no offer ever arrives"),
+    };
+    // Distinguishable from tampering (`Chat(ChatError::BadSignature)`), from `AnswerTimeout` (the
+    // opposite side of the handshake), and from every other `SessionError` variant.
+    assert!(
+        matches!(err, SessionError::OfferTimeout(_)),
+        "expected SessionError::OfferTimeout, got a different variant: {err}"
+    );
+    assert!(
+        elapsed >= meridian_core::session::OFFER_TIMEOUT,
+        "returned after {elapsed:?}, before the {:?} bound elapsed",
+        meridian_core::session::OFFER_TIMEOUT
+    );
+    assert!(
+        elapsed < meridian_core::session::OFFER_TIMEOUT + std::time::Duration::from_secs(5),
+        "returned after {elapsed:?}, far past the configured {:?} bound — some other, much longer \
+         wait fired instead of the offer-timeout",
+        meridian_core::session::OFFER_TIMEOUT
     );
 }
 
