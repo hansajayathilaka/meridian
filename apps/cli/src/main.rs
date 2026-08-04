@@ -198,6 +198,17 @@ enum DemoCommand {
         #[arg(long, default_value_t = 100)]
         rounds: usize,
     },
+    /// Task 2.12: the opacity audit at BOTH servers — the local c2s `Route`/`Deliver` wire (same
+    /// property `opacity-audit` already proves) plus the s2s `FedRoute` wire the federation
+    /// boundary introduces (Feature 06's "envelopes at both servers pass the opacity audit").
+    FederatedOpacityAudit {
+        /// Where to write the captured local + federated transcript.
+        #[arg(default_value = "federated-transcript.pcapish")]
+        out: PathBuf,
+        /// Number of cross-org message rounds to script.
+        #[arg(long, default_value_t = 100)]
+        rounds: usize,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -629,6 +640,21 @@ fn run_demo(cmd: DemoCommand) -> Result<ExitCode, String> {
                 .map_err(|e| format!("writing {}: {e}", out.display()))?;
             println!(
                 "→ {} plaintext leaks; {} envelopes; sizes only observable field",
+                report.leaks, report.envelopes
+            );
+            println!(
+                "  transcript ({} bytes) written to {}",
+                report.transcript.len(),
+                out.display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        DemoCommand::FederatedOpacityAudit { out, rounds } => {
+            let report = opacity::run_federated_audit(rounds)?;
+            std::fs::write(&out, &report.transcript)
+                .map_err(|e| format!("writing {}: {e}", out.display()))?;
+            println!(
+                "→ {} plaintext leaks across the local + federated transcripts; {} envelopes",
                 report.leaks, report.envelopes
             );
             println!(

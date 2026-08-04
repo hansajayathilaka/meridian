@@ -322,11 +322,35 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   taken seriously and fixed — `run-walkthrough.sh` had declared a bash array literally named `HOME`,
   silently clobbering the real `$HOME` env var for every subsequent `docker compose` call in the
   script (renamed to `HOMES`).
-- **NEXT:** `/next-task`. Continuing the batch: **2.12** next (the phase exit gate). **2.14** (new,
-  from 2.10's review) queues up after 2.10's own dependents since it depends on 2.10. **2.16** (new,
-  a carried-in CI-flakiness defect surfaced while closing 2.15/2.11 — `session_connect_webrtc.rs`'s
-  TURN-grant test hangs in real CI for reasons this sandbox cannot reproduce, `#[ignore]`d rather
-  than guessed at) is independent and can land whenever it's picked up.
+- **ALSO NOW:** **2.12 is done — the Phase 2 exit gate.** Turned Feature 06's acceptance criteria
+  into executable, CI-wired gates: `apps/rendezvous/tests/federation_abuse.rs` (route-dimension rate
+  limits, allowlist-miss rejection with a positive control, oversized envelopes, the A2×2 cross-org
+  malicious-server bundle-substitution test pinned to `SignalError::BundleVerification`, plus the
+  F17 structural-inertness counterpart) and `apps/cli/tests/two_orgs_walkthrough.rs` (a CLI-
+  subprocess message-request-gate-then-delivery walkthrough, and a continuity test killing **both**
+  rendezvous servers post-P2P-establishment with chat still flowing both ways). New federated
+  opacity audit (`apps/cli/src/opacity.rs::run_federated_audit`, proven sensitive to a fed-only leak,
+  not vacuous) and new cross-org cells in `harnesses/mitm-sim`/`harnesses/opacity-audit`. The one
+  in-scope production change: extended the existing `test-tamper-hook` feature (1.28/1.32) so a
+  malicious server B can substitute a bundle on the federated fetch path, same F17 discipline.
+  security-reviewer APPROVE-WITH-CHANGES, architect consistent, test-engineer PASS (independently
+  reproduced both required mutation tests from a clean start), code-reviewer approve-with-nits. All
+  four reviewers independently confirmed a real production gap the suite's own mutation testing
+  surfaced: `session::answer`'s wait for an offer (`recv_sdp`) is unbounded — the mirror of task
+  1.33's dialer-side fix, newly reachable because a federated route can now be rejected server-side
+  before any offer arrives. Filed as its own tracked task rather than left in review prose, mirroring
+  2.9→2.15 and 2.10→2.14: **2.17**. code-reviewer also flagged (non-blocking, recommended as a
+  Phase-3 fix-task) that test-harness PKI/server-bootstrap boilerplate has now been duplicated a
+  fifth/sixth time across `apps/rendezvous/tests/` and `apps/cli/tests/` — debt first noted at 2.7/
+  2.8 and still unaddressed.
+- **NEXT:** `/next-task`. **2.14** (from 2.10's review) queues up after 2.10's own dependents since
+  it depends on 2.10. **2.16** (a carried-in CI-flakiness defect surfaced while closing 2.15/2.11 —
+  `session_connect_webrtc.rs`'s TURN-grant test hangs in real CI for reasons this sandbox cannot
+  reproduce, `#[ignore]`d rather than guessed at) and **2.17** (the newly-filed unbounded
+  answerer-wait fix, mirroring 1.33) are both independent and can land whenever picked up. With
+  2.1-2.13 and 2.15 all `[x]`, Feature 06's own scope is functionally complete; 2.14/2.16/2.17 are
+  carried-in fix-tasks, not blockers to calling Phase 2's T06 work done, but should land before
+  `/start-review-phase` for Phase 3 so the review sweep isn't tripping over already-known gaps.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -433,12 +457,13 @@ into 2.9 or 2.11.
 
 **Demo + exit gate**
 - [x] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./phase-2/2.11-demo-two-orgs.md)
-- [ ] **2.12** Cross-org abuse + acceptance suite (the phase exit gate) — [file](./phase-2/2.12-cross-org-abuse-acceptance.md)
+- [x] **2.12** Cross-org abuse + acceptance suite (the phase exit gate) — [file](./phase-2/2.12-cross-org-abuse-acceptance.md)
 
 **Carried in from Phase 1** (production defect surfaced by 1.32; not part of T06)
 - [x] **2.13** A replayed envelope permanently wedges the receiving ratchet (`Ratchet::decrypt` commits `ckr`/`nr` before `aead_open` and never rolls back — unauthenticated permanent session DoS) — [file](./phase-2/2.13-ratchet-replay-dos.md)
 - [ ] **2.14** Wire the message-request gate into the P2P session substrate (from 2.10's review; `session connect` currently bypasses the gate entirely) — [file](./phase-2/2.14-p2p-message-request-gate.md)
 - [ ] **2.16** `session_connect_webrtc.rs`'s TURN-grant test hangs in real CI, root cause unconfirmed (surfaced while closing 2.15; `#[ignore]`d rather than guessed at) — [file](./phase-2/2.16-turn-grant-ci-hang.md)
+- [ ] **2.17** Bound the answerer's wait for an offer (`recv_sdp`, mirror of 1.33; surfaced by 2.12's review) — [file](./phase-2/2.17-bound-offer-wait.md)
 
 ---
 

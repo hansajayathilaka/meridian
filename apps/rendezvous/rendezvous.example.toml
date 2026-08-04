@@ -23,7 +23,11 @@ invite_tokens = []               # tokens accepted when admission = "invite"
                                   # env: MERIDIAN_RENDEZVOUS_SERVER__INVITE_TOKENS (e.g. ["tok-a","tok-b"])
 allow_test_tamper = false        # TEST HOOK — only takes effect when built with `--features
                                   # test-tamper-hook` (the substitution code is compiled out
-                                  # otherwise). MUST be false in production.
+                                  # otherwise). MUST be false in production. Arms bundle
+                                  # substitution on the LOCAL fetch path (also needs the client's
+                                  # per-request `tamper` flag) and, as of task 2.12, on the
+                                  # FEDERATED fetch path (`fed_fetch_bundle`) — unconditionally
+                                  # there, since that request carries no per-request opt-in bit.
                                   # env: MERIDIAN_RENDEZVOUS_SERVER__ALLOW_TEST_TAMPER
 allow_test_route_tamper = false  # TEST HOOK (tasks 1.28 + 1.32) — UMBRELLA gate for tampering with
                                   # the ROUTED path, to prove a malicious relay cannot get anything

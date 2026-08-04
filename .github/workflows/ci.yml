@@ -60,7 +60,10 @@ jobs:
       # NOTE: this step needs no change as guards are added — it is package-scoped and runs the whole
       # default-feature test binary, so task 1.32's per-mode inertness tests
       # (route_{spoof_from,replay,reorder,drop,cross_deliver}_is_inert_without_feature and
-      # all_route_modes_are_inert_without_feature) are picked up automatically.
+      # all_route_modes_are_inert_without_feature) are picked up automatically. Task 2.12's
+      # `apps/rendezvous/tests/federation_abuse.rs` (the FEDERATED bundle-substitution tamper hook,
+      # `fed_fetch_tamper_flag_is_inert_without_feature`) is picked up the same way — no edit needed
+      # here either, which is the point of this step being package-scoped rather than `--test`-filtered.
       - name: Tamper-hook compile-gate guards (default features only — see comment)
         run: cargo test -p meridian-rendezvous
       # The MIRROR of the step above, and just as load-bearing. The runtime-gate tests — the
@@ -76,7 +79,9 @@ jobs:
       # them. (Stated precisely because it is checkable: right now `cargo test --workspace` does run
       # them. A reader who checks a sloppier claim, finds it false, and concludes this step is stale
       # might delete it — which is exactly the regression it exists to prevent.) Feature-on coverage
-      # must not depend on a dev-dep.
+      # must not depend on a dev-dep. Also runs task 2.12's federated A2×2 cell
+      # (`federation_abuse.rs::cross_org_malicious_server_bundle_substitution_is_rejected_by_the_client`)
+      # for the same reason: package-scoped, feature ON, no `--test` filter.
       - name: Tamper-hook runtime-gate tests (feature ON — see comment)
         run: cargo test -p meridian-rendezvous --features test-tamper-hook
       # F17, checked at the level that actually decides it: feature *resolution*. A release/normal
@@ -117,6 +122,14 @@ jobs:
           bash harnesses/opacity-audit/run.sh
           bash harnesses/mitm-sim/run.sh
           bash harnesses/ghost-device/run.sh
+      # Task 2.12 (phase-2 exit gate): the cross-org abuse + acceptance suite. Already covered by
+      # `cargo test --workspace` above too (no feature-gating on this file), but named explicitly
+      # here — same convention as the harness invocations above — so the phase exit gate is
+      # discoverable as its own CI line rather than buried in a workspace-wide run.
+      - name: Cross-org abuse + acceptance suite (2.12)
+        run: |
+          cargo test -p meridian-rendezvous --features test-tamper-hook --test federation_abuse
+          cargo test -p meridian-cli --test two_orgs_walkthrough
       - name: NAT matrix + relay policy (T05; netns rig skips without NET_ADMIN)
         run: bash harnesses/nat-matrix/run.sh
       # TODO: migrate to cargo nextest run --workspace

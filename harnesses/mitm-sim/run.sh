@@ -74,3 +74,23 @@ echo "[mitm-sim] X3DH preamble mutation + prekey-depletion (1.32 / ADR 0016)…"
 cargo test -q -p meridian-core --test preamble_mutation
 echo "[mitm-sim] OK: a mutated preamble is rejected before the vault is touched — no prekey burned,"
 echo "  no poisoned session, and the genuine envelope still establishes."
+
+# 2.12: the A2×2 CROSS-ORG cell — threat-mitigation-matrix.md names T06 as the owner of A2×2, the
+# dual-side MITM/malicious-server-substitution mitigation, and this is what actually proves it.
+# Extends the single-hop bundle-substitution cell above (line ~27) across a federation boundary:
+# TWO real meridian-rendezvous servers, org-a (honest, dials out) and org-b (malicious, the
+# `test-tamper-hook` federated fetch extension armed), talking real s2s mTLS. Org B lies to org A
+# about bob's real, already-published prekey bundle over `fed_fetch_bundle`; Alice's client — which
+# only ever talks to org-a — must abort via its OWN verify_bundle check, pinned to
+# SignalError::BundleVerification specifically (never a bare unwrap_err), exactly mirroring how
+# 1.28 pinned the responder's rejection to Rejected(Chat(BadSignature)) rather than "somebody
+# errored". A companion structural-inertness cell (in the same file, `#[cfg(not(feature =
+# "test-tamper-hook"))]`) proves the hook does not exist at all without the cargo feature — it only
+# executes under the package-scoped `cargo test -p meridian-rendezvous` CI step (see
+# .github/workflows/ci.yml's "Tamper-hook" steps), not under this filtered invocation.
+echo "[mitm-sim] cross-org malicious-server bundle substitution (2.12 / A2×2)…"
+cargo test -q -p meridian-rendezvous --features test-tamper-hook --test federation_abuse \
+  cross_org_malicious_server_bundle_substitution_is_rejected_by_the_client
+echo "[mitm-sim] OK: org B lying about bob's bundle over the FEDERATED fetch path is caught by"
+echo "  alice's own client-side verify_bundle check (SignalError::BundleVerification), even though"
+echo "  alice never talks to org B directly."

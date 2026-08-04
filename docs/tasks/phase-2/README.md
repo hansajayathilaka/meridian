@@ -152,7 +152,7 @@ into 2.9 (would reopen an already-narrow review) or into 2.11 (wrong agent/revie
 
 **Demo + exit gate**
 - [x] **2.11** `demo/two-orgs/`: two full stacks, private CA, both discovery modes — [file](./2.11-demo-two-orgs.md)
-- [ ] **2.12** Cross-org abuse + acceptance suite (the phase exit gate) — [file](./2.12-cross-org-abuse-acceptance.md)
+- [x] **2.12** Cross-org abuse + acceptance suite (the phase exit gate) — [file](./2.12-cross-org-abuse-acceptance.md)
 
 **Carried in from Phase 1** — not T06 work, and not on the DAG below. A production defect surfaced by
 [1.32](../phase-1/1.32-relay-attacks-past-signature.md) and confirmed by its security review: it lands
@@ -170,6 +170,11 @@ above; `#[ignore]`d with a documented reason rather than fixed by guessing (this
 reproduce GitHub Actions' network conditions).
 - [ ] **2.16** `session_connect_webrtc.rs`'s TURN-grant test hangs in real CI, root cause
   unconfirmed — [file](./2.16-turn-grant-ci-hang.md)
+
+**Carried-in availability defect surfaced by 2.12's review** — security-reviewer + architect
+independently found and required this be tracked, mirroring task 1.33 (dialer side) for the
+answerer side.
+- [ ] **2.17** Bound the answerer's wait for an offer (`recv_sdp`, mirror of 1.33) — [file](./2.17-bound-offer-wait.md)
 
 ### Dependency order
 ```
