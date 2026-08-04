@@ -168,13 +168,13 @@ tracked explicitly rather than silently deferred to Feature 08.
 **Carried-in CI defect surfaced while closing 2.15** — not T06 work, independent of every task
 above; `#[ignore]`d with a documented reason rather than fixed by guessing (this sandbox cannot
 reproduce GitHub Actions' network conditions).
-- [ ] **2.16** `session_connect_webrtc.rs`'s TURN-grant test hangs in real CI, root cause
+- [~] **2.16** `session_connect_webrtc.rs`'s TURN-grant test hangs in real CI, root cause
   unconfirmed — [file](./2.16-turn-grant-ci-hang.md)
 
 **Carried-in availability defect surfaced by 2.12's review** — security-reviewer + architect
 independently found and required this be tracked, mirroring task 1.33 (dialer side) for the
 answerer side.
-- [ ] **2.17** Bound the answerer's wait for an offer (`recv_sdp`, mirror of 1.33) — [file](./2.17-bound-offer-wait.md)
+- [~] **2.17** Bound the answerer's wait for an offer (`recv_sdp`, mirror of 1.33) — [file](./2.17-bound-offer-wait.md)
 
 ### Dependency order
 ```
