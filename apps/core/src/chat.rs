@@ -458,13 +458,14 @@ impl ChatState {
     /// directly by the P2P session substrate (`apps/core/src/session.rs`) for `mrd.ctrl/1`
     /// SDP/ICE signaling on the *same* ratchet, and that traffic must never be gated: a call
     /// establishing a P2P session is not a "message" the user is being asked to accept/reject.
-    /// Because signaling always runs before any chat content flows over a resulting P2P data
-    /// channel, a session (and therefore `is_first_contact` below) is already installed by the
-    /// time `open_inbound` first sees that peer via the substrate — so this gate is, in practice,
-    /// specific to the relay-first-contact path §3.5's demo targets. See `docs/architecture/
-    /// features/06-cross-org-federation.md` for that flow; flagged for architect/security-reviewer
-    /// as a residual gap (a direct P2P dial is not itself gated) rather than fixed here, since
-    /// closing it would mean restructuring the session substrate, out of this task's scope.
+    ///
+    /// This is a thin wrapper over the crate-private `open_inbound_gated` with
+    /// `force_first_contact = false` — i.e. first-contact detection purely from local session
+    /// state, correct for this (relay/mailbox) call path. See that method's doc for why the P2P
+    /// substrate (task 2.14) needs the forcing variant instead: by the time a `mrd.chat/1` content
+    /// frame reaches `P2pSession::pump`, the offer/answer handshake has already installed the
+    /// session as a side effect of its own `open_bytes` calls, so this method's own
+    /// session-presence check would never see a first contact on that path.
     ///
     /// **Hard invariant (task 2.10): gating happens after signature verification and session
     /// establishment.** The check below runs *after* [`open_bytes`] has already verified the
@@ -482,6 +483,43 @@ impl ChatState {
         from: &[u8; 32],
         blob: &[u8],
     ) -> Result<ChatContent, ChatError> {
+        self.open_inbound_gated(store, handle, our_ik, from, blob, false)
+    }
+
+    /// (task 2.14) Like [`open_inbound`](Self::open_inbound), but lets the caller assert that this
+    /// is genuinely the first-ever content received from `from`, overriding this method's own
+    /// session-presence heuristic.
+    ///
+    /// **Why this exists.** [`open_inbound`](Self::open_inbound)'s first-contact detection —
+    /// `!self.sessions.contains_key(from)`, snapshotted before [`open_bytes`] runs — is correct for
+    /// the relay/mailbox path, where the very envelope being gated is *also* the one whose
+    /// `open_bytes` call installs the responder session (X3DH). The P2P session substrate
+    /// (`apps/core/src/session.rs`) is structurally different: its offer/answer handshake calls
+    /// [`open_bytes`] directly (never through this gate) to install the session *before* any
+    /// `mrd.chat/1` content frame exists to gate — by the time a chat frame reaches
+    /// `P2pSession::pump`, the session is already there, so `open_inbound`'s own check would always
+    /// read "not first contact", even on a genuine first-ever P2P dial from an unrecognized peer
+    /// (this was 2.10's known, tracked gap — see the module docs on `session.rs` and task 2.14).
+    ///
+    /// `session.rs` closes that gap by snapshotting, from its own vantage point, whether the peer
+    /// was known *before* its offer/answer exchange ran (see `dial_established`/
+    /// `answer_with_config`) and passing that through as `force_first_contact`. `pub(crate)`: only
+    /// `session.rs`, in the same crate, has the handshake-ordering context needed to supply that
+    /// flag correctly — every other caller should go through [`open_inbound`](Self::open_inbound).
+    ///
+    /// Same hard invariant as [`open_inbound`](Self::open_inbound): this still runs *after*
+    /// [`open_bytes`] has verified the signature (and, on first contact, completed X3DH) — gating
+    /// is delivery-only, never a crypto shortcut, and a rejected first contact still costs whatever
+    /// handshake material (e.g. a one-time prekey) it consumed.
+    pub(crate) fn open_inbound_gated(
+        &mut self,
+        store: &dyn SecretStore,
+        handle: &KeyHandle,
+        our_ik: &[u8; 32],
+        from: &[u8; 32],
+        blob: &[u8],
+        force_first_contact: bool,
+    ) -> Result<ChatContent, ChatError> {
         // A sender with an undecided pending request is refused outright, before touching crypto
         // state at all: their first envelope already ran X3DH and installed the session (and the
         // OTK-consumption cost above), so there is nothing further to establish, and refusing here
@@ -493,8 +531,11 @@ impl ChatState {
 
         // Snapshot *before* `open_bytes`, which — on a genuine first contact — installs the
         // responder session as a side effect. Capturing this first is what lets us tell "this
-        // envelope is what just created the session" from "the session already existed".
-        let is_first_contact = !self.sessions.contains_key(from);
+        // envelope is what just created the session" from "the session already existed". A caller
+        // that already knows independently (2.14: `session.rs`) that this is first contact — even
+        // though a session now sits in `self.sessions` from its own earlier handshake — forces the
+        // gate to fire via `force_first_contact` regardless of that local presence check.
+        let is_first_contact = force_first_contact || !self.sessions.contains_key(from);
 
         let plaintext = self.open_bytes(store, handle, our_ik, from, blob)?;
         let content = ChatContent::decode(&plaintext)?;

@@ -18,12 +18,12 @@
 
 use std::sync::Arc;
 
-use meridian_core::chat::ChatState;
+use meridian_core::chat::{ChatError, ChatState};
 use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{generate_account, AccountId, KeyHandle, MemorySecretStore};
 use meridian_core::relay;
 use meridian_core::session::{
-    answer_with_config, dial_with_config, MemRelay, P2pSession, SessionEvent,
+    answer_with_config, dial_with_config, MemRelay, P2pSession, SessionError, SessionEvent,
 };
 use meridian_core::signaling::generate_bundle;
 use meridian_core::streams::StreamRegistry;
@@ -290,11 +290,31 @@ async fn run_demo_generic<T: Transport>(
         .send_chat(&alice.store, &ahandle, &mut alice.chat, "hello over p2p")
         .await
         .map_err(|e| e.to_string())?;
-    if let Some(SessionEvent::Chat(ChatContent::Text { body, .. })) = bsess
-        .pump(&bob.store, &bhandle, &mut bob.chat)
-        .await
-        .map_err(|e| e.to_string())?
-    {
+    // (task 2.14) Bob's chat state has no prior session with Alice before this handshake — a
+    // genuine first P2P contact — so this content frame is gated exactly like the relay path
+    // (2.10). This single-process demo simulates *both* peers purely to exercise the substrate
+    // mechanism deterministically; there is no separate human on Bob's side deciding whether to
+    // trust "alice" here, so it auto-accepts (the same action a real user takes by answering "y")
+    // rather than bolting a second, parallel interactive prompt onto a non-interactive script. The
+    // real accept/reject decision points are `meridian chat`'s interactive prompt (2.10) and
+    // `session connect`'s loud notice (2.14) — this demo's job is proving the mechanism holds, not
+    // re-demonstrating a UX those already cover.
+    let alice_to_bob = match bsess.pump(&bob.store, &bhandle, &mut bob.chat).await {
+        Ok(Some(SessionEvent::Chat(ChatContent::Text { body, .. }))) => Some(body),
+        Ok(_) => None,
+        Err(SessionError::Chat(ChatError::MessageRequest)) => {
+            let req = bob
+                .chat
+                .accept_request(&alice.ik())
+                .expect("open_inbound_gated just inserted this request");
+            match req.intro {
+                ChatContent::Text { body, .. } => Some(body),
+                _ => None,
+            }
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    if let Some(body) = alice_to_bob {
         lines.push(format!("  [alice \u{2192} bob] {body}"));
     }
     bsess

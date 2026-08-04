@@ -365,6 +365,23 @@ pub struct P2pSession<T: Transport> {
     /// The abandoned first attempt's wait, when `relay_fallback` is set — see
     /// [`SessionInfo::relay_fallback_wait_ms`].
     relay_fallback_wait_ms: Option<f64>,
+    /// (task 2.14) `true` until this session's *first* `mrd.chat/1` content frame has been through
+    /// the message-request gate. Set at construction from a snapshot — taken by
+    /// [`dial_established`]/[`answer_with_config`] *before* the offer/answer handshake installed
+    /// this session — of whether `peer_ik` was already a known contact. `false` from the start for
+    /// a dialer (whose crypto session with `peer_ik` must already exist before `dial` is called,
+    /// per [`dial_with_config`]'s doc) and for a responder answering an already-known peer;
+    /// `true` for a responder's first-ever P2P session with an unrecognized peer.
+    ///
+    /// [`ChatState::open_inbound`]'s own first-contact detection (`!sessions.contains_key(from)`)
+    /// cannot see this: by the time a chat frame reaches [`P2pSession::pump`], the session was
+    /// already installed as a side effect of the SDP/offer-answer exchange's own `open_bytes`
+    /// calls, so that check would always read `false`. This flag is what lets `pump` force the
+    /// gate via [`ChatState::open_inbound_gated`] on exactly the first content frame, then clear
+    /// itself once the gate has actually fired (inserted a [`crate::chat::MessageRequest`]) — see
+    /// `pump`'s `CHAT_LABEL` arm. Left `true` on any *other* error (e.g. a forged first frame) so a
+    /// subsequent, genuine first frame is still gated rather than slipping through ungated.
+    chat_first_contact_gate: bool,
 }
 
 impl<T: Transport> P2pSession<T> {
@@ -547,9 +564,43 @@ impl<T: Transport> P2pSession<T> {
         };
         match self.labels.get(&cid).copied() {
             Some(l) if l == CHAT_LABEL => {
-                let content =
-                    chat.open_inbound(store, handle, &self.our_ik, &self.peer_ik, &blob)?;
-                Ok(Some(SessionEvent::Chat(content)))
+                if self.chat_first_contact_gate {
+                    // (task 2.14) Force the gate on this content frame regardless of what
+                    // `ChatState` itself can see (the session already exists — see the field's
+                    // doc). `Err(ChatError::MessageRequest)` means the content decoded and
+                    // verified fine and is now held in `chat.pending_requests`, exactly like the
+                    // relay path (`ChatError::MessageRequest` propagates through
+                    // `SessionError::Chat` via `?`, same as it did before this frame was gated) —
+                    // clear the flag so subsequent frames (post accept/reject) use the ordinary,
+                    // session-presence-based check. Any *other* error (bad signature, desync, …)
+                    // leaves the flag set: a hostile/garbled first frame must not let a later,
+                    // genuine first frame slip through ungated.
+                    match chat.open_inbound_gated(
+                        store,
+                        handle,
+                        &self.our_ik,
+                        &self.peer_ik,
+                        &blob,
+                        true,
+                    ) {
+                        Ok(content) => {
+                            // Structurally unreachable while `force_first_contact` is `true` (that
+                            // always takes the gate branch on a successful decode) — handled
+                            // rather than assumed, and still clears the flag if it ever did fire.
+                            self.chat_first_contact_gate = false;
+                            Ok(Some(SessionEvent::Chat(content)))
+                        }
+                        Err(ChatError::MessageRequest) => {
+                            self.chat_first_contact_gate = false;
+                            Err(SessionError::Chat(ChatError::MessageRequest))
+                        }
+                        Err(e) => Err(SessionError::Chat(e)),
+                    }
+                } else {
+                    let content =
+                        chat.open_inbound(store, handle, &self.our_ik, &self.peer_ik, &blob)?;
+                    Ok(Some(SessionEvent::Chat(content)))
+                }
             }
             _ => {
                 // Treat anything else (ctrl, or a not-yet-labelled channel) as a ctrl frame.
@@ -838,6 +889,15 @@ async fn dial_established<T: Transport>(
     relay: &mut dyn SignalRelay,
     registry: Arc<StreamRegistry>,
 ) -> Result<P2pSession<T>, SessionError> {
+    // (task 2.14) Snapshot *before* anything below touches `chat`'s session map, for
+    // `chat_first_contact_gate` (see that field's doc). In practice this reads `true` (known)
+    // here: `dial`/`dial_with_config`'s own doc requires the caller to have already established
+    // the crypto session with `peer_ik` (X3DH) before dialing, and nothing in this function's own
+    // signaling touches a *new* session for `peer_ik` (the answer is opened via `chat.open_bytes`
+    // on the session that already exists). Computed rather than hardcoded so the invariant is
+    // enforced structurally, not just documented.
+    let peer_known_before = chat.has_session(&peer_ik);
+
     let ctrl_ch = transport
         .add_data_channel(&conn, ChannelCfg::reliable_ordered(CTRL_LABEL))
         .await?;
@@ -912,6 +972,7 @@ async fn dial_established<T: Transport>(
         offered,
         relay_fallback: false,
         relay_fallback_wait_ms: None,
+        chat_first_contact_gate: !peer_known_before,
     };
     session.handshake(store, handle, chat).await?;
     Ok(session)
@@ -969,6 +1030,14 @@ pub async fn answer_with_config<T: Transport>(
 ) -> Result<P2pSession<T>, SessionError> {
     let attempt_start = Instant::now();
     let policy = cfg.policy;
+    // (task 2.14) Snapshot *before* the first `recv_sdp` below, whose `chat.open_bytes` call
+    // installs the responder session as a side effect on a genuine first-ever offer (X3DH) — same
+    // ordering requirement as `ChatState::open_inbound`'s own `is_first_contact` snapshot (see
+    // `chat_first_contact_gate`'s doc on `P2pSession`). Computed once, here, and reused for both
+    // `answer_established` calls below (including the 1.29 relay-fallback retry's second
+    // `recv_sdp`): that second offer lands on the *same*, by-then-already-installed session, so
+    // recomputing this after it would always (wrongly) read "known".
+    let peer_known_before = chat.has_session(&peer_ik);
     let (offer_sdp, asserted_fp, offer_ice) =
         recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, true).await?;
 
@@ -989,6 +1058,7 @@ pub async fn answer_with_config<T: Transport>(
         chat,
         relay,
         registry.clone(),
+        peer_known_before,
     )
     .await;
     match result {
@@ -1019,6 +1089,7 @@ pub async fn answer_with_config<T: Transport>(
                 chat,
                 relay,
                 registry,
+                peer_known_before,
             )
             .await;
             match result2 {
@@ -1063,6 +1134,7 @@ async fn answer_established<T: Transport>(
     chat: &mut ChatState,
     relay: &mut dyn SignalRelay,
     registry: Arc<StreamRegistry>,
+    peer_known_before: bool,
 ) -> Result<P2pSession<T>, SessionError> {
     let ctrl_ch = transport
         .add_data_channel(&conn, ChannelCfg::reliable_ordered(CTRL_LABEL))
@@ -1118,6 +1190,7 @@ async fn answer_established<T: Transport>(
         offered,
         relay_fallback: false,
         relay_fallback_wait_ms: None,
+        chat_first_contact_gate: !peer_known_before,
     };
     session.handshake(store, handle, chat).await?;
     Ok(session)
