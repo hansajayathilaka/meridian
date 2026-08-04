@@ -174,7 +174,7 @@ reproduce GitHub Actions' network conditions).
 **Carried-in availability defect surfaced by 2.12's review** — security-reviewer + architect
 independently found and required this be tracked, mirroring task 1.33 (dialer side) for the
 answerer side.
-- [~] **2.17** Bound the answerer's wait for an offer (`recv_sdp`, mirror of 1.33) — [file](./2.17-bound-offer-wait.md)
+- [x] **2.17** Bound the answerer's wait for an offer (`recv_sdp`, mirror of 1.33) — [file](./2.17-bound-offer-wait.md)
 
 ### Dependency order
 ```

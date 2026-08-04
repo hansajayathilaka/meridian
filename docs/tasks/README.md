@@ -361,13 +361,27 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   direction, worth a future regression test). test-engineer: PASS, all four affected suites green
   including `--features webrtc`. `docs/security/threat-mitigation-matrix.md`'s gate entry updated to
   close 2.10's relay-path-only caveat.
+- **ALSO NOW:** **2.17 is done.** New `OFFER_TIMEOUT` (30s, a distinct name from `ANSWER_TIMEOUT` but
+  the same value — the two waits bound different sides of the handshake for different reasons, so
+  keeping them independently named allows future independent tuning even though the underlying cost,
+  one relay hop plus one peer's up-to-~20s full-candidate gather under non-trickle ICE, is the same)
+  and `SessionError::OfferTimeout` now bound both of `answer_with_config`'s `recv_sdp` waits (the
+  initial offer wait and the 1.29 relay-fallback retry) — a peer whose offer never arrives (e.g. a
+  federated route rejected server-side before any offer reaches the answering side, per 2.12's
+  review) now fails closed with a diagnosable error instead of hanging forever, mirroring 1.33's
+  dialer-side fix. Traced and ruled out the OTK-consumption-amplifier question the task required:
+  `take_otk_secret` only fires after an offer's bytes actually arrive and pass verification, so a
+  timed-out wait never touches it — a hostile/absent dial can't drain anything of the answerer's own
+  by repeatedly triggering `answer()`. architect: consistent, no required changes — verified the
+  timeout math against the real `WAIT_TIMEOUT`/`GATHER_TIMEOUT` bounds, not just asserted.
+  security-reviewer: APPROVE — confirmed via code trace, no new attack surface, no wire change.
 - **NEXT:** `/next-task`. **2.16** (a carried-in CI-flakiness defect surfaced while closing 2.15/2.11 —
   `session_connect_webrtc.rs`'s TURN-grant test hangs in real CI for reasons this sandbox cannot
-  reproduce, `#[ignore]`d rather than guessed at) and **2.17** (the newly-filed unbounded
-  answerer-wait fix, mirroring 1.33) are both independent and can land whenever picked up. With
-  2.1-2.15 all `[x]`, Feature 06's own scope is functionally complete; 2.16/2.17 are carried-in
-  fix-tasks, not blockers to calling Phase 2's T06 work done, but should land before
-  `/start-review-phase` for Phase 3 so the review sweep isn't tripping over already-known gaps.
+  reproduce, `#[ignore]`d rather than guessed at) is the last open Phase 2 task, in progress — a
+  connectivity-debugger pass is investigating the root cause now. With 2.1-2.15 and 2.17 all `[x]`,
+  Feature 06's own scope is functionally complete; 2.16 is a carried-in fix-task, not a blocker to
+  calling Phase 2's T06 work done, but should land before `/start-review-phase` for Phase 3 so the
+  review sweep isn't tripping over an already-known gap.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -480,7 +494,7 @@ into 2.9 or 2.11.
 - [x] **2.13** A replayed envelope permanently wedges the receiving ratchet (`Ratchet::decrypt` commits `ckr`/`nr` before `aead_open` and never rolls back — unauthenticated permanent session DoS) — [file](./phase-2/2.13-ratchet-replay-dos.md)
 - [x] **2.14** Wire the message-request gate into the P2P session substrate (from 2.10's review; `session connect` currently bypasses the gate entirely) — [file](./phase-2/2.14-p2p-message-request-gate.md)
 - [~] **2.16** `session_connect_webrtc.rs`'s TURN-grant test hangs in real CI, root cause unconfirmed (surfaced while closing 2.15; `#[ignore]`d rather than guessed at) — [file](./phase-2/2.16-turn-grant-ci-hang.md)
-- [~] **2.17** Bound the answerer's wait for an offer (`recv_sdp`, mirror of 1.33; surfaced by 2.12's review) — [file](./phase-2/2.17-bound-offer-wait.md)
+- [x] **2.17** Bound the answerer's wait for an offer (`recv_sdp`, mirror of 1.33; surfaced by 2.12's review) — [file](./phase-2/2.17-bound-offer-wait.md)
 
 ---
 
