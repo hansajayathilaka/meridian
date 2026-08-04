@@ -474,10 +474,10 @@ fn cli_walkthrough_message_request_gate_then_delivery() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn killing_both_rendezvous_servers_after_p2p_established_does_not_interrupt_the_data_channel()
 {
-    use meridian_core::chat::ChatState;
+    use meridian_core::chat::{ChatError, ChatState};
     use meridian_core::envelope::ChatContent;
     use meridian_core::identity::{generate_account, AccountId, KeyHandle, MemorySecretStore};
-    use meridian_core::session::{answer, dial, SessionEvent};
+    use meridian_core::session::{answer, dial, SessionError, SessionEvent};
     use meridian_core::signal_relay::RendezvousRelay;
     use meridian_core::signaling::{generate_bundle, SignalingClient};
     use meridian_core::streams::StreamRegistry;
@@ -624,15 +624,26 @@ async fn killing_both_rendezvous_servers_after_p2p_established_does_not_interrup
         )
         .await
         .expect("send must still work with both rendezvous servers killed");
-    match bsess
-        .pump(&bob.store, &bhandle, &mut bob.chat)
-        .await
-        .expect("pump must still work with both rendezvous servers killed")
-    {
-        Some(SessionEvent::Chat(ChatContent::Text { body, .. })) => {
+    // (task 2.14) This is Bob's first-ever P2P content from Alice, so it's gated exactly like the
+    // relay path (2.10) — accept it (mirroring the CLI's accept/reject UX) before asserting this
+    // test's actual subject, continuity after both servers are killed.
+    match bsess.pump(&bob.store, &bhandle, &mut bob.chat).await {
+        Err(SessionError::Chat(ChatError::MessageRequest)) => {
+            let req = bob
+                .chat
+                .accept_request(&alice_ik)
+                .expect("open_inbound_gated just inserted this request");
+            match req.intro {
+                ChatContent::Text { body, .. } => {
+                    assert_eq!(body, "hello after both servers are dead");
+                }
+                other => panic!("unexpected gated intro: {other:?}"),
+            }
+        }
+        Ok(Some(SessionEvent::Chat(ChatContent::Text { body, .. }))) => {
             assert_eq!(body, "hello after both servers are dead");
         }
-        other => panic!("bob expected chat after server kill, got {other:?}"),
+        other => panic!("pump must still work with both rendezvous servers killed: {other:?}"),
     }
 
     bsess

@@ -23,7 +23,7 @@ use std::sync::Arc;
 /// by `chat_manager.rs`.
 const TEST_NOW_UNIX: u64 = 1_700_000_000;
 
-use meridian_core::chat::ChatState;
+use meridian_core::chat::{ChatError, ChatState};
 use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{generate_account, AccountId, KeyHandle, MemorySecretStore};
 use meridian_core::session::{answer, dial, MemRelay, P2pSession, SessionError, SessionEvent};
@@ -122,6 +122,40 @@ async fn connect(
     )
 }
 
+/// (task 2.14) Mirrors `p2p_session.rs`'s helper of the same name: `establish_ratchet` above only
+/// sets up Bob's X3DH vault, never a session entry for Alice, so Bob's first-ever P2P content frame
+/// from Alice is gated (task 2.14) — accept it (mirroring the CLI's accept/reject UX) before a
+/// test's own (unrelated) assertions continue.
+async fn accept_first_p2p_message(
+    sess: &mut P2pSession<WebRtcTransport>,
+    store: &MemorySecretStore,
+    handle: &KeyHandle,
+    chat: &mut ChatState,
+    peer_ik: &[u8; 32],
+    expected_body: &str,
+) {
+    match sess.pump(store, handle, chat).await {
+        Err(SessionError::Chat(ChatError::MessageRequest)) => {}
+        other => panic!(
+            "expected the first P2P chat frame to be gated as a message request, got {other:?}"
+        ),
+    }
+    let req = chat
+        .pending_request(peer_ik)
+        .expect("gated first contact must be held in pending_requests");
+    match &req.intro {
+        ChatContent::Text { body, .. } => assert_eq!(body, expected_body),
+        other => panic!("unexpected intro content: {other:?}"),
+    }
+    let accepted = chat
+        .accept_request(peer_ik)
+        .expect("accept the pending request");
+    match accepted.intro {
+        ChatContent::Text { body, .. } => assert_eq!(body, expected_body),
+        other => panic!("unexpected accepted intro: {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_down_chat_continuity_over_webrtc() {
     let mut alice = Peer::new("chat.a");
@@ -164,16 +198,15 @@ async fn server_down_chat_continuity_over_webrtc() {
         .send_chat(&alice.store, &ahandle, &mut alice.chat, "hello over p2p")
         .await
         .unwrap();
-    match bsess
-        .pump(&bob.store, &bhandle, &mut bob.chat)
-        .await
-        .unwrap()
-    {
-        Some(SessionEvent::Chat(ChatContent::Text { body, .. })) => {
-            assert_eq!(body, "hello over p2p");
-        }
-        other => panic!("bob expected chat, got {other:?}"),
-    }
+    accept_first_p2p_message(
+        &mut bsess,
+        &bob.store,
+        &bhandle,
+        &mut bob.chat,
+        &alice.ik(),
+        "hello over p2p",
+    )
+    .await;
 
     bsess
         .send_chat(
@@ -370,13 +403,15 @@ async fn ice_restart_preserves_session_and_ratchet_over_webrtc() {
         .send_chat(&alice.store, &ahandle, &mut alice.chat, "before restart")
         .await
         .unwrap();
-    assert!(matches!(
-        bsess
-            .pump(&bob.store, &bhandle, &mut bob.chat)
-            .await
-            .unwrap(),
-        Some(SessionEvent::Chat(ChatContent::Text { .. }))
-    ));
+    accept_first_p2p_message(
+        &mut bsess,
+        &bob.store,
+        &bhandle,
+        &mut bob.chat,
+        &alice.ik(),
+        "before restart",
+    )
+    .await;
 
     asess.ice_restart().await.unwrap();
     bsess.ice_restart().await.unwrap();

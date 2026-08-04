@@ -161,8 +161,32 @@ const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 /// several full connectivity-check rounds against the relay pair before our own bound expires.
 /// Deliberately still well above one keepalive/check round (not a hair-trigger) so a merely-slow
 /// real link isn't mistaken for a dead one.
-const ICE_DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(2);
-const ICE_FAILED_TIMEOUT: Duration = Duration::from_secs(4);
+///
+/// (task 2.16) `disconnected_timeout`+`failed_timeout` was `2s`+`4s` (6s total) from 1.29 until this
+/// task found a second, distinct failure mode it was too tight for: a **valid** host-candidate pair
+/// (both peers on the same reachable network, e.g. the `session_connect_webrtc.rs` acceptance test)
+/// can fail to get validated within a 6s Checking budget whenever *other* ICE-server gathering
+/// (STUN reflexive probing, a TURN Allocate) is concurrently running against a server that's
+/// configured but doesn't actually answer — confirmed by repeated, timestamped reproduction: the
+/// Checking→Failed transition landed almost exactly 6.0s after Checking began, every time, with a
+/// real host/host pair sitting right there unvalidated. Widening to `3s`+`9s` (12s total — still
+/// comfortably inside [`WAIT_TIMEOUT`]'s 15s, preserving 1.29's own margin requirement) fixed it
+/// (repeated local runs: session establishes directly, no 1.29 relay-fallback retry needed, in
+/// ~21–23s total end to end instead of failing after ~70–90s across two doomed attempts). This is a
+/// **narrower, distinct problem from 1.29's** (1.29: even a *correct* relay-vs-relay pair under real
+/// NAT got zero STUN responses at all, a hard non-convergence unrelated to timeout length, which is
+/// why 1.29 rejected timeout-tuning as insufficient *for that problem* and added the session-level
+/// relay-fallback retry instead) — here the pair genuinely was reachable and would have validated
+/// given a little more of the *existing* Checking budget, no protocol-level non-convergence
+/// involved. Verified locally against every NAT-scenario test this sandbox can run without
+/// `NET_ADMIN` (`nat_matrix_selects_the_right_path`, `relay_only_strips_host_and_srflx_before_gathering`,
+/// `doctor_connects_all_four_cells`, `symmetric_nat_relays_over_udp`,
+/// `udp_blocked_falls_back_to_tls_443`) — all still pass unchanged. Per 1.29's own precedent, a
+/// change to these constants should still get a live confirmation run against the real
+/// `tools/netns-nat-matrix.sh` rig (this sandbox has no `NET_ADMIN`/`iproute2` to run it) before
+/// being considered fully verified — flagged for connectivity-debugger follow-up.
+const ICE_DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(3);
+const ICE_FAILED_TIMEOUT: Duration = Duration::from_secs(9);
 const ICE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 
 fn backend_err(e: impl std::fmt::Display) -> TransportError {

@@ -19,11 +19,22 @@ Companion to design §1. Every adversary maps to concrete mitigations *and* to t
 ## Enumeration / spam (cross-cutting, §3.5)
 - 256-bit key namespace → nothing to walk; `fetch_bundle` exact-key only (T02).
 - Federation rate limits per (origin server, account); allowlist/closed policies (T06).
-- First-contact message-request gate (T06/T08; landed 2.10) — **covers the relay/mailbox delivery
-  path (`ChatState::open_inbound`) only.** A direct P2P dial (`meridian session connect`) currently
-  bypasses it entirely: the crypto session is already installed by the SDP offer/answer exchange
-  (`chat.open_bytes`, not `open_inbound`) before any chat content flows, so `is_first_contact` is
-  structurally always false on that path. Tracked as [2.14](../tasks/phase-2/2.14-p2p-message-request-gate.md).
+- First-contact message-request gate (T06/T08; landed 2.10, extended to the P2P substrate by 2.14)
+  — covers **both** the relay/mailbox delivery path (`ChatState::open_inbound`) **and** a direct P2P
+  dial (`meridian session connect`, `apps/core/src/session.rs`). The P2P substrate's offer/answer
+  handshake installs the crypto session via `chat.open_bytes` (not `open_inbound`) before any chat
+  content flows, so `open_inbound`'s own session-presence check can never see a first contact on
+  that path by itself; `P2pSession` now snapshots, before that handshake runs
+  (`dial_established`/`answer_with_config`), whether the peer was already known, and forces the gate
+  via `ChatState::open_inbound_gated` on the session's first `mrd.chat/1` content frame when it
+  wasn't. Same invariants as the relay path: the gate fires after signature verification/session
+  establishment (a rejected first contact still costs whatever handshake material — e.g. a one-time
+  prekey — it consumed), and a second envelope from a still-undecided sender is refused, never
+  merged. `meridian session connect`'s CLI wiring surfaces the held request loudly (sender + safety
+  number) rather than silently delivering or dropping it; it does not yet have `meridian chat`'s
+  interactive accept/reject prompt (its `ChatState` is fresh per invocation, so every dial's
+  responder side is first contact) — that polished UX is Feature 08's job, tracked separately from
+  this gate. Proven by `apps/core/tests/p2p_session.rs::p2p_first_contact_is_gated_second_envelope_refused_accept_delivers`.
   Optional contact tokens + PoW stamp (T14).
 - OTK depletion bounded per-source; signed-prekey fallback weakens only first-message deniability, never confidentiality (T02). (Moot for envelope v1, which is not deniable at all — every ciphertext is identity-signed; see [ADR 0016](../adr/0016-envelope-deniability.md).)
 

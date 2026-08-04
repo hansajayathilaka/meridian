@@ -26,7 +26,9 @@
 //! goal 6's conceded "a malicious server can deny service", but poor diagnostics. Not fixed in 1.28,
 //! whose scope is adversarial test infrastructure — bounded in 1.33 (see [`recv_sdp`] and
 //! [`SessionError::AnswerTimeout`]), mirroring the [`Transport::selected_path`] bounded wait this
-//! same module already relied on.
+//! same module already relied on. Federation (2.9+) later opened the mirror-image gap on the
+//! *responder's* own wait for the offer — a route can be rejected server-side before any offer ever
+//! arrives — closed in 2.17 (see [`SessionError::OfferTimeout`]).
 //!
 //! ## Transport independence
 //! Once connected, chat and ctrl ride data channels peer-to-peer; the relay is only used for
@@ -89,6 +91,44 @@ const CHAT_SID: u64 = 1;
 /// just worth being on record now that the failure mode is diagnosable instead of silent.
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// (2.17) How long [`answer_with_config`] will wait for the offer envelope before giving up, on
+/// *both* of its `recv_sdp` call sites: the initial offer wait and the 1.29 relay-fallback second
+/// wait for the dialer's retried offer. Mirrors [`ANSWER_TIMEOUT`]'s reasoning for the opposite side
+/// of the handshake — that doc comment already says explicitly it bounds "the dialer's wait
+/// specifically — the responder's wait for the offer is unchanged," which was true until federation
+/// (2.9+) introduced a failure mode 1.33 never covered: a route can now be rejected *server-side*
+/// (closed policy, allowlist miss, rate limit) before any offer ever reaches the answering side, so
+/// the bare `loop { relay.recv().await?; ... }` inside `recv_sdp` blocks forever with nothing to
+/// reject — the same DoS-class gap 1.33 fixed for the dialer, just reachable from the other side now.
+///
+/// **Distinct constant, not a reuse of `ANSWER_TIMEOUT`**, even though the value is currently
+/// identical: the two bound different sides of the handshake for different reasons (see
+/// [`SessionError::OfferTimeout`] vs. [`SessionError::AnswerTimeout`]), and a distinct name keeps
+/// each call site's intent readable and lets the two be tuned independently later without an
+/// implicit coupling. The value itself is deliberately the *same* 30s: the two waits cover
+/// overlapping chains built from the same underlying costs (one relay hop + one peer's up-to-~20s
+/// full-candidate gather, since trickle ICE isn't supported — see `GATHER_TIMEOUT` in
+/// `apps/transport/src/webrtc_backend.rs`), so there's no principled reason for a tighter number
+/// here, and reusing 30s avoids introducing a second independently-tuned magic value with no data to
+/// justify a different one. This also comfortably covers the relay-fallback second wait: by the time
+/// that wait starts, the dialer has already detected its own `NoPath` (bounded by the transport's own
+/// `WAIT_TIMEOUT`, 15s) and immediately re-dials, so this window only needs to absorb one more
+/// gather-plus-relay-hop cycle — the same order of magnitude `ANSWER_TIMEOUT` already budgets for.
+/// Not a security boundary any more than `ANSWER_TIMEOUT` is: firing early only costs a spurious
+/// `OfferTimeout` on an unusually slow-but-honest dialer, never a weaker session.
+///
+/// OTK-amplifier check (2.17, mirroring `ANSWER_TIMEOUT`'s own note): waiting here does **not**
+/// consume anything of the *answerer's* own that a hostile/absent dial could drain repeatedly.
+/// `recv_sdp`'s loop only calls `relay.recv()` and, on this bound firing, `chat.open_bytes` is never
+/// reached at all — no bytes arrived, so nothing is decrypted, no ratchet state advances, and no OTK
+/// is consumed by this wait. Any OTK the *answerer* holds is consumed only when some caller fetches
+/// its published prekey bundle from the rendezvous server (an X3DH-initiation event that happens
+/// independently of whether this function is even running, and is already bounded by the server-side
+/// per-source OTK-issuance cap, §3.5) — never as a side effect of waiting here. So a peer that spams
+/// `answer()` calls against a target that never offers gains nothing beyond the cost of the calls it
+/// makes itself; it cannot drain the answerer's OTKs through this wait.
+pub const OFFER_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Errors from the P2P substrate.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -138,6 +178,18 @@ pub enum SessionError {
     /// whether because it's offline or because a hostile relay silently dropped/rewrote the offer.
     #[error("timed out after {0:?} waiting for the peer's answer")]
     AnswerTimeout(Duration),
+    /// (2.17) The answerer's bounded wait (see [`OFFER_TIMEOUT`]) for the dialer's offer expired —
+    /// mirrors [`SessionError::AnswerTimeout`] on the opposite side of the handshake. Fires on either
+    /// of `answer_with_config`'s `recv_sdp` calls: the initial offer wait, or the 1.29 relay-fallback
+    /// second wait for the dialer's retried offer. No session is ever established when this fires
+    /// (fail-closed, never a degraded one) — distinguishable from `Chat(ChatError::BadSignature)`
+    /// (tampering detected on a byte that *did* arrive) and from `Relay`/`SignalingEnded` (the relay
+    /// itself misbehaved/vanished): this specifically means "no offer ever arrived", whether because
+    /// the dialer is offline, a hostile relay silently dropped it, or (2.9+, federation) the route was
+    /// rejected server-side — closed policy, allowlist miss, rate limit — before any offer could ever
+    /// reach us.
+    #[error("timed out after {0:?} waiting for the peer's offer")]
+    OfferTimeout(Duration),
     /// (2.9) A federated signaling request was refused by the peer org's own admission policy —
     /// mirrors [`meridian_signaling::SignalError::FedDenied`] (`fed_denied`, task 2.6). A **policy**
     /// outcome, structurally distinct from [`SessionError::FingerprintMismatch`] and
@@ -365,6 +417,23 @@ pub struct P2pSession<T: Transport> {
     /// The abandoned first attempt's wait, when `relay_fallback` is set — see
     /// [`SessionInfo::relay_fallback_wait_ms`].
     relay_fallback_wait_ms: Option<f64>,
+    /// (task 2.14) `true` until this session's *first* `mrd.chat/1` content frame has been through
+    /// the message-request gate. Set at construction from a snapshot — taken by
+    /// [`dial_established`]/[`answer_with_config`] *before* the offer/answer handshake installed
+    /// this session — of whether `peer_ik` was already a known contact. `false` from the start for
+    /// a dialer (whose crypto session with `peer_ik` must already exist before `dial` is called,
+    /// per [`dial_with_config`]'s doc) and for a responder answering an already-known peer;
+    /// `true` for a responder's first-ever P2P session with an unrecognized peer.
+    ///
+    /// [`ChatState::open_inbound`]'s own first-contact detection (`!sessions.contains_key(from)`)
+    /// cannot see this: by the time a chat frame reaches [`P2pSession::pump`], the session was
+    /// already installed as a side effect of the SDP/offer-answer exchange's own `open_bytes`
+    /// calls, so that check would always read `false`. This flag is what lets `pump` force the
+    /// gate via [`ChatState::open_inbound_gated`] on exactly the first content frame, then clear
+    /// itself once the gate has actually fired (inserted a [`crate::chat::MessageRequest`]) — see
+    /// `pump`'s `CHAT_LABEL` arm. Left `true` on any *other* error (e.g. a forged first frame) so a
+    /// subsequent, genuine first frame is still gated rather than slipping through ungated.
+    chat_first_contact_gate: bool,
 }
 
 impl<T: Transport> P2pSession<T> {
@@ -547,9 +616,43 @@ impl<T: Transport> P2pSession<T> {
         };
         match self.labels.get(&cid).copied() {
             Some(l) if l == CHAT_LABEL => {
-                let content =
-                    chat.open_inbound(store, handle, &self.our_ik, &self.peer_ik, &blob)?;
-                Ok(Some(SessionEvent::Chat(content)))
+                if self.chat_first_contact_gate {
+                    // (task 2.14) Force the gate on this content frame regardless of what
+                    // `ChatState` itself can see (the session already exists — see the field's
+                    // doc). `Err(ChatError::MessageRequest)` means the content decoded and
+                    // verified fine and is now held in `chat.pending_requests`, exactly like the
+                    // relay path (`ChatError::MessageRequest` propagates through
+                    // `SessionError::Chat` via `?`, same as it did before this frame was gated) —
+                    // clear the flag so subsequent frames (post accept/reject) use the ordinary,
+                    // session-presence-based check. Any *other* error (bad signature, desync, …)
+                    // leaves the flag set: a hostile/garbled first frame must not let a later,
+                    // genuine first frame slip through ungated.
+                    match chat.open_inbound_gated(
+                        store,
+                        handle,
+                        &self.our_ik,
+                        &self.peer_ik,
+                        &blob,
+                        true,
+                    ) {
+                        Ok(content) => {
+                            // Structurally unreachable while `force_first_contact` is `true` (that
+                            // always takes the gate branch on a successful decode) — handled
+                            // rather than assumed, and still clears the flag if it ever did fire.
+                            self.chat_first_contact_gate = false;
+                            Ok(Some(SessionEvent::Chat(content)))
+                        }
+                        Err(ChatError::MessageRequest) => {
+                            self.chat_first_contact_gate = false;
+                            Err(SessionError::Chat(ChatError::MessageRequest))
+                        }
+                        Err(e) => Err(SessionError::Chat(e)),
+                    }
+                } else {
+                    let content =
+                        chat.open_inbound(store, handle, &self.our_ik, &self.peer_ik, &blob)?;
+                    Ok(Some(SessionEvent::Chat(content)))
+                }
             }
             _ => {
                 // Treat anything else (ctrl, or a not-yet-labelled channel) as a ctrl frame.
@@ -838,6 +941,15 @@ async fn dial_established<T: Transport>(
     relay: &mut dyn SignalRelay,
     registry: Arc<StreamRegistry>,
 ) -> Result<P2pSession<T>, SessionError> {
+    // (task 2.14) Snapshot *before* anything below touches `chat`'s session map, for
+    // `chat_first_contact_gate` (see that field's doc). In practice this reads `true` (known)
+    // here: `dial`/`dial_with_config`'s own doc requires the caller to have already established
+    // the crypto session with `peer_ik` (X3DH) before dialing, and nothing in this function's own
+    // signaling touches a *new* session for `peer_ik` (the answer is opened via `chat.open_bytes`
+    // on the session that already exists). Computed rather than hardcoded so the invariant is
+    // enforced structurally, not just documented.
+    let peer_known_before = chat.has_session(&peer_ik);
+
     let ctrl_ch = transport
         .add_data_channel(&conn, ChannelCfg::reliable_ordered(CTRL_LABEL))
         .await?;
@@ -912,6 +1024,7 @@ async fn dial_established<T: Transport>(
         offered,
         relay_fallback: false,
         relay_fallback_wait_ms: None,
+        chat_first_contact_gate: !peer_known_before,
     };
     session.handshake(store, handle, chat).await?;
     Ok(session)
@@ -969,8 +1082,27 @@ pub async fn answer_with_config<T: Transport>(
 ) -> Result<P2pSession<T>, SessionError> {
     let attempt_start = Instant::now();
     let policy = cfg.policy;
-    let (offer_sdp, asserted_fp, offer_ice) =
-        recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, true).await?;
+    // (task 2.14) Snapshot *before* the first `recv_sdp` below, whose `chat.open_bytes` call
+    // installs the responder session as a side effect on a genuine first-ever offer (X3DH) — same
+    // ordering requirement as `ChatState::open_inbound`'s own `is_first_contact` snapshot (see
+    // `chat_first_contact_gate`'s doc on `P2pSession`). Computed once, here, and reused for both
+    // `answer_established` calls below (including the 1.29 relay-fallback retry's second
+    // `recv_sdp`): that second offer lands on the *same*, by-then-already-installed session, so
+    // recomputing this after it would always (wrongly) read "known".
+    let peer_known_before = chat.has_session(&peer_ik);
+    // Await the offer, bounded (2.17 — see `OFFER_TIMEOUT`'s doc for the full rationale, including
+    // why this is a distinct constant/variant from the dialer-side `ANSWER_TIMEOUT`/`AnswerTimeout`):
+    // a dialer that never offers — offline, a hostile relay that drops it, or (federation) a route
+    // rejected server-side before any offer reaches us — must not hang `answer` forever.
+    let (offer_sdp, asserted_fp, offer_ice) = match tokio::time::timeout(
+        OFFER_TIMEOUT,
+        recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, true),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => return Err(SessionError::OfferTimeout(OFFER_TIMEOUT)),
+    };
 
     let conn = transport.new_session(cfg.clone()).await?;
     // See `dial_with_config`'s comment: close the session on any failure below rather than
@@ -989,6 +1121,7 @@ pub async fn answer_with_config<T: Transport>(
         chat,
         relay,
         registry.clone(),
+        peer_known_before,
     )
     .await;
     match result {
@@ -998,8 +1131,18 @@ pub async fn answer_with_config<T: Transport>(
         {
             let _ = transport.close(&conn).await;
             let wait_ms = attempt_start.elapsed().as_secs_f64() * 1000.0;
-            let (offer_sdp2, asserted_fp2, offer_ice2) =
-                recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, true).await?;
+            // Same bound as the initial wait above (2.17): the dialer's own retry is expected
+            // quickly (it independently detected the same `NoPath`), but nothing guarantees it
+            // arrives at all, so this second wait must not be able to hang forever either.
+            let (offer_sdp2, asserted_fp2, offer_ice2) = match tokio::time::timeout(
+                OFFER_TIMEOUT,
+                recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, true),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => return Err(SessionError::OfferTimeout(OFFER_TIMEOUT)),
+            };
             let fallback_cfg = IceConfig {
                 policy: IcePolicy::RelayOnly,
                 ..cfg
@@ -1019,6 +1162,7 @@ pub async fn answer_with_config<T: Transport>(
                 chat,
                 relay,
                 registry,
+                peer_known_before,
             )
             .await;
             match result2 {
@@ -1063,6 +1207,7 @@ async fn answer_established<T: Transport>(
     chat: &mut ChatState,
     relay: &mut dyn SignalRelay,
     registry: Arc<StreamRegistry>,
+    peer_known_before: bool,
 ) -> Result<P2pSession<T>, SessionError> {
     let ctrl_ch = transport
         .add_data_channel(&conn, ChannelCfg::reliable_ordered(CTRL_LABEL))
@@ -1118,6 +1263,7 @@ async fn answer_established<T: Transport>(
         offered,
         relay_fallback: false,
         relay_fallback_wait_ms: None,
+        chat_first_contact_gate: !peer_known_before,
     };
     session.handshake(store, handle, chat).await?;
     Ok(session)

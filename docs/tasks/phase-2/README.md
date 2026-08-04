@@ -3,7 +3,7 @@
 
 # Phase 2 — Cross-Org Federation
 
-**Kind:** build · **Status:** in progress · **Reviews phase(s):** n/a (build phase; Phase 3 will review it)
+**Kind:** build · **Status:** done · **Reviews phase(s):** n/a (build phase; Phase 3 will review it)
 
 ## Goal
 Ship **Feature 06 — Cross-Org Federation**: a user registered on Org A's rendezvous establishes a
@@ -162,19 +162,19 @@ above and can run at any point in the phase.
 
 **Follow-up surfaced by 2.10's review** — architect + security-reviewer both required this be
 tracked explicitly rather than silently deferred to Feature 08.
-- [ ] **2.14** Wire the message-request gate into the P2P session substrate (`session connect`
+- [x] **2.14** Wire the message-request gate into the P2P session substrate (`session connect`
   currently bypasses 2.10's gate entirely) — [file](./2.14-p2p-message-request-gate.md)
 
 **Carried-in CI defect surfaced while closing 2.15** — not T06 work, independent of every task
 above; `#[ignore]`d with a documented reason rather than fixed by guessing (this sandbox cannot
 reproduce GitHub Actions' network conditions).
-- [ ] **2.16** `session_connect_webrtc.rs`'s TURN-grant test hangs in real CI, root cause
+- [x] **2.16** `session_connect_webrtc.rs`'s TURN-grant test hangs in real CI, root cause
   unconfirmed — [file](./2.16-turn-grant-ci-hang.md)
 
 **Carried-in availability defect surfaced by 2.12's review** — security-reviewer + architect
 independently found and required this be tracked, mirroring task 1.33 (dialer side) for the
 answerer side.
-- [ ] **2.17** Bound the answerer's wait for an offer (`recv_sdp`, mirror of 1.33) — [file](./2.17-bound-offer-wait.md)
+- [x] **2.17** Bound the answerer's wait for an offer (`recv_sdp`, mirror of 1.33) — [file](./2.17-bound-offer-wait.md)
 
 ### Dependency order
 ```
@@ -193,16 +193,17 @@ Track S (server spine, serialized): 1.32 → 2.1 → 2.2 → 2.3 → 2.4 → 2.6
 fetch) — it now gates 2.11 and 2.12, since both need real cross-org routing to run at all.
 2.4 and 2.5 both touch `config::Federation` — sequence them if one developer.
 
-## Exit criteria
-- Every Phase 2 task `[x]`.
-- Tree green: `cargo test --workspace` and `cargo clippy --workspace --all-targets -D warnings` clean;
-  all invariant lints (including `lint-server-no-core.sh` — federation must **not** pull
-  `meridian-core` into the server) pass.
-- Docs synced (`tools/check-docs.sh`, no broken links); `federation-protocol-v1.md` published and
+## Exit criteria — all met
+- [x] Every Phase 2 task `[x]` (2.1-2.17, plus gating Phase-1 follow-ups 1.32/1.33).
+- [x] Tree green: `cargo test --workspace` and `cargo clippy --workspace --all-targets -D warnings`
+  clean; all invariant lints (including `lint-server-no-core.sh`) pass — confirmed in real CI, PR #46
+  run [30891921311](https://github.com/hansajayathilaka/meridian/actions/runs/30891921311), including
+  (as of 2.16) the netns NAT-matrix rig running for real for the first time in this repo's CI history.
+- [x] Docs synced (`tools/check-docs.sh`, no broken links); `federation-protocol-v1.md` published and
   covered by conformance vectors.
-- The acceptance demo runs: `demo/two-orgs` walkthrough passes under **both** discovery modes; a
-  `closed`-policy org rejects inbound federation with a clean client-side error; a substituted bundle
-  from the foreign server fails closed; killing either rendezvous after setup does not interrupt the
-  P2P session; the stale-hint case reports "unreachable at hint" and never a security warning; the
-  opacity audit passes at both servers.
+- [x] The acceptance demo runs (task 2.11): `demo/two-orgs` walkthrough passes under **both**
+  discovery modes; a `closed`-policy org rejects inbound federation with a clean client-side error; a
+  substituted bundle from the foreign server fails closed; killing either rendezvous after setup does
+  not interrupt the P2P session; the stale-hint case reports "unreachable at hint" and never a
+  security warning; the opacity audit passes at both servers.
 - Then: `/start-review-phase` for Phase 3.

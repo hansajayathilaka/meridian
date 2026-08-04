@@ -13,7 +13,11 @@
 //!   * **ICE restart** on a network change keeps the session and ratchet alive (<5 s, invariant 5);
 //!   * (1.33) the dialer's wait for an answer is **bounded**: a peer that never answers (offline, or
 //!     a hostile relay that lets the responder reject without ever producing one — 1.28) times out
-//!     with a distinct, diagnosable `SessionError::AnswerTimeout` rather than hanging forever.
+//!     with a distinct, diagnosable `SessionError::AnswerTimeout` rather than hanging forever;
+//!   * (2.17) the mirror on the answerer's side: `answer`'s wait for an offer is **bounded** too — a
+//!     dialer that never offers (offline, or, since federation, a route rejected server-side before
+//!     any offer reaches the answering side at all) times out with a distinct, diagnosable
+//!     `SessionError::OfferTimeout` rather than hanging forever.
 
 use std::sync::Arc;
 
@@ -23,7 +27,7 @@ use std::sync::Arc;
 /// by `chat_manager.rs`.
 const TEST_NOW_UNIX: u64 = 1_700_000_000;
 
-use meridian_core::chat::ChatState;
+use meridian_core::chat::{ChatError, ChatState};
 use meridian_core::envelope::{ChatContent, SignalContent};
 use meridian_core::identity::{generate_account, AccountId, KeyHandle, MemorySecretStore};
 use meridian_core::relay;
@@ -134,6 +138,44 @@ async fn connect<T: meridian_core::transport::Transport>(
     )
 }
 
+/// (task 2.14) Pump `sess`'s **first-ever** `mrd.chat/1` content frame through the message-request
+/// gate and accept it, asserting the held intro matches `expected_body` — the substrate-level
+/// counterpart of a CLI user answering "y" to `chat.rs`'s "message request from … — accept? y/n"
+/// prompt (task 2.10). `establish_ratchet` only ever sets up Bob's X3DH *vault*, never a session
+/// entry for Alice, so — mirroring the real `session_connect` flow, whose `ChatState` is fresh per
+/// invocation — every test in this file that has Bob receive Alice's opening message needs this
+/// once before its own (unrelated) assertions continue. `p2p_first_contact_is_gated_*` below is
+/// what actually pins the gate's own behavior end to end.
+async fn accept_first_p2p_message<T: meridian_core::transport::Transport>(
+    sess: &mut P2pSession<T>,
+    store: &MemorySecretStore,
+    handle: &KeyHandle,
+    chat: &mut ChatState,
+    peer_ik: &[u8; 32],
+    expected_body: &str,
+) {
+    match sess.pump(store, handle, chat).await {
+        Err(SessionError::Chat(ChatError::MessageRequest)) => {}
+        other => panic!(
+            "expected the first P2P chat frame to be gated as a message request, got {other:?}"
+        ),
+    }
+    let req = chat
+        .pending_request(peer_ik)
+        .expect("gated first contact must be held in pending_requests");
+    match &req.intro {
+        ChatContent::Text { body, .. } => assert_eq!(body, expected_body),
+        other => panic!("unexpected intro content: {other:?}"),
+    }
+    let accepted = chat
+        .accept_request(peer_ik)
+        .expect("accept the pending request");
+    match accepted.intro {
+        ChatContent::Text { body, .. } => assert_eq!(body, expected_body),
+        other => panic!("unexpected accepted intro: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn server_down_chat_continuity() {
     let mut alice = Peer::new("chat.a");
@@ -179,21 +221,22 @@ async fn server_down_chat_continuity() {
     let ahandle = alice.handle();
     let bhandle = bob.handle();
 
-    // Alice -> Bob.
+    // Alice -> Bob. This is Bob's first-ever P2P content from Alice, so it is gated (task 2.14) —
+    // accept it (mirroring the CLI's accept/reject UX) before the test's actual subject: continuity
+    // once the relay is gone.
     asess
         .send_chat(&alice.store, &ahandle, &mut alice.chat, "hello over p2p")
         .await
         .unwrap();
-    match bsess
-        .pump(&bob.store, &bhandle, &mut bob.chat)
-        .await
-        .unwrap()
-    {
-        Some(SessionEvent::Chat(ChatContent::Text { body, .. })) => {
-            assert_eq!(body, "hello over p2p");
-        }
-        other => panic!("bob expected chat, got {other:?}"),
-    }
+    accept_first_p2p_message(
+        &mut bsess,
+        &bob.store,
+        &bhandle,
+        &mut bob.chat,
+        &alice.ik(),
+        "hello over p2p",
+    )
+    .await;
 
     // Bob -> Alice.
     bsess
@@ -329,6 +372,67 @@ async fn dial_times_out_when_the_peer_never_answers() {
     );
 }
 
+/// 2.17: `recv_sdp`'s wait for the offer, on the *answerer* side, is bounded too — the mirror of
+/// 1.33's `dial_times_out_when_the_peer_never_answers` above, but for `answer`. Reproduces the
+/// federation-era failure mode named in the task: a route can be rejected server-side (closed
+/// policy, allowlist miss, rate limit) before any offer ever reaches the answering side, so nothing
+/// is ever going to arrive on Bob's relay half — only Bob's *receiving* half of the relay pair
+/// exists; nothing ever sends anything down it, so `answer`'s wait for an offer would hang forever
+/// without 2.17's bound. Alice/the dialer side is never even run, isolating the answerer's own bound
+/// exactly as 1.33's test isolated the dialer's.
+#[tokio::test(start_paused = true)]
+async fn answer_times_out_when_no_offer_ever_arrives() {
+    let mut bob = Peer::new("silent-answerer");
+
+    let fabric = LoopbackFabric::new();
+    let tb = Arc::new(LoopbackTransport::new(fabric));
+    let registry = Arc::new(StreamRegistry::with_builtins());
+
+    // `_relay_a_unused` could send, but we never call `.send()` on it, so `relay_b.recv()` — what
+    // `recv_sdp` awaits inside `answer` — never resolves on its own.
+    let alice_ik = *generate_account(&MemorySecretStore::new(), "dialer-never-shows")
+        .expect("account")
+        .public_key()
+        .as_bytes();
+    let (_relay_a_unused, mut relay_b) = MemRelay::pair(alice_ik, bob.ik());
+
+    let start = tokio::time::Instant::now();
+    let result = answer(
+        tb,
+        &bob.store,
+        &bob.handle(),
+        bob.ik(),
+        alice_ik,
+        &mut bob.chat,
+        &mut relay_b,
+        registry,
+    )
+    .await;
+    let elapsed = start.elapsed();
+
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("answer must not succeed when no offer ever arrives"),
+    };
+    // Distinguishable from tampering (`Chat(ChatError::BadSignature)`), from `AnswerTimeout` (the
+    // opposite side of the handshake), and from every other `SessionError` variant.
+    assert!(
+        matches!(err, SessionError::OfferTimeout(_)),
+        "expected SessionError::OfferTimeout, got a different variant: {err}"
+    );
+    assert!(
+        elapsed >= meridian_core::session::OFFER_TIMEOUT,
+        "returned after {elapsed:?}, before the {:?} bound elapsed",
+        meridian_core::session::OFFER_TIMEOUT
+    );
+    assert!(
+        elapsed < meridian_core::session::OFFER_TIMEOUT + std::time::Duration::from_secs(5),
+        "returned after {elapsed:?}, far past the configured {:?} bound — some other, much longer \
+         wait fired instead of the offer-timeout",
+        meridian_core::session::OFFER_TIMEOUT
+    );
+}
+
 // TODO(1.28, flagged during 1.23's split): replace with an active relay-rewrite attack
 // test once the real transport backend lands.
 #[tokio::test]
@@ -367,21 +471,23 @@ async fn relay_path_connects_healthily() {
     assert_eq!(b_local, a_remote);
 }
 
-/// (2.10 follow-up, tracked as 2.14) Pins TODAY's actual, known-gap behavior: a first-ever P2P
-/// session's chat content is delivered ungated, unlike the relay/mailbox path task 2.10 gates via
-/// `ChatState::open_inbound`. By the time `dial`/`answer` can run at all, the crypto session for the
-/// peer must already exist (`establish_ratchet`, mirroring the real flow where X3DH completes before
-/// `session_connect` dials) — so `ChatState`'s "is this a first contact" check is already `false`
-/// before any chat content ever reaches `pump`'s `open_inbound` call. This is not a security
-/// assertion — it's a regression pin, so a future change to `session.rs` (e.g. task 2.14 wiring a
-/// gate into this path) changes this test's expectation deliberately, not silently. See
-/// `docs/tasks/phase-2/2.14-p2p-message-request-gate.md` and the doc comment on
-/// `ChatState::open_inbound` (`apps/core/src/chat.rs`) for the full context.
+/// (task 2.14) The message-request gate now covers the P2P substrate too, closing the gap
+/// `p2p_first_chat_content_is_not_yet_gated_known_gap_tracked_as_2_14` used to pin: a first-ever
+/// P2P session's chat content lands in the segregated `pending_requests` state instead of
+/// delivering (mirroring 2.10's relay-path gate, `ChatState::open_inbound`), a second envelope sent
+/// before Bob answers is refused outright — never merged into the held request — and accepting
+/// delivers the original intro, after which further content flows normally (not re-gated).
+///
+/// `session.rs`'s own `ChatState::open_inbound` can't detect this first contact itself (the
+/// offer/answer handshake already installed Bob's responder session before any chat frame exists to
+/// gate) — this test is what proves `P2pSession`'s own `chat_first_contact_gate` snapshot (taken
+/// before that handshake ran) closes exactly that gap end to end, not just at the unit level.
 #[tokio::test]
-async fn p2p_first_chat_content_is_not_yet_gated_known_gap_tracked_as_2_14() {
+async fn p2p_first_contact_is_gated_second_envelope_refused_accept_delivers() {
     let mut alice = Peer::new("chat.a");
     let mut bob = Peer::new("chat.b");
     establish_ratchet(&mut alice, &mut bob);
+    let alice_ik = alice.ik();
 
     let fabric = LoopbackFabric::new();
     let ta = Arc::new(LoopbackTransport::new(fabric.clone()));
@@ -401,20 +507,72 @@ async fn p2p_first_chat_content_is_not_yet_gated_known_gap_tracked_as_2_14() {
 
     let ahandle = alice.handle();
     let bhandle = bob.handle();
+
+    // First content frame: gated, not delivered.
     asess
         .send_chat(&alice.store, &ahandle, &mut alice.chat, "hello over p2p")
         .await
         .unwrap();
-
-    // If this starts failing with Err(SessionError::Chat(ChatError::MessageRequest)) instead of
-    // delivering, that means 2.14 landed and gated this path — update this test to assert the gate
-    // fires and accept/reject before content delivery, matching apps/core/tests/message_request_gate.rs's
-    // pattern, rather than loosening this assertion.
     match bsess.pump(&bob.store, &bhandle, &mut bob.chat).await {
-        Ok(Some(SessionEvent::Chat(ChatContent::Text { body, .. }))) => {
-            assert_eq!(body, "hello over p2p");
+        Err(SessionError::Chat(ChatError::MessageRequest)) => {}
+        other => panic!("expected the first P2P content frame to be gated, got {other:?}"),
+    }
+    let req = bob
+        .chat
+        .pending_request(&alice_ik)
+        .expect("gated first contact held in pending_requests");
+    assert!(
+        !req.safety_number.is_empty(),
+        "the held request must carry a safety number to show before accept/reject"
+    );
+    match &req.intro {
+        ChatContent::Text { body, .. } => assert_eq!(body, "hello over p2p"),
+        other => panic!("unexpected intro: {other:?}"),
+    }
+
+    // Second envelope arriving before Bob decides: refused outright, never merged into the held
+    // request (task 2.10 invariant, preserved here).
+    asess
+        .send_chat(&alice.store, &ahandle, &mut alice.chat, "are you there?")
+        .await
+        .unwrap();
+    match bsess.pump(&bob.store, &bhandle, &mut bob.chat).await {
+        Err(SessionError::Chat(ChatError::RequestPending)) => {}
+        other => panic!("expected the second pre-accept envelope to be refused, got {other:?}"),
+    }
+    let req = bob
+        .chat
+        .pending_request(&alice_ik)
+        .expect("the original request must still be held, untouched");
+    match &req.intro {
+        ChatContent::Text { body, .. } => assert_eq!(body, "hello over p2p"),
+        other => panic!("the held intro must not have been replaced: {other:?}"),
+    }
+
+    // Accept: delivers the original (first) intro.
+    let accepted = bob
+        .chat
+        .accept_request(&alice_ik)
+        .expect("accept the pending request");
+    match accepted.intro {
+        ChatContent::Text { body, .. } => assert_eq!(body, "hello over p2p"),
+        other => panic!("unexpected accepted intro: {other:?}"),
+    }
+
+    // Post-accept: a fresh envelope now delivers normally — no re-gating.
+    asess
+        .send_chat(&alice.store, &ahandle, &mut alice.chat, "welcome back")
+        .await
+        .unwrap();
+    match bsess
+        .pump(&bob.store, &bhandle, &mut bob.chat)
+        .await
+        .unwrap()
+    {
+        Some(SessionEvent::Chat(ChatContent::Text { body, .. })) => {
+            assert_eq!(body, "welcome back");
         }
-        other => panic!("expected ungated delivery (today's known gap, 2.14), got {other:?}"),
+        other => panic!("post-accept delivery failed: {other:?}"),
     }
 }
 
@@ -496,18 +654,22 @@ async fn ice_restart_preserves_session_and_ratchet() {
     let bhandle = bob.handle();
 
     // Send one message, then simulate a Wi-Fi->other-interface switch: ICE restarts, the ratchet is
-    // untouched, and the next message decrypts on the SAME session (no re-handshake).
+    // untouched, and the next message decrypts on the SAME session (no re-handshake). This is Bob's
+    // first-ever P2P content from Alice, so it's gated (task 2.14) — accept it before the ICE
+    // restart this test actually exercises.
     asess
         .send_chat(&alice.store, &ahandle, &mut alice.chat, "before restart")
         .await
         .unwrap();
-    assert!(matches!(
-        bsess
-            .pump(&bob.store, &bhandle, &mut bob.chat)
-            .await
-            .unwrap(),
-        Some(SessionEvent::Chat(ChatContent::Text { .. }))
-    ));
+    accept_first_p2p_message(
+        &mut bsess,
+        &bob.store,
+        &bhandle,
+        &mut bob.chat,
+        &alice.ik(),
+        "before restart",
+    )
+    .await;
 
     asess.ice_restart().await.unwrap();
     bsess.ice_restart().await.unwrap();

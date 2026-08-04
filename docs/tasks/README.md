@@ -343,14 +343,61 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   Phase-3 fix-task) that test-harness PKI/server-bootstrap boilerplate has now been duplicated a
   fifth/sixth time across `apps/rendezvous/tests/` and `apps/cli/tests/` — debt first noted at 2.7/
   2.8 and still unaddressed.
-- **NEXT:** `/next-task`. **2.14** (from 2.10's review) queues up after 2.10's own dependents since
-  it depends on 2.10. **2.16** (a carried-in CI-flakiness defect surfaced while closing 2.15/2.11 —
-  `session_connect_webrtc.rs`'s TURN-grant test hangs in real CI for reasons this sandbox cannot
-  reproduce, `#[ignore]`d rather than guessed at) and **2.17** (the newly-filed unbounded
-  answerer-wait fix, mirroring 1.33) are both independent and can land whenever picked up. With
-  2.1-2.13 and 2.15 all `[x]`, Feature 06's own scope is functionally complete; 2.14/2.16/2.17 are
-  carried-in fix-tasks, not blockers to calling Phase 2's T06 work done, but should land before
-  `/start-review-phase` for Phase 3 so the review sweep isn't tripping over already-known gaps.
+- **ALSO NOW:** **2.14 is done.** `ChatState::open_inbound` is now a thin wrapper over
+  `open_inbound_gated(..., force_first_contact)`; `P2pSession` snapshots
+  `chat.has_session(&peer_ik)` before the offer/answer handshake (both `dial_established` and
+  `answer_with_config`, including the 1.29 relay-fallback retry, which correctly reuses rather than
+  recomputes the snapshot) and forces the gate on the first `CHAT_LABEL` frame via `pump`, clearing
+  the flag only once the gate actually fires — a garbled first frame can't let a later genuine one
+  slip through ungated. `session_connect.rs` prints a loud sender+safety-number notice instead of
+  silently delivering, since that command's `ChatState` has no persisted contacts to accept/reject
+  against. New pinning test in `apps/core/tests/p2p_session.rs` proves first content is held, a
+  second pre-accept envelope is refused, and accept delivers normally; test-engineer independently
+  proved non-vacuity by disabling the gate and confirming the test (plus two others) fail with
+  plaintext delivered ungated. architect: consistent, no required changes — confirmed the mechanism
+  doesn't disturb the handshake structure and the snapshot timing is race-free. security-reviewer:
+  APPROVE — gate-after-verification holds, no new server-visible signal; one non-blocking follow-up
+  noted (a narrow mailbox/P2P concurrent-accept race that could spuriously over-gate, fail-safe
+  direction, worth a future regression test). test-engineer: PASS, all four affected suites green
+  including `--features webrtc`. `docs/security/threat-mitigation-matrix.md`'s gate entry updated to
+  close 2.10's relay-path-only caveat.
+- **ALSO NOW:** **2.17 is done.** New `OFFER_TIMEOUT` (30s, a distinct name from `ANSWER_TIMEOUT` but
+  the same value — the two waits bound different sides of the handshake for different reasons, so
+  keeping them independently named allows future independent tuning even though the underlying cost,
+  one relay hop plus one peer's up-to-~20s full-candidate gather under non-trickle ICE, is the same)
+  and `SessionError::OfferTimeout` now bound both of `answer_with_config`'s `recv_sdp` waits (the
+  initial offer wait and the 1.29 relay-fallback retry) — a peer whose offer never arrives (e.g. a
+  federated route rejected server-side before any offer reaches the answering side, per 2.12's
+  review) now fails closed with a diagnosable error instead of hanging forever, mirroring 1.33's
+  dialer-side fix. Traced and ruled out the OTK-consumption-amplifier question the task required:
+  `take_otk_secret` only fires after an offer's bytes actually arrive and pass verification, so a
+  timed-out wait never touches it — a hostile/absent dial can't drain anything of the answerer's own
+  by repeatedly triggering `answer()`. architect: consistent, no required changes — verified the
+  timeout math against the real `WAIT_TIMEOUT`/`GATHER_TIMEOUT` bounds, not just asserted.
+  security-reviewer: APPROVE — confirmed via code trace, no new attack surface, no wire change.
+- **ALSO NOW:** **2.16 is done — and with it, Phase 2 is fully closed.** Root cause, found by direct
+  repeated reproduction (not guessed at): `webrtc_backend.rs`'s `ICE_DISCONNECTED_TIMEOUT`+
+  `ICE_FAILED_TIMEOUT` (2s+4s, from 1.29) were tight enough that a genuinely-reachable host-candidate
+  pair could get declared `Failed` whenever other configured ICE servers stalled against a dead TURN
+  endpoint, triggering 1.29's own relay-fallback retry (also doomed) and summing two full bounded
+  attempts to ~70-90s — past every external bound the test had tried. Widened to 3s+9s (still inside
+  `WAIT_TIMEOUT`'s 15s). architect's review of that widening surfaced a real concern (shrinks 1.29's
+  real-NAT margin from 9s to 3s headroom) and, investigating it, a repo-wide gap: the netns-nat-matrix
+  rig has **never actually run in CI** since task 1.25 (silently skips without root, and is missing
+  `coturn` even with it). Fixed — with explicit user sign-off before pushing, since it grants a CI
+  step `sudo` — by installing `coturn` and running the rig's final invocation under `sudo`, scoped to
+  that one step. Real CI (PR #46, run `30891921311`) then supplied the actual verification no sandbox
+  could: the previously-hanging test passed, and the netns rig executed for the first time ever,
+  passing all four NAT cells' pcap assertions (3/4 connect via relay with zero address leak,
+  udp-blocked fails per 1.30's documented gap) — confirming the timeout widening is safe under real
+  multi-hop NAT, not just asserted. Test hardened with an IP-literal TURN endpoint and bounded runtime
+  teardown as defense-in-depth. With 2.1-2.17 all `[x]`, every Phase 2 task is closed.
+- **NEXT:** `/start-review-phase` for Phase 3. Every task in Phase 2 (2.1-2.17, plus the gating
+  Phase-1 follow-ups 1.32/1.33) is `[x]`. Tree green in real CI across lint, clippy, the full test
+  suite (including `--features webrtc`), the cross-org abuse/acceptance suite, conformance vectors,
+  and — as of this task — the netns NAT-matrix rig for real. Docs synced. The `demo/two-orgs`
+  acceptance walkthrough (2.11) and the phase exit gate (2.12) both already passed. Nothing known is
+  left un-triaged going into the Phase 3 review sweep.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -424,7 +471,7 @@ design decisions). Blocking gate for Phase 2: F1, F2, F3, F10, F11.
 - [x] **1.32** Relay attacks that PASS the envelope signature check (from-spoof / replay / reorder / cross-delivery; from 1.28's security review, fold into [ADR 0016](../adr/0016-envelope-deniability.md)'s test obligations) — [file](./phase-1/1.32-relay-attacks-past-signature.md)
 - [x] **1.33** Bound the dialer's wait for an answer in `recv_sdp` (availability/diagnostics; from 1.28) — [file](./phase-1/1.33-bound-answer-wait.md)
 
-### Phase 2 — Cross-Org Federation · **in progress** · [details](./phase-2/README.md)
+### Phase 2 — Cross-Org Federation · **done** · [details](./phase-2/README.md)
 Build phase. **[T06 — Cross-Org Federation](../architecture/features/06-cross-org-federation.md)**
 alone: s2s mTLS (WebPKI + private-CA), federated prekey fetch + envelope forwarding on the strict
 `client → own server → foreign server → client` invariant, DNS-SRV **and** static-map discovery,
@@ -461,9 +508,9 @@ into 2.9 or 2.11.
 
 **Carried in from Phase 1** (production defect surfaced by 1.32; not part of T06)
 - [x] **2.13** A replayed envelope permanently wedges the receiving ratchet (`Ratchet::decrypt` commits `ckr`/`nr` before `aead_open` and never rolls back — unauthenticated permanent session DoS) — [file](./phase-2/2.13-ratchet-replay-dos.md)
-- [ ] **2.14** Wire the message-request gate into the P2P session substrate (from 2.10's review; `session connect` currently bypasses the gate entirely) — [file](./phase-2/2.14-p2p-message-request-gate.md)
-- [ ] **2.16** `session_connect_webrtc.rs`'s TURN-grant test hangs in real CI, root cause unconfirmed (surfaced while closing 2.15; `#[ignore]`d rather than guessed at) — [file](./phase-2/2.16-turn-grant-ci-hang.md)
-- [ ] **2.17** Bound the answerer's wait for an offer (`recv_sdp`, mirror of 1.33; surfaced by 2.12's review) — [file](./phase-2/2.17-bound-offer-wait.md)
+- [x] **2.14** Wire the message-request gate into the P2P session substrate (from 2.10's review; `session connect` currently bypasses the gate entirely) — [file](./phase-2/2.14-p2p-message-request-gate.md)
+- [x] **2.16** `session_connect_webrtc.rs`'s TURN-grant test hangs in real CI, root cause unconfirmed (surfaced while closing 2.15; `#[ignore]`d rather than guessed at) — [file](./phase-2/2.16-turn-grant-ci-hang.md)
+- [x] **2.17** Bound the answerer's wait for an offer (`recv_sdp`, mirror of 1.33; surfaced by 2.12's review) — [file](./phase-2/2.17-bound-offer-wait.md)
 
 ---
 

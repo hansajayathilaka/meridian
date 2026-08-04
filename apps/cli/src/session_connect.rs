@@ -10,6 +10,11 @@
 //!
 //! `--transport loopback` is rejected outright: there is no cross-process loopback mode.
 //!
+//! A first-ever P2P session's chat content is now gated exactly like the relay path (task 2.10's
+//! `pending_requests` state, closed for this path by task 2.14): see `note_message_request` for the
+//! loud (non-interactive — this command has no persisted `ChatState` across runs, so there's no
+//! later "y/n" input to read) notice printed when that fires.
+//!
 //! Real TURN is wired for real (task 1.25's coturn + `meridian-rendezvous` ephemeral-credential
 //! minting): before dialing, this always asks the still-open signaling connection for a fresh
 //! [`meridian_core::proto::TurnGrant`] via `request_turn_credentials`. A successful grant feeds a
@@ -72,11 +77,13 @@ pub async fn run(args: ConnectArgs<'_>) -> Result<(), String> {
 async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
     use std::sync::Arc;
 
-    use meridian_core::chat::ChatState;
+    use meridian_core::chat::{ChatError, ChatState};
     use meridian_core::envelope::ChatContent;
     use meridian_core::proto::error_codes;
     use meridian_core::relay;
-    use meridian_core::session::{answer_with_config, dial_with_config, SessionEvent};
+    use meridian_core::session::{
+        answer_with_config, dial_with_config, SessionError, SessionEvent,
+    };
     use meridian_core::signal_relay::RendezvousRelay;
     use meridian_core::signaling::{SignalError, SignalingClient, DEFAULT_OTK_COUNT};
     use meridian_core::streams::StreamRegistry;
@@ -233,27 +240,49 @@ async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
     // One chat message each way over the re-homed data channel, mirroring `session demo`'s
     // headline: the initiator sends first, the responder receives then replies, so both processes
     // have something concrete printed to assert on.
+    //
+    // (task 2.14) The responder's receipt of the initiator's opening message is now subject to the
+    // same message-request gate 2.10 wired into the relay/mailbox path — see `note_message_request`
+    // below for why this command surfaces it as a loud notice rather than an interactive
+    // accept/reject prompt (the polished UX is Feature 08's job; `meridian chat` already has the
+    // interactive version for the relay path). The initiator branch handles the same outcome
+    // defensively — structurally it should never actually fire there, since `dial`/
+    // `dial_with_config` require the caller to have already established the crypto session with
+    // the peer before dialing (so that side is never "first contact") — but this must never be a
+    // silent bypass if that invariant is ever violated.
     if initiator {
         session
             .send_chat(store, handle, &mut chat, "hello over p2p")
             .await
             .map_err(|e| e.to_string())?;
         lines.push("[chat] sent: hello over p2p".to_string());
-        if let Some(SessionEvent::Chat(ChatContent::Text { body, .. })) = session
-            .pump(store, handle, &mut chat)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            lines.push(format!("[chat] recv: {body}"));
+        match session.pump(store, handle, &mut chat).await {
+            Ok(Some(SessionEvent::Chat(ChatContent::Text { body, .. }))) => {
+                lines.push(format!("[chat] recv: {body}"));
+            }
+            Ok(_) => {}
+            Err(SessionError::Chat(ChatError::MessageRequest)) => {
+                note_message_request(&chat, &peer_ik, &peer_label, json, &mut lines);
+            }
+            Err(e) => return Err(e.to_string()),
         }
     } else {
-        if let Some(SessionEvent::Chat(ChatContent::Text { body, .. })) = session
-            .pump(store, handle, &mut chat)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            lines.push(format!("[chat] recv: {body}"));
+        match session.pump(store, handle, &mut chat).await {
+            Ok(Some(SessionEvent::Chat(ChatContent::Text { body, .. }))) => {
+                lines.push(format!("[chat] recv: {body}"));
+            }
+            Ok(_) => {}
+            Err(SessionError::Chat(ChatError::MessageRequest)) => {
+                note_message_request(&chat, &peer_ik, &peer_label, json, &mut lines);
+            }
+            Err(e) => return Err(e.to_string()),
         }
+        // Sent unconditionally, whether or not the message above was gated — this is a fixed demo
+        // line, not a reflection of a trust decision, and sending it never delivers, previews, or
+        // otherwise exposes the gated content itself (which stays held in `chat.pending_requests`
+        // either way). This mirrors `ChatState::reject_request`'s own security property: nothing
+        // about our own outbound traffic here tells the peer whether their message was accepted —
+        // there is still no protocol-level "accepted"/"rejected" signal for them to observe.
         session
             .send_chat(store, handle, &mut chat, "hi back — no server in the path")
             .await
@@ -288,6 +317,47 @@ async fn run_webrtc(args: ConnectArgs<'_>) -> Result<(), String> {
 
     let _ = session.close().await;
     Ok(())
+}
+
+/// (task 2.14) Surface a gated first-contact message request the way `chat.rs`'s interactive prompt
+/// does — sender + safety number — but `session connect` is a one-shot, two-process demo with no
+/// persisted `ChatState` across runs (see this module's doc), so there is no later "type y/n" input
+/// to read here, and every fresh dial's responder side is therefore first contact. Rather than build
+/// a second, parallel interactive accept/reject loop for a command that exchanges exactly one demo
+/// message and exits, this loudly notes the hold and leaves the request pending — never a silent
+/// downgrade to auto-accept (which would defeat the gate) or a silent drop (which would look like a
+/// generic failure). The task's own scope note: the polished accept-or-decline UX is Feature 08's
+/// job; `meridian chat` already has the interactive version of this prompt for the relay path. The
+/// P2P session itself is unaffected — the crypto/transport handshake genuinely succeeded and is
+/// still reported as established; only the gated chat *content* is withheld, per system-design.md
+/// §3.5.
+#[cfg(feature = "webrtc")]
+fn note_message_request(
+    chat: &meridian_core::chat::ChatState,
+    peer_ik: &[u8; 32],
+    peer_label: &str,
+    json: bool,
+    lines: &mut Vec<String>,
+) {
+    let req = chat
+        .pending_request(peer_ik)
+        .expect("ChatError::MessageRequest just inserted this request");
+    if json {
+        println!(
+            "{{\"event\":\"message_request\",\"from\":{},\"safety_number\":{}}}",
+            json_string(peer_label),
+            json_string(&req.safety_number)
+        );
+    } else {
+        lines.push(format!(
+            "message request from {peer_label} — held, not delivered (session connect has no \
+             interactive accept/reject yet; use `meridian chat` for the persistent gated flow)"
+        ));
+        lines.push(format!(
+            "  safety number: {}",
+            meridian_core::crypto::display_groups(&req.safety_number)
+        ));
+    }
 }
 
 /// Fetch + verify the peer's bundle, retrying while the peer has not published yet (`not_found`,
