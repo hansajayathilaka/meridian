@@ -198,6 +198,17 @@ enum DemoCommand {
         #[arg(long, default_value_t = 100)]
         rounds: usize,
     },
+    /// Task 2.12: the opacity audit at BOTH servers — the local c2s `Route`/`Deliver` wire (same
+    /// property `opacity-audit` already proves) plus the s2s `FedRoute` wire the federation
+    /// boundary introduces (Feature 06's "envelopes at both servers pass the opacity audit").
+    FederatedOpacityAudit {
+        /// Where to write the captured local + federated transcript.
+        #[arg(default_value = "federated-transcript.pcapish")]
+        out: PathBuf,
+        /// Number of cross-org message rounds to script.
+        #[arg(long, default_value_t = 100)]
+        rounds: usize,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -477,6 +488,34 @@ fn cmd_fetch_bundle(id: &str, server: &str, tamper: bool) -> Result<ExitCode, St
             eprintln!("FATAL: {e}");
             Ok(ExitCode::FAILURE)
         }
+        // (2.9) The hinted org's own policy refused this request (closed, or an allowlist that
+        // doesn't include us) — a clean, named, non-zero exit. A **policy** outcome: never a
+        // security warning, never conflated with the FATAL bundle-verification case above.
+        Err(SignalError::FedDenied { hint, detail }) => {
+            eprintln!(
+                "federation denied: {hint} is not accepting this request ({detail}) — a policy \
+                 outcome, not a security warning"
+            );
+            Ok(ExitCode::FAILURE)
+        }
+        // (2.9) Could not even reach the hinted org — a connectivity outcome, distinct from a
+        // policy refusal and from bundle verification.
+        Err(SignalError::FedUnreachable { hint, detail }) => {
+            eprintln!("{hint} unreachable at hint: could not reach that server ({detail})");
+            Ok(ExitCode::FAILURE)
+        }
+        // (2.9) The stale-hint case (ADR 0001): the hinted org answered but doesn't hold this
+        // account — indistinguishable, from this one response, from "hasn't published there yet"
+        // and "the peer re-registered elsewhere". Named honestly as "unreachable at hint" rather
+        // than inventing precision the wire doesn't carry — and never a security warning.
+        Err(SignalError::NotFoundAtHint { hint, detail }) => {
+            eprintln!(
+                "unreachable at hint {hint}: no such account there ({detail}) — the hint may be \
+                 stale (the peer may have re-registered elsewhere); a reachability issue, never a \
+                 security warning"
+            );
+            Ok(ExitCode::FAILURE)
+        }
         Err(e) => Err(e.to_string()),
     }
 }
@@ -601,6 +640,21 @@ fn run_demo(cmd: DemoCommand) -> Result<ExitCode, String> {
                 .map_err(|e| format!("writing {}: {e}", out.display()))?;
             println!(
                 "→ {} plaintext leaks; {} envelopes; sizes only observable field",
+                report.leaks, report.envelopes
+            );
+            println!(
+                "  transcript ({} bytes) written to {}",
+                report.transcript.len(),
+                out.display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        DemoCommand::FederatedOpacityAudit { out, rounds } => {
+            let report = opacity::run_federated_audit(rounds)?;
+            std::fs::write(&out, &report.transcript)
+                .map_err(|e| format!("writing {}: {e}", out.display()))?;
+            println!(
+                "→ {} plaintext leaks across the local + federated transcripts; {} envelopes",
                 report.leaks, report.envelopes
             );
             println!(

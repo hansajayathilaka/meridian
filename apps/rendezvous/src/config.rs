@@ -35,6 +35,13 @@ pub struct Server {
     /// `test-tamper-hook` cargo feature (off by default; absent from release binaries entirely,
     /// not merely gated at runtime, F17). This flag stays present (harmlessly inert) without the
     /// feature so downstream config/test plumbing that merely sets it keeps compiling.
+    ///
+    /// **Task 2.12 extension:** also arms bundle substitution on the FEDERATED fetch path
+    /// (`federation::inbound::handle_fed_fetch`) — a malicious/compromised B lying to A about the
+    /// requested identity's prekey bundle over `fed_fetch_bundle`. Unlike the local path, this is
+    /// **unconditional** on this one flag: `FedFetchBundle` (federation-protocol-v1.md §2) carries
+    /// no per-request `tamper` bit for a foreign caller to set, and a real malicious server would
+    /// not wait to be asked to lie.
     pub allow_test_tamper: bool,
     /// TEST HOOK (tasks 1.28 + 1.32): the **umbrella** gate for tampering with the *routed* path —
     /// the malicious-relay attacks that `allow_test_tamper`'s bundle substitution does not cover.

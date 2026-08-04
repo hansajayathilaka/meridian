@@ -122,7 +122,12 @@ domain = "chat.example"          # folded into the auth challenge
 bind = "127.0.0.1:8443"
 admission = "open"               # open | invite
 invite_tokens = []               # for invite admission
-allow_test_tamper = false        # TEST HOOK — must be false in production
+allow_test_tamper = false        # TEST HOOK — must be false in production. Arms bundle
+                                 # substitution on BOTH the local fetch path (client must also set
+                                 # the per-request `tamper` flag) AND, as of task 2.12, the
+                                 # FEDERATED fetch path (`fed_fetch_bundle`) — unconditionally there,
+                                 # since that wire message carries no per-request opt-in bit and a
+                                 # real malicious/compromised B does not wait to be asked to lie.
 allow_test_route_tamper = false  # TEST HOOK — must be false in production. UMBRELLA gate for
                                  # tampering with the routed path (tasks 1.28 + 1.32). Inert unless
                                  # built with `--features test-tamper-hook`, AND additionally

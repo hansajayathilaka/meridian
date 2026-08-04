@@ -127,12 +127,12 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
                 match maybe_line {
                     Some(text) if text.trim().is_empty() => {}
                     Some(text) if awaiting_request => {
-                        answer_request(&mut client, &mut state, store, handle, &account_pub, &peer_ik, &peer_label, &text, json, &mut pending).await?;
+                        answer_request(&mut client, &mut state, store, handle, &account_pub, &peer_ik, &peer_hint, &peer_label, &text, json, &mut pending).await?;
                         awaiting_request = false;
                     }
                     Some(text) => {
                         if state.has_session(&peer_ik) {
-                            send_text(&mut client, &mut state, store, handle, &account_pub, &peer_ik, &text, json).await?;
+                            send_text(&mut client, &mut state, store, handle, &account_pub, &peer_ik, &peer_hint, &peer_label, &text, json).await?;
                         } else {
                             pending.push(text);
                             if !json {
@@ -145,7 +145,7 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
             }
             delivered = client.next_deliver() => {
                 let deliver = delivered.map_err(|e| format!("receiving: {e}"))?;
-                handle_inbound(&mut client, &mut state, store, handle, &account_pub, &deliver, &peer_label, json, &mut pending, &mut awaiting_request).await?;
+                handle_inbound(&mut client, &mut state, store, handle, &account_pub, &deliver, &peer_hint, &peer_label, json, &mut pending, &mut awaiting_request).await?;
             }
         }
         save_state(&state, store, handle)?;
@@ -156,8 +156,9 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
     Ok(())
 }
 
-/// Fetch + verify the peer's bundle, retrying while the peer has not published yet (`not_found`).
-/// A signature mismatch is still a hard, immediate failure (never a downgrade).
+/// Fetch + verify the peer's bundle, retrying while the peer has not published yet (`not_found`,
+/// or the federated `not_found_at_hint` — task 2.7/2.9). A signature mismatch, a policy denial, or
+/// an unreachable hint is still a hard, immediate failure (never a downgrade, never retried).
 async fn fetch_with_retry(
     client: &mut SignalingClient,
     peer_ik: [u8; 32],
@@ -165,45 +166,105 @@ async fn fetch_with_retry(
     peer_label: &str,
 ) -> Result<meridian_core::proto::PrekeyBundle, String> {
     use meridian_core::signaling::SignalError;
+    // Set once a `not_found_at_hint` (task 2.9) is observed, so the final message — if every
+    // attempt exhausts — can name the reachability-specific outcome instead of the generic
+    // "did not publish" text used for a purely local `not_found`.
+    let mut stale_hint = false;
     for attempt in 0..40u32 {
         match client
             .fetch_bundle(peer_ik, Some(peer_hint.to_string()), false)
             .await
         {
             Ok(bundle) => return Ok(bundle),
-            // "not_found" (local) and "not_found_at_hint" (cross-org, task 2.7) both mean "no
-            // bundle there yet" from this retry loop's point of view — retry either way. A
-            // permanently stale hint (peer re-registered elsewhere) still eventually surfaces as
-            // this same retry exhausting, same as a peer that never publishes locally; refining
-            // that distinction further is 2.9's job, not this loop's.
-            Err(SignalError::Server(e))
-                if e.code == "not_found" || e.code == "not_found_at_hint" =>
-            {
+            // "not_found" (local): no bundle here yet — retry, the peer may publish soon.
+            Err(SignalError::Server(e)) if e.code == "not_found" => {
+                stale_hint = false;
                 if attempt == 0 {
                     eprintln!("waiting for {peer_label} to come online…");
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
-            Err(e) => return Err(format!("fetching {peer_label}: {e}")),
+            // `not_found_at_hint` (task 2.7/2.9): the hinted org doesn't hold this account. From a
+            // single response this is indistinguishable from "hasn't published there yet" and
+            // "the hint is permanently stale" (e.g. the peer re-registered at a different org) —
+            // retry the same bounded number of times as the local case, but if every attempt
+            // exhausts this way, report the distinct "unreachable at hint" outcome below (never a
+            // security warning: ADR 0001, docs/security/verification-ux.md).
+            Err(SignalError::NotFoundAtHint { .. }) => {
+                stale_hint = true;
+                if attempt == 0 {
+                    eprintln!("waiting for {peer_label} to come online at {peer_hint}…");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            // `fed_denied`/`fed_unreachable` (and anything else): definitive policy/connectivity
+            // outcomes, never retried — see `federation_error_line` for the distinct copy.
+            Err(e) => return Err(federation_error_line(&e, peer_label, "fetching")),
         }
     }
-    Err(format!("{peer_label} did not publish a bundle in time"))
+    if stale_hint {
+        Err(format!(
+            "{peer_label} unreachable at hint {peer_hint}: no account found there after \
+             retrying — the hint may be stale (the peer may have re-registered elsewhere); this \
+             is a reachability issue, never a security warning"
+        ))
+    } else {
+        Err(format!("{peer_label} did not publish a bundle in time"))
+    }
+}
+
+/// Render a definitive (non-retried) fetch/route failure as one diagnosable line, keeping the
+/// reachability-vs-policy-vs-security distinction visible in the copy itself (task 2.9, extended
+/// to the routing path by task 2.15). `BundleVerification` falls through to the generic arm below,
+/// which prefixes context but never rewords its canonical, un-softenable wording
+/// (docs/security/verification-ux.md) — only `FedDenied`/`FedUnreachable` get bespoke,
+/// reachability/policy-flavored copy here. `action` names the operation in the generic arm's
+/// prefix (`"fetching"` for the bundle path, `"routing message to"` for the ongoing-chat path) so
+/// one shared match doesn't misdescribe which call failed.
+fn federation_error_line(
+    e: &meridian_core::signaling::SignalError,
+    peer_label: &str,
+    action: &str,
+) -> String {
+    use meridian_core::signaling::SignalError;
+    match e {
+        SignalError::FedDenied { hint, detail } => format!(
+            "federation denied: {hint} is not accepting requests for {peer_label} ({detail}) — \
+             a policy outcome, not a security warning"
+        ),
+        SignalError::FedUnreachable { hint, detail } => format!(
+            "{peer_label} unreachable at hint {hint}: could not reach that server ({detail})"
+        ),
+        other => format!("{action} {peer_label}: {other}"),
+    }
 }
 
 /// Route a blob, treating a `not_connected` server reply as "not delivered" rather than a fatal
 /// error: a momentarily-offline peer must not tear down the chat session (offline delivery is the
 /// T07 mailbox). Other transport/server errors still propagate.
+///
+/// `hint` (task 2.15) is the peer's `@domain` routing hint — the same value already threaded into
+/// `fetch_with_retry` — passed on every routed call (not just the initial bundle fetch) so an
+/// ongoing chat with a cross-org peer actually reaches the federation path instead of the server
+/// treating an absent hint as local-only (system-design.md §3.3 step 2, §3.4). A definitive
+/// `FedDenied`/`FedUnreachable` surfaces through the same non-security-flavored copy the fetch path
+/// already gets (`federation_error_line`), rather than collapsing into a generic string.
 async fn route_tolerant(
     client: &mut SignalingClient,
     to: [u8; 32],
+    hint: &str,
     blob: Vec<u8>,
+    peer_label: &str,
 ) -> Result<bool, String> {
     use meridian_core::proto::error_codes::NOT_CONNECTED;
     use meridian_core::signaling::SignalError;
-    match client.route(to, blob).await {
+    match client
+        .route_with_hint(to, Some(hint.to_string()), blob)
+        .await
+    {
         Ok(delivered) => Ok(delivered),
         Err(SignalError::Server(e)) if e.code == NOT_CONNECTED => Ok(false),
-        Err(e) => Err(format!("routing message: {e}")),
+        Err(e) => Err(federation_error_line(&e, peer_label, "routing message to")),
     }
 }
 
@@ -215,6 +276,8 @@ async fn send_text(
     handle: &KeyHandle,
     account_pub: &[u8; 32],
     peer_ik: &[u8; 32],
+    peer_hint: &str,
+    peer_label: &str,
     text: &str,
     json: bool,
 ) -> Result<(), String> {
@@ -232,7 +295,7 @@ async fn send_text(
             },
         )
         .map_err(|e| format!("sealing message: {e}"))?;
-    let delivered = route_tolerant(client, *peer_ik, blob).await?;
+    let delivered = route_tolerant(client, *peer_ik, peer_hint, blob, peer_label).await?;
     if json {
         println!(
             "{{\"event\":\"sent\",\"id\":\"{}\",\"delivered\":{}}}",
@@ -255,6 +318,7 @@ async fn handle_inbound(
     handle: &KeyHandle,
     account_pub: &[u8; 32],
     deliver: &meridian_core::proto::Deliver,
+    peer_hint: &str,
     peer_label: &str,
     json: bool,
     pending: &mut Vec<String>,
@@ -281,6 +345,7 @@ async fn handle_inbound(
                 handle,
                 account_pub,
                 &deliver.from,
+                peer_hint,
                 peer_label,
                 json,
                 pending,
@@ -343,6 +408,7 @@ async fn deliver_content(
     handle: &KeyHandle,
     account_pub: &[u8; 32],
     from: &[u8; 32],
+    peer_hint: &str,
     peer_label: &str,
     json: bool,
     pending: &mut Vec<String>,
@@ -369,12 +435,24 @@ async fn deliver_content(
                     &ChatContent::Receipt { ack: id },
                 )
                 .map_err(|e| format!("sealing receipt: {e}"))?;
-            let _ = route_tolerant(client, *from, receipt).await?;
+            let _ = route_tolerant(client, *from, peer_hint, receipt, peer_label).await?;
 
             // Session is now live (or newly accepted) — flush anything typed early.
             let queued = std::mem::take(pending);
             for text in queued {
-                send_text(client, state, store, handle, account_pub, from, &text, json).await?;
+                send_text(
+                    client,
+                    state,
+                    store,
+                    handle,
+                    account_pub,
+                    from,
+                    peer_hint,
+                    peer_label,
+                    &text,
+                    json,
+                )
+                .await?;
             }
         }
         ChatContent::Receipt { ack } => {
@@ -400,6 +478,7 @@ async fn answer_request(
     handle: &KeyHandle,
     account_pub: &[u8; 32],
     peer_ik: &[u8; 32],
+    peer_hint: &str,
     peer_label: &str,
     answer: &str,
     json: bool,
@@ -423,6 +502,7 @@ async fn answer_request(
                 handle,
                 account_pub,
                 peer_ik,
+                peer_hint,
                 peer_label,
                 json,
                 pending,

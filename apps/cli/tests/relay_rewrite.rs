@@ -202,8 +202,9 @@ async fn establish_through(url: &str) -> (Outcome, Outcome) {
     let bob_tp = Arc::new(LoopbackTransport::new(fabric));
     let registry = Arc::new(StreamRegistry::with_builtins());
 
-    let mut alice_relay = RendezvousRelay::new(&mut alice_client);
-    let mut bob_relay = RendezvousRelay::new(&mut bob_client);
+    // Same server for both peers in this test — no cross-org hint in play.
+    let mut alice_relay = RendezvousRelay::new(&mut alice_client, None);
+    let mut bob_relay = RendezvousRelay::new(&mut bob_client, None);
 
     let alice_fut = dial(
         alice_tp,

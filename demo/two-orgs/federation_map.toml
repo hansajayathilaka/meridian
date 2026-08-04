@@ -1,8 +1,12 @@
-# Reference `federation_map.toml` for the two-org air-gap federation demo (feature 06).
+# `federation_map.toml` for the two-org air-gap federation demo (feature 06), used for real by
+# task 2.11's static-discovery compose profile (docker-compose.static.yml) — this file started as
+# task 2.5's schema fixture and is now the live map both rendezvous containers load when
+# `federation.discovery = "static"`.
 #
-# This file is task 2.5's schema fixture, consumed as-is by task 2.11 ("demo/two-orgs/: two full
-# stacks, private CA, both discovery modes") — it is NOT itself the full demo stack (no
-# docker-compose.yml/Dockerfile here yet; that's 2.11's job).
+# `endpoint`'s host (`fed.org-a.test` / `fed.org-b.test`) is a docker-compose network alias for
+# `rendezvous-a` / `rendezvous-b` (see docker-compose.static.yml) — deliberately a different name
+# from `domain` (the public hint) even though both resolve on this demo network, to keep the
+# discovery/trust split concrete (see `endpoint`'s own doc note below).
 #
 # Parsed by `meridian_rendezvous::federation::discovery::StaticMap` when a rendezvous is
 # configured with `federation.discovery = "static"` and
@@ -19,9 +23,11 @@
 #                    apps/rendezvous/src/federation/discovery.rs.
 #   pinned_identity  REQUIRED. The peer certificate's SAN/CN this partner is pinned to in
 #                    private-CA/air-gap mode (ADR 0017 C4). A missing/empty pin is a fail-closed
-#                    config-load error — see `StaticMap::load`. Matches the CN
-#                    `infra/deploy/bootstrap-ca.sh` issues for each org (`CN=org-a.test`, no SAN),
-#                    NOT `endpoint`'s host.
+#                    config-load error — see `StaticMap::load`. Matches the SAN (and CN)
+#                    `infra/deploy/bootstrap-ca.sh` issues for each org (`CN=org-a.test`,
+#                    `SAN=DNS:org-a.test` as of this task's fix — rustls-webpki never falls back to
+#                    the bare CN, so the SAN is what the TLS handshake itself actually checks), NOT
+#                    `endpoint`'s host.
 #   policy           optional; carried through unparsed/uninterpreted by task 2.5.
 #                    Semantics (`open | allowlist | closed`) are task 2.6's ("federation policy
 #                    limits") to define and enforce — this file only reserves the field.

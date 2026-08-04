@@ -2328,6 +2328,7 @@ dependencies = [
  "keyring",
  "meridian-core",
  "meridian-rendezvous",
+ "rcgen",
  "rpassword",
  "rustls",
  "serde",

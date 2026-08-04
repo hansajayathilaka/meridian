@@ -34,19 +34,33 @@ use crate::session::{SessionError, SignalRelay};
 /// property over a real socket.
 pub struct RendezvousRelay<'a> {
     client: &'a mut SignalingClient,
+    /// (2.15) The peer's `@domain` routing hint — the same wire-level hint already threaded into
+    /// `fetch_bundle` (task 2.7/2.9), now also carried on every `send()`. `None` for a same-server
+    /// peer, `Some(domain)` when this relay's one fixed peer is believed to live at a foreign
+    /// org's server. One `RendezvousRelay` always wraps one client for one fixed peer relationship
+    /// (see the module docs), so a single hint fixed at construction is sufficient — there is no
+    /// per-call hint to thread separately.
+    hint: Option<String>,
 }
 
 impl<'a> RendezvousRelay<'a> {
-    /// Wrap an already-connected, already-authenticated `SignalingClient`.
-    pub fn new(client: &'a mut SignalingClient) -> Self {
-        Self { client }
+    /// Wrap an already-connected, already-authenticated `SignalingClient`. `hint` is the peer's
+    /// `@domain` routing hint (task 2.7/2.8's wire-level hint), passed on every `send()` so
+    /// cross-org routing — not just the initial bundle fetch — reaches the federation path
+    /// (task 2.15, system-design.md §3.3 step 2's "subsequent signaling envelopes" requirement).
+    pub fn new(client: &'a mut SignalingClient, hint: Option<String>) -> Self {
+        Self { client, hint }
     }
 }
 
 #[async_trait::async_trait]
 impl SignalRelay for RendezvousRelay<'_> {
     async fn send(&mut self, to: &[u8; 32], blob: Vec<u8>) -> Result<(), SessionError> {
-        map_route_result(self.client.route(*to, blob).await)
+        map_route_result(
+            self.client
+                .route_with_hint(*to, self.hint.clone(), blob)
+                .await,
+        )
     }
 
     async fn recv(&mut self) -> Result<([u8; 32], Vec<u8>), SessionError> {
@@ -54,8 +68,27 @@ impl SignalRelay for RendezvousRelay<'_> {
     }
 }
 
+/// (2.9) Reclassify a [`SignalError`] into a [`SessionError`], preserving the three
+/// federation-specific outcomes (`FedDenied`/`FedUnreachable`/`NotFoundAtHint`) as their own
+/// structurally distinct `SessionError` variants rather than folding them into the generic
+/// [`SessionError::Relay`] string — mirrors [`meridian_signaling`]'s own taxonomy so the
+/// reachability-vs-policy-vs-security distinction survives crossing from the signaling crate into
+/// the session substrate. Any other error still degrades to `Relay(e.to_string())`, unchanged.
+fn map_signal_error(e: SignalError) -> SessionError {
+    match e {
+        SignalError::FedDenied { hint, detail } => SessionError::FedDenied { hint, detail },
+        SignalError::FedUnreachable { hint, detail } => {
+            SessionError::FedUnreachable { hint, detail }
+        }
+        SignalError::NotFoundAtHint { hint, detail } => {
+            SessionError::NotFoundAtHint { hint, detail }
+        }
+        other => SessionError::Relay(other.to_string()),
+    }
+}
+
 /// The `route()` outcome → `send()` mapping, extracted so it is unit-testable without a live
-/// WebSocket. A [`SignalError`] propagates as [`SessionError::Relay`]; `Ok(false)` (the peer was
+/// WebSocket. A [`SignalError`] propagates via [`map_signal_error`]; `Ok(false)` (the peer was
 /// not connected, so the server could not deliver) is *also* a hard error — see the module docs.
 fn map_route_result(result: Result<bool, SignalError>) -> Result<(), SessionError> {
     match result {
@@ -63,7 +96,7 @@ fn map_route_result(result: Result<bool, SignalError>) -> Result<(), SessionErro
         Ok(false) => Err(SessionError::Relay(
             "peer is not currently connected to the rendezvous".to_string(),
         )),
-        Err(e) => Err(SessionError::Relay(e.to_string())),
+        Err(e) => Err(map_signal_error(e)),
     }
 }
 
@@ -71,7 +104,7 @@ fn map_route_result(result: Result<bool, SignalError>) -> Result<(), SessionErro
 fn map_deliver_result(
     result: Result<meridian_proto::Deliver, SignalError>,
 ) -> Result<([u8; 32], Vec<u8>), SessionError> {
-    let deliver = result.map_err(|e| SessionError::Relay(e.to_string()))?;
+    let deliver = result.map_err(map_signal_error)?;
     Ok((deliver.from, deliver.blob.as_bytes().to_vec()))
 }
 
@@ -119,5 +152,59 @@ mod tests {
         let (from, blob) = map_deliver_result(Ok(deliver)).unwrap();
         assert_eq!(from, [7u8; 32]);
         assert_eq!(blob, vec![1, 2, 3]);
+    }
+
+    // -- 2.9: federation outcomes survive the SignalError -> SessionError crossing distinctly ----
+
+    #[test]
+    fn route_fed_denied_maps_to_its_own_session_variant_not_relay() {
+        let err = map_route_result(Err(SignalError::FedDenied {
+            hint: "org-b.test".to_string(),
+            detail: "closed".to_string(),
+        }))
+        .unwrap_err();
+        match err {
+            SessionError::FedDenied { hint, detail } => {
+                assert_eq!(hint, "org-b.test");
+                assert_eq!(detail, "closed");
+            }
+            other => panic!("expected SessionError::FedDenied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_fed_unreachable_maps_to_its_own_session_variant() {
+        let err = map_route_result(Err(SignalError::FedUnreachable {
+            hint: "org-b.test".to_string(),
+            detail: "dial failed".to_string(),
+        }))
+        .unwrap_err();
+        assert!(matches!(err, SessionError::FedUnreachable { .. }));
+    }
+
+    #[test]
+    fn deliver_not_found_at_hint_maps_to_its_own_session_variant_never_a_security_error() {
+        let err = map_deliver_result(Err(SignalError::NotFoundAtHint {
+            hint: "org-b.test".to_string(),
+            detail: "no such account".to_string(),
+        }))
+        .unwrap_err();
+        match err {
+            SessionError::NotFoundAtHint { hint, .. } => assert_eq!(hint, "org-b.test"),
+            other => panic!("expected SessionError::NotFoundAtHint, got {other:?}"),
+        }
+        // Structurally distinct from the fingerprint/envelope security checks — never
+        // `FingerprintMismatch`/`Chat`, and the reachability outcome above must never be
+        // constructible from this mapping as one of those.
+    }
+
+    #[test]
+    fn other_signal_errors_still_fall_back_to_the_generic_relay_variant() {
+        // Unaffected by the 2.9 additions: anything that isn't one of the three federation
+        // outcomes keeps degrading to the pre-existing generic string, exactly as before.
+        let err = map_route_result(Err(SignalError::ClosedEarly("frame"))).unwrap_err();
+        assert!(matches!(err, SessionError::Relay(_)));
+        let err = map_deliver_result(Err(SignalError::ClosedEarly("frame"))).unwrap_err();
+        assert!(matches!(err, SessionError::Relay(_)));
     }
 }

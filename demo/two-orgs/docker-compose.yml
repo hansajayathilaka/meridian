@@ -1,0 +1,151 @@
+# demo/two-orgs — the feature-06 acceptance demo, runnable (task 2.11).
+#
+# `cd demo/two-orgs && docker compose -f docker-compose.yml -f docker-compose.static.yml up`
+# (or use run-walkthrough.sh, which drives both this file and whichever discovery-mode override —
+# static or srv — end to end, including the CA bootstrap and the walkthrough itself).
+#
+# This file alone is mode-agnostic and does not federate on its own: every `federation.*` setting
+# (ADR 0017/0002) comes from whichever override you add — docker-compose.static.yml (air-gap
+# static map) or docker-compose.srv.yml (DNS SRV, needs the `dns` service that override adds).
+#
+# Topology per org (docs/operations/diagrams/deployment-topology.mermaid, one-VIP-not-two shape):
+#   edge-<org>        nginx `stream` TLS termination for client wss:// (ADR 0008 — never in-process)
+#   rendezvous-<org>  meridian-rendezvous; ALSO terminates s2s federation mTLS in-process (ADR 0017 C7)
+#   coturn-<org>      TURN relay, ephemeral HMAC credentials only (never static per-user secrets)
+# `client` is this demo's own addition (not part of any org's real deployment): one container with
+# the `meridian` CLI + this demo's CA trust already installed, used by run-walkthrough.sh to drive
+# alice (org-a) and bob (org-b) without touching the host's DNS or trust store.
+#
+# Air-gap (docs/operations/deployment.md §9.3): `meridian-demo` is an `internal: true` network —
+# Docker refuses it a default route out, so nothing on it can reach the internet once the stack is
+# up, structurally, not just by convention. (Image pulls/builds go through the host's Docker
+# engine, outside any container's network namespace, so `docker compose up --build` still works.)
+
+networks:
+  meridian-demo:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+x-rendezvous-build: &rendezvous-build
+  context: ../..
+  dockerfile: demo/two-orgs/Dockerfile.rendezvous
+
+services:
+  # ---------------------------------------------------------------------------------------------
+  # Org A
+  # ---------------------------------------------------------------------------------------------
+  rendezvous-a:
+    build: *rendezvous-build
+    networks:
+      meridian-demo:
+        aliases: [fed.org-a.test]   # federation_map.toml's `endpoint` for org-a (static mode)
+    volumes:
+      - ./org-a.toml:/etc/meridian/rendezvous.toml:ro
+      - ./.ca/org-a.test.crt:/etc/meridian/fed/org-a.test.crt:ro
+      - ./.ca/org-a.test.key:/etc/meridian/fed/org-a.test.key:ro
+      - rendezvous-a-data:/data
+    environment:
+      MERIDIAN_RENDEZVOUS_TURN__SECRET: ${TURN_SHARED_SECRET:?set TURN_SHARED_SECRET (run-walkthrough.sh generates this)}
+      MERIDIAN_RENDEZVOUS_FEDERATION__ENABLED: "true"
+      MERIDIAN_RENDEZVOUS_FEDERATION__BIND: "0.0.0.0:8444"
+      MERIDIAN_RENDEZVOUS_FEDERATION__CERT_PATH: /etc/meridian/fed/org-a.test.crt
+      MERIDIAN_RENDEZVOUS_FEDERATION__KEY_PATH: /etc/meridian/fed/org-a.test.key
+      MERIDIAN_RENDEZVOUS_FEDERATION__POLICY: allowlist
+      MERIDIAN_RENDEZVOUS_FEDERATION__ALLOWLIST: '["org-b.test"]'
+    restart: unless-stopped
+
+  coturn-a:
+    image: coturn/coturn:4.6.2
+    networks: [meridian-demo]
+    command:
+      - "-c"
+      - "/etc/coturn/turnserver.conf"
+      - "--static-auth-secret=${TURN_SHARED_SECRET:?set TURN_SHARED_SECRET}"
+      - "--realm=turn.org-a.test"
+      # This whole network is RFC-1918 (the demo bridge subnet), so the reference conf's
+      # denied-peer-ip lines (aimed at an internet-facing coturn) would refuse every relay
+      # candidate here — deployment.md §9.3a's own air-gap note ("relaxed to the org's own ranges")
+      # applied via coturn's allow-list override rather than forking turnserver.conf.
+      - "--allowed-peer-ip=172.16.0.0-172.31.255.255"
+    volumes:
+      - ../../infra/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    restart: unless-stopped
+
+  edge-a:
+    image: nginx:1.27-alpine
+    networks:
+      meridian-demo:
+        aliases: [org-a.test]   # static-mode profile: no DNS server needed, this alias is enough
+    volumes:
+      - ./edge/org-a.nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./.ca/org-a.test.crt:/etc/meridian/tls/org-a.test.crt:ro
+      - ./.ca/org-a.test.key:/etc/meridian/tls/org-a.test.key:ro
+    depends_on: [rendezvous-a]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------------------------
+  # Org B
+  # ---------------------------------------------------------------------------------------------
+  rendezvous-b:
+    build: *rendezvous-build
+    networks:
+      meridian-demo:
+        aliases: [fed.org-b.test]
+    volumes:
+      - ./org-b.toml:/etc/meridian/rendezvous.toml:ro
+      - ./.ca/org-b.test.crt:/etc/meridian/fed/org-b.test.crt:ro
+      - ./.ca/org-b.test.key:/etc/meridian/fed/org-b.test.key:ro
+      - rendezvous-b-data:/data
+    environment:
+      MERIDIAN_RENDEZVOUS_TURN__SECRET: ${TURN_SHARED_SECRET:?set TURN_SHARED_SECRET}
+      MERIDIAN_RENDEZVOUS_FEDERATION__ENABLED: "true"
+      MERIDIAN_RENDEZVOUS_FEDERATION__BIND: "0.0.0.0:8444"
+      MERIDIAN_RENDEZVOUS_FEDERATION__CERT_PATH: /etc/meridian/fed/org-b.test.crt
+      MERIDIAN_RENDEZVOUS_FEDERATION__KEY_PATH: /etc/meridian/fed/org-b.test.key
+      MERIDIAN_RENDEZVOUS_FEDERATION__POLICY: allowlist
+      MERIDIAN_RENDEZVOUS_FEDERATION__ALLOWLIST: '["org-a.test"]'
+    restart: unless-stopped
+
+  coturn-b:
+    image: coturn/coturn:4.6.2
+    networks: [meridian-demo]
+    command:
+      - "-c"
+      - "/etc/coturn/turnserver.conf"
+      - "--static-auth-secret=${TURN_SHARED_SECRET:?set TURN_SHARED_SECRET}"
+      - "--realm=turn.org-b.test"
+      - "--allowed-peer-ip=172.16.0.0-172.31.255.255"
+    volumes:
+      - ../../infra/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    restart: unless-stopped
+
+  edge-b:
+    image: nginx:1.27-alpine
+    networks:
+      meridian-demo:
+        aliases: [org-b.test]
+    volumes:
+      - ./edge/org-b.nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./.ca/org-b.test.crt:/etc/meridian/tls/org-b.test.crt:ro
+      - ./.ca/org-b.test.key:/etc/meridian/tls/org-b.test.key:ro
+    depends_on: [rendezvous-b]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------------------------
+  # Demo driver (not part of either org's real deployment — see header)
+  # ---------------------------------------------------------------------------------------------
+  client:
+    build: *rendezvous-build
+    networks: [meridian-demo]
+    volumes:
+      - ./.ca:/usr/local/share/ca-certificates/meridian-demo:ro
+    entrypoint: ["/usr/local/bin/demo-entrypoint.sh"]
+    command: ["sleep", "infinity"]
+    depends_on: [edge-a, edge-b]
+    restart: unless-stopped
+
+volumes:
+  rendezvous-a-data:
+  rendezvous-b-data:

@@ -6,3 +6,4 @@
 
 # dev CA artifacts
 infra/deploy/.ca/
+demo/two-orgs/.ca/

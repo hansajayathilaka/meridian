@@ -63,7 +63,8 @@ workspace builds and enforces its own invariants, and the missing agents/skills/
 
 ## D. Worth-having (now done)
 `CONTRIBUTING.md` (+ global Definition of Done) · `docs/glossary.md` · `LICENSE` (Apache-2.0 stub,
-tied to D1) · `infra/deploy/bootstrap-ca.sh` + `two-orgs.compose.yml` so `just two-orgs` can run.
+tied to D1) · `infra/deploy/bootstrap-ca.sh` + `demo/two-orgs/` so `just two-orgs` can run (task
+2.11 superseded the earlier `infra/deploy/two-orgs.compose.yml` stub this line used to name).
 
 ## E. Deliberately skipped (with reasons)
 - **Dedicated crypto agent** — folded into [security-reviewer](../.claude/agents/security-reviewer.md)

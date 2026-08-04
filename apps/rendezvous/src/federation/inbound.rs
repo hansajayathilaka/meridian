@@ -62,10 +62,24 @@ use crate::store::Store;
 /// per-origin/per-origin-account rate limits (2.6), then an exact-key store lookup — the federated
 /// mirror of `ws::handle_fetch`'s local path, minus anything socket-shaped (this function never
 /// touches a client connection; [`serve_link`] is what talks to the wire on both sides).
+///
+/// **TEST HOOK (task 2.12, F17 discipline):** when compiled with the `test-tamper-hook` cargo
+/// feature AND `server_cfg.allow_test_tamper` is `true`, the bundle handed back is
+/// [`crate::auth::substitute_bundle`]'d before it is returned — a malicious/compromised B lying to
+/// A about the requested identity's prekey bundle, the cross-org analogue of `ws::handle_fetch`'s
+/// existing local substitution. Deliberately **unconditional** on this flag alone, unlike the local
+/// path's additional client-supplied `Fetch.tamper` bit: `FedFetchBundle`
+/// (federation-protocol-v1.md §2) carries no such field, and a wire change to add one is out of
+/// this task's scope (any wire change is a `meridian-proto` change, versioned, per this crate's own
+/// invariants) — a real malicious B does not wait to be asked to lie. Compiled in only under the
+/// cargo feature (absent from release binaries entirely, not merely runtime-gated, F17); see
+/// `apps/rendezvous/tests/federation_abuse.rs` for the adversarial cell and its structural
+/// inertness proof.
 pub async fn handle_fed_fetch(
     store: &dyn Store,
     policy: &FederationPolicy,
     limits: &FederationLimits,
+    server_cfg: &crate::config::Server,
     origin_domain: &str,
     req: &FedFetchBundle,
 ) -> Result<FedBundle, FedErr> {
@@ -86,7 +100,21 @@ pub async fn handle_fed_fetch(
         });
     }
     match store.get_bundle(&req.target).await {
-        Ok(Some(bundle)) => Ok(FedBundle { bundle }),
+        Ok(Some(bundle)) => {
+            // TEST HOOK (F17): compiled in only under `test-tamper-hook`; see this function's doc
+            // comment. Without the feature, `server_cfg` is unused by this branch entirely (still
+            // referenced by the `#[cfg(not(...))]` arm below so the parameter itself is never
+            // reported as dead).
+            #[cfg(feature = "test-tamper-hook")]
+            let bundle = if server_cfg.allow_test_tamper {
+                crate::auth::substitute_bundle(&bundle)
+            } else {
+                bundle
+            };
+            #[cfg(not(feature = "test-tamper-hook"))]
+            let _ = server_cfg;
+            Ok(FedBundle { bundle })
+        }
         Ok(None) => Err(FedErr {
             code: fed_error_codes::NOT_FOUND.to_string(),
             msg: "no bundle for the requested account".to_string(),
@@ -250,6 +278,7 @@ pub async fn serve_link(mut link: FederationLink, state: Arc<AppState>) {
                     state.store.as_ref(),
                     &state.federation.policy,
                     &state.federation.limits,
+                    &state.config.server,
                     &origin_domain,
                     &req,
                 )

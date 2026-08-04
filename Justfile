@@ -40,6 +40,7 @@ test: build harnesses
     # default builds/CI-without-this-step stay pure-Rust and network-free.
     cargo test -p meridian-transport --features webrtc
     cargo test -p meridian-core --features webrtc
+    cargo test -p meridian-cli --features webrtc
     @echo "TODO: migrate to cargo nextest run --workspace"
     @echo "TODO: conformance vectors — docs/testing/strategy.md §1"
 
@@ -72,10 +73,13 @@ codegen:
 vectors:
     cargo run -p xtask -- vectors
 
-# Local two-org federation demo (needs the CA bootstrap first).
-two-orgs:
-    bash infra/deploy/bootstrap-ca.sh
-    @echo "TODO: docker compose -f infra/deploy/two-orgs.compose.yml up (see infra/CLAUDE.md)"
+# Local two-org federation demo (task 2.11): brings up two full org stacks (rendezvous+coturn x2,
+# private CA, TLS edges) with no internet required once built, and drives a real cross-org E2EE
+# chat (+ P2P where it establishes) between them. `mode` is `static` (air-gap federation map, the
+# default) or `srv` (real internal DNS SRV discovery) — see demo/two-orgs/README.md for both modes,
+# what each proves, and troubleshooting. Tears itself down on exit; set KEEP_UP=1 to leave it up.
+two-orgs mode="static":
+    bash demo/two-orgs/run-walkthrough.sh {{mode}}
 
 # Validate docs: mermaid syntax + relative links.
 check-docs:
