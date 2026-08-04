@@ -343,13 +343,30 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   Phase-3 fix-task) that test-harness PKI/server-bootstrap boilerplate has now been duplicated a
   fifth/sixth time across `apps/rendezvous/tests/` and `apps/cli/tests/` — debt first noted at 2.7/
   2.8 and still unaddressed.
-- **NEXT:** `/next-task`. **2.14** (from 2.10's review) queues up after 2.10's own dependents since
-  it depends on 2.10. **2.16** (a carried-in CI-flakiness defect surfaced while closing 2.15/2.11 —
+- **ALSO NOW:** **2.14 is done.** `ChatState::open_inbound` is now a thin wrapper over
+  `open_inbound_gated(..., force_first_contact)`; `P2pSession` snapshots
+  `chat.has_session(&peer_ik)` before the offer/answer handshake (both `dial_established` and
+  `answer_with_config`, including the 1.29 relay-fallback retry, which correctly reuses rather than
+  recomputes the snapshot) and forces the gate on the first `CHAT_LABEL` frame via `pump`, clearing
+  the flag only once the gate actually fires — a garbled first frame can't let a later genuine one
+  slip through ungated. `session_connect.rs` prints a loud sender+safety-number notice instead of
+  silently delivering, since that command's `ChatState` has no persisted contacts to accept/reject
+  against. New pinning test in `apps/core/tests/p2p_session.rs` proves first content is held, a
+  second pre-accept envelope is refused, and accept delivers normally; test-engineer independently
+  proved non-vacuity by disabling the gate and confirming the test (plus two others) fail with
+  plaintext delivered ungated. architect: consistent, no required changes — confirmed the mechanism
+  doesn't disturb the handshake structure and the snapshot timing is race-free. security-reviewer:
+  APPROVE — gate-after-verification holds, no new server-visible signal; one non-blocking follow-up
+  noted (a narrow mailbox/P2P concurrent-accept race that could spuriously over-gate, fail-safe
+  direction, worth a future regression test). test-engineer: PASS, all four affected suites green
+  including `--features webrtc`. `docs/security/threat-mitigation-matrix.md`'s gate entry updated to
+  close 2.10's relay-path-only caveat.
+- **NEXT:** `/next-task`. **2.16** (a carried-in CI-flakiness defect surfaced while closing 2.15/2.11 —
   `session_connect_webrtc.rs`'s TURN-grant test hangs in real CI for reasons this sandbox cannot
   reproduce, `#[ignore]`d rather than guessed at) and **2.17** (the newly-filed unbounded
   answerer-wait fix, mirroring 1.33) are both independent and can land whenever picked up. With
-  2.1-2.13 and 2.15 all `[x]`, Feature 06's own scope is functionally complete; 2.14/2.16/2.17 are
-  carried-in fix-tasks, not blockers to calling Phase 2's T06 work done, but should land before
+  2.1-2.15 all `[x]`, Feature 06's own scope is functionally complete; 2.16/2.17 are carried-in
+  fix-tasks, not blockers to calling Phase 2's T06 work done, but should land before
   `/start-review-phase` for Phase 3 so the review sweep isn't tripping over already-known gaps.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
@@ -461,7 +478,7 @@ into 2.9 or 2.11.
 
 **Carried in from Phase 1** (production defect surfaced by 1.32; not part of T06)
 - [x] **2.13** A replayed envelope permanently wedges the receiving ratchet (`Ratchet::decrypt` commits `ckr`/`nr` before `aead_open` and never rolls back — unauthenticated permanent session DoS) — [file](./phase-2/2.13-ratchet-replay-dos.md)
-- [~] **2.14** Wire the message-request gate into the P2P session substrate (from 2.10's review; `session connect` currently bypasses the gate entirely) — [file](./phase-2/2.14-p2p-message-request-gate.md)
+- [x] **2.14** Wire the message-request gate into the P2P session substrate (from 2.10's review; `session connect` currently bypasses the gate entirely) — [file](./phase-2/2.14-p2p-message-request-gate.md)
 - [ ] **2.16** `session_connect_webrtc.rs`'s TURN-grant test hangs in real CI, root cause unconfirmed (surfaced while closing 2.15; `#[ignore]`d rather than guessed at) — [file](./phase-2/2.16-turn-grant-ci-hang.md)
 - [ ] **2.17** Bound the answerer's wait for an offer (`recv_sdp`, mirror of 1.33; surfaced by 2.12's review) — [file](./phase-2/2.17-bound-offer-wait.md)
 
