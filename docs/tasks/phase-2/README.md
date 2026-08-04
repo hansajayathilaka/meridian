@@ -162,7 +162,7 @@ above and can run at any point in the phase.
 
 **Follow-up surfaced by 2.10's review** — architect + security-reviewer both required this be
 tracked explicitly rather than silently deferred to Feature 08.
-- [ ] **2.14** Wire the message-request gate into the P2P session substrate (`session connect`
+- [~] **2.14** Wire the message-request gate into the P2P session substrate (`session connect`
   currently bypasses 2.10's gate entirely) — [file](./2.14-p2p-message-request-gate.md)
 
 **Carried-in CI defect surfaced while closing 2.15** — not T06 work, independent of every task
