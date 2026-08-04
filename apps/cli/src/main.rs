@@ -432,7 +432,7 @@ fn cmd_register(server: &str, invite: Option<String>) -> Result<ExitCode, String
     let store = load_store(&descriptor)?;
     let handle = KeyHandle::from_label(&descriptor.label);
 
-    let published = runtime()?.block_on(async {
+    let published = block_on(runtime()?, async {
         let mut client =
             SignalingClient::connect(server, store.as_ref(), &handle, account_pub, invite, 1)
                 .await
@@ -466,7 +466,7 @@ fn cmd_fetch_bundle(id: &str, server: &str, tamper: bool) -> Result<ExitCode, St
     let store = load_store(&descriptor)?;
     let handle = KeyHandle::from_label(&descriptor.label);
 
-    let outcome = runtime()?.block_on(async {
+    let outcome = block_on(runtime()?, async {
         let mut client =
             SignalingClient::connect(server, store.as_ref(), &handle, account_pub, None, 1).await?;
         let bundle = client.fetch_bundle(target, Some(hint), tamper).await;
@@ -532,16 +532,19 @@ fn cmd_chat(id: &str, server: &str, json: bool) -> Result<ExitCode, String> {
     let store = load_store(&descriptor)?;
     let handle = KeyHandle::from_label(&descriptor.label);
 
-    runtime()?.block_on(chat::run(chat::ChatArgs {
-        server: server.to_string(),
-        store: store.as_ref(),
-        handle: &handle,
-        account_pub,
-        peer_ik,
-        peer_label: peer.to_id_string(),
-        peer_hint: peer.hint().to_string(),
-        json,
-    }))?;
+    block_on(
+        runtime()?,
+        chat::run(chat::ChatArgs {
+            server: server.to_string(),
+            store: store.as_ref(),
+            handle: &handle,
+            account_pub,
+            peer_ik,
+            peer_label: peer.to_id_string(),
+            peer_hint: peer.hint().to_string(),
+            json,
+        }),
+    )?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -561,12 +564,15 @@ fn run_session(cmd: SessionCommand) -> Result<ExitCode, String> {
                     "unknown nat '{nat}' (expected full-cone | port-restricted | symmetric | udp-blocked)"
                 )
             })?;
-            runtime()?.block_on(session::run_demo(session::DemoOpts {
-                json,
-                policy,
-                scenario,
-                transport,
-            }))?;
+            block_on(
+                runtime()?,
+                session::run_demo(session::DemoOpts {
+                    json,
+                    policy,
+                    scenario,
+                    transport,
+                }),
+            )?;
             Ok(ExitCode::SUCCESS)
         }
         SessionCommand::Connect {
@@ -582,24 +588,27 @@ fn run_session(cmd: SessionCommand) -> Result<ExitCode, String> {
             let store = load_store(&descriptor)?;
             let handle = KeyHandle::from_label(&descriptor.label);
 
-            runtime()?.block_on(session_connect::run(session_connect::ConnectArgs {
-                server,
-                store: store.as_ref(),
-                handle: &handle,
-                account_pub,
-                peer_ik,
-                peer_label: peer.to_id_string(),
-                peer_hint: peer.hint().to_string(),
-                transport,
-                json,
-            }))?;
+            block_on(
+                runtime()?,
+                session_connect::run(session_connect::ConnectArgs {
+                    server,
+                    store: store.as_ref(),
+                    handle: &handle,
+                    account_pub,
+                    peer_ik,
+                    peer_label: peer.to_id_string(),
+                    peer_hint: peer.hint().to_string(),
+                    transport,
+                    json,
+                }),
+            )?;
             Ok(ExitCode::SUCCESS)
         }
     }
 }
 
 fn run_doctor(json: bool) -> Result<ExitCode, String> {
-    runtime()?.block_on(doctor::run(json))?;
+    block_on(runtime()?, doctor::run(json))?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -710,6 +719,40 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
         .enable_all()
         .build()
         .map_err(|e| format!("starting async runtime: {e}"))
+}
+
+/// How long [`block_on`] will give any `spawn_blocking` work still outstanding on `rt`'s blocking
+/// pool a chance to finish before we abandon it and let the process move on to exit. Short: by the
+/// time we reach this point `fut` has already run to completion (or failed), so nothing the *user*
+/// is waiting on is gated by this — it only bounds how long we wait on stragglers we've already
+/// given up on.
+const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Run `fut` to completion on `rt`, then tear `rt` down with a bounded [`shutdown_timeout`]
+/// instead of relying on [`Runtime`](tokio::runtime::Runtime)'s `Drop` impl.
+///
+/// `Drop for Runtime` cancels ordinary (non-blocking) tasks immediately, but waits *indefinitely*
+/// for any outstanding `spawn_blocking` work to finish — and hostname resolution
+/// (`tokio::net::lookup_host`, and therefore `std::net::ToSocketAddrs` under it) always runs on
+/// that blocking pool for any host that isn't already a literal IP address (see
+/// `tokio::net::addr`'s `ToSocketAddrs for str` impl: it only skips `spawn_blocking` when the
+/// input parses directly as a `SocketAddr`). `webrtc-ice`'s STUN/TURN candidate gathering
+/// (`webrtc-ice` `agent_gather.rs`) resolves every configured ICE-server URL this way in its own
+/// `tokio::spawn`ed worker, which this binary never joins or aborts — our own bounds on that work
+/// (`GATHER_TIMEOUT`/`WAIT_TIMEOUT` in `apps/transport/src/webrtc_backend.rs`, `ANSWER_TIMEOUT` in
+/// `meridian_core::session`) all correctly give up and let `fut` finish, but the orphaned
+/// `tokio::spawn` task (and the `spawn_blocking` DNS query it may still be sitting in) keeps
+/// running underneath. A hostname that is slow to resolve — or simply never answers, rather than
+/// failing fast with NXDOMAIN — leaves that query blocked on a blocking-pool thread that plain
+/// `Drop` would then wait on forever *after* `fut` has already succeeded or failed, hanging
+/// process exit with no internal timeout able to touch it (confirmed against the vendored
+/// `webrtc-ice`/`webrtc-util`/`turn` 0.17.1 sources; see task 2.16). `shutdown_timeout` bounds
+/// that wait instead: anything still outstanding after [`RUNTIME_SHUTDOWN_TIMEOUT`] is abandoned
+/// (the OS reclaims the thread when the process exits) rather than stalling it.
+fn block_on<F: std::future::Future>(rt: tokio::runtime::Runtime, fut: F) -> F::Output {
+    let out = rt.block_on(fut);
+    rt.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    out
 }
 
 // ---------------------------------------------------------------------------
