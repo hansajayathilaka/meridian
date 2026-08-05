@@ -419,8 +419,33 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   (F19), missing c2s hint conformance vectors (F20), 5 nits. `ROUTE_REPLY_GRACE`'s 500 ms false-
   success residual also needs a tracked task + possible `/adr`. On-the-fly decisions ratified in the
   report's table.
-- **NEXT:** `/plan-review-phase` — convert F1–F20 (+ the ROUTE_REPLY_GRACE residual and the F16 ADR)
-  into numbered Phase-3 fix-tasks; F1/F2/F3 are the blocking gate for the next build phase.
+- **ALSO NOW: Phase 3 is planned — 22 fix-tasks (3.1-3.22)**, [phase README](./phase-3/README.md).
+  All 25 findings are accounted for; nothing was dropped silently. Three planning calls are worth
+  carrying forward:
+  **(1) F2 and F3 stay separate tasks** even though both are "s2s timeouts" — accept-side vs
+  dial-side, unauthenticated remote DoS vs partner-induced local resource leak, different tests,
+  independently revertable. They share only the `with_deadline` helper 3.2 introduces, which is why
+  3.2 lands first.
+  **(2) The test-harness extraction (3.4/F18) is sequenced *after* the blocking gate, not before.**
+  It is the single most important ordering call in the plan: the blockers must not wait on an
+  11-file refactor, so the phase deliberately accepts three more `make_ca` copies (from 3.1-3.3) for
+  one PR window — but 3.4 then lands before every other test-adding task so a 12th copy never
+  appears.
+  **(3) Four tasks carry `TODO: confirm` markers rather than guessed numbers** — the timeout/cap
+  defaults in 3.2 and 3.3, the `pending_requests` cap in 3.10, and whether a non-public trust root is
+  even detectable in 3.16. Implementers must not invent these silently.
+  Findings deliberately given **no task**, each with its reason recorded in the phase README: the
+  "fine as-is" ratification list (with one carry-forward obligation — zero s2s replay dedup must
+  appear in the envelope-v2 task's obligations), the `demo/two-orgs` CI smoke, `relay_rewrite.rs`'s
+  timing slack (if it flakes, widen `SIDE_TIMEOUT`, **never** `ANSWER_TIMEOUT`), and the Phase-1
+  carried adversarial frontier (SPK grace aging, stale-bundle replay, same-OTK-to-many-fetchers,
+  reflection, per-device delivery, skipped-key exhaustion) — carried forward, not dropped.
+  **ADR obligations:** 3.19 → ADR 0019 (required); 3.20 → ADR 0020 (conditional, only if the RTT
+  measurement reopens the no-`FedRouteOk` wire decision); 3.9 and 3.16 need an architect decision but
+  no new ADR (3.16 may need an amending note on ADR 0017).
+- **NEXT:** `/next-task` — start Wave 1. **3.1, 3.2, 3.3 are the blocking gate** for the next build
+  phase and are independently landable; 3.1 first (highest severity: SSRF/admission), then 3.2, then
+  3.3.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -542,7 +567,39 @@ publish, Dokploy stack, coturn fixes, CLI `wss://`). [Report](./phase-3/review-r
 — **3 blocking** (F1 outbound-policy SSRF, F2 serial-accept listener DoS, F3 unbounded outbound s2s
 I/O), 17 should-fix, 5 nits. Verdict: **blocked until F1/F2/F3 land**, then green for the next build
 phase. Fix-tasks (`3.N`) filled by `/plan-review-phase`.
-- [ ] _Tasks pending — run `/plan-review-phase`._
+**Wave 1 — blocking gate** (3.2 before 3.3: same `link.rs`, and 3.3 reuses 3.2's `with_deadline`)
+- [ ] **3.1** Enforce federation policy on the outbound dial path (F1) — [file](./phase-3/3.1-outbound-federation-policy.md)
+- [ ] **3.2** Un-wedge the inbound s2s listener: concurrent, time-bounded accept (F2+N5) — [file](./phase-3/3.2-inbound-accept-loop-hardening.md)
+- [ ] **3.3** Bound every outbound s2s I/O exchange (F3) — [file](./phase-3/3.3-outbound-s2s-timeouts.md)
+
+**Wave 2 — test harness** (after the gate, before every other test-adding task)
+- [ ] **3.4** Extract the shared s2s test harness (PKI + server boot) (F18) — [file](./phase-3/3.4-federation-test-support-harness.md)
+
+**Wave 3 — federation server**
+- [ ] **3.5** Stop the reachability pre-check double-spending route budgets (F4) — [file](./phase-3/3.5-fed-ratelimit-double-spend.md)
+- [ ] **3.6** Accept-side peer identity must consider all authenticated SANs (F9) — [file](./phase-3/3.6-multi-san-peer-identity.md)
+- [ ] **3.7** Reuse TLS config + one link per federated message, SRV failover (F10+N2) — [file](./phase-3/3.7-federation-link-reuse.md)
+- [ ] **3.8** Count federated deliveries in `envelopes_routed_total` (F8+N4) — [file](./phase-3/3.8-fed-delivery-metrics.md)
+- [ ] **3.9** Resolve the dead per-partner `policy` field in `federation_map.toml` (F7) — [file](./phase-3/3.9-federation-map-policy-field.md)
+
+**Wave 4 — parallel track** (core client + CI; no federation-server contention)
+- [ ] **3.10** Bound `pending_requests` against a stranger flood (F5) — [file](./phase-3/3.10-message-request-flood-bound.md)
+- [ ] **3.11** Thread first-contact state into `decide_open` (ctrl-frame gate) (F11) — [file](./phase-3/3.11-first-contact-ctrl-gate.md)
+- [ ] **3.12** Build the rendezvous image pre-merge + schedule the `--ignored` runner (F12) — [file](./phase-3/3.12-ci-docker-build-gate.md)
+- [ ] **3.13** Test the `wss://` crypto-provider install (F13) — [file](./phase-3/3.13-wss-crypto-provider-test.md)
+- [ ] **3.14** Conformance vectors for the c2s hint extension (F20) — [file](./phase-3/3.14-c2s-hint-conformance-vectors.md)
+
+**Wave 5 — docs, ops, ratification**
+- [ ] **3.15** Doc-sync the federation wire/deploy facts (F14+F15) — [file](./phase-3/3.15-federation-protocol-doc-sync.md)
+- [ ] **3.16** Warn on private-CA trust anchors under SRV discovery (F6) — [file](./phase-3/3.16-private-ca-srv-hazard.md)
+- [ ] **3.17** Give the production stack a federation surface with a C7 guard-rail (F17) — [file](./phase-3/3.17-dokploy-federation-surface.md)
+- [ ] **3.18** Fix the live coturn `realm` placeholder (F19) — [file](./phase-3/3.18-coturn-realm-placeholder.md)
+- [ ] **3.19** ADR 0019 — container image distribution + signing (F16 remainder) — [file](./phase-3/3.19-adr-image-distribution-signing.md)
+
+**Wave 6 — last**
+- [ ] **3.20** Resolve the `ROUTE_REPLY_GRACE` false-positive-success residual (may yield ADR 0020) — [file](./phase-3/3.20-route-reply-grace-residual.md)
+- [ ] **3.21** Nit sweep (N1, N3) — [file](./phase-3/3.21-phase-3-nit-sweep.md)
+- [ ] **3.22** s2s framing adversarial suite (**optional — first to cut**) — [file](./phase-3/3.22-s2s-framing-adversarial.md)
 
 ---
 
