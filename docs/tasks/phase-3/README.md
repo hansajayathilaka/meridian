@@ -41,9 +41,9 @@ alternate with build phases, so Phase 3 is unblocked by definition.
 
 ## Tasks (todo)
 <!-- Filled by /plan-review-phase from review-report.md. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
-_Pending — run `/plan-review-phase` after the [review report](./review-report.md)._
+_Pending — run `/plan-review-phase` after the review report (`review-report.md`, in progress)._
 
 ## Exit criteria
-All findings from [review-report.md](./review-report.md) triaged into fix-tasks (or explicitly
+All findings from the review report (`review-report.md`) triaged into fix-tasks (or explicitly
 waived with reasons), all fix-tasks `[x]`, unratified architectural decisions recorded via
 `/adr`, tree green, docs synced.
