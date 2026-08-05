@@ -11,7 +11,7 @@
 # named volume holding the SQLite file instead.
 services:
   rendezvous:
-    image: ${RENDEZVOUS_IMAGE:?set RENDEZVOUS_IMAGE, e.g. yourdockerhubuser/meridian-rendezvous:latest — see docs/operations/docker-image.md}
+    image: ${RENDEZVOUS_IMAGE:?set RENDEZVOUS_IMAGE, e.g. ghcr.io/hansajayathilaka/meridian-rendezvous:latest — see docs/operations/docker-image.md}
     # `docker compose up`, even with `--build`, does NOT re-pull an `image:`-referenced tag on its
     # own — `--build` only rebuilds services with a `build:` context, which this one doesn't have.
     # Without this, a host that already has an old `:latest` cached locally keeps reusing it forever,

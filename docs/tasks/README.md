@@ -412,7 +412,9 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   (F9), per-message TLS-config/trust-store reloads + double-dial (F10), the 2.14 gate covering chat
   frames but not stream `Open` (F11), no pre-merge docker build (F12), untested wss:// path (F13),
   plus doc-sync/ratification debt: port 8444 + 1 MiB frame ceiling undocumented (F14), C5 fetch-keying
-  in comments only (F15), **unsigned Docker Hub publish needs a short ADR** (F16), Dokploy stack lacks
+  in comments only (F15), image publish **migrated Docker Hub → ghcr.io** (removes the long-lived
+  registry credential; still-unsigned images + the distribution-channel choice want a short ADR — F16),
+  Dokploy stack lacks
   a C7 federation guard-rail (F17), 8× duplicated test PKI (F18), a live `<CHANGE_ME>` coturn realm
   (F19), missing c2s hint conformance vectors (F20), 5 nits. `ROUTE_REPLY_GRACE`'s 500 ms false-
   success residual also needs a tracked task + possible `/adr`. On-the-fly decisions ratified in the

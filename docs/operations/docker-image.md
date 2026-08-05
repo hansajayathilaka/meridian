@@ -1,6 +1,6 @@
 # The `meridian-rendezvous` Docker image
 
-<!-- Source: this decision (Docker Hub publish pipeline). -->
+<!-- Source: this decision (GitHub Container Registry publish pipeline). -->
 > **Nav:** [docs index](../INDEX.md) · [operations index](./README.md) · [deployment](./deployment.md) ·
 > [rendezvous-protocol-v1 §5 (full config surface)](../api/rendezvous-protocol-v1.md#5-config-surface-the-92-subset) ·
 > [ADR 0018 (figment config loading)](../adr/0018-rendezvous-config-loading.md)
@@ -8,12 +8,14 @@
 ## 1. What publishes it
 
 [`.github/workflows/docker-publish.yml`](../../.github/workflows/docker-publish.yml) builds
-[`apps/rendezvous/Dockerfile`](../../apps/rendezvous/Dockerfile) and pushes it to Docker Hub
-**every time a PR merges to `main`** that touches `apps/rendezvous/**`, `apps/proto/**`,
-`Cargo.toml`, or `Cargo.lock`. That path filter is exhaustive by construction: the rendezvous
-server depends on nothing else in the workspace — enforced by
-[`tools/lint-server-no-core.sh`](../../tools/lint-server-no-core.sh) — so a merge touching any
-other crate cannot change the image and is skipped rather than publishing an identical rebuild.
+[`apps/rendezvous/Dockerfile`](../../apps/rendezvous/Dockerfile) and pushes it to the **GitHub
+Container Registry (`ghcr.io`)** as `ghcr.io/<owner>/meridian-rendezvous` **every time a PR merges
+to `main`** that touches `apps/rendezvous/**`, `apps/proto/**`, `Cargo.toml`, or `Cargo.lock`. For
+this repository that resolves to `ghcr.io/hansajayathilaka/meridian-rendezvous`. That path filter is
+exhaustive by construction: the rendezvous server depends on nothing else in the workspace —
+enforced by [`tools/lint-server-no-core.sh`](../../tools/lint-server-no-core.sh) — so a merge
+touching any other crate cannot change the image and is skipped rather than publishing an identical
+rebuild.
 
 The job does **not** re-run the test suite itself; it relies on branch protection already having
 required [`ci.yml`](../../.github/workflows/ci.yml) to pass before a PR can merge to `main`.
@@ -36,13 +38,22 @@ right.
 
 ## 2. One-time repo setup
 
-Configure these under **Settings → Secrets and variables → Actions** before the workflow can run:
+**No repository secrets to configure.** `ghcr.io` authenticates with the workflow's built-in
+`GITHUB_TOKEN`; `docker-publish.yml` grants it `packages: write` and logs in as `${{ github.actor }}`,
+so there are no `DOCKERHUB_*` (or any other) secrets or variables to set. This is the main reason for
+publishing to `ghcr.io` rather than Docker Hub — the registry is scoped to the repo, the credential
+is short-lived and never leaves the runner, and there is nothing to rotate.
 
-| Kind | Name | Value |
-|---|---|---|
-| Secret | `DOCKERHUB_USERNAME` | Your Docker Hub username. |
-| Secret | `DOCKERHUB_TOKEN` | A Docker Hub **access token** (Docker Hub → Account Settings → Security → New Access Token) — never your account password. Scope it to this repo only if Docker Hub's org tier supports scoped tokens. |
-| Variable | `DOCKERHUB_IMAGE_NAME` | The target repo, e.g. `yourdockerhubuser/meridian-rendezvous`. Not a secret — it's just a name — but it lives in repo config rather than the workflow file so it can change without a code review. |
+The only manual step is a one-time **visibility** choice, done *after* the first publish:
+
+1. Merge a change touching the rendezvous inputs so the workflow runs once. It creates a package
+   named `meridian-rendezvous` linked to this repo (the `org.opencontainers.image.source` label
+   wires that link automatically).
+2. Open the package at **`github.com/users/<owner>/packages/container/meridian-rendezvous`** →
+   **Package settings**. A new ghcr package is **private** by default: either set its visibility to
+   **Public** (so `docker pull` needs no auth — the usual choice for a self-hostable server image),
+   or keep it private and grant pull access to the accounts/deploy hosts that need it (a
+   read-scoped Personal Access Token or, for org repos, the package's "Manage Actions access").
 
 Credentials are never in the repo (root `CLAUDE.md` — "no secrets in the repo") and the image
 itself carries none either: [`rendezvous.example.toml`](../../apps/rendezvous/rendezvous.example.toml)
@@ -68,16 +79,16 @@ docker run -d \
   -e MERIDIAN_RENDEZVOUS_TURN__SECRET="$TURN_SHARED_SECRET" \
   -e MERIDIAN_RENDEZVOUS_TURN__REALM=turn.chat.example \
   -e MERIDIAN_RENDEZVOUS_TURN__URLS='["turn:turn.chat.example:3478?transport=udp","turn:turn.chat.example:3478?transport=tcp","turns:turn.chat.example:443?transport=tcp"]' \
-  yourdockerhubuser/meridian-rendezvous:latest
+  ghcr.io/hansajayathilaka/meridian-rendezvous:latest
 ```
 
 Or in compose form — see [`infra/deploy/docker-compose.yml`](../../infra/deploy/docker-compose.yml),
 which wires `MERIDIAN_RENDEZVOUS_SERVER__DOMAIN`/`MERIDIAN_RENDEZVOUS_TURN__SECRET`/`MERIDIAN_RENDEZVOUS_TURN__REALM`
 through `environment:` and expects `MERIDIAN_RENDEZVOUS_IMAGE` (the `image:` for the `rendezvous`
-service) to be set to whatever `DOCKERHUB_IMAGE_NAME` above resolved to, e.g.:
+service) to be set to the published `ghcr.io/<owner>/meridian-rendezvous` path, e.g.:
 
 ```bash
-export MERIDIAN_RENDEZVOUS_IMAGE=yourdockerhubuser/meridian-rendezvous:latest
+export MERIDIAN_RENDEZVOUS_IMAGE=ghcr.io/hansajayathilaka/meridian-rendezvous:latest
 export TURN_SHARED_SECRET=...   # out of band, never committed
 docker compose -f infra/deploy/docker-compose.yml up -d
 ```
@@ -114,7 +125,7 @@ Environment tab, fill in the four required values, and deploy:
 
 | Var | Required? | What it is |
 |---|---|---|
-| `RENDEZVOUS_IMAGE` | yes | The image `docker-publish.yml` pushed, e.g. `yourdockerhubuser/meridian-rendezvous:latest` — or pin a `:<short-sha>` tag (§4) for a reproducible deploy. |
+| `RENDEZVOUS_IMAGE` | yes | The image `docker-publish.yml` pushed, e.g. `ghcr.io/hansajayathilaka/meridian-rendezvous:latest` — or pin a `:<short-sha>` tag (§4) for a reproducible deploy. If you kept the ghcr package **private** (§2), the deploy host must first `docker login ghcr.io` with a read-scoped token. |
 | `MERIDIAN_RENDEZVOUS_SERVER__DOMAIN` | yes | Your public signaling hostname, e.g. `chat.example.com`. |
 | `TURN_SHARED_SECRET` | yes | A long random value. Shared verbatim between the `rendezvous` and `coturn` services in the compose file — that's the whole trust mechanism for ephemeral TURN credentials (§"TURN / coturn" in [deployment.md](./deployment.md)). Generate one with `openssl rand -hex 32` and never commit it. |
 | `TURN_EXTERNAL_IP` | yes | This host's public IP. coturn runs on Docker's bridge network (see below), so without this it hands clients its private container IP as the relay candidate and every relayed call fails. |
