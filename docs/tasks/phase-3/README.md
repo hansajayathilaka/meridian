@@ -2,7 +2,7 @@
 
 # Phase 3 — Review of Phase 2
 
-**Kind:** review · **Status:** in progress · **Reviews phase(s):** Phase 2 (Cross-Org Federation, tasks 2.1–2.17) plus the Phase-1 follow-ups that landed in the same window (1.32, 1.33) and the untracked out-of-band work merged alongside (PRs #36–#42: figment config loading / ADR 0018, Docker Hub publish pipeline, Dokploy deploy stack + fixes, coturn config fixes, CLI `wss://` support).
+**Kind:** review · **Status:** planning · **Reviews phase(s):** Phase 2 (Cross-Org Federation, tasks 2.1–2.17) plus the Phase-1 follow-ups that landed in the same window (1.32, 1.33) and the untracked out-of-band work merged alongside (PRs #36–#42: figment config loading / ADR 0018, Docker Hub publish pipeline, Dokploy deploy stack + fixes, coturn config fixes, CLI `wss://` support).
 
 ## Goal
 Sweep everything built since the Phase-1 review report for bugs, gaps, loopholes, dead ends,
@@ -41,9 +41,10 @@ alternate with build phases, so Phase 3 is unblocked by definition.
 
 ## Tasks (todo)
 <!-- Filled by /plan-review-phase from review-report.md. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
-_Pending — run `/plan-review-phase` after the review report (`review-report.md`, in progress)._
+_Pending — run `/plan-review-phase` to convert the [review report](./review-report.md)'s findings
+(3 blocking, 17 should-fix, 5 nits) into numbered fix-tasks._
 
 ## Exit criteria
-All findings from the review report (`review-report.md`) triaged into fix-tasks (or explicitly
+All findings from the [review report](./review-report.md) triaged into fix-tasks (or explicitly
 waived with reasons), all fix-tasks `[x]`, unratified architectural decisions recorded via
 `/adr`, tree green, docs synced.
