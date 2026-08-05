@@ -392,12 +392,35 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   udp-blocked fails per 1.30's documented gap) — confirming the timeout widening is safe under real
   multi-hop NAT, not just asserted. Test hardened with an IP-literal TURN endpoint and bounded runtime
   teardown as defense-in-depth. With 2.1-2.17 all `[x]`, every Phase 2 task is closed.
-- **NEXT:** `/start-review-phase` for Phase 3. Every task in Phase 2 (2.1-2.17, plus the gating
-  Phase-1 follow-ups 1.32/1.33) is `[x]`. Tree green in real CI across lint, clippy, the full test
-  suite (including `--features webrtc`), the cross-org abuse/acceptance suite, conformance vectors,
-  and — as of this task — the netns NAT-matrix rig for real. Docs synced. The `demo/two-orgs`
-  acceptance walkthrough (2.11) and the phase exit gate (2.12) both already passed. Nothing known is
-  left un-triaged going into the Phase 3 review sweep.
+- **NOW: Phase 3 review sweep is written** — [report](./phase-3/review-report.md), 25 findings
+  (**3 blocking, 17 should-fix, 5 nits**), [PR #47](https://github.com/hansajayathilaka/meridian/pull/47).
+  Verdict: **blocked until the 3 blockers land**, then green to proceed. Phase 2's crypto/opacity core
+  is sound — all six anonymity "must never" invariants and ADRs 0016/0017/0018 hold in code — but the
+  sweep found what per-task review structurally could not: three availability/admission defects in the
+  **2.6/2.7/2.8 seams** of the federation *server* plane.
+  **F1 (blocking)** — outbound federation enforces **no policy**: `admit` is called only on the three
+  inbound handlers, never in `dial_foreign`, so a `closed`/allowlist server still dials any
+  client-named `hint`; in SRV mode that's client-driven SSRF / internal port-probe (2.6 scoped the
+  outbound check and 2.7/2.8 wired only inbound). **F2 (blocking)** — one silent TCP connection wedges
+  the whole inbound listener: `accept()` runs the mTLS handshake + `FedHello` inline in a serial,
+  timeout-free loop. **F3 (blocking)** — no timeouts on any outbound s2s I/O, so a black-holed partner
+  hangs a client's whole ws session and leaks the task + TLS link. All three verified against code, all
+  have local fixes. Below blocking: a reachability pre-check that halves 2.6's rate budgets to ~30
+  msg/min (F4), an unbounded stranger-flood amplifier in the message-request gate (F5), a shared-
+  private-CA + SRV+WebPKI pinning-bypass the demo itself models (F6), dead per-partner `policy` map
+  field (F7), fed deliveries uncounted in `envelopes_routed_total` (F8), first-SAN-only allowlisting
+  (F9), per-message TLS-config/trust-store reloads + double-dial (F10), the 2.14 gate covering chat
+  frames but not stream `Open` (F11), no pre-merge docker build (F12), untested wss:// path (F13),
+  plus doc-sync/ratification debt: port 8444 + 1 MiB frame ceiling undocumented (F14), C5 fetch-keying
+  in comments only (F15), image publish **migrated Docker Hub → ghcr.io** (removes the long-lived
+  registry credential; still-unsigned images + the distribution-channel choice want a short ADR — F16),
+  Dokploy stack lacks
+  a C7 federation guard-rail (F17), 8× duplicated test PKI (F18), a live `<CHANGE_ME>` coturn realm
+  (F19), missing c2s hint conformance vectors (F20), 5 nits. `ROUTE_REPLY_GRACE`'s 500 ms false-
+  success residual also needs a tracked task + possible `/adr`. On-the-fly decisions ratified in the
+  report's table.
+- **NEXT:** `/plan-review-phase` — convert F1–F20 (+ the ROUTE_REPLY_GRACE residual and the F16 ADR)
+  into numbered Phase-3 fix-tasks; F1/F2/F3 are the blocking gate for the next build phase.
   **One Phase-1 follow-up is still open** — **1.33** (bound the dialer's unbounded `recv_sdp` wait;
   availability/diagnostics only). It does not block Phase 2's gate (F1, F2, F3, F10, F11 — satisfied
   by Group D) and is nit class, but it sits on code T06 extends: 06's "a `closed`-policy org rejects
@@ -511,6 +534,15 @@ into 2.9 or 2.11.
 - [x] **2.14** Wire the message-request gate into the P2P session substrate (from 2.10's review; `session connect` currently bypasses the gate entirely) — [file](./phase-2/2.14-p2p-message-request-gate.md)
 - [x] **2.16** `session_connect_webrtc.rs`'s TURN-grant test hangs in real CI, root cause unconfirmed (surfaced while closing 2.15; `#[ignore]`d rather than guessed at) — [file](./phase-2/2.16-turn-grant-ci-hang.md)
 - [x] **2.17** Bound the answerer's wait for an offer (`recv_sdp`, mirror of 1.33; surfaced by 2.12's review) — [file](./phase-2/2.17-bound-offer-wait.md)
+
+### Phase 3 — Review of Phase 2 · **planning** · [details](./phase-3/README.md)
+Review phase. Sweeps everything built since the Phase-1 review: Phase 2 (2.1–2.17), the Phase-1
+follow-ups 1.32/1.33, and the untracked out-of-band PRs #36–#42 (figment/ADR 0018, Docker Hub
+publish, Dokploy stack, coturn fixes, CLI `wss://`). [Report](./phase-3/review-report.md): 25 findings
+— **3 blocking** (F1 outbound-policy SSRF, F2 serial-accept listener DoS, F3 unbounded outbound s2s
+I/O), 17 should-fix, 5 nits. Verdict: **blocked until F1/F2/F3 land**, then green for the next build
+phase. Fix-tasks (`3.N`) filled by `/plan-review-phase`.
+- [ ] _Tasks pending — run `/plan-review-phase`._
 
 ---
 

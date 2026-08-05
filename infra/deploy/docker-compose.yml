@@ -6,7 +6,7 @@ services:
     # Published by .github/workflows/docker-publish.yml on every merge to main that touches
     # apps/rendezvous or apps/proto — see docs/operations/docker-image.md for the tagging scheme
     # and the full MERIDIAN_RENDEZVOUS_<SECTION>__<FIELD> runtime config surface.
-    image: ${MERIDIAN_RENDEZVOUS_IMAGE:?set MERIDIAN_RENDEZVOUS_IMAGE, e.g. yourdockerhubuser/meridian-rendezvous:latest}
+    image: ${MERIDIAN_RENDEZVOUS_IMAGE:?set MERIDIAN_RENDEZVOUS_IMAGE, e.g. ghcr.io/hansajayathilaka/meridian-rendezvous:latest}
     # depends_on: [postgres]
     # ports: ["443:443"]
     # volumes: ["./config:/etc/meridian:ro"]   # TODO: config surface (deployment.md)
