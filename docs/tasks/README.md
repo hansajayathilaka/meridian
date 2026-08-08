@@ -16,13 +16,14 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 3 is planned — 22 fix-tasks (3.1–3.22)** from the Phase-2
-  [review report](./phase-3/review-report.md)'s 25 findings ([phase README](./phase-3/README.md),
-  [PR #48](https://github.com/hansajayathilaka/meridian/pull/48)). Phases 0–2 are **done**.
-- **NEXT:** `/next-task` — start **Wave 1**, the blocking gate for the next build phase:
-  **3.1** (outbound federation enforces no policy → client-driven SSRF), **3.2** (one silent TCP
-  connection wedges the inbound listener), **3.3** (no timeouts on outbound s2s I/O). Land 3.1 first
-  (highest severity), then 3.2 before 3.3 — they share `link.rs` and 3.3 reuses 3.2's `with_deadline`.
+- **NOW:** **Phase 3, Wave 1 (blocking gate) in progress.** **3.1** (outbound federation SSRF, F1)
+  is **done** ([file](./phase-3/3.1-outbound-federation-policy.md)) — security-reviewer, architect,
+  and code-reviewer all signed off; code-reviewer's should-fix (a `NotConfigured`-vs-`Denied`
+  ordering inconsistency between the fetch and route outbound paths when federation is simply
+  disabled) was fixed in the same task. Phases 0–2 are **done**.
+- **NEXT:** `/next-task` — **3.2** (one silent TCP connection wedges the inbound listener), then
+  **3.3** (no timeouts on outbound s2s I/O) — land 3.2 before 3.3, they share `link.rs` and 3.3
+  reuses 3.2's `with_deadline`.
 
 ### Live carry-forwards (not owned by any open task)
 Everything else is owned by a Phase-3 task; these are the exceptions that would otherwise evaporate:
@@ -153,7 +154,7 @@ I/O), 17 should-fix, 5 nits. Verdict: **blocked until F1/F2/F3 land**, then gree
 phase.
 
 **Wave 1 — blocking gate** (3.2 before 3.3: same `link.rs`, and 3.3 reuses 3.2's `with_deadline`)
-- [ ] **3.1** Enforce federation policy on the outbound dial path (F1) — [file](./phase-3/3.1-outbound-federation-policy.md)
+- [x] **3.1** Enforce federation policy on the outbound dial path (F1) — [file](./phase-3/3.1-outbound-federation-policy.md)
 - [ ] **3.2** Un-wedge the inbound s2s listener: concurrent, time-bounded accept (F2+N5) — [file](./phase-3/3.2-inbound-accept-loop-hardening.md)
 - [ ] **3.3** Bound every outbound s2s I/O exchange (F3) — [file](./phase-3/3.3-outbound-s2s-timeouts.md)
 

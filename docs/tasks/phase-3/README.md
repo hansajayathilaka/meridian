@@ -45,7 +45,7 @@ alternate with build phases, so Phase 3 is unblocked by definition.
 
 **Wave 1 — the blocking gate** (must land before the next build phase; 3.2 before 3.3 to serialise
 the two `link.rs` edits and let 3.3 reuse 3.2's `with_deadline` helper)
-- [ ] **3.1** Enforce federation policy on the outbound dial path (F1, blocking) — [file](./3.1-outbound-federation-policy.md)
+- [x] **3.1** Enforce federation policy on the outbound dial path (F1, blocking) — [file](./3.1-outbound-federation-policy.md)
 - [ ] **3.2** Un-wedge the inbound s2s listener: concurrent, time-bounded accept (F2+N5, blocking) — [file](./3.2-inbound-accept-loop-hardening.md)
 - [ ] **3.3** Bound every outbound s2s I/O exchange (F3, blocking) — [file](./3.3-outbound-s2s-timeouts.md)
 

@@ -335,6 +335,17 @@ fn federated_fetch_error_reply(hint: &str, e: &FetchForeignError) -> (&'static s
             error_codes::FED_UNREACHABLE,
             "federated fetch protocol error".to_string(),
         ),
+        // (task 3.1, review finding F1) OUR OWN federation policy refused to dial `hint` at all —
+        // never even a DNS lookup, let alone a connection attempt. Distinct from every arm above
+        // (which all mean "we tried to reach org-b.test and couldn't") and from `Fed(fed_err)`'s
+        // `POLICY_DENIED` case below (which means org-b.test itself answered and declined): this
+        // is `fed_denied` without ever leaving this server, matching the same code a foreign
+        // `POLICY_DENIED` reply produces so a client cannot distinguish "A wouldn't dial" from "B
+        // wouldn't admit" by error code alone.
+        FetchForeignError::Denied => (
+            error_codes::FED_DENIED,
+            format!("federation policy does not allow dialing {hint:?}"),
+        ),
         // The foreign server DID answer — translate its structured `FedErr` into the closest
         // existing local code (never a new one — see this function's doc comment).
         FetchForeignError::Fed(fed_err) => {
@@ -517,6 +528,15 @@ fn federated_route_error_reply(hint: &str, e: &RouteForeignError) -> (&'static s
         RouteForeignError::TargetUnreachable => {
             (error_codes::NOT_CONNECTED, "recipient offline".to_string())
         }
+        // (task 3.1, review finding F1) OUR OWN federation policy refused to dial `hint` at all —
+        // never even a DNS lookup, let alone a connection attempt. Same reasoning as
+        // `federated_fetch_error_reply`'s identical arm: distinct from every connectivity arm
+        // above, and mapped to the same `fed_denied` a foreign `POLICY_DENIED` reply produces
+        // below, so a client cannot tell "A wouldn't dial" apart from "B wouldn't admit."
+        RouteForeignError::Denied => (
+            error_codes::FED_DENIED,
+            format!("federation policy does not allow dialing {hint:?}"),
+        ),
         // The foreign server DID answer — translate its structured `FedErr` into the closest
         // existing local code (never a new one — see this function's doc comment), reusing
         // `federated_fetch_error_reply`'s exact mapping (task 2.7 precedent).

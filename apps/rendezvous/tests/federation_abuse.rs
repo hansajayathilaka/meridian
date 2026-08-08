@@ -187,6 +187,11 @@ fn org_a_federation(
         ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
         discovery: DiscoveryMode::Static,
         map_path: map_path.to_str().unwrap().to_string(),
+        // (task 3.1) `Federation::default`'s `policy` is `Closed` — the fail-closed default. This
+        // file's tests exercise B's abuse-handling behavior (rate limits/allowlist/tamper), not
+        // A's own outbound admission decision (dedicated coverage: `federation_outbound_policy.rs`),
+        // so A itself must be willing to dial `b_domain` at all for any of them to reach B.
+        policy: FederationPolicyMode::Open,
         ..Federation::default()
     }
 }
