@@ -167,6 +167,11 @@ fn org_a_federation(dir: &Path, ca: &TestCa, a_domain: &str, b_fed_addr: SocketA
         ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
         discovery: DiscoveryMode::Static,
         map_path: map_path.to_str().unwrap().to_string(),
+        // A's own OUTBOUND admission policy (task 3.1, review finding F1) — `open`, since this
+        // test is about A successfully routing to B, not about A refusing to dial out at all.
+        // `Federation::default()`'s fail-closed `Closed` would otherwise make A deny before ever
+        // reaching B.
+        policy: FederationPolicyMode::Open,
         ..Federation::default()
     }
 }
