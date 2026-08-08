@@ -156,6 +156,12 @@ fn org_a_federation(
         ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
         discovery: DiscoveryMode::Static,
         map_path: map_path.to_str().unwrap().to_string(),
+        // A's own OUTBOUND admission policy (task 3.1, review finding F1) — always `open` here:
+        // both scenarios in this file are about B's response (closed-policy denial or a stale
+        // hint), never about A refusing to dial out in the first place. `Federation::default()`'s
+        // fail-closed `Closed` would otherwise make A deny before ever reaching B, which is a
+        // different, untested code path in this file.
+        policy: FederationPolicyMode::Open,
         ..Federation::default()
     }
 }

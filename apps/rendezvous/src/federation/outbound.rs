@@ -32,6 +32,7 @@ use meridian_proto::{
 
 use crate::federation::discovery::{DiscoveryError, Endpoint};
 use crate::federation::link::{self, FederationLink, LinkError};
+use crate::federation::policy::Decision;
 use crate::state::AppState;
 
 /// Everything that can go wrong resolving/dialing/speaking to a foreign server on the outbound
@@ -75,6 +76,13 @@ pub enum FetchForeignError {
     /// unexpected `FedOp` in the reply).
     #[error("federation protocol error: {0}")]
     Protocol(String),
+    /// This server's OWN outbound federation admission policy (`state.federation.policy`)
+    /// rejected `hint_domain` before [`dial_foreign`] ever attempted discovery or a dial — task
+    /// 3.1 (review finding F1). Distinct from [`FetchForeignError::Fed`]: `Fed` means a FOREIGN
+    /// server dialed successfully and then declined; `Denied` means THIS server refused to dial at
+    /// all.
+    #[error("federation policy denies dialing this domain")]
+    Denied,
 }
 
 /// Server A's outbound path for a client's `Fetch{target, hint}` naming a foreign account: resolve
@@ -145,7 +153,9 @@ pub async fn fetch_foreign_bundle(
 /// `EnvelopeTooLarge` or `TargetUnreachable` (both are 2.8-specific, constructed only by
 /// `route_foreign`'s own oversized/pre-check logic, never by the shared dial path) or `Fed`
 /// (`dial_foreign` never sends a request, so nothing can reply) — those three arms are
-/// structurally unreachable here, not merely assumed to be.
+/// structurally unreachable here, not merely assumed to be. `Denied` (task 3.1), by contrast, IS
+/// producible by `dial_foreign` itself (its choke-point policy check) and so gets a real mapped
+/// arm below, not folded into the `unreachable!()` group.
 fn convert_dial_error(e: RouteForeignError) -> FetchForeignError {
     match e {
         RouteForeignError::NotConfigured => FetchForeignError::NotConfigured,
@@ -156,6 +166,7 @@ fn convert_dial_error(e: RouteForeignError) -> FetchForeignError {
             FetchForeignError::AddrResolution { host, port, source }
         }
         RouteForeignError::Dial { domain, source } => FetchForeignError::Dial { domain, source },
+        RouteForeignError::Denied => FetchForeignError::Denied,
         RouteForeignError::EnvelopeTooLarge { .. }
         | RouteForeignError::TargetUnreachable
         | RouteForeignError::Fed(_) => {
@@ -229,6 +240,16 @@ pub enum RouteForeignError {
     /// unexpected `FedOp` in the reply).
     #[error("federation protocol error: {0}")]
     Protocol(String),
+    /// This server's OWN outbound federation admission policy (`state.federation.policy`)
+    /// rejected `hint_domain` before [`dial_foreign`] ever attempted discovery or a dial — task
+    /// 3.1 (review finding F1: a client naming an arbitrary foreign domain must not be able to
+    /// force this server to resolve DNS for, or open a TCP connection to, that domain when this
+    /// server's own policy is `closed`/`allowlist` and doesn't admit it — even a DNS lookup alone
+    /// is an SSRF/internal-port-probe oracle). Distinct from [`RouteForeignError::Fed`]: `Fed`
+    /// means a FOREIGN server dialed successfully and then declined; `Denied` means THIS server
+    /// refused to dial at all.
+    #[error("federation policy denies dialing this domain")]
+    Denied,
 }
 
 /// How long [`route_foreign`] waits, after sending a `FedRoute`, for a possible `FedErr` reply
@@ -265,11 +286,40 @@ async fn dial_foreign(
     state: &AppState,
     hint_domain: &str,
 ) -> Result<(FederationLink, String), RouteForeignError> {
+    // `NotConfigured` first, ahead of the SSRF choke point below: both are zero-I/O checks (no
+    // discovery call, no DNS lookup, no TCP dial either way), so ordering them this way costs
+    // nothing on the SSRF closure. It does keep `fetch_foreign_bundle` (which has no guard of its
+    // own and relies entirely on this one) consistent with `route_foreign` (which has its own
+    // early `discovery.is_none()` guard, `outbound.rs` `route_foreign`, before it ever reaches
+    // here) about which error a client sees when federation is simply switched off vs. actively
+    // refusing a domain: `fed_unreachable` ("not configured"), never `fed_denied` ("policy
+    // refuses"), when there is no policy decision to report at all.
     let discovery = state
         .federation
         .discovery
         .as_deref()
         .ok_or(RouteForeignError::NotConfigured)?;
+
+    // SSRF choke point (task 3.1, review finding F1) — the first statement to touch discovery or
+    // dial, before any discovery call, DNS lookup, or TCP dial. Even a DNS lookup alone is an
+    // oracle: a client that can name an arbitrary foreign domain and observe "resolved" vs.
+    // "didn't resolve"/"connection refused" vs. "connection timed out" can probe this server's
+    // internal DNS visibility and network reachability (including internal, non-federation ports)
+    // regardless of whether the domain is an actual federation partner. `state.federation.policy`
+    // is this server's OWN admission policy — the identical `FederationPolicy` value
+    // `federation::inbound`'s handlers (`handle_fed_fetch`/`handle_fed_route`/
+    // `handle_fed_reachability`) already consult for the INBOUND direction. Federation admission
+    // is symmetric (ADR 0002's bilateral federation model, ADR 0017): a `closed`/`allowlist`
+    // server refuses a non-admitted domain in either direction, not merely when that domain dials
+    // in.
+    if let Decision::Reject(_reason) = state.federation.policy.admit(hint_domain) {
+        // `_reason` (Closed vs. NotAllowlisted) is internal detail only — mirrors
+        // `federation::inbound`'s identical discard of the same `Decision::Reject` payload (see
+        // `policy` module's doc comment on the 2.7/2.8/2.9 boundary this task inherits). Both
+        // collapse to the same client-visible `fed_denied` code in `ws.rs`; leaking WHY would
+        // itself tell a client whether this server even has an allowlist, let alone what's on it.
+        return Err(RouteForeignError::Denied);
+    }
 
     let endpoints =
         discovery
@@ -366,10 +416,19 @@ pub async fn route_foreign(
     // itself — collapsing a closed-policy answer into "recipient offline" would both hide a real
     // policy signal from the caller and contradict this task's own required behaviour ("closed
     // origin at B → fed_denied", not `not_connected`).
+    //
+    // (task 3.1) `RouteForeignError::Denied` — THIS server's own policy refusing to dial
+    // `hint_domain` at all, surfaced by the pre-check's own internal `dial_foreign` call — is the
+    // identical axis as `Fed` above, not the target-liveness axis: A never even attempted to learn
+    // whether `to` is reachable, so folding this into `TargetUnreachable` would misreport a local
+    // policy refusal as "recipient offline" and (worse, since this task's whole point is closing an
+    // SSRF oracle) would make the pre-check's own denial indistinguishable from the real dial
+    // attempt just below ever having happened at all.
     match reachable_foreign(state, hint_domain, to).await {
         Ok(true) => {}
         Ok(false) => return Err(RouteForeignError::TargetUnreachable),
         Err(RouteForeignError::Fed(fed_err)) => return Err(RouteForeignError::Fed(fed_err)),
+        Err(RouteForeignError::Denied) => return Err(RouteForeignError::Denied),
         Err(_) => return Err(RouteForeignError::TargetUnreachable),
     }
 

@@ -177,6 +177,12 @@ fn org_a_federation(
         ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
         discovery: DiscoveryMode::Static,
         map_path: map_path.to_str().unwrap().to_string(),
+        // (task 3.1) `Federation::default`'s `policy` is `Closed` — the fail-closed default. This
+        // module's tests are exercising B's behavior (discovery/dial/policy/rate-limit outcomes AT
+        // B), not A's own outbound admission decision (that axis has its own dedicated coverage in
+        // `tests/federation_outbound_policy.rs`), so A itself must be willing to dial `b_domain` at
+        // all for any of them to reach B in the first place.
+        policy: FederationPolicyMode::Open,
         ..Federation::default()
     }
 }
