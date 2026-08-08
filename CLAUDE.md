@@ -66,8 +66,10 @@ just two-orgs     # local two-org federation demo stack
   [/new-task](./.claude/commands/new-task.md) (manual escape hatch)
 - **Subagents:** [task-picker](./.claude/agents/task-picker.md) · [planner](./.claude/agents/planner.md) ·
   [rust-dev](./.claude/agents/rust-dev.md) · [web-dev](./.claude/agents/web-dev.md) ·
-  [code-reviewer](./.claude/agents/code-reviewer.md) · [architect](./.claude/agents/architect.md) ·
-  [security-reviewer](./.claude/agents/security-reviewer.md) ·
+  [reviewer](./.claude/agents/reviewer.md) — combined correctness + security/privacy + architecture
+  review in one pass; default for a task's `Reviews` gate and for `/start-review-phase`'s sweep,
+  replacing separate parallel calls to `code-reviewer` + `security-reviewer` + `architect` (kept as
+  single-lens agents for when a task names exactly one of them) ·
   [test-engineer](./.claude/agents/test-engineer.md) · [devops](./.claude/agents/devops.md) ·
   [connectivity-debugger](./.claude/agents/connectivity-debugger.md)
 - **Skills:** [task-tracking](./.claude/skills/task-tracking/SKILL.md) ·

@@ -18,11 +18,13 @@ Load the [task-tracking skill](../skills/task-tracking/SKILL.md) and follow its 
       the browser/WASM client — strictly within the task's Scope. Honour the invariants (server-no-core,
       wire types from `meridian-proto`, never hand-roll crypto, additive stream types touch the registry
       only).
-   3. Run the task's Tests (narrowest first). Get the required **Reviews** sign-off (security-reviewer /
-      architect / test-engineer / code-reviewer as the task specifies) — this single pass **is** the
-      security/architecture gate in the [Definition of Done](../../CONTRIBUTING.md); do not also run
-      `/review` on the same diff, that command is for ad-hoc scopes outside this workflow. Satisfy the
-      remaining Definition of Done gates; run `/doc-sync` if behaviour/wire/diagrams changed.
+   3. Run the task's Tests (narrowest first). Get the required **Reviews** sign-off via **one
+      `reviewer` agent call** covering every lens the task names (security-reviewer / architect /
+      code-reviewer combined in a single pass over the diff, not one agent per named reviewer);
+      **test-engineer**, if named, runs as its own separate call. This **is** the security/architecture
+      gate in the [Definition of Done](../../CONTRIBUTING.md); do not also run `/review` on the same
+      diff, that command is for ad-hoc scopes outside this workflow. Satisfy the remaining Definition
+      of Done gates; run `/doc-sync` if behaviour/wire/diagrams changed.
    4. Update the task file Status, mark `- [x]`, refresh the tracker ▶ NOW/NEXT.
    5. Commit **this task alone** (use the push-retry loop in the skill §6) — one commit per task even in
       a batch run, so each task stays independently reviewable and revertable. Keep the message scoped

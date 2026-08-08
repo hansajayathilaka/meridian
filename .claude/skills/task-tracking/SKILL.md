@@ -93,11 +93,17 @@ Each command: (a) reads the master tracker to orient, (b) does its one job, (c) 
 - For each task in the batch, in order: mark it `- [~]`. Implement with the right dev agent: **rust-dev**
   (core/server) or **web-dev** (browser/WASM). Follow the task file's Scope/Deliverables. Run its tests
   (narrowest first).
-- Get the task's `Reviews` sign-off (the reviewers its file names). That single pass **is** the
-  Definition of Done's security/architecture gate — it's grounded in the same threat-model docs `/review`
-  uses, so don't also run `/review` on the same diff here; that command is for ad-hoc scopes outside this
-  workflow. Satisfy the rest of the Definition of Done. Update the task file Status, mark `- [x]`, refresh
-  ▶ NOW/NEXT.
+- Get the task's `Reviews` sign-off (the reviewers its file names) via **one `reviewer` agent call**
+  covering every lens the file names (security-reviewer / architect / code-reviewer) — not one agent
+  call per named reviewer. A single pass over the same diff is cheaper than three, and the combined
+  agent produces a verdict per lens, so the sign-off is exactly as complete as running them
+  separately. Only spawn a single-lens agent (e.g. **security-reviewer** alone) when the task file
+  names exactly one reviewer; **test-engineer** stays a separate call when a task names it — adding
+  test coverage is a different kind of work, not another read-only lens over the same diff. That
+  pass **is** the Definition of Done's security/architecture gate — it's grounded in the same
+  threat-model docs `/review` uses, so don't also run `/review` on the same diff here; that command
+  is for ad-hoc scopes outside this workflow. Satisfy the rest of the Definition of Done. Update the
+  task file Status, mark `- [x]`, refresh ▶ NOW/NEXT.
 - Commit **that one task** before starting the next in the batch — one commit per task keeps each
   independently reviewable/revertable even when several land in one run. If a task turns out too large
   for one PR, stop the whole run there rather than starting the next queued task.
@@ -106,9 +112,12 @@ Each command: (a) reads the master tracker to orient, (b) does its one job, (c) 
 
 ### `/start-review-phase`
 - Create the next-numbered phase as a **review phase** (`phase-N/README.md`, kind: review).
-- Run the review sweep across everything built since the last review, delegating to **code-reviewer**
-  (correctness/loopholes/gaps), **security-reviewer** (privacy/crypto invariants), **architect**
-  (ADR drift), and **test-engineer** (coverage/adversarial). Also capture any decisions made on the fly.
+- Run the review sweep across everything built since the last review, delegating to **one `reviewer`
+  agent call** for the correctness + security/privacy + architecture lenses together
+  (loopholes/gaps/dead-ends, anonymity-model "must never" invariants, and ADR/dependency-graph drift
+  — one read of the diff instead of three), plus a separate **test-engineer** call for coverage/
+  adversarial gaps (a distinct kind of work, not another read-only lens). Also capture any decisions
+  made on the fly.
 - Write `docs/tasks/phase-N/review-report.md` from `TEMPLATE-review-report.md`: findings with severity
   (blocking / should-fix / nit), affected files, and recommended fix. Move ▶ NEXT to `/plan-review-phase`.
 

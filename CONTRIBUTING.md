@@ -47,8 +47,9 @@ A change is **not done** until all of the following hold:
    and **conformance vectors regenerated** (byte-identical across CLI/WASM/mobile). See the
    [api-contracts skill](./.claude/skills/api-contracts/SKILL.md).
 4. **Security invariants intact.** For anything touching identity, keys, signaling, storage, logging, or
-   metrics, the task's required `Reviews` sign-off (typically `security-reviewer`) satisfies this gate in
-   one pass — it already checks against the same threat-model docs and the
+   metrics, the task's required `Reviews` sign-off — run as **one `reviewer` agent call** covering
+   every lens the task names, not one call per named reviewer — satisfies this gate in one pass. It
+   already checks against the same threat-model docs and the
    [anonymity-model skill](./.claude/skills/anonymity-model/SKILL.md) "must never" list that
    [/review](./.claude/commands/review.md) would. Don't run `/review` again on top of it inside
    `/next-task`; that command is for ad-hoc diffs outside the tracked task flow. The two CI enforcement
@@ -73,9 +74,11 @@ A change is **not done** until all of the following hold:
 [task-picker](./.claude/agents/task-picker.md) (what's next) ·
 [planner](./.claude/agents/planner.md) (task breakdown) ·
 [rust-dev](./.claude/agents/rust-dev.md) / [web-dev](./.claude/agents/web-dev.md) (implementation) ·
-[code-reviewer](./.claude/agents/code-reviewer.md) (correctness/gaps in review phases) ·
-[architect](./.claude/agents/architect.md) (design conformance) ·
-[security-reviewer](./.claude/agents/security-reviewer.md) (privacy/crypto) ·
+[reviewer](./.claude/agents/reviewer.md) (correctness + privacy/crypto + design conformance, combined
+in one pass — the default for a task's `Reviews` gate and for review-phase sweeps) ·
+[code-reviewer](./.claude/agents/code-reviewer.md) / [architect](./.claude/agents/architect.md) /
+[security-reviewer](./.claude/agents/security-reviewer.md) (single-lens agents, for when a task names
+exactly one) ·
 [test-engineer](./.claude/agents/test-engineer.md) ·
 [devops](./.claude/agents/devops.md) ·
 [connectivity-debugger](./.claude/agents/connectivity-debugger.md) (WebRTC/NAT).
