@@ -112,12 +112,12 @@ Each command: (a) reads the master tracker to orient, (b) does its one job, (c) 
 
 ### `/start-review-phase`
 - Create the next-numbered phase as a **review phase** (`phase-N/README.md`, kind: review).
-- Run the review sweep across everything built since the last review, delegating to **one `reviewer`
-  agent call** for the correctness + security/privacy + architecture lenses together
-  (loopholes/gaps/dead-ends, anonymity-model "must never" invariants, and ADR/dependency-graph drift
-  — one read of the diff instead of three), plus a separate **test-engineer** call for coverage/
-  adversarial gaps (a distinct kind of work, not another read-only lens). Also capture any decisions
-  made on the fly.
+- Run the review sweep across everything built since the last review, delegating to **code-reviewer**
+  (correctness/loopholes/gaps), **security-reviewer** (privacy/crypto invariants), **architect**
+  (ADR drift), and **test-engineer** (coverage/adversarial), in parallel where possible — a whole
+  phase's worth of diff is large enough that dedicated single-lens agents each going deep is worth
+  the extra reads (unlike a single task's diff at the `/next-task` Reviews gate, which uses the
+  combined `reviewer` agent instead — see below). Also capture any decisions made on the fly.
 - Write `docs/tasks/phase-N/review-report.md` from `TEMPLATE-review-report.md`: findings with severity
   (blocking / should-fix / nit), affected files, and recommended fix. Move ▶ NEXT to `/plan-review-phase`.
 

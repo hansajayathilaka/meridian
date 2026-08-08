@@ -6,14 +6,15 @@ contract. Optional scope override: **$ARGUMENTS** (defaults to all build work si
 
 1. Read the master tracker to determine the next phase number and which build phase(s)/tasks this review covers.
 2. Create `docs/tasks/phase-N/README.md` from [TEMPLATE-phase-readme.md](../../docs/tasks/TEMPLATE-phase-readme.md) with **Kind: review** and the reviewed scope.
-3. Run the review sweep over the reviewed scope's diff and deliverables:
-   - **reviewer** (one combined call) — correctness/loopholes/gaps/dead ends/simplifications,
-     anonymity-model "must never" list + key/opacity/logging/metrics invariants, and ADR drift +
-     dependency-graph/stream-registry contracts, all in a single pass over the same diff instead of
-     three separate agent calls each re-reading it.
-   - **test-engineer** (separate call) — coverage gaps across the pyramid + adversarial harnesses;
-     this is test-writing/running work, not another read-only review lens, so it stays its own call.
-   Also collect **decisions made on the fly** during earlier build phases that were never recorded.
+3. Run the review sweep over the reviewed scope's diff and deliverables, delegating in parallel where possible:
+   - **code-reviewer** — correctness, loopholes, gaps, dead ends, missing pieces, simplifications.
+   - **security-reviewer** — anonymity-model "must never" list, key/opacity/logging/metrics invariants.
+   - **architect** — ADR drift, dependency-graph and stream-registry contracts.
+   - **test-engineer** — coverage gaps across the pyramid + adversarial harnesses.
+   A phase-wide diff is large enough that dedicated single-lens agents each going deep is worth the
+   extra reads (unlike a single task's `/next-task` Reviews gate, which uses the combined `reviewer`
+   agent — see that skill section). Also collect **decisions made on the fly** during earlier build
+   phases that were never recorded.
 4. Write `docs/tasks/phase-N/review-report.md` from [TEMPLATE-review-report.md](../../docs/tasks/TEMPLATE-review-report.md): each finding with severity (blocking / should-fix / nit), file:line, and recommended fix; unratified decisions (architectural ones → `/adr`); coverage gaps; a verdict.
 5. Add the phase to the master tracker and set ▶ NEXT to `/plan-review-phase`.
 

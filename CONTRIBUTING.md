@@ -75,10 +75,10 @@ A change is **not done** until all of the following hold:
 [planner](./.claude/agents/planner.md) (task breakdown) ·
 [rust-dev](./.claude/agents/rust-dev.md) / [web-dev](./.claude/agents/web-dev.md) (implementation) ·
 [reviewer](./.claude/agents/reviewer.md) (correctness + privacy/crypto + design conformance, combined
-in one pass — the default for a task's `Reviews` gate and for review-phase sweeps) ·
+in one pass — the default for a single task's `Reviews` gate) ·
 [code-reviewer](./.claude/agents/code-reviewer.md) / [architect](./.claude/agents/architect.md) /
 [security-reviewer](./.claude/agents/security-reviewer.md) (single-lens agents, for when a task names
-exactly one) ·
+exactly one, and run in parallel for `/start-review-phase`'s phase-wide sweep) ·
 [test-engineer](./.claude/agents/test-engineer.md) ·
 [devops](./.claude/agents/devops.md) ·
 [connectivity-debugger](./.claude/agents/connectivity-debugger.md) (WebRTC/NAT).
