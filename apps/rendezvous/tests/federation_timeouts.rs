@@ -31,8 +31,13 @@
 //!   receive window" does not, in practice, make a single sub-1-MiB `write_all` block at the
 //!   syscall level at all (`write()` only blocks once the LOCAL kernel send buffer itself is full,
 //!   which never happens for a payload this small on a fresh connection, regardless of what the
-//!   peer does or does not read). A live-socket integration test built on that premise would pass
-//!   identically whether or not the fix is present — i.e. it would be exactly the "asserted
+//!   peer does or does not read). Shrinking the *dialer's own* `SO_SNDBUF` would reliably induce
+//!   blocking well under `MAX_FRAME_LEN` (confirmed empirically) and could distinguish wrapped from
+//!   unwrapped — but `link::dial`'s `TcpStream::connect` has no socket-options hook and
+//!   `FederationLink` has no test-only constructor from a pre-configured stream, so that path isn't
+//!   wired up today; adding one would be its own scope-creeping change with its own review burden.
+//!   Given that, a live-socket test built on "shrink the peer's receive window" specifically would
+//!   pass identically whether or not the fix is present — i.e. it would be exactly the "asserted
 //!   vacuously" failure mode this task's own Risks section warns about — so this task's actual
 //!   proof is source-level (the exact vulnerable call site is wrapped) plus a colocated
 //!   `outbound.rs` unit test proving the wrapping mechanism itself genuinely bounds an
@@ -342,8 +347,11 @@ async fn peer_completes_hello_but_never_replies_returns_fed_unreachable_within_b
 /// explicitly shrunk to a few KiB still completed in well under a second) — so a genuinely
 /// black-holed peer that "never drains its receive window" does not, in practice, make a single
 /// sub-1-MiB `write_all` block at all, regardless of whether the call is wrapped in a deadline.
-/// A live-socket integration test built on that premise would therefore pass identically whether
-/// or not this fix is present — the exact "asserted vacuously" failure mode task 3.3's own Risks
+/// Shrinking the *dialer's own* send buffer would reliably induce blocking and could distinguish
+/// wrapped from unwrapped, but `link::dial`/`FederationLink` have no hook to configure that from a
+/// test today — wiring one up would be its own scope-creeping change. Given that, a live-socket
+/// test built on "shrink the peer's receive window" specifically would pass identically whether or
+/// not this fix is present — the exact "asserted vacuously" failure mode task 3.3's own Risks
 /// section warns about (confirmed directly: this same live-socket scenario was run against BOTH
 /// the pre-fix and post-fix code during this task and passed either way, for the reason above).
 ///
