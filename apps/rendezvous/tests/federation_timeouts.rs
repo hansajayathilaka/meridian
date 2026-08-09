@@ -19,6 +19,26 @@
 //!   timeout elapsing, not some other/vacuous mechanism), and the resource — `Metrics::
 //!   connections_active`, this crate's existing allowlisted live-connection gauge — DOES return to
 //!   baseline once that timeout elapses, not held open forever.
+//! - (d) code-review follow-up on this same task (`route_foreign`'s outbound `send_frame` was left
+//!   unbounded by the original diff — the one call site in this file that carries an actual
+//!   authenticated user's routed envelope). See
+//!   `route_foreigns_outbound_send_is_wrapped_under_the_request_deadline`'s own doc comment for why
+//!   this is a source-level structural test rather than a live-socket one: a single
+//!   `route_foreign` call sends at most one `link::MAX_FRAME_LEN`-bounded (1 MiB) frame over a
+//!   *fresh* one-shot link, and on ordinary Linux TCP defaults (confirmed empirically against this
+//!   very environment) a brand-new socket's send buffer is already sized in the multi-MiB range
+//!   before a single byte is written — so a genuinely black-holed peer that "never drains its
+//!   receive window" does not, in practice, make a single sub-1-MiB `write_all` block at the
+//!   syscall level at all (`write()` only blocks once the LOCAL kernel send buffer itself is full,
+//!   which never happens for a payload this small on a fresh connection, regardless of what the
+//!   peer does or does not read). A live-socket integration test built on that premise would pass
+//!   identically whether or not the fix is present — i.e. it would be exactly the "asserted
+//!   vacuously" failure mode this task's own Risks section warns about — so this task's actual
+//!   proof is source-level (the exact vulnerable call site is wrapped) plus a colocated
+//!   `outbound.rs` unit test proving the wrapping mechanism itself genuinely bounds an
+//!   indefinitely-pending send/recv future. The defensive value of the fix (never trust an
+//!   unbounded network await, even one that doesn't block under today's typical buffer sizing) is
+//!   real regardless of what a specific test environment's socket buffers happen to do.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -303,6 +323,68 @@ async fn peer_completes_hello_but_never_replies_returns_fed_unreachable_within_b
         SignalError::FedUnreachable { hint, .. } => assert_eq!(hint, "org-b.test"),
         other => panic!("expected FedUnreachable, got {other:?}"),
     }
+}
+
+// -- (d) route_foreign's own outbound send is wrapped under the request deadline ------------
+
+/// Code-review follow-up (finding F3, blocking): the original 3.3 diff wrapped every send/recv in
+/// this file under `with_request_deadline` except `route_foreign`'s own outbound `send_frame` —
+/// the one call site that carries an actual authenticated user's routed envelope. This is a
+/// source-level structural test, not a live-socket one, deliberately: a live-socket version would
+/// need a real black-holed peer's `write_all` to genuinely block at the syscall level, but
+/// `write()` only blocks once the LOCAL kernel send buffer is full — and a single `route_foreign`
+/// call sends at most one `link::MAX_FRAME_LEN`-bounded (1 MiB) frame over a *fresh* one-shot
+/// link (`dial_foreign` is called anew each time, never reused — task 3.7's territory, not
+/// touched here). On ordinary Linux TCP defaults, a brand-new socket's send buffer is already
+/// sized in the multi-MiB range from the moment it connects (confirmed empirically against this
+/// crate's own CI-shaped sandbox: a fresh loopback socket's `SO_SNDBUF` measured ~3.75 MiB before
+/// a single byte was written, and a 900 KiB `write_all` against a peer whose receive window was
+/// explicitly shrunk to a few KiB still completed in well under a second) — so a genuinely
+/// black-holed peer that "never drains its receive window" does not, in practice, make a single
+/// sub-1-MiB `write_all` block at all, regardless of whether the call is wrapped in a deadline.
+/// A live-socket integration test built on that premise would therefore pass identically whether
+/// or not this fix is present — the exact "asserted vacuously" failure mode task 3.3's own Risks
+/// section warns about (confirmed directly: this same live-socket scenario was run against BOTH
+/// the pre-fix and post-fix code during this task and passed either way, for the reason above).
+///
+/// The real proof is two-part instead: this test pins that the exact vulnerable call site is
+/// wrapped (so the fix cannot silently regress), and `outbound.rs`'s own colocated unit test
+/// (`with_request_deadline_bounds_a_future_that_never_resolves`) proves the wrapping mechanism
+/// itself genuinely turns an indefinitely-pending send/recv future into a bounded
+/// `RouteForeignError::Dial{source: LinkError::Timeout}` — deterministically, with no real socket
+/// involved at all. Together they cover what a live-socket test would have claimed to prove,
+/// without the vacuous-pass risk.
+#[test]
+fn route_foreigns_outbound_send_is_wrapped_under_the_request_deadline() {
+    let src = include_str!("../src/federation/outbound.rs");
+    let start = src
+        .find("pub async fn route_foreign")
+        .expect("route_foreign must exist in outbound.rs");
+    // The next `pub async fn` after it is `reachable_foreign` — bound the search to exactly this
+    // function's body, so this test cannot accidentally match `fetch_foreign_bundle`'s or
+    // `reachable_foreign`'s already-wrapped sends instead of `route_foreign`'s own.
+    let after = &src[start..];
+    let end = after[1..]
+        .find("\npub async fn ")
+        .map(|i| i + 1)
+        .unwrap_or(after.len());
+    let body = &after[..end];
+
+    assert!(
+        !body.contains("fed_link\n        .send_frame(&out)\n        .await\n        .map_err(|source| RouteForeignError::Dial"),
+        "route_foreign must not go back to sending `out` via a bare, unwrapped \
+         `fed_link.send_frame(&out).await` — that is the exact F3 regression this test guards \
+         against: {body}"
+    );
+    assert!(
+        body.contains(
+            "with_request_deadline(request_timeout, &expected_domain, fed_link.send_frame(&out))"
+        ),
+        "route_foreign's own outbound send_frame call must be wrapped under \
+         with_request_deadline, exactly like fetch_foreign_bundle's and reachable_foreign's \
+         already-bounded sends — a caller (ws.rs) must never be able to observe a difference \
+         between this call site and those two: {body}"
+    );
 }
 
 // -- (c) no-leak: the resource returns to baseline, but only once the deadline elapses --------

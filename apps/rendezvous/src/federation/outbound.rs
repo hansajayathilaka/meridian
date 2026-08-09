@@ -470,13 +470,15 @@ pub async fn route_foreign(
     }
 
     let (mut fed_link, expected_domain) = dial_foreign(state, hint_domain).await?;
-    fed_link
-        .send_frame(&out)
-        .await
-        .map_err(|source| RouteForeignError::Dial {
-            domain: expected_domain.clone(),
-            source,
-        })?;
+    // Task 3.3 (F3), review fix: bounded under `state.federation.timeouts.request` — same
+    // treatment as `fetch_foreign_bundle`'s and `reachable_foreign`'s send/recv exchanges (see
+    // `with_request_deadline`'s doc comment). Without this, a partner that completes real
+    // mTLS+`FedHello` (i.e. is admitted by policy) and then never drains its TCP receive window
+    // hangs this `write_all`/`flush` forever, leaking a pinned task plus TLS link on the path
+    // that carries an actual authenticated user's routed envelope — exactly the failure mode this
+    // task exists to close, just missed on this one call site in the original diff.
+    let request_timeout = state.federation.timeouts.request;
+    with_request_deadline(request_timeout, &expected_domain, fed_link.send_frame(&out)).await?;
 
     // See `ROUTE_REPLY_GRACE`'s doc comment: `FedOp::Route` is fire-and-forget on success, so
     // "nothing arrived within a generous bound" IS the success outcome, not an error.
@@ -558,4 +560,48 @@ async fn resolve_dial_addr(endpoint: &Endpoint) -> std::io::Result<SocketAddr> {
                 format!("no address found for {}:{}", endpoint.host, endpoint.port),
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Task 3.3 review follow-up (finding F3, blocking): a deterministic, no-real-socket proof
+    //! that [`with_request_deadline`] genuinely bounds an indefinitely-pending send/recv future —
+    //! complementing `tests/federation_timeouts.rs`'s
+    //! `route_foreigns_outbound_send_is_wrapped_under_the_request_deadline`, which pins that
+    //! [`route_foreign`]'s own outbound `send_frame` call is actually wrapped by this helper. That
+    //! test proves the wrap is PRESENT; this one proves the wrap WORKS — together they cover what
+    //! a live-socket integration test would have claimed to prove, without that test's vacuous-pass
+    //! risk (see this crate's `tests/federation_timeouts.rs` module doc comment, case (d), for why
+    //! a live-socket version of this specific assertion cannot reliably distinguish "wrapped" from
+    //! "not wrapped" at all: a single envelope-sized `write_all` essentially never blocks at the
+    //! syscall level on ordinary Linux TCP defaults, regardless of peer behavior).
+    use super::*;
+
+    #[tokio::test]
+    async fn with_request_deadline_bounds_a_future_that_never_resolves() {
+        let timeout = Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        // `std::future::pending` never completes, on its own, under any circumstances — the same
+        // shape as a `send_frame`/`recv_frame` call against a peer that never reads or replies.
+        let never_resolves = std::future::pending::<Result<(), LinkError>>();
+        let result = with_request_deadline(timeout, "org-b.test", never_resolves).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "with_request_deadline must not itself hang waiting on a future that never resolves"
+        );
+        match result {
+            Err(RouteForeignError::Dial {
+                domain,
+                source: LinkError::Timeout { phase, duration },
+            }) => {
+                assert_eq!(domain, "org-b.test");
+                assert_eq!(phase, "request");
+                assert_eq!(duration, timeout);
+            }
+            other => panic!(
+                "expected RouteForeignError::Dial{{source: LinkError::Timeout{{..}}, ..}} once \
+                 the deadline elapsed, got {other:?}"
+            ),
+        }
+    }
 }
