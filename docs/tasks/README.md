@@ -16,16 +16,17 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 3, Waves 1–2 done; Wave 3 in progress.** **3.1**–**3.6** all landed
+- **NOW:** **Phase 3, Waves 1–2 done; Wave 3 in progress.** **3.1**–**3.7** all landed
   ([3.1](./phase-3/3.1-outbound-federation-policy.md), [3.2](./phase-3/3.2-inbound-accept-loop-hardening.md),
   [3.3](./phase-3/3.3-outbound-s2s-timeouts.md), [3.4](./phase-3/3.4-federation-test-support-harness.md),
-  [3.5](./phase-3/3.5-fed-ratelimit-double-spend.md), [3.6](./phase-3/3.6-multi-san-peer-identity.md)).
-  3.5 (fed ratelimit double-spend, F4) took three review rounds — see its Outcome for the full trail.
-  3.6 (multi-SAN peer identity, F9): clean pass, zero findings — accept-side now considers the full
-  validated SAN set for admission, with a deterministic single-key tie-break for rate-limit metering
-  kept structurally separate from the authorization check. Phases 0–2 are **done**.
-- **NEXT:** `/next-task` — Wave 3's **3.7** (federation link reuse, F10+N2), then **3.8**/**3.9** in
-  the phase README's dependency order — all build on 3.4's shared harness.
+  [3.5](./phase-3/3.5-fed-ratelimit-double-spend.md), [3.6](./phase-3/3.6-multi-san-peer-identity.md),
+  [3.7](./phase-3/3.7-federation-link-reuse.md)). 3.5 (fed ratelimit double-spend, F4) took three
+  review rounds — see its Outcome. 3.7 (link reuse + SRV failover, F10+N2): cached TLS config,
+  collapsed route_foreign's two-link-per-message exchange into one, added SRV failover with the
+  domain pin recomputed per candidate — one trivial nit (a duplicated test helper) closed in the
+  same task. Phases 0–2 are **done**.
+- **NEXT:** `/next-task` — Wave 3's **3.8** (federated delivery metrics, F8+N4), then **3.9** —
+  both build on 3.4's shared harness.
 
 ### Live carry-forwards (not owned by any open task)
 Everything else is owned by a Phase-3 task; these are the exceptions that would otherwise evaporate:
@@ -166,7 +167,7 @@ phase.
 **Wave 3 — federation server**
 - [x] **3.5** Stop the reachability pre-check double-spending route budgets (F4) — [file](./phase-3/3.5-fed-ratelimit-double-spend.md)
 - [x] **3.6** Accept-side peer identity must consider all authenticated SANs (F9) — [file](./phase-3/3.6-multi-san-peer-identity.md)
-- [~] **3.7** Reuse TLS config + one link per federated message, SRV failover (F10+N2) — [file](./phase-3/3.7-federation-link-reuse.md)
+- [x] **3.7** Reuse TLS config + one link per federated message, SRV failover (F10+N2) — [file](./phase-3/3.7-federation-link-reuse.md)
 - [ ] **3.8** Count federated deliveries in `envelopes_routed_total` (F8+N4) — [file](./phase-3/3.8-fed-delivery-metrics.md)
 - [ ] **3.9** Resolve the dead per-partner `policy` field in `federation_map.toml` (F7) — [file](./phase-3/3.9-federation-map-policy-field.md)
 
