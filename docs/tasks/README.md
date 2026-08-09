@@ -16,14 +16,14 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 3, Wave 1 (blocking gate) in progress.** **3.1** (outbound federation SSRF, F1)
-  is **done** ([file](./phase-3/3.1-outbound-federation-policy.md)) — security-reviewer, architect,
-  and code-reviewer all signed off; code-reviewer's should-fix (a `NotConfigured`-vs-`Denied`
-  ordering inconsistency between the fetch and route outbound paths when federation is simply
-  disabled) was fixed in the same task. Phases 0–2 are **done**.
-- **NEXT:** `/next-task` — **3.2** (one silent TCP connection wedges the inbound listener), then
-  **3.3** (no timeouts on outbound s2s I/O) — land 3.2 before 3.3, they share `link.rs` and 3.3
-  reuses 3.2's `with_deadline`.
+- **NOW:** **Phase 3, Wave 1 (blocking gate) in progress.** **3.1** and **3.2** are **done**
+  ([3.1](./phase-3/3.1-outbound-federation-policy.md), [3.2](./phase-3/3.2-inbound-accept-loop-hardening.md)).
+  3.2 (inbound accept-loop hardening, F2+N5): reviewer agent (security/architect/code-reviewer) signed
+  off clean; test-engineer's mutation-check found two real test-coverage gaps (the concurrency-cap test
+  didn't prove the cap was enforced; `max_links` had zero coverage) — both fixed and re-verified by
+  mutation in the same task. Phases 0–2 are **done**.
+- **NEXT:** `/next-task` — **3.3** (no timeouts on outbound s2s I/O) reuses 3.2's `with_deadline`
+  helper, then Wave 2's **3.4** (shared s2s test harness) before Wave 3.
 
 ### Live carry-forwards (not owned by any open task)
 Everything else is owned by a Phase-3 task; these are the exceptions that would otherwise evaporate:
@@ -155,7 +155,7 @@ phase.
 
 **Wave 1 — blocking gate** (3.2 before 3.3: same `link.rs`, and 3.3 reuses 3.2's `with_deadline`)
 - [x] **3.1** Enforce federation policy on the outbound dial path (F1) — [file](./phase-3/3.1-outbound-federation-policy.md)
-- [~] **3.2** Un-wedge the inbound s2s listener: concurrent, time-bounded accept (F2+N5) — [file](./phase-3/3.2-inbound-accept-loop-hardening.md)
+- [x] **3.2** Un-wedge the inbound s2s listener: concurrent, time-bounded accept (F2+N5) — [file](./phase-3/3.2-inbound-accept-loop-hardening.md)
 - [ ] **3.3** Bound every outbound s2s I/O exchange (F3) — [file](./phase-3/3.3-outbound-s2s-timeouts.md)
 
 **Wave 2 — test harness** (after the gate, before every other test-adding task)
