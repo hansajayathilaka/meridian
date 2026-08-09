@@ -235,8 +235,21 @@ pub struct Federation {
     /// "exempt reachability from rate limiting, or double the existing three defaults" as its two
     /// sanctioned alternatives) — a fourth, independent limiter dimension was what review actually
     /// required, so this field, like `handshake_timeout_ms`/`max_concurrent_handshakes`/`max_links`
-    /// above, is left `TODO: confirm` rather than presented as an already-settled number. See
-    /// [`Federation::default`] for the chosen starting value and its reasoning.
+    /// above, is left `TODO: confirm` rather than presented as an already-settled number.
+    ///
+    /// **Coupling constraint (re-review, second follow-up to F4), stronger than "same order of
+    /// magnitude":** `route_foreign` unconditionally runs the reachability pre-check ONCE for every
+    /// real `fed_route` delivery it attempts (never cached, never skipped — see that function's own
+    /// doc comment), and both dimensions aggregate the same way (whole-origin, no cross-account
+    /// pooling). That 1:1 coupling makes the SMALLER of the two limits the binding constraint on
+    /// real, delivered messages, regardless of which one is nominally "the route budget" — a
+    /// `fed_reachability_per_origin_per_min` set below `fed_route_per_origin_per_min` silently caps
+    /// achievable route throughput at its own (lower) value, reintroducing exactly the
+    /// halved-throughput symptom this task exists to fix, just via a second limiter instead of a
+    /// double-spend. This field's value MUST therefore be `>=` [`Federation::fed_route_per_origin_per_min`],
+    /// not merely "roughly comparable" — see [`Federation::validate`], which enforces this at
+    /// config-load time. See [`Federation::default`] for the chosen starting value and its
+    /// reasoning.
     pub fed_reachability_per_origin_per_min: u32,
     /// **`TODO: confirm`** (task 3.2 / review finding F2+N5): how long `run_federation`'s accept
     /// loop gives one inbound connection to complete mTLS + `FedHello` (via
@@ -382,28 +395,36 @@ impl Default for Federation {
             fed_fetch_per_origin_per_min: 300,
             fed_route_per_origin_per_min: 600,
             fed_per_origin_account_per_min: 30,
-            // `TODO: confirm` (task 3.5 follow-up, review finding F4, blocking): a fourth, newly
-            // added limiter dimension — not one of the three original numbers above, and not
-            // grounded in a prior design doc any more than `handshake_timeout_ms`/
-            // `max_concurrent_handshakes`/`max_links` below are. Reasoning, relative to the three
-            // existing defaults just above: `fed_reachability` requests are cheap (one in-memory
-            // `Registry::is_connected` lookup, no store I/O at all — contrast `fed_fetch_bundle`'s
-            // store lookup) and read-only, and legitimate use is bursty-but-light — either a real
-            // route's own internal liveness pre-check (one reachability probe per route attempt,
-            // so it scales with real route volume, not independently of it) or genuine
-            // presence-checking UX, neither of which needs anywhere near the volume a compromised
-            // peer running an unthrottled enumeration sweep would generate. That puts it in the
-            // same rough order of magnitude as `fed_fetch_per_origin_per_min` (300) rather than
-            // `fed_route_per_origin_per_min` (600, sized for the highest-volume ordinary traffic
-            // type) or the conservative, self-asserted-identity-scoped `fed_per_origin_account_per_min`
-            // (30, and in any case inapplicable here — this budget has no account axis at all).
-            // Picked equal to the fetch default (300) as a starting point: generous enough that a
-            // real route's own pre-check (bounded by, and always well under, the route budget
-            // above it) or a legitimate presence-check UI never trips it, conservative enough to
-            // meaningfully bound a single hostile-but-admitted peer's standalone reachability-probe
-            // sweep. Operators can raise it; picking too low is a false-closed rejection an
-            // operator notices, not a silent abuse hole.
-            fed_reachability_per_origin_per_min: 300,
+            // `TODO: confirm` (task 3.5 follow-up, review finding F4, blocking; value corrected by
+            // a second follow-up after re-review): a fourth, newly added limiter dimension — not
+            // one of the three original numbers above, and not grounded in a prior design doc any
+            // more than `handshake_timeout_ms`/`max_concurrent_handshakes`/`max_links` below are.
+            //
+            // **Coupling constraint, which dominates the reasoning below:** `route_foreign` spends
+            // exactly one unit of THIS budget for every real `fed_route` delivery it attempts (the
+            // mandatory, uncached, 1:1 liveness pre-check — see that function's doc comment), and
+            // both this limiter and `fed_route_per_origin_per_min` aggregate the same way
+            // (whole-origin, no per-account pooling on this one). Because the two are chained 1:1
+            // on every real message, the achievable real-delivery throughput for one origin is
+            // `min(fed_route_per_origin_per_min, fed_reachability_per_origin_per_min)` — so this
+            // value MUST be `>=` `fed_route_per_origin_per_min` (`600`) or it, not the route budget,
+            // becomes the real throughput ceiling, silently reintroducing this task's own
+            // halved-throughput symptom through a second limiter dimension instead of a
+            // double-spend. [`Federation::validate`] enforces this at config-load time so an
+            // operator who lowers one without the other gets a clear, fail-closed error instead of
+            // a silent cap.
+            //
+            // Picked equal to `fed_route_per_origin_per_min` (`600`), the smallest value the
+            // coupling constraint above allows, rather than some larger multiple: `fed_reachability`
+            // requests are cheap (one in-memory `Registry::is_connected` lookup, no store I/O at
+            // all — contrast `fed_fetch_bundle`'s store lookup) and read-only, and legitimate use is
+            // bursty-but-light — either a real route's own internal liveness pre-check (which, by
+            // construction, can never exceed the route budget's own call volume) or genuine
+            // presence-checking UX, neither of which needs headroom above the route budget itself.
+            // Operators can raise it further (e.g. to leave slack for standalone presence-checking
+            // UX beyond what real routes alone generate); they may not lower it below the route
+            // default without also lowering that default — validated, not merely documented.
+            fed_reachability_per_origin_per_min: 600,
             // `TODO: confirm` (task 3.2, review findings F2/N5): none of these three are grounded
             // in an existing design doc — picked here, conservatively, purely to stop one
             // silent/slow inbound s2s connection from wedging the whole federation listener. See
@@ -620,6 +641,26 @@ impl Federation {
                  federation link at all)"
                     .to_string(),
             );
+        }
+        // Task 3.5 second follow-up (re-review of F4): `route_foreign` spends exactly one unit of
+        // `fed_reachability_per_origin_per_min` for every real `fed_route` delivery it attempts (an
+        // uncached, mandatory 1:1 liveness pre-check — see that function's doc comment), and both
+        // limiters aggregate whole-origin with no per-account pooling on the reachability side. That
+        // 1:1 chaining means the SMALLER of the two values is the real, achievable per-origin route
+        // throughput, regardless of which field's name suggests it's "the route budget" — a
+        // reachability budget set below the route budget silently caps real message throughput at
+        // its own value, reintroducing this task's own halved-throughput symptom via a second
+        // limiter dimension instead of a double-spend. Reject that combination here, at config-load
+        // time, rather than let an operator discover it only as an unexplained throughput cap.
+        if self.fed_reachability_per_origin_per_min < self.fed_route_per_origin_per_min {
+            return Err(format!(
+                "federation.fed_reachability_per_origin_per_min ({}) must be >= \
+                 federation.fed_route_per_origin_per_min ({}): route_foreign's internal \
+                 reachability pre-check spends exactly one reachability unit for every real routed \
+                 message, so a lower reachability budget silently caps real route throughput at its \
+                 own value, below the documented route budget",
+                self.fed_reachability_per_origin_per_min, self.fed_route_per_origin_per_min
+            ));
         }
         // Task 3.3 (F3): the OUTBOUND mirror of the same "0 isn't the strictest possible
         // setting, it's a config that either wedges/refuses every dial instantly" reasoning above.
@@ -851,8 +892,13 @@ mod tests {
                     "5",
                 ),
                 (
+                    // Must stay >= the FED_ROUTE_PER_ORIGIN_PER_MIN value above (20) — task 3.5's
+                    // second follow-up (re-review of F4) added cross-field validation rejecting a
+                    // reachability budget below the route budget (see
+                    // `Federation::validate`), so this value can no longer be picked independently
+                    // of the route override just above it.
                     "MERIDIAN_RENDEZVOUS_FEDERATION__FED_REACHABILITY_PER_ORIGIN_PER_MIN",
-                    "15",
+                    "25",
                 ),
             ],
         );
@@ -868,19 +914,23 @@ mod tests {
         assert_eq!(config.federation.fed_fetch_per_origin_per_min, 10);
         assert_eq!(config.federation.fed_route_per_origin_per_min, 20);
         assert_eq!(config.federation.fed_per_origin_account_per_min, 5);
-        assert_eq!(config.federation.fed_reachability_per_origin_per_min, 15);
+        assert_eq!(config.federation.fed_reachability_per_origin_per_min, 25);
     }
 
     /// Task 3.5 follow-up (review finding F4, blocking): `fed_reachability_per_origin_per_min` is a
     /// newly added limiter dimension — pin its default value directly (not just via env-override
     /// round-tripping above) so a future accidental edit to `Federation::default` is caught here.
+    /// Task 3.5's second follow-up (re-review of F4) raised this default from `300` to `600` so it
+    /// is never, itself, below `fed_route_per_origin_per_min` — see [`Federation::validate`] for the
+    /// cross-field check that now enforces this at config-load time too.
     #[test]
     fn federation_reachability_limit_default_is_positive() {
         let f = Federation::default();
-        assert_eq!(f.fed_reachability_per_origin_per_min, 300);
+        assert_eq!(f.fed_reachability_per_origin_per_min, 600);
+        assert!(f.fed_reachability_per_origin_per_min >= f.fed_route_per_origin_per_min);
 
         let config = Config::from_toml_str("").unwrap();
-        assert_eq!(config.federation.fed_reachability_per_origin_per_min, 300);
+        assert_eq!(config.federation.fed_reachability_per_origin_per_min, 600);
     }
 
     #[test]
@@ -1008,6 +1058,59 @@ mod tests {
             .expect("static discovery with a private CA bundle must be accepted");
 
         assert_eq!(config.federation.ca_bundle_path, "/etc/meridian/fed-ca.pem");
+    }
+
+    // -- task 3.5 second follow-up (re-review of F4): reachability/route coupling validation ----
+
+    #[test]
+    fn fed_reachability_below_fed_route_is_rejected_fail_closed() {
+        // The precise bug the re-review found: `route_foreign` spends one reachability unit for
+        // every real routed message (a mandatory, uncached 1:1 pre-check), so a reachability budget
+        // set below the route budget silently caps real throughput at the smaller number — a second
+        // limiter reintroducing this task's own "halved throughput" symptom. Must be a hard `Err`,
+        // not a silent load.
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml(
+            "[federation]\nfed_route_per_origin_per_min = 600\n\
+             fed_reachability_per_origin_per_min = 300\n",
+        );
+
+        let err = Config::load(Some(file.path().to_str().unwrap())).expect_err(
+            "a reachability budget below the route budget must be rejected, not silently loaded",
+        );
+        assert!(err
+            .to_string()
+            .contains("fed_reachability_per_origin_per_min"));
+        assert!(err.to_string().contains("fed_route_per_origin_per_min"));
+    }
+
+    #[test]
+    fn fed_reachability_equal_to_fed_route_is_accepted() {
+        // The boundary case: equal is fine (this is the shipped default relationship) — only
+        // strictly less than is rejected.
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml(
+            "[federation]\nfed_route_per_origin_per_min = 600\n\
+             fed_reachability_per_origin_per_min = 600\n",
+        );
+
+        let config = Config::load(Some(file.path().to_str().unwrap()))
+            .expect("equal route and reachability budgets must be accepted");
+        assert_eq!(config.federation.fed_route_per_origin_per_min, 600);
+        assert_eq!(config.federation.fed_reachability_per_origin_per_min, 600);
+    }
+
+    #[test]
+    fn fed_reachability_above_fed_route_is_accepted() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml(
+            "[federation]\nfed_route_per_origin_per_min = 600\n\
+             fed_reachability_per_origin_per_min = 900\n",
+        );
+
+        let config = Config::load(Some(file.path().to_str().unwrap()))
+            .expect("a reachability budget above the route budget must be accepted");
+        assert_eq!(config.federation.fed_reachability_per_origin_per_min, 900);
     }
 
     // -- task 3.2: inbound-handshake-hardening config knobs -----------------------------------

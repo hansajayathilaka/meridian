@@ -40,7 +40,7 @@
 use std::sync::Arc;
 
 use meridian_proto::error_codes;
-use meridian_rendezvous::config::FederationPolicyMode;
+use meridian_rendezvous::config::{Federation, FederationPolicyMode};
 use meridian_rendezvous::AppState;
 use meridian_signaling::SignalError;
 
@@ -74,8 +74,10 @@ async fn stand_up(
         fed_route_per_origin_per_min,
         fed_per_origin_account_per_min,
         // `Federation::default`'s own value — callers not exercising the reachability dimension
-        // specifically get its ordinary generous default, never an accidentally-tight one.
-        300,
+        // specifically get its ordinary generous default, never an accidentally-tight one. (Task
+        // 3.5 second follow-up, re-review of F4: raised from 300 to 600 alongside the real default,
+        // which must stay `>=` `fed_route_per_origin_per_min` — see `config::Federation::validate`.)
+        600,
         arm_b_test_tamper,
     )
     .await
@@ -288,27 +290,63 @@ async fn sustained_cross_org_messages_under_budget_all_succeed() {
 }
 
 /// The CONFIGURED `fed_route_per_origin_per_min` budget must be achievable one-for-one by real
-/// deliveries — i.e. N configured units buy N real routed messages, not N/2. Uses a scaled-down
-/// limit (rather than the full default of 600) purely to keep this test fast; the property being
-/// proven — `RateLimiter::check`'s per-key counter increments once per call, so N calls exhaust
-/// exactly an N-unit budget — does not depend on which N is chosen, so this generalizes to the
-/// documented default without this test needing to spend 600 real wire round trips doing it.
+/// deliveries — i.e. N configured units buy N real routed messages, not N/2 (or, per the re-review
+/// of F4, not silently capped by an under-sized `fed_reachability_per_origin_per_min` chained 1:1
+/// in front of every real route — see `config::Federation::fed_reachability_per_origin_per_min`'s
+/// doc comment and `Federation::validate` for that coupling).
+///
+/// Uses a scaled-down pair of limits (rather than the full shipped defaults) purely to keep this
+/// test fast — each successful `fed_route` pays a fixed `ROUTE_REPLY_GRACE` (500ms) latency tax by
+/// design (fire-and-forget on success), so wall-clock cost scales linearly with the route budget
+/// exercised. **Critically, unlike this test's pre-re-review version, the scaled-down reachability
+/// budget is DERIVED from the real shipped defaults' ratio, not hand-picked.** The bug this
+/// specifically guards against: the previous version fixed `ROUTE_BUDGET = 20` while leaving
+/// `fed_reachability_per_origin_per_min` at a separately-chosen value comfortably above 20 — so
+/// `route_foreign`'s mandatory, uncached, 1:1 reachability pre-check (see that function's doc
+/// comment) never became the binding constraint in the test, even though the real shipped defaults
+/// at the time (`route = 600`, `reachability = 300`) meant it WAS the binding constraint in
+/// production (`min(600, 300) = 300`, not `600`). Deriving the test's ratio from
+/// `Federation::default()` itself means a future edit that reintroduces `reachability < route` in
+/// the shipped defaults shrinks `reachability_budget` below `ROUTE_BUDGET` here too, and this test
+/// fails on the same re-review finding it was written to close.
 #[tokio::test]
 async fn documented_org_wide_route_throughput_is_achievable_one_for_one() {
+    let default_route = Federation::default().fed_route_per_origin_per_min;
+    let default_reachability = Federation::default().fed_reachability_per_origin_per_min;
+    // Belt-and-suspenders: `Federation::validate` already enforces this at config-load time (task
+    // 3.5 second follow-up), but this test derives its own scaled budgets from these two values
+    // below, so if this ever fires, `Federation::default()` itself regressed — a config-loading
+    // caller would already see a hard `Err` from `Config::load` before ever reaching this test's
+    // scenario.
+    assert!(
+        default_reachability >= default_route,
+        "Federation::default() must satisfy reachability >= route (see Federation::validate); \
+         found reachability={default_reachability}, route={default_route}"
+    );
+
     // Route budget is the tight, scaled-down stand-in for the documented default; the account
     // budget is set far above it so the ACCOUNT limiter can never be what's actually tested here.
-    // Kept modest (not the full 600 default): each successful `fed_route` pays a fixed
-    // `ROUTE_REPLY_GRACE` (500ms) latency tax by design (fire-and-forget on success — see that
-    // constant's doc comment), so this test's wall-clock cost scales linearly with ROUTE_BUDGET;
-    // 20 is enough to demonstrate the linear "N buys N" property without paying that tax 600
-    // times over in CI.
     const ROUTE_BUDGET: u32 = 20;
-    let rig = stand_up(
+    // The reachability budget exercised by this test, at the SAME ratio to ROUTE_BUDGET that
+    // `fed_reachability_per_origin_per_min` has to `fed_route_per_origin_per_min` in the real
+    // shipped defaults — rounded down, so this test can never end up accidentally MORE generous
+    // (relative to ROUTE_BUDGET) than production actually is.
+    let reachability_budget =
+        ((ROUTE_BUDGET as u64 * default_reachability as u64) / default_route as u64) as u32;
+    assert!(
+        reachability_budget >= ROUTE_BUDGET,
+        "derived reachability_budget ({reachability_budget}) must be >= ROUTE_BUDGET \
+         ({ROUTE_BUDGET}) — otherwise this test would itself be exercising a coupling ratio the \
+         real defaults reject"
+    );
+
+    let rig = stand_up_with_reachability(
         FederationPolicyMode::Open,
         Vec::new(),
         300,
         ROUTE_BUDGET,
         1_000,
+        reachability_budget,
         false,
     )
     .await;
@@ -318,9 +356,11 @@ async fn documented_org_wide_route_throughput_is_achievable_one_for_one() {
     let bob = new_acct("org-b.test");
     let mut bc = bob.connect(&rig.b_c2s_url).await.unwrap();
 
-    // All ROUTE_BUDGET real messages must deliver: before this task's fix, only ROUTE_BUDGET / 2
-    // of these would have succeeded (the reachability pre-check preceding each route silently
-    // spent a second unit of this same shared budget).
+    // All ROUTE_BUDGET real messages must deliver: before this task's original fix, only
+    // ROUTE_BUDGET / 2 of these would have succeeded (the reachability pre-check preceding each
+    // route silently spent a second unit of this same shared budget); before the re-review's
+    // second follow-up fix, an under-ratioed reachability budget could cap real deliveries below
+    // ROUTE_BUDGET even with the original double-spend fixed.
     for i in 0..ROUTE_BUDGET {
         let delivered = ac
             .route_with_hint(bob.pubkey, Some("org-b.test".to_string()), b"hi".to_vec())
@@ -329,15 +369,16 @@ async fn documented_org_wide_route_throughput_is_achievable_one_for_one() {
                 panic!(
                     "message {i} of the full {ROUTE_BUDGET}-unit route budget must succeed — the \
                      documented org-wide route throughput must be genuinely achievable one-for-one, \
-                     not silently halved: {e:?}"
+                     not silently capped by the reachability pre-check's own budget: {e:?}"
                 )
             });
         assert!(delivered);
         bc.next_deliver().await.unwrap();
     }
     // The very next one, having now genuinely exhausted the budget with ROUTE_BUDGET real
-    // deliveries (not ROUTE_BUDGET/2 deliveries plus ROUTE_BUDGET/2 phantom pre-check spends),
-    // must be rejected.
+    // deliveries (not ROUTE_BUDGET/2 deliveries plus ROUTE_BUDGET/2 phantom pre-check spends, and
+    // not fewer than ROUTE_BUDGET deliveries capped by an under-sized reachability budget), must be
+    // rejected.
     let err = ac
         .route_with_hint(bob.pubkey, Some("org-b.test".to_string()), b"hi".to_vec())
         .await
