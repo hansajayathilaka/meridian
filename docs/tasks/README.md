@@ -16,15 +16,15 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 3, Wave 1 (blocking gate) is done.** **3.1**, **3.2**, and **3.3** all landed
+- **NOW:** **Phase 3, Waves 1–2 are done.** **3.1**–**3.4** all landed
   ([3.1](./phase-3/3.1-outbound-federation-policy.md), [3.2](./phase-3/3.2-inbound-accept-loop-hardening.md),
-  [3.3](./phase-3/3.3-outbound-s2s-timeouts.md)). 3.3 (outbound s2s timeouts, F3): review found and
-  fixed one blocking gap (`route_foreign`'s own outbound send was left unbounded by the first pass);
-  two design calls were explicitly ratified rather than silently substituted — see 3.3's Outcome for
-  the bounded-vs-reactive-cancellation interpretation and the refined timing-oracle residual note.
-  Phases 0–2 are **done**.
-- **NEXT:** `/next-task` — Wave 2's **3.4** (extract the shared s2s test harness), deliberately before
-  Wave 3 so no further ad-hoc PKI/server-boot test-fixture duplication accumulates.
+  [3.3](./phase-3/3.3-outbound-s2s-timeouts.md), [3.4](./phase-3/3.4-federation-test-support-harness.md)).
+  3.4 (shared s2s test harness, F18): a pure refactor across 11 test files, confirmed byte-identical
+  assertions/config-defaults before vs. after by both review lenses; 4 should-fix hygiene findings
+  (dead code, stale doc comments, a spec/implementation API-shape divergence) closed in the same task
+  — see 3.4's Outcome. Phases 0–2 are **done**.
+- **NEXT:** `/next-task` — Wave 3's **3.5** (fed ratelimit double-spend, F4), then **3.6**/**3.7**/
+  **3.8**/**3.9** in the phase README's dependency order — all now build on 3.4's shared harness.
 
 ### Live carry-forwards (not owned by any open task)
 Everything else is owned by a Phase-3 task; these are the exceptions that would otherwise evaporate:
@@ -160,7 +160,7 @@ phase.
 - [x] **3.3** Bound every outbound s2s I/O exchange (F3) — [file](./phase-3/3.3-outbound-s2s-timeouts.md)
 
 **Wave 2 — test harness** (after the gate, before every other test-adding task)
-- [~] **3.4** Extract the shared s2s test harness (PKI + server boot) (F18) — [file](./phase-3/3.4-federation-test-support-harness.md)
+- [x] **3.4** Extract the shared s2s test harness (PKI + server boot) (F18) — [file](./phase-3/3.4-federation-test-support-harness.md)
 
 **Wave 3 — federation server**
 - [ ] **3.5** Stop the reachability pre-check double-spending route budgets (F4) — [file](./phase-3/3.5-fed-ratelimit-double-spend.md)

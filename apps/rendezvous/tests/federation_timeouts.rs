@@ -3,10 +3,10 @@
 //! never replies to the actual request — must not hang the originating client's WebSocket session,
 //! and must not leak a pinned server-side task/link forever.
 //!
-//! Reuses `federation_fetch.rs`'s PKI + server-harness conventions (mint_identity/base_config/
-//! spawn_c2s/Acct), and `federation_link_dos.rs`'s `Identity::paths()` convenience, rather than
-//! duplicating them under a different name — each federation test file mints its own small harness
-//! per this crate's existing per-file-duplication precedent (see those files' own doc comments).
+//! Uses this crate's shared `tests/support/mod.rs` harness (task 3.4/F18: `TestCa`/`base_config`/
+//! `spawn_c2s`/`Acct`, replacing the per-file `mint_identity`/etc. duplication this comment used to
+//! describe) for the PKI + server-boot boilerplate, plus a small file-local `org_a_federation` for
+//! this task's two timeout knobs.
 //!
 //! Each test maps to one of the task file's required cases:
 //! - (a) a peer that accepts TCP but never completes TLS → `fetch_bundle` resolves to

@@ -1,11 +1,12 @@
 //! Task 2.8 acceptance: federated envelope routing + per-request reachability (system-design.md
 //! §3.3 step 5, §3.4).
 //!
-//! Same two-real-server-over-real-mTLS harness as `federation_fetch.rs` (task 2.7) — cert-minting,
-//! `spawn_c2s`/`spawn_federation`, `org_a_federation`/`org_b_federation` config builders — copied
-//! and adapted per-file (the existing `federation_mtls.rs`/`federation_fetch.rs` duplication
-//! convention this crate already established; code-reviewer flagged this as acceptable on 2.7, not
-//! something to fix here).
+//! Same two-real-server-over-real-mTLS harness as `federation_fetch.rs` (task 2.7): cert-minting,
+//! `spawn_c2s`/`spawn_federation`, and `stand_up`/`boot_federated_pair` (this crate's shared
+//! `tests/support/mod.rs`, task 3.4/F18 — the per-file `make_ca`/`mint_identity`/server-boot
+//! duplication this comment used to describe was extracted there). This file keeps a local
+//! `org_a_federation` for the one config knob (A's `Federation`) `boot_federated_pair`'s options
+//! don't parameterize; B's side goes through `boot_federated_pair` directly.
 //!
 //! Each test maps to one of the task file's required cases:
 //! - byte-identical envelope A→B delivery, asserted on the exact bytes Bob's OWN live connection

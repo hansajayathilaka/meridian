@@ -140,7 +140,8 @@ fn cli_walkthrough_message_request_gate_then_delivery() {
 // deterministic substrate `p2p_session.rs` uses), so the property under test — "does chat keep
 // flowing once the servers are gone" — is isolated from real-network flakiness while the signaling
 // half is still fully real. Both rendezvous servers are then genuinely KILLED (their listener
-// tasks aborted — see `TwoOrgs::kill_both_servers` — not merely an in-process channel dropped),
+// tasks aborted — see `support::BidirectionalPair::kill_both_servers` — not merely an in-process
+// channel dropped),
 // and the already-established P2P session must keep carrying chat both ways.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

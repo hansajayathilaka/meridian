@@ -184,21 +184,6 @@ pub async fn spawn_federation_handle(state: Arc<AppState>) -> (SocketAddr, JoinH
     (addr, handle)
 }
 
-/// Boot a rendezvous server instance for testing: a fresh in-memory [`MemoryStore`],
-/// `AppState::new`, and its c2s listener spawned. Returns the state (so a caller can e.g. read its
-/// store directly afterward) and the bound c2s address.
-pub async fn boot_rendezvous(config: Config) -> (Arc<AppState>, SocketAddr) {
-    let store = Arc::new(MemoryStore::new());
-    let state = AppState::new(config, store);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let state_for_task = state.clone();
-    tokio::spawn(async move {
-        let _ = serve(state_for_task, listener).await;
-    });
-    (state, addr)
-}
-
 /// Build a `federation_map.toml` (private-CA mode, task 2.5's schema): one `[[partner]]` entry per
 /// `(domain, endpoint, pinned_identity)` tuple.
 pub fn write_federation_map(dir: &Path, entries: &[(&str, SocketAddr, &str)]) -> PathBuf {
@@ -256,11 +241,6 @@ pub struct FederatedPairOpts {
     pub b_fed_route_per_origin_per_min: u32,
     pub b_fed_per_origin_account_per_min: u32,
     pub b_allow_test_tamper: bool,
-    /// What A's `federation_map.toml` pins B's identity to. `None` (the default) pins to
-    /// `b_domain` itself; `Some(other)` is the deliberate pinned-identity-mismatch shape
-    /// `federation_fetch.rs`'s
-    /// `dial_rejects_a_peer_cert_matching_the_hint_domain_but_not_the_pinned_identity` test needs.
-    pub a_pin_b_as: Option<String>,
     /// Whether to also spawn B's c2s listener (and include its URL in the returned pair). Several
     /// tests only ever reach B through A's federation link and never need a direct client
     /// connection to B at all.
@@ -280,7 +260,6 @@ impl Default for FederatedPairOpts {
             b_fed_route_per_origin_per_min: 600,
             b_fed_per_origin_account_per_min: 30,
             b_allow_test_tamper: false,
-            a_pin_b_as: None,
             spawn_b_c2s: true,
         }
     }
@@ -333,15 +312,7 @@ pub async fn boot_federated_pair(opts: FederatedPairOpts) -> FederatedPair {
     };
 
     let a_id = ca.issue(dir.path(), &opts.a_domain);
-    let b_pin_owned;
-    let b_pin: &str = match &opts.a_pin_b_as {
-        Some(pin) => pin.as_str(),
-        None => {
-            b_pin_owned = opts.b_domain.clone();
-            &b_pin_owned
-        }
-    };
-    let a_map = write_federation_map(dir.path(), &[(&opts.b_domain, b_fed_addr, b_pin)]);
+    let a_map = write_federation_map(dir.path(), &[(&opts.b_domain, b_fed_addr, &opts.b_domain)]);
     let a_federation = Federation {
         enabled: true,
         bind: "127.0.0.1:0".to_string(),
