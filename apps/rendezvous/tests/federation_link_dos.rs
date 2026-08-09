@@ -137,7 +137,7 @@ async fn silent_connection_does_not_wedge_the_listener_for_a_legitimate_dial() {
         dial(
             addr,
             "b.federation.test",
-            &a.paths(),
+            a.client_tls(),
             "a.federation.test",
             None,
             FederationTimeouts::default(),
@@ -292,7 +292,7 @@ async fn exhausting_max_concurrent_handshakes_drops_the_next_connection_promptly
             let attempt = dial(
                 addr,
                 "b.federation.test",
-                &a.paths(),
+                a.client_tls(),
                 "a.federation.test",
                 None,
                 FederationTimeouts::default(),
@@ -357,7 +357,7 @@ async fn exhausting_max_links_drops_the_next_link_promptly_after_a_successful_ha
         let link = dial(
             addr,
             "b.federation.test",
-            &a.paths(),
+            a.client_tls(),
             &format!("a{i}.federation.test"),
             None,
             FederationTimeouts::default(),
@@ -381,7 +381,7 @@ async fn exhausting_max_links_drops_the_next_link_promptly_after_a_successful_ha
     let mut over_link = dial(
         addr,
         "b.federation.test",
-        &over.paths(),
+        over.client_tls(),
         "over.federation.test",
         None,
         FederationTimeouts::default(),

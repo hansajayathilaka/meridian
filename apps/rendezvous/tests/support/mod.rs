@@ -30,10 +30,12 @@ use meridian_rendezvous::config::{
     Config, DiscoveryMode, Federation, FederationPolicyMode, Limits, Server, Turn,
 };
 use meridian_rendezvous::federation::inbound::{bind_federation, run_federation};
-use meridian_rendezvous::federation::FederationTlsPaths;
+use meridian_rendezvous::federation::link::build_client_tls_config;
+use meridian_rendezvous::federation::{Discovery, FederationTlsPaths};
 use meridian_rendezvous::{serve, AppState, MemoryStore};
 use meridian_signaling::{SignalError, SignalingClient};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+use rustls::ClientConfig;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -148,6 +150,20 @@ impl Identity {
             ca_bundle_path: "",
         }
     }
+
+    /// Build the outbound `rustls::ClientConfig` [`federation::link::dial`] now takes directly
+    /// (task 3.7: `dial` no longer builds this itself from paths — see `FederationRuntime::client_tls`'s
+    /// doc comment in production code). A thin convenience over `build_client_tls_config(&self.paths())`
+    /// so per-test call sites don't each repeat that call.
+    pub fn client_tls(&self) -> Arc<ClientConfig> {
+        build_client_tls_config(&self.paths()).expect("valid test identity builds a client config")
+    }
+
+    /// Same as [`Self::client_tls`], but WebPKI-mode ([`Self::webpki_paths`]).
+    pub fn webpki_client_tls(&self) -> Arc<ClientConfig> {
+        build_client_tls_config(&self.webpki_paths())
+            .expect("valid test identity builds a client config")
+    }
 }
 
 // -- Server-boot harness -------------------------------------------------------------------------
@@ -213,6 +229,20 @@ pub fn write_federation_map(dir: &Path, entries: &[(&str, SocketAddr, &str)]) ->
         ));
     }
     write(dir, "federation_map.toml", &toml)
+}
+
+/// Install `discovery` into a freshly-built (not yet cloned/spawned) [`AppState`], via
+/// `Arc::get_mut` — the only way to reach `FederationRuntime::discovery` with a test-controlled
+/// [`Discovery`] impl, since [`AppState::new`] always builds a config-driven one internally. Must
+/// be called before the returned `Arc` is cloned anywhere (no live listener spawned on it yet).
+/// Originally local to `federation_outbound_policy.rs` (task 3.1); promoted here (task 3.7) for a
+/// second caller (`federation_route.rs`'s SRV-failover test) that needs the same seam to inject a
+/// multi-`Endpoint`, call-observing `Discovery` stand-in.
+pub fn install_discovery(state: &mut Arc<AppState>, discovery: Arc<dyn Discovery>) {
+    Arc::get_mut(state)
+        .expect("AppState must still be uniquely owned (not yet cloned/spawned)")
+        .federation
+        .discovery = Some(discovery);
 }
 
 // -- Signaling-client harness --------------------------------------------------------------------

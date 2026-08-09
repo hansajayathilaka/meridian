@@ -13,6 +13,13 @@
 //!   never additionally the system store — the whole air-gap trust model depends on this being an
 //!   *exclusive* root, not an additive one (ADR 0017 C4).
 //!
+//! **Task 3.7:** [`dial`] itself no longer builds the client config from `FederationTlsPaths` on
+//! every call — it takes a pre-built `Arc<ClientConfig>` from its caller, who builds it once via
+//! [`build_client_tls_config`] and reuses the same `Arc` across every dial (see
+//! `state::FederationRuntime::client_tls`'s doc comment). [`build_server_tls_config`] is still
+//! built from `FederationTlsPaths` too, but that already only ever happened once, at
+//! [`FederationListener::bind`] time — the listener side was never rebuilding it per-connection.
+//!
 //! [`dial`] additionally takes `expected_domain`: the domain THIS side intended to reach, per ADR
 //! 0017 (a) — never the literal address/hostname it happened to dial (that's a job for discovery,
 //! [2.5](../../../../docs/tasks/phase-2/2.5-federation-discovery.md), out of scope here). rustls's
@@ -474,6 +481,16 @@ impl Drop for FederationLink {
 /// self-asserted `FedHello.domain` (diagnostic only). `metrics`, if given, is updated for the
 /// link's lifetime (see [`FederationLink`]'s `Drop` impl).
 ///
+/// **Task 3.7 (review finding F10):** `client_tls` is a pre-built `Arc<ClientConfig>` — this
+/// function does **no** filesystem I/O and no cert/key/CA-bundle parsing of its own. It used to
+/// call [`build_client_tls_config`] internally on every single invocation, re-reading and
+/// re-parsing the same on-disk cert/key/CA-bundle material fresh for every outbound dial even
+/// though none of it changes between calls in a running server. `rustls::ClientConfig` is designed
+/// to be built once and reused across many connections (hence the `Arc`) — callers now build it
+/// once, at startup, and pass the same `Arc` to every `dial` call (see
+/// `state::FederationRuntime::client_tls`'s doc comment for the fail-closed timing tradeoff this
+/// creates).
+///
 /// **Task 3.3 (review finding F3, blocking):** every step that can block on a black-holed or
 /// merely slow partner — the raw `TcpStream::connect`, the TLS handshake, and the `FedHello`
 /// exchange — runs under [`dial_phase`]/[`with_deadline`], bounded by `timeouts.connect` (the
@@ -486,13 +503,12 @@ impl Drop for FederationLink {
 pub async fn dial(
     addr: SocketAddr,
     expected_domain: &str,
-    paths: &FederationTlsPaths<'_>,
+    client_tls: Arc<ClientConfig>,
     own_domain: &str,
     metrics: Option<Arc<Metrics>>,
     timeouts: FederationTimeouts,
 ) -> Result<FederationLink, LinkError> {
-    let tls_config = build_client_tls_config(paths)?;
-    let connector = TlsConnector::from(tls_config);
+    let connector = TlsConnector::from(client_tls);
     let tcp = dial_phase(timeouts.connect, "connect", TcpStream::connect(addr)).await?;
     let server_name = ServerName::try_from(expected_domain.to_string())
         .map_err(|e| LinkError::Cert(format!("invalid domain {expected_domain:?}: {e}")))?;

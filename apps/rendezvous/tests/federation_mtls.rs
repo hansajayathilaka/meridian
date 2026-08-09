@@ -85,7 +85,7 @@ async fn happy_path_private_ca_mode() {
     let mut dialer_link = dial(
         addr,
         "b.federation.test",
-        &a.paths(),
+        a.client_tls(),
         "a.federation.test",
         Some(metrics.clone()),
         FederationTimeouts::default(),
@@ -142,7 +142,7 @@ async fn happy_path_webpki_mode() {
     let dialer_link = dial(
         addr,
         "b.federation.test",
-        &a.webpki_paths(),
+        a.webpki_client_tls(),
         "a.federation.test",
         None,
         FederationTimeouts::default(),
@@ -192,7 +192,7 @@ async fn untrusted_ca_is_rejected() {
     let dial_result = dial(
         addr,
         "b.federation.test",
-        &a_dial_paths,
+        build_client_tls_config(&a_dial_paths).unwrap(),
         "a.federation.test",
         None,
         FederationTimeouts::default(),
@@ -231,7 +231,7 @@ async fn valid_cert_for_wrong_domain_is_rejected() {
     let dial_result = dial(
         addr,
         "b.federation.test",
-        &a.paths(),
+        a.client_tls(),
         "a.federation.test",
         None,
         FederationTimeouts::default(),
@@ -461,7 +461,7 @@ async fn multi_san_cert_with_non_first_san_allowlisted_is_admitted() {
     let _dialer_link = dial(
         addr,
         "b.federation.test",
-        &a_multi.paths(),
+        a_multi.client_tls(),
         "a.federation.test",
         None,
         FederationTimeouts::default(),
@@ -523,7 +523,7 @@ async fn multi_san_admission_never_admits_a_domain_the_cert_does_not_authenticat
     let _dialer_link = dial(
         addr,
         "b.federation.test",
-        &a_multi.paths(),
+        a_multi.client_tls(),
         "a.federation.test",
         None,
         FederationTimeouts::default(),
@@ -569,7 +569,7 @@ async fn san_reordering_across_a_cert_renewal_does_not_change_the_metering_key()
     let _dialer1 = dial(
         addr1,
         "b.federation.test",
-        &a_order1.paths(),
+        a_order1.client_tls(),
         "a.federation.test",
         None,
         FederationTimeouts::default(),
@@ -584,7 +584,7 @@ async fn san_reordering_across_a_cert_renewal_does_not_change_the_metering_key()
     let _dialer2 = dial(
         addr2,
         "b.federation.test",
-        &a_order2.paths(),
+        a_order2.client_tls(),
         "a.federation.test",
         None,
         FederationTimeouts::default(),
