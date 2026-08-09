@@ -51,7 +51,7 @@ the two `link.rs` edits and let 3.3 reuse 3.2's `with_deadline` helper)
 
 **Wave 2 — test harness** (deliberately after the gate so the blockers aren't held hostage to an
 11-file refactor; deliberately before everything else so no 12th `make_ca` copy appears)
-- [ ] **3.4** Extract the shared s2s test harness (PKI + server boot) (F18) — [file](./3.4-federation-test-support-harness.md)
+- [~] **3.4** Extract the shared s2s test harness (PKI + server boot) (F18) — [file](./3.4-federation-test-support-harness.md)
 
 **Wave 3 — federation server** (dependency-ordered: they edit the same two functions)
 - [ ] **3.5** Stop the reachability pre-check double-spending route budgets (F4) — [file](./3.5-fed-ratelimit-double-spend.md)
