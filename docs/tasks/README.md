@@ -16,17 +16,19 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 3, Waves 1–2 done; Wave 3 in progress.** **3.1**–**3.7** all landed
-  ([3.1](./phase-3/3.1-outbound-federation-policy.md), [3.2](./phase-3/3.2-inbound-accept-loop-hardening.md),
+- **NOW:** **Phase 3 Wave 3 is done** (3.5–3.8; Waves 1–2 were already done). **3.1**–**3.8** all
+  landed ([3.1](./phase-3/3.1-outbound-federation-policy.md), [3.2](./phase-3/3.2-inbound-accept-loop-hardening.md),
   [3.3](./phase-3/3.3-outbound-s2s-timeouts.md), [3.4](./phase-3/3.4-federation-test-support-harness.md),
   [3.5](./phase-3/3.5-fed-ratelimit-double-spend.md), [3.6](./phase-3/3.6-multi-san-peer-identity.md),
-  [3.7](./phase-3/3.7-federation-link-reuse.md)). 3.5 (fed ratelimit double-spend, F4) took three
-  review rounds — see its Outcome. 3.7 (link reuse + SRV failover, F10+N2): cached TLS config,
-  collapsed route_foreign's two-link-per-message exchange into one, added SRV failover with the
-  domain pin recomputed per candidate — one trivial nit (a duplicated test helper) closed in the
-  same task. Phases 0–2 are **done**.
-- **NEXT:** `/next-task` — Wave 3's **3.8** (federated delivery metrics, F8+N4), then **3.9** —
-  both build on 3.4's shared harness.
+  [3.7](./phase-3/3.7-federation-link-reuse.md), [3.8](./phase-3/3.8-fed-delivery-metrics.md)). 3.5
+  (fed ratelimit double-spend, F4) took three review rounds — see its Outcome. 3.6/3.7/3.8 each
+  closed with only trivial/zero findings. Phases 0–2 are **done**.
+- **NEXT:** `/next-task` — **3.9** (dead per-partner `policy` field in `federation_map.toml`, F7)
+  is the next item in Wave 3, but per its own file needs an **architect decision** before
+  implementation (three materially different fixes on the table, no default named — see
+  [phase-3/README.md](./phase-3/README.md#adr-obligations)); this is a genuine pre-implementation
+  escalation, not a normal review gate. Wave 4 (3.10–3.14) is unblocked and can run in parallel /
+  before 3.9 is resolved if preferred.
 
 ### Live carry-forwards (not owned by any open task)
 Everything else is owned by a Phase-3 task; these are the exceptions that would otherwise evaporate:
@@ -168,7 +170,7 @@ phase.
 - [x] **3.5** Stop the reachability pre-check double-spending route budgets (F4) — [file](./phase-3/3.5-fed-ratelimit-double-spend.md)
 - [x] **3.6** Accept-side peer identity must consider all authenticated SANs (F9) — [file](./phase-3/3.6-multi-san-peer-identity.md)
 - [x] **3.7** Reuse TLS config + one link per federated message, SRV failover (F10+N2) — [file](./phase-3/3.7-federation-link-reuse.md)
-- [~] **3.8** Count federated deliveries in `envelopes_routed_total` (F8+N4) — [file](./phase-3/3.8-fed-delivery-metrics.md)
+- [x] **3.8** Count federated deliveries in `envelopes_routed_total` (F8+N4) — [file](./phase-3/3.8-fed-delivery-metrics.md)
 - [ ] **3.9** Resolve the dead per-partner `policy` field in `federation_map.toml` (F7) — [file](./phase-3/3.9-federation-map-policy-field.md)
 
 **Wave 4 — parallel track** (core client + CI; no federation-server contention)
