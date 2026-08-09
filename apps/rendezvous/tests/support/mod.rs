@@ -240,6 +240,9 @@ pub struct FederatedPairOpts {
     pub b_fed_fetch_per_origin_per_min: u32,
     pub b_fed_route_per_origin_per_min: u32,
     pub b_fed_per_origin_account_per_min: u32,
+    /// Task 3.5 follow-up (review finding F4, blocking): `fed_reachability`'s own dedicated
+    /// per-origin budget, independent of the three above.
+    pub b_fed_reachability_per_origin_per_min: u32,
     pub b_allow_test_tamper: bool,
     /// Whether to also spawn B's c2s listener (and include its URL in the returned pair). Several
     /// tests only ever reach B through A's federation link and never need a direct client
@@ -259,6 +262,7 @@ impl Default for FederatedPairOpts {
             b_fed_fetch_per_origin_per_min: 300,
             b_fed_route_per_origin_per_min: 600,
             b_fed_per_origin_account_per_min: 30,
+            b_fed_reachability_per_origin_per_min: 300,
             b_allow_test_tamper: false,
             spawn_b_c2s: true,
         }
@@ -297,6 +301,7 @@ pub async fn boot_federated_pair(opts: FederatedPairOpts) -> FederatedPair {
         fed_fetch_per_origin_per_min: opts.b_fed_fetch_per_origin_per_min,
         fed_route_per_origin_per_min: opts.b_fed_route_per_origin_per_min,
         fed_per_origin_account_per_min: opts.b_fed_per_origin_account_per_min,
+        fed_reachability_per_origin_per_min: opts.b_fed_reachability_per_origin_per_min,
         ..Federation::default()
     };
     let mut b_config = base_config(&opts.b_domain);

@@ -67,12 +67,40 @@ async fn stand_up(
     fed_per_origin_account_per_min: u32,
     arm_b_test_tamper: bool,
 ) -> Rig {
+    stand_up_with_reachability(
+        b_policy,
+        b_allowlist,
+        fed_fetch_per_origin_per_min,
+        fed_route_per_origin_per_min,
+        fed_per_origin_account_per_min,
+        // `Federation::default`'s own value — callers not exercising the reachability dimension
+        // specifically get its ordinary generous default, never an accidentally-tight one.
+        300,
+        arm_b_test_tamper,
+    )
+    .await
+}
+
+/// Same as [`stand_up`], with an explicit `fed_reachability_per_origin_per_min` — needed by the
+/// reachability-specific rate-limit cell below, which must set this one tight while keeping the
+/// other three generous (so it fails only on the dimension actually under test).
+#[allow(clippy::too_many_arguments)]
+async fn stand_up_with_reachability(
+    b_policy: FederationPolicyMode,
+    b_allowlist: Vec<String>,
+    fed_fetch_per_origin_per_min: u32,
+    fed_route_per_origin_per_min: u32,
+    fed_per_origin_account_per_min: u32,
+    fed_reachability_per_origin_per_min: u32,
+    arm_b_test_tamper: bool,
+) -> Rig {
     let pair = boot_federated_pair(FederatedPairOpts {
         b_policy,
         b_allowlist,
         b_fed_fetch_per_origin_per_min: fed_fetch_per_origin_per_min,
         b_fed_route_per_origin_per_min: fed_route_per_origin_per_min,
         b_fed_per_origin_account_per_min: fed_per_origin_account_per_min,
+        b_fed_reachability_per_origin_per_min: fed_reachability_per_origin_per_min,
         b_allow_test_tamper: arm_b_test_tamper,
         ..Default::default()
     })
@@ -141,6 +169,76 @@ async fn bs_federation_route_rate_limit_trips_through_the_real_path() {
             error_codes::RATE_LIMITED,
             "once B's per-origin ROUTE budget (2/min) is spent by two real deliveries, a third \
              real route to the SAME still-connected target must be rejected as rate_limited"
+        ),
+        other => panic!("expected rate_limited, got {other:?}"),
+    }
+}
+
+// -- rate-limit enforcement: the REACHABILITY dimension (task 3.5 follow-up, review finding F4) --
+//
+// Blocking finding on the ORIGINAL 3.5 fix: removing `check_route` from
+// `handle_fed_reachability` correctly stopped it double-spending the route/account budgets, but
+// also left `FedOp::Reachability` completely UNMETERED, bounded only by task 3.2's *global* link
+// caps, not anything per-peer — a real, distinct DoS/enumeration-probing surface. This proves the
+// follow-up fix (a fourth, dedicated `reachability_per_origin` limiter) actually bounds sustained
+// reachability probing through the real wire path, not merely at the unit level.
+//
+// `route_with_hint` is the one client-reachable trigger for an outbound `FedOp::Reachability`
+// request in this codebase (`route_foreign`'s own internal `reachable_foreign` pre-check, run
+// before every route attempt) — so a sustained series of routes to a connected, reachable target
+// drives exactly one reachability probe per call. The route and per-account budgets are set far
+// above the tight reachability budget so this test fails ONLY on the reachability dimension, never
+// conflating it with `bs_federation_route_rate_limit_trips_through_the_real_path` above.
+
+#[tokio::test]
+async fn bs_federation_reachability_rate_limit_trips_through_the_real_path() {
+    const REACHABILITY_BUDGET: u32 = 2;
+    let rig = stand_up_with_reachability(
+        FederationPolicyMode::Open,
+        Vec::new(),
+        300,
+        300,
+        300,
+        REACHABILITY_BUDGET,
+        false,
+    )
+    .await;
+
+    let alice = new_acct("org-a.test");
+    let mut ac = alice.connect(&rig.a_c2s_url).await.unwrap();
+    let bob = new_acct("org-b.test");
+    let mut bc = bob.connect(&rig.b_c2s_url).await.unwrap();
+
+    // The first REACHABILITY_BUDGET real routes must succeed — each one spends exactly one unit of
+    // B's `reachability_per_origin` budget via `route_foreign`'s internal pre-check, well within
+    // the far higher route (300/min) and per-account (300/min) budgets, so neither of those trips
+    // first.
+    for i in 0..REACHABILITY_BUDGET {
+        let delivered = ac
+            .route_with_hint(bob.pubkey, Some("org-b.test".to_string()), b"hi".to_vec())
+            .await
+            .unwrap_or_else(|e| {
+                panic!("route {i} of the {REACHABILITY_BUDGET}-unit reachability budget must succeed: {e:?}")
+            });
+        assert!(delivered, "bob is connected the whole time; every one of the first {REACHABILITY_BUDGET} routes must deliver");
+        bc.next_deliver().await.unwrap(); // drain, so B's socket buffer never backs up
+    }
+    // The next route's internal reachability pre-check must now be rejected as rate_limited —
+    // bob is STILL connected the whole time, so this is not a `not_connected`/target-liveness
+    // outcome (which task 2.8's architect decision #3 already covers elsewhere): it is B's
+    // dedicated reachability budget, and only that budget, tripping.
+    let err = ac
+        .route_with_hint(bob.pubkey, Some("org-b.test".to_string()), b"hi".to_vec())
+        .await
+        .unwrap_err();
+    match err {
+        SignalError::Server(body) => assert_eq!(
+            body.code,
+            error_codes::RATE_LIMITED,
+            "once B's dedicated reachability budget ({REACHABILITY_BUDGET}/min) is spent, a \
+             further route's internal reachability pre-check must be rejected as rate_limited — \
+             before the task 3.5 follow-up fix, this request was completely unmetered and this \
+             assertion would never fire no matter how many times this loop ran"
         ),
         other => panic!("expected rate_limited, got {other:?}"),
     }

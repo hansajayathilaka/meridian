@@ -144,10 +144,11 @@ pub async fn handle_fed_fetch(
 /// budget (once as `from` when they send, once as the reachability pre-check's `target` when the
 /// other side sends to them), roughly doubling the effective per-message cost against the
 /// documented `fed_per_origin_account_per_min` number too. See
-/// [`handle_fed_reachability`]'s doc comment for why the pre-check no longer spends any budget at
-/// all: **one real routed message now costs exactly one `route_per_origin` unit and one
-/// `per_origin_account` unit (keyed on `req.from`, the sender, alone)** — matching the Goal this
-/// task was filed to restore.
+/// [`handle_fed_reachability`]'s doc comment for why the pre-check no longer spends either of
+/// THIS budget's units at all (it spends its own, separate `reachability_per_origin` budget
+/// instead, as of the task 3.5 follow-up — never this one): **one real routed message now costs
+/// exactly one `route_per_origin` unit and one `per_origin_account` unit (keyed on `req.from`, the
+/// sender, alone)** — matching the Goal this task was filed to restore.
 ///
 /// **`req.from` is relayed verbatim, never inspected.** Per [`FedRoute`]'s own doc comment and
 /// `apps/proto/src/fed.rs`'s module docs (ADR 0017 C1/C2), `from` is routing metadata asserted by
@@ -229,52 +230,51 @@ pub async fn handle_fed_route(
     Ok(())
 }
 
-/// Server B's inbound `fed_reachability` handler (task 2.8): origin admission, then EXACTLY
-/// `FedReachable{connected}` — no other branch, ever. `Registry::is_connected` already returns
-/// `false` identically whether `target` never registered or registered-then-disconnected (see
-/// [`Registry`]'s own doc comment); there is no separate existence check here to leak, and this
-/// function must never grow one. Nothing on this path is logged or persisted: `registry` is an
-/// in-memory `Registry` lookup only, and this module (like `federation::policy`) adds no
-/// `tracing`/`println!`-style logging at all.
+/// Server B's inbound `fed_reachability` handler (task 2.8): origin admission, then the DEDICATED
+/// `reachability_per_origin` rate-limit check (task 3.5 follow-up, review finding F4, blocking —
+/// see below), then EXACTLY `FedReachable{connected}` — no other branch, ever.
+/// `Registry::is_connected` already returns `false` identically whether `target` never registered
+/// or registered-then-disconnected (see [`Registry`]'s own doc comment); there is no separate
+/// existence check here to leak, and this function must never grow one. Nothing on this path is
+/// logged or persisted: `registry` is an in-memory `Registry` lookup only, and this module (like
+/// `federation::policy`) adds no `tracing`/`println!`-style logging at all.
 ///
-/// **Task 3.5 (review finding F4): deliberately spends NO [`FederationLimits`] budget at all —**
-/// no `limits` parameter, no `check_route`/`check_fetch` call. This is the *preferred* fix the
-/// task file names, chosen over doubling the three `fed_*_per_origin*` defaults, and it is a
-/// judgment call recorded here rather than a fait accompli (architect + security-reviewer are
-/// REQUIRED reviewers on this task specifically because of it — ADR 0017 C5's per-account axis
-/// now meters real route delivery only, never a liveness probe).
+/// **Task 3.5's original fix (review finding F4) removed this function's `check_route` call
+/// entirely** — before it, `route_foreign`'s internal reachability pre-check and the real
+/// `fed_route` it precedes both spent the same shared `route_per_origin`/`per_origin_account`
+/// budgets for one logical message, halving real cross-org route throughput against the
+/// documented per-minute numbers (see [`handle_fed_route`]'s doc comment for the exact
+/// double-spend that closed). That much of the original fix is unchanged by this follow-up.
 ///
-/// Why this is safe to do here, and not merely convenient: the ONLY caller of the outbound
-/// `FedOp::Reachability` request in this codebase is
-/// [`route_foreign`](crate::federation::outbound::route_foreign)'s own internal
-/// [`reachable_foreign`](crate::federation::outbound::reachable_foreign) pre-check (see that
-/// function's doc comment) — a liveness check, not itself a message delivery, and not a distinct
-/// client-visible capability A's own users can trigger standalone. Spending a shared route budget
-/// on it double-charged every real routed message for no real anti-abuse benefit (see
-/// [`handle_fed_route`]'s doc comment for the exact double-spend this closes).
+/// **What that original fix got wrong, and this follow-up corrects (review finding F4, blocking):**
+/// removing `check_route` left `FedOp::Reachability` completely UNMETERED, for any peer,
+/// indefinitely. That was not a safe residual: `FedOp::Reachability` is task 2.8's own independent
+/// wire op (federation-protocol-v1.md §2), not solely an implementation detail of routing — this
+/// server cannot tell, from the wire frame alone, "A's own `route_foreign` pre-check" apart from
+/// "a federated peer directly probing reachability as a standalone operation." Worse, task 3.2's
+/// `max_links` semaphore (the only thing bounding this before this follow-up) is a *global* cap
+/// shared across every partner, not per-peer — so one hostile-but-admitted peer holding open a
+/// large share of that shared budget could loop reachability probes serially, at wire-RTT speed,
+/// indefinitely, against arbitrary account IDs, while also starving every other legitimate partner
+/// of link capacity (re-opening the DoS class task 3.2 exists to bound). It also made
+/// `docs/architecture/system-design.md` §3.5 and `docs/api/wire-protocol.md` §4's claims that the
+/// federation API rate-limits every query overclaim relative to the code.
 ///
-/// **The residual this trades in, stated honestly (per the task file's Risk note — "must not be
-/// reachable by any client-driven op, otherwise it becomes a free rate-limit bypass, inverting
-/// the fix"):** `FedOp::Reachability` is task 2.8's own independent wire op (federation-protocol-
-/// v1.md §2), not solely an implementation detail of routing — this server cannot tell, from the
-/// wire frame alone, "A's own `route_foreign` pre-check" apart from "a federated peer directly
-/// probing reachability as a standalone operation." Removing `check_route` here therefore makes
-/// reachability-probing **unmetered, for any peer, indefinitely** — a real, distinct abuse
-/// surface (unbounded presence/online-status polling of arbitrary accounts over time). It is
-/// NOT, however, a bypass of the *route* rate limit in the sense of getting more actual message
-/// content delivered for free: `handle_fed_route` above still spends its own budget on every real
-/// delivery, unconditionally, regardless of how many (now-free) reachability probes preceded it.
-/// The residual is bounded independently, not unboundedly, by machinery this task does not touch:
-/// task 3.2's `max_concurrent_handshakes`/`max_links` semaphores cap how many links (and thus
-/// how much reachability-probing concurrency) one peer can hold open at once, and
-/// [`serve_link`]'s strictly-serial `recv_frame`/dispatch/reply loop (one in-flight request per
-/// link, no pipelining) caps how fast even a single held-open link can issue them — so this is
-/// "unlimited probes *over time*, within whatever connection-level caps already exist," not
-/// "unlimited concurrent probes." That residual is the one architect/security-reviewer must
-/// ratify for this task to be considered done, per the task file's Reviews section.
+/// The fix: [`FederationLimits::check_reachability`] — a fourth, independent [`RateLimiter`]
+/// dimension (`reachability_per_origin`), deliberately NOT a reuse of `route_per_origin` (that
+/// would reintroduce coupling reachability's budget to real route throughput, the original bug's
+/// shape) and keyed on `origin_domain` alone, with no per-account axis (`FedReachability` carries
+/// no `from`/requester-account field — see that method's own doc comment). `handle_fed_reachability`
+/// is the only caller. This is not a bypass of the *route* rate limit in the sense of getting more
+/// actual message content delivered for free: `handle_fed_route` still spends its own,
+/// unconditional budget on every real delivery, regardless of how many reachability probes
+/// preceded it — this is a genuinely separate budget for a genuinely separate operation.
+///
+/// [`RateLimiter`]: crate::ratelimit::RateLimiter
 pub async fn handle_fed_reachability(
     registry: &Registry,
     policy: &FederationPolicy,
+    limits: &FederationLimits,
     origin_domain: &str,
     req: &FedReachability,
 ) -> Result<FedReachable, FedErr> {
@@ -282,6 +282,12 @@ pub async fn handle_fed_reachability(
         return Err(FedErr {
             code: fed_error_codes::POLICY_DENIED.to_string(),
             msg: "federation is closed for this origin".to_string(),
+        });
+    }
+    if let Decision::Reject(_reason) = limits.check_reachability(origin_domain) {
+        return Err(FedErr {
+            code: fed_error_codes::RATE_LIMITED.to_string(),
+            msg: "too many federated reachability requests".to_string(),
         });
     }
     Ok(FedReachable {
@@ -386,6 +392,7 @@ pub async fn serve_link(mut link: FederationLink, state: Arc<AppState>) {
                 let result = handle_fed_reachability(
                     &state.registry,
                     &state.federation.policy,
+                    &state.federation.limits,
                     &origin_domain,
                     &req,
                 )

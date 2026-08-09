@@ -221,6 +221,23 @@ pub struct Federation {
     /// doc comment on that reading). See [`Federation::default`] for the chosen starting value and
     /// its reasoning.
     pub fed_per_origin_account_per_min: u32,
+    /// **`TODO: confirm`** (task 3.5 follow-up / review finding F4, blocking): per-origin-server
+    /// budget for `fed_reachability` requests (task 2.8), fixed one-minute window, keyed on
+    /// `origin_domain` ALONE — deliberately no per-account axis (`FedReachability` carries no
+    /// `from`/requester-account field to key one on; see
+    /// [`crate::federation::policy::FederationLimits::check_reachability`]'s doc comment). Added by
+    /// this follow-up, not the original task 3.5 fix: removing `fed_reachability`'s
+    /// `check_route` call stopped it double-spending the route budget, but also left it
+    /// completely unmetered — `FedOp::Reachability` is 2.8's own independent wire op, reachable by
+    /// any mTLS-admitted peer directly, not solely an internal implementation detail of
+    /// `route_foreign`'s liveness pre-check (a peer cannot be told apart from the wire frame
+    /// alone). This is genuine scope growth beyond the original task 3.5 file (which only named
+    /// "exempt reachability from rate limiting, or double the existing three defaults" as its two
+    /// sanctioned alternatives) — a fourth, independent limiter dimension was what review actually
+    /// required, so this field, like `handshake_timeout_ms`/`max_concurrent_handshakes`/`max_links`
+    /// above, is left `TODO: confirm` rather than presented as an already-settled number. See
+    /// [`Federation::default`] for the chosen starting value and its reasoning.
+    pub fed_reachability_per_origin_per_min: u32,
     /// **`TODO: confirm`** (task 3.2 / review finding F2+N5): how long `run_federation`'s accept
     /// loop gives one inbound connection to complete mTLS + `FedHello` (via
     /// [`crate::federation::link::with_deadline`]) before dropping it. Not grounded in any prior
@@ -341,7 +358,8 @@ impl Default for Federation {
             // bug, not an intended part of this reasoning) — so, until 3.5 fixed it, the true
             // achievable throughput for ordinary cross-org chat was roughly HALF of `600`/`30`
             // (~30 msg/min per account, ≈1 message per 2s), not the number this comment describes.
-            // As of 3.5, `fed_reachability` no longer spends any budget at all (see
+            // As of 3.5, `fed_reachability` no longer spends `route_per_origin`/
+            // `fed_per_origin_account_per_min` at all (see
             // `federation::inbound::handle_fed_reachability`'s doc comment), so `600` and `30` now
             // deliver the full throughput the paragraph above always intended — a real `fed_route`
             // costs exactly one unit of each, once. The three numbers themselves are UNCHANGED by
@@ -349,9 +367,43 @@ impl Default for Federation {
             // the two sanctioned alternatives and why the accounting fix, not doubling these
             // defaults, was chosen); they are simply, for the first time, honest about what they
             // actually meter.
+            //
+            // **Task 3.5 follow-up correction (review finding F4, blocking):** the paragraph above
+            // was, in turn, only half the fix — it stopped `fed_reachability` from double-spending
+            // `route_per_origin`/`fed_per_origin_account_per_min`, but the review that landed it
+            // found that made `FedOp::Reachability` (2.8's own independent wire op, directly
+            // reachable by any mTLS-admitted peer, not merely `route_foreign`'s internal
+            // implementation detail) completely UNMETERED — bounded only by task 3.2's *global*
+            // link-count caps, not anything per-peer. `fed_reachability_per_origin_per_min` below
+            // is the fix: a fourth, independent limiter dimension, so `fed_reachability` is metered
+            // again without reintroducing any coupling to `fed_route_per_origin_per_min` (see that
+            // field's own doc comment, and `federation::policy::FederationLimits::check_reachability`'s,
+            // for the full accounting).
             fed_fetch_per_origin_per_min: 300,
             fed_route_per_origin_per_min: 600,
             fed_per_origin_account_per_min: 30,
+            // `TODO: confirm` (task 3.5 follow-up, review finding F4, blocking): a fourth, newly
+            // added limiter dimension — not one of the three original numbers above, and not
+            // grounded in a prior design doc any more than `handshake_timeout_ms`/
+            // `max_concurrent_handshakes`/`max_links` below are. Reasoning, relative to the three
+            // existing defaults just above: `fed_reachability` requests are cheap (one in-memory
+            // `Registry::is_connected` lookup, no store I/O at all — contrast `fed_fetch_bundle`'s
+            // store lookup) and read-only, and legitimate use is bursty-but-light — either a real
+            // route's own internal liveness pre-check (one reachability probe per route attempt,
+            // so it scales with real route volume, not independently of it) or genuine
+            // presence-checking UX, neither of which needs anywhere near the volume a compromised
+            // peer running an unthrottled enumeration sweep would generate. That puts it in the
+            // same rough order of magnitude as `fed_fetch_per_origin_per_min` (300) rather than
+            // `fed_route_per_origin_per_min` (600, sized for the highest-volume ordinary traffic
+            // type) or the conservative, self-asserted-identity-scoped `fed_per_origin_account_per_min`
+            // (30, and in any case inapplicable here — this budget has no account axis at all).
+            // Picked equal to the fetch default (300) as a starting point: generous enough that a
+            // real route's own pre-check (bounded by, and always well under, the route budget
+            // above it) or a legitimate presence-check UI never trips it, conservative enough to
+            // meaningfully bound a single hostile-but-admitted peer's standalone reachability-probe
+            // sweep. Operators can raise it; picking too low is a false-closed rejection an
+            // operator notices, not a silent abuse hole.
+            fed_reachability_per_origin_per_min: 300,
             // `TODO: confirm` (task 3.2, review findings F2/N5): none of these three are grounded
             // in an existing design doc — picked here, conservatively, purely to stop one
             // silent/slow inbound s2s connection from wedging the whole federation listener. See
@@ -415,6 +467,7 @@ impl Federation {
             self.fed_fetch_per_origin_per_min,
             self.fed_route_per_origin_per_min,
             self.fed_per_origin_account_per_min,
+            self.fed_reachability_per_origin_per_min,
         )
     }
 
@@ -797,6 +850,10 @@ mod tests {
                     "MERIDIAN_RENDEZVOUS_FEDERATION__FED_PER_ORIGIN_ACCOUNT_PER_MIN",
                     "5",
                 ),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__FED_REACHABILITY_PER_ORIGIN_PER_MIN",
+                    "15",
+                ),
             ],
         );
         let file = write_toml("");
@@ -811,6 +868,19 @@ mod tests {
         assert_eq!(config.federation.fed_fetch_per_origin_per_min, 10);
         assert_eq!(config.federation.fed_route_per_origin_per_min, 20);
         assert_eq!(config.federation.fed_per_origin_account_per_min, 5);
+        assert_eq!(config.federation.fed_reachability_per_origin_per_min, 15);
+    }
+
+    /// Task 3.5 follow-up (review finding F4, blocking): `fed_reachability_per_origin_per_min` is a
+    /// newly added limiter dimension — pin its default value directly (not just via env-override
+    /// round-tripping above) so a future accidental edit to `Federation::default` is caught here.
+    #[test]
+    fn federation_reachability_limit_default_is_positive() {
+        let f = Federation::default();
+        assert_eq!(f.fed_reachability_per_origin_per_min, 300);
+
+        let config = Config::from_toml_str("").unwrap();
+        assert_eq!(config.federation.fed_reachability_per_origin_per_min, 300);
     }
 
     #[test]

@@ -199,7 +199,7 @@ async fn oversized_envelope_is_rejected_before_any_dial() {
 async fn bs_defense_in_depth_oversized_check_rejects_directly() {
     let registry = Registry::default();
     let policy = FederationPolicy::Open;
-    let limits = FederationLimits::new(300, 600, 30);
+    let limits = FederationLimits::new(300, 600, 30, 300);
     let req = FedRoute {
         to: [0x11u8; 32],
         from: [0x22u8; 32],

@@ -507,11 +507,12 @@ pub async fn route_foreign(
 /// design §3.4). The only caller in this task is [`route_foreign`]'s own internal pre-check
 /// (architect decision #3); nothing here makes this a new client-visible c2s trigger.
 ///
-/// **Task 3.5 (review finding F4):** the request this sends is answered, on B's side, by
-/// `federation::inbound::handle_fed_reachability`, which as of this task spends no
-/// `FederationLimits` budget at all — see that function's doc comment for the full accounting fix
-/// and the residual it accepts. Nothing on A's side changes: this call still costs exactly one
-/// wire round trip, same as before.
+/// **Task 3.5 + its review follow-up (review finding F4):** the request this sends is answered, on
+/// B's side, by `federation::inbound::handle_fed_reachability`, which spends its own dedicated
+/// `reachability_per_origin` budget — never `route_per_origin`/`per_origin_account` (the original
+/// double-spend this task closed), and never fully unmetered either (the review-finding gap the
+/// follow-up closed) — see that function's doc comment for the full accounting fix. Nothing on A's
+/// side changes: this call still costs exactly one wire round trip, same as before.
 pub async fn reachable_foreign(
     state: &AppState,
     hint_domain: &str,

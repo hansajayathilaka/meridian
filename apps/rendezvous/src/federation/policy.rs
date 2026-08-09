@@ -20,15 +20,35 @@
 //!   [2.7](../../../../docs/tasks/phase-2/2.7-federated-prekey-fetch.md) (prekey fetch) and
 //!   [2.8](../../../../docs/tasks/phase-2/2.8-federated-route-reachability.md) (route
 //!   reachability), which will call [`FederationLimits::check_fetch`]/
-//!   [`FederationLimits::check_route`] from their handler bodies. **Task 3.5 (review finding
-//!   F4):** `check_route` is now called from exactly ONE handler body,
-//!   `federation::inbound::handle_fed_route` — the real `fed_route` delivery path, keyed on
-//!   `req.from` alone. `handle_fed_reachability` (2.8's `fed_reachability` handler) deliberately
-//!   calls neither `check_fetch` nor `check_route` at all; see that function's own doc comment for
-//!   why (it used to call `check_route` too, which meant `route_foreign`'s internal reachability
-//!   pre-check and the real route it precedes both spent the same shared `route_per_origin`
-//!   budget for one logical message, and spent two DIFFERENT `per_origin_account` keys — halving
-//!   real cross-org route throughput against the documented per-minute numbers);
+//!   [`FederationLimits::check_route`]/[`FederationLimits::check_reachability`] from their handler
+//!   bodies. **Task 3.5 (review finding F4):** `check_route` is now called from exactly ONE handler
+//!   body, `federation::inbound::handle_fed_route` — the real `fed_route` delivery path, keyed on
+//!   `req.from` alone. `handle_fed_reachability` (2.8's `fed_reachability` handler) calls neither
+//!   `check_fetch` nor `check_route`; see that function's own doc comment for why (it used to call
+//!   `check_route` too, which meant `route_foreign`'s internal reachability pre-check and the real
+//!   route it precedes both spent the same shared `route_per_origin` budget for one logical
+//!   message, and spent two DIFFERENT `per_origin_account` keys — halving real cross-org route
+//!   throughput against the documented per-minute numbers).
+//!   **Task 3.5 follow-up (review finding F4, blocking):** simply removing `check_route` from
+//!   `handle_fed_reachability` stopped that double-spend, but also left `FedOp::Reachability` —
+//!   2.8's own independent wire op, not solely an internal implementation detail of
+//!   `route_foreign`'s pre-check (a peer cannot be told apart from the wire frame alone) —
+//!   completely unmetered, bounded only by task 3.2's *global*, not per-peer, link-count caps: a
+//!   real, distinct DoS/enumeration-probing surface (thousands of presence probes per minute
+//!   against arbitrary account IDs from one admitted-but-hostile peer), and one that made
+//!   `docs/architecture/system-design.md` §3.5 and `docs/api/wire-protocol.md` §4's claims that the
+//!   federation API rate-limits every query overclaim relative to the code. The fix, landed in this
+//!   follow-up: a FOURTH, separate [`RateLimiter`] dimension, `reachability_per_origin`, consulted
+//!   by [`FederationLimits::check_reachability`] — deliberately its own budget, not a reuse of
+//!   `route_per_origin` (that would reintroduce coupling reachability's budget to real route
+//!   throughput, the original bug's shape), and deliberately keyed on `origin_domain` ALONE, no
+//!   account axis: `FedReachability` (like `FedFetchBundle` — see
+//!   [`handle_fed_fetch`](crate::federation::inbound::handle_fed_fetch)'s doc comment on that same
+//!   "no requester-account field" wire shape) carries no `from`/requester-account field at all, so
+//!   there is nothing request-shaped to key a per-account budget on here (unlike `check_fetch`,
+//!   which has `req.target` to stand in for one). `handle_fed_reachability` now calls
+//!   [`FederationLimits::check_reachability`] before proceeding — see that function's own doc
+//!   comment for the corrected accounting;
 //! - decide what a rejected client is told — [`Decision`]/[`RejectReason`] carry enough internal
 //!   structure for [2.9](../../../../docs/tasks/phase-2/2.9-federation-error-copy.md) to build
 //!   client-visible error copy from later, but **nothing in this module renders that structure to
@@ -82,8 +102,10 @@
 //! ## Growth bound holds per `RateLimiter` instance (task 1.20 / review finding F21)
 //! [`FederationLimits`] adds a **third rate-limit key class** on top of the two `state::AppState`
 //! already has (IP-keyed `auth_limiter`; account-keyed `fetch_limiter`/`route_limiter`/
-//! `turn_limiter`) — three more `RateLimiter` instances (`fetch_per_origin`, `route_per_origin`,
-//! `per_origin_account`). Confirmed, not assumed: `RateLimiter`'s amortised-sweep growth bound
+//! `turn_limiter`) — now FOUR `RateLimiter` instances (`fetch_per_origin`, `route_per_origin`,
+//! `per_origin_account`, and, as of the 3.5 follow-up above, `reachability_per_origin`), all still
+//! the one "per origin server, and/or per origin account" key class, not a fourth *class* of key.
+//! Confirmed, not assumed: `RateLimiter`'s amortised-sweep growth bound
 //! (`src/ratelimit.rs`) is a property of **each instance**, not of any shared/global state —
 //! `Counters { map, last_sweep }` lives behind a `Mutex` field owned by that one `RateLimiter`
 //! struct, and nothing in `ratelimit.rs` is `static`/thread-local/otherwise shared across
@@ -95,8 +117,9 @@
 //! an attacker can still create one entry per distinct key they present, bounded here by the
 //! number of distinct `(domain, account)` claims a single connected federation peer chooses to
 //! assert (`per_origin_account`) and by the number of distinct domains actually enrolled in this
-//! server's federation policy (`fetch_per_origin`/`route_per_origin` — an unlisted domain never
-//! reaches `FederationLimits` at all, having already been rejected by [`FederationPolicy::admit`]).
+//! server's federation policy (`fetch_per_origin`/`route_per_origin`/`reachability_per_origin` — an
+//! unlisted domain never reaches `FederationLimits` at all, having already been rejected by
+//! [`FederationPolicy::admit`]).
 //!
 //! ## No logging in this module
 //! This decision layer adds no `tracing`/`println!`-style logging at all — mirroring how
@@ -216,10 +239,13 @@ pub enum RejectReason {
 }
 
 /// Which of the two independent budgets ([`FederationLimits`]'s Goal: "per origin server AND per
-/// origin account, not either alone") was exceeded.
+/// origin account, not either alone") was exceeded. [`FederationLimits::check_reachability`] always
+/// reports [`RateLimitScope::Origin`] — see that method's doc comment for why it has no account
+/// axis at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RateLimitScope {
-    /// The whole origin server's aggregate budget for this operation kind (fetch or route).
+    /// The whole origin server's aggregate budget for this operation kind (fetch, route, or
+    /// reachability).
     Origin,
     /// This specific `(origin_domain, origin_account)` pair's shared budget.
     OriginAccount,
@@ -230,21 +256,27 @@ pub enum RateLimitScope {
 // ---------------------------------------------------------------------------------------------
 
 /// The two rate-limit *dimensions* the Goal requires (per origin server; per origin account),
-/// realized as three [`RateLimiter`] instances: separate per-origin budgets for the two federated
-/// operation kinds — prekey fetch (2.7) and route reachability (2.8) — plus one budget shared by
-/// both kinds for a given `(origin_domain, origin_account)` pair. Matches
-/// `config::Federation`'s `fed_fetch_per_origin_per_min`/`fed_route_per_origin_per_min`/
-/// `fed_per_origin_account_per_min` field-for-field, one `RateLimiter` per field.
+/// realized as four [`RateLimiter`] instances: separate per-origin budgets for the three federated
+/// operation kinds — prekey fetch (2.7), route (2.8), and, as of the task 3.5 follow-up (review
+/// finding F4), reachability (2.8) — plus one budget shared by fetch and route (never
+/// reachability, which has no account axis at all — see [`check_reachability`](Self::check_reachability))
+/// for a given `(origin_domain, origin_account)` pair. Matches `config::Federation`'s
+/// `fed_fetch_per_origin_per_min`/`fed_route_per_origin_per_min`/`fed_per_origin_account_per_min`/
+/// `fed_reachability_per_origin_per_min` field-for-field, one `RateLimiter` per field.
 pub struct FederationLimits {
     fetch_per_origin: RateLimiter,
     route_per_origin: RateLimiter,
     per_origin_account: RateLimiter,
+    reachability_per_origin: RateLimiter,
 }
 
 /// Which federated operation kind a [`FederationLimits`] check is for. Determines which
 /// *per-origin* limiter is consulted; the per-origin-account limiter is shared by both kinds
 /// (mirrors `config::Federation::fed_per_origin_account_per_min` being a single field, not one per
-/// operation kind).
+/// operation kind). [`Operation::Reachability`] is deliberately absent from this enum:
+/// [`FederationLimits::check_reachability`] does not go through [`FederationLimits::check`] at all
+/// (no per-account axis to order against — see that method's doc comment), so it has no need of a
+/// variant here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Operation {
     Fetch,
@@ -252,18 +284,20 @@ enum Operation {
 }
 
 impl FederationLimits {
-    /// Build from the three per-minute limits (`config::Federation::to_limits` is the intended
+    /// Build from the four per-minute limits (`config::Federation::to_limits` is the intended
     /// caller — see that method's doc comment for why config assembly, not this module, owns the
     /// conversion from raw config fields).
     pub fn new(
         fetch_per_origin_per_min: u32,
         route_per_origin_per_min: u32,
         per_origin_account_per_min: u32,
+        reachability_per_origin_per_min: u32,
     ) -> Self {
         Self {
             fetch_per_origin: RateLimiter::per_minute(fetch_per_origin_per_min),
             route_per_origin: RateLimiter::per_minute(route_per_origin_per_min),
             per_origin_account: RateLimiter::per_minute(per_origin_account_per_min),
+            reachability_per_origin: RateLimiter::per_minute(reachability_per_origin_per_min),
         }
     }
 
@@ -278,12 +312,38 @@ impl FederationLimits {
     /// [`check_fetch`](Self::check_fetch). Despite the name (kept from 2.8, "route" is the
     /// operation kind this budget covers, not "route-or-reachability"), task 3.5 (review finding
     /// F4) made this the ONLY check spent per logical routed message: `handle_fed_route` is now
-    /// this method's sole caller — `handle_fed_reachability`'s internal-liveness-probe path spends
-    /// no budget at all (see that function's doc comment). One real `fed_route` request therefore
-    /// costs exactly one `route_per_origin` unit and one `per_origin_account` unit, keyed on
-    /// `origin_account` = the SENDER (`req.from`) — never doubled, never charged to the recipient.
+    /// this method's sole caller — `handle_fed_reachability` spends its own, separate
+    /// `reachability_per_origin` budget instead (see [`check_reachability`](Self::check_reachability)).
+    /// One real `fed_route` request therefore costs exactly one `route_per_origin` unit and one
+    /// `per_origin_account` unit, keyed on `origin_account` = the SENDER (`req.from`) — never
+    /// doubled, never charged to the recipient.
     pub fn check_route(&self, origin_domain: &str, origin_account: &[u8]) -> Decision {
         self.check(Operation::Route, origin_domain, origin_account)
+    }
+
+    /// Is a `fed_reachability` request (2.8) claimed by `origin_domain` within budget? Task 3.5
+    /// follow-up (review finding F4, blocking): a FOURTH, independent [`RateLimiter`] dimension,
+    /// deliberately NOT a reuse of `route_per_origin` (that would reintroduce coupling
+    /// reachability's budget to real route throughput — the shape of the original double-spend
+    /// bug this task's first fix closed) and deliberately keyed on `origin_domain` alone, with no
+    /// per-account check at all: `FedReachability` (federation-protocol-v1.md §2) carries no
+    /// `from`/requester-account field, unlike `FedRoute` (which has `from`) — mirrors how
+    /// [`check_fetch`](Self::check_fetch) reads `FedFetchBundle`'s identically-shaped absence of a
+    /// requester-account field (see `federation::inbound::handle_fed_fetch`'s doc comment), except
+    /// `check_fetch` has `req.target` available as a practical per-account stand-in and
+    /// `FedReachability` genuinely has nothing else request-shaped to key a second dimension on —
+    /// keying on `req.target` here would make this indistinguishable from a second, redundant
+    /// per-origin-account fetch-style budget rather than a real second dimension. Always reports
+    /// [`RateLimitScope::Origin`] on rejection, never `OriginAccount` — there is no account-scoped
+    /// counter here to have been the one that tripped.
+    pub fn check_reachability(&self, origin_domain: &str) -> Decision {
+        if !self
+            .reachability_per_origin
+            .check(origin_key(origin_domain).as_slice())
+        {
+            return Decision::Reject(RejectReason::RateLimited(RateLimitScope::Origin));
+        }
+        Decision::Admit
     }
 
     /// Per-account budget first, **then** the shared per-origin budget — deliberately not the other

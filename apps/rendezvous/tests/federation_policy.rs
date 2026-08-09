@@ -108,7 +108,7 @@ fn open_admits_any_domain() {
 #[test]
 fn exhausting_the_per_origin_budget_does_not_affect_a_different_origins_budget() {
     let limits = FederationLimits::new(
-        /* fetch */ 1, /* route */ 1, /* account */ 100,
+        /* fetch */ 1, /* route */ 1, /* account */ 100, /* reachability */ 100,
     );
 
     assert_eq!(limits.check_fetch("org-a.test", b"alice"), Decision::Admit);
@@ -125,6 +125,7 @@ fn exhausting_the_per_origin_budget_does_not_affect_a_different_origins_budget()
 fn exhausting_the_per_account_budget_does_not_exhaust_the_per_origin_budget() {
     let limits = FederationLimits::new(
         /* fetch */ 100, /* route */ 100, /* account */ 1,
+        /* reachability */ 100,
     );
 
     assert_eq!(limits.check_fetch("org-a.test", b"alice"), Decision::Admit);
@@ -143,6 +144,7 @@ fn exhausting_the_per_account_budget_does_not_exhaust_the_per_origin_budget() {
 fn exhausting_the_per_origin_budget_does_not_exhaust_any_accounts_budget() {
     let limits = FederationLimits::new(
         /* fetch */ 1, /* route */ 100, /* account */ 100,
+        /* reachability */ 100,
     );
 
     assert_eq!(limits.check_fetch("org-a.test", b"alice"), Decision::Admit);
@@ -160,7 +162,7 @@ fn exhausting_the_per_origin_budget_does_not_exhaust_any_accounts_budget() {
 #[test]
 fn fetch_and_route_per_origin_budgets_are_independent_operation_kinds() {
     let limits = FederationLimits::new(
-        /* fetch */ 1, /* route */ 1, /* account */ 100,
+        /* fetch */ 1, /* route */ 1, /* account */ 100, /* reachability */ 100,
     );
 
     assert_eq!(limits.check_fetch("org-a.test", b"alice"), Decision::Admit);
@@ -178,6 +180,7 @@ fn per_account_budget_is_shared_across_fetch_and_route_for_the_same_pair() {
     // budget is spent by either request kind against the same counter.
     let limits = FederationLimits::new(
         /* fetch */ 100, /* route */ 100, /* account */ 1,
+        /* reachability */ 100,
     );
 
     assert_eq!(limits.check_fetch("org-a.test", b"alice"), Decision::Admit);
@@ -193,6 +196,7 @@ fn different_origins_claiming_the_same_account_bytes_have_independent_budgets() 
     // different origins asserting the identical account byte string must not share a budget.
     let limits = FederationLimits::new(
         /* fetch */ 100, /* route */ 100, /* account */ 1,
+        /* reachability */ 100,
     );
 
     assert_eq!(
@@ -217,7 +221,7 @@ fn an_already_exhausted_accounts_retries_do_not_drain_the_shared_origin_budget()
     // still consume one of the origin's only 2 units even though both are rejected on account
     // grounds, leaving nothing for bob.
     let limits = FederationLimits::new(
-        /* fetch */ 2, /* route */ 100, /* account */ 1,
+        /* fetch */ 2, /* route */ 100, /* account */ 1, /* reachability */ 100,
     );
 
     assert_eq!(limits.check_fetch("org-a.test", b"alice"), Decision::Admit);
@@ -239,6 +243,83 @@ fn an_already_exhausted_accounts_retries_do_not_drain_the_shared_origin_budget()
         "bob must not be denied service by alice's already-rejected retries draining the shared \
          origin pool"
     );
+}
+
+// -- FederationLimits: reachability's own dedicated budget (task 3.5 follow-up, F4) --------------
+//
+// `check_reachability` is a FOURTH, independent dimension: keyed on `origin_domain` alone (no
+// account axis at all — `FedReachability` carries no requester-account field), and never sharing a
+// counter with `check_fetch`/`check_route`/the per-account budget.
+
+#[test]
+fn reachability_budget_admits_then_rejects_once_exhausted() {
+    let limits = FederationLimits::new(
+        /* fetch */ 100, /* route */ 100, /* account */ 100,
+        /* reachability */ 1,
+    );
+
+    assert_eq!(limits.check_reachability("org-a.test"), Decision::Admit);
+    assert_eq!(
+        limits.check_reachability("org-a.test"),
+        Decision::Reject(RejectReason::RateLimited(RateLimitScope::Origin)),
+        "a rejected reachability check must report the Origin scope — there is no account-scoped \
+         counter here to have tripped instead"
+    );
+}
+
+#[test]
+fn reachability_budget_is_independent_per_origin_domain() {
+    let limits = FederationLimits::new(
+        /* fetch */ 100, /* route */ 100, /* account */ 100,
+        /* reachability */ 1,
+    );
+
+    assert_eq!(limits.check_reachability("org-a.test"), Decision::Admit);
+    assert_eq!(
+        limits.check_reachability("org-a.test"),
+        Decision::Reject(RejectReason::RateLimited(RateLimitScope::Origin))
+    );
+    // A different origin domain has its own, untouched reachability budget.
+    assert_eq!(limits.check_reachability("org-b.test"), Decision::Admit);
+}
+
+#[test]
+fn reachability_budget_is_never_shared_with_fetch_route_or_the_account_budget() {
+    // Exhaust fetch, route, and the per-account budget for org-a.test/alice — none of that may
+    // touch the SEPARATE reachability budget, which must still have its own full budget available.
+    let limits = FederationLimits::new(
+        /* fetch */ 1, /* route */ 1, /* account */ 1, /* reachability */ 1,
+    );
+
+    assert_eq!(limits.check_fetch("org-a.test", b"alice"), Decision::Admit);
+    assert_eq!(
+        limits.check_fetch("org-a.test", b"alice"),
+        Decision::Reject(RejectReason::RateLimited(RateLimitScope::OriginAccount))
+    );
+    assert_eq!(limits.check_route("org-a.test", b"bob"), Decision::Admit);
+    assert_eq!(
+        limits.check_route("org-a.test", b"bob"),
+        Decision::Reject(RejectReason::RateLimited(RateLimitScope::OriginAccount))
+    );
+    // Reachability's own budget (1/min) has never been touched by any of the above.
+    assert_eq!(limits.check_reachability("org-a.test"), Decision::Admit);
+}
+
+#[test]
+fn exhausting_the_reachability_budget_does_not_affect_fetch_route_or_the_account_budget() {
+    let limits = FederationLimits::new(
+        /* fetch */ 100, /* route */ 100, /* account */ 100,
+        /* reachability */ 1,
+    );
+
+    assert_eq!(limits.check_reachability("org-a.test"), Decision::Admit);
+    assert_eq!(
+        limits.check_reachability("org-a.test"),
+        Decision::Reject(RejectReason::RateLimited(RateLimitScope::Origin))
+    );
+    // Fetch and route (and the shared account budget) are entirely unaffected.
+    assert_eq!(limits.check_fetch("org-a.test", b"alice"), Decision::Admit);
+    assert_eq!(limits.check_route("org-a.test", b"alice"), Decision::Admit);
 }
 
 // -- Rate-limit keys never reach a log line unhashed (task 1.20's LogId mechanism) --------------
