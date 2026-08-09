@@ -506,6 +506,12 @@ pub async fn route_foreign(
 /// device for `target` connected right now?" — per-request only, never a subscription (system
 /// design §3.4). The only caller in this task is [`route_foreign`]'s own internal pre-check
 /// (architect decision #3); nothing here makes this a new client-visible c2s trigger.
+///
+/// **Task 3.5 (review finding F4):** the request this sends is answered, on B's side, by
+/// `federation::inbound::handle_fed_reachability`, which as of this task spends no
+/// `FederationLimits` budget at all — see that function's doc comment for the full accounting fix
+/// and the residual it accepts. Nothing on A's side changes: this call still costs exactly one
+/// wire round trip, same as before.
 pub async fn reachable_foreign(
     state: &AppState,
     hint_domain: &str,

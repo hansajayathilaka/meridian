@@ -93,6 +93,15 @@ async fn stand_up(
 // this for FETCH. Nothing in this crate's existing suite drives the identical property for ROUTE
 // through the real wire path — this closes that gap, which is exactly what Feature 06's "abuse
 // tests: rate-limit enforcement" criterion asks for.
+//
+// **Task 3.5 (review finding F4) rewrite.** Before this task, `route_foreign` always ran an
+// internal `fed_reachability` pre-check that ALSO spent `route_per_origin`, so a target that was
+// simply offline (`not_connected`) still cost the origin budget a unit via that pre-check alone —
+// this test used to prove the budget tripped WITHOUT ever reaching a real `fed_route` delivery,
+// which was itself a symptom of the bug this task fixes (see `federation::inbound::
+// handle_fed_reachability`'s doc comment). As of 3.5, the pre-check spends no budget at all, so
+// this test now connects a real, reachable Bob and proves the origin budget is spent by, and only
+// by, actual routed DELIVERIES — the true post-fix behavior.
 
 #[tokio::test]
 async fn bs_federation_route_rate_limit_trips_through_the_real_path() {
@@ -100,40 +109,225 @@ async fn bs_federation_route_rate_limit_trips_through_the_real_path() {
 
     let alice = new_acct("org-a.test");
     let mut ac = alice.connect(&rig.a_c2s_url).await.unwrap();
+    let bob = new_acct("org-b.test");
+    let mut bc = bob.connect(&rig.b_c2s_url).await.unwrap();
 
-    // The per-origin-ACCOUNT limiter keys on the SENDER's account (`req.from` — Alice, constant
-    // across all three calls here, per `apps/rendezvous/src/federation/inbound.rs`), never the
-    // route's target, so varying the target below doesn't affect which limiter trips — it's set
-    // high enough (30/min) relative to the tight per-ORIGIN route budget (2/min) that the origin
-    // budget trips first regardless. None of these targets are connected at B, so each
-    // individually would be `not_connected`; what this test proves is that the THIRD one is
-    // `rate_limited` instead, i.e. the origin budget (not the account budget, and not a
-    // coincidental not-connected error) is what trips.
-    for i in 0..2u8 {
-        let target = [i; 32];
-        let err = ac
-            .route_with_hint(target, Some("org-b.test".to_string()), b"hi".to_vec())
+    // `fed_route_per_origin_per_min = 2`: the first two real, delivered messages must succeed —
+    // each one real `fed_route` costing exactly one unit of the origin budget (task 3.5's fix;
+    // before it, each would have cost two: one from the reachability pre-check, one from the real
+    // route). The per-origin-ACCOUNT limiter (keyed on Alice, the sender) is set far higher
+    // (30/min) so it never trips first.
+    for _ in 0..2u8 {
+        let delivered = ac
+            .route_with_hint(bob.pubkey, Some("org-b.test".to_string()), b"hi".to_vec())
             .await
-            .unwrap_err();
-        match err {
-            SignalError::Server(body) => assert_eq!(body.code, error_codes::NOT_CONNECTED),
-            other => panic!("expected not_connected (target simply isn't online), got {other:?}"),
-        }
+            .unwrap();
+        assert!(
+            delivered,
+            "bob is connected; every one of the first two routes must deliver"
+        );
+        bc.next_deliver().await.unwrap(); // drain, so B's socket buffer never backs up
     }
-    let third = [0xFFu8; 32];
+    // A third real route, once the 2/min origin budget is spent, must be rejected as
+    // `rate_limited` — not silently delivered, and not conflated with `not_connected` (bob is
+    // still connected the whole time).
     let err = ac
-        .route_with_hint(third, Some("org-b.test".to_string()), b"hi".to_vec())
+        .route_with_hint(bob.pubkey, Some("org-b.test".to_string()), b"hi".to_vec())
         .await
         .unwrap_err();
     match err {
         SignalError::Server(body) => assert_eq!(
             body.code,
             error_codes::RATE_LIMITED,
-            "once B's per-origin ROUTE budget (2/min) is spent, a third distinct-target route \
-             must be rejected as rate_limited, not not_connected"
+            "once B's per-origin ROUTE budget (2/min) is spent by two real deliveries, a third \
+             real route to the SAME still-connected target must be rejected as rate_limited"
         ),
         other => panic!("expected rate_limited, got {other:?}"),
     }
+}
+
+// -- task 3.5 deliverable 3: the fix actually restores documented throughput --------------------
+//
+// Three cells, each proving a distinct part of the Goal ("one federated message must cost one
+// route unit and one per-account unit, not two"):
+// - sustained ordinary chat, well under budget, never spuriously rate-limits;
+// - the CONFIGURED org-wide route budget is genuinely achievable one-for-one by real deliveries
+//   (not silently halved);
+// - per-account counters are truly per-ACCOUNT, not shared with a phantom RECIPIENT-keyed
+//   counter — the precise, corrected mechanism behind the account-axis half of the bug (see
+//   below).
+
+/// Ordinary sustained cross-org chat, well under every configured budget, must never spuriously
+/// rate-limit — the direct, practical restatement of this task's Goal.
+#[tokio::test]
+async fn sustained_cross_org_messages_under_budget_all_succeed() {
+    let rig = stand_up(FederationPolicyMode::Open, Vec::new(), 300, 600, 30, false).await;
+
+    let alice = new_acct("org-a.test");
+    let mut ac = alice.connect(&rig.a_c2s_url).await.unwrap();
+    let bob = new_acct("org-b.test");
+    let mut bc = bob.connect(&rig.b_c2s_url).await.unwrap();
+
+    // 10 messages: comfortably under BOTH the per-origin (600/min) and per-account (30/min)
+    // defaults, so nothing here should ever trip a limiter — before this task's fix, the ORIGIN
+    // budget alone would have silently been exhausted twice as fast (effectively ~300/min), and
+    // this cell would still have passed at N=10 (10 << 300) — the point is establishing the
+    // baseline "ordinary chat just works" cell the other two cells in this section build on.
+    const N: usize = 10;
+    for i in 0..N {
+        let delivered = ac
+            .route_with_hint(
+                bob.pubkey,
+                Some("org-b.test".to_string()),
+                format!("message {i}").into_bytes(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("message {i} of {N} must succeed under budget: {e:?}"));
+        assert!(delivered);
+        let msg = bc.next_deliver().await.unwrap();
+        assert_eq!(msg.blob.as_bytes(), format!("message {i}").as_bytes());
+    }
+}
+
+/// The CONFIGURED `fed_route_per_origin_per_min` budget must be achievable one-for-one by real
+/// deliveries — i.e. N configured units buy N real routed messages, not N/2. Uses a scaled-down
+/// limit (rather than the full default of 600) purely to keep this test fast; the property being
+/// proven — `RateLimiter::check`'s per-key counter increments once per call, so N calls exhaust
+/// exactly an N-unit budget — does not depend on which N is chosen, so this generalizes to the
+/// documented default without this test needing to spend 600 real wire round trips doing it.
+#[tokio::test]
+async fn documented_org_wide_route_throughput_is_achievable_one_for_one() {
+    // Route budget is the tight, scaled-down stand-in for the documented default; the account
+    // budget is set far above it so the ACCOUNT limiter can never be what's actually tested here.
+    // Kept modest (not the full 600 default): each successful `fed_route` pays a fixed
+    // `ROUTE_REPLY_GRACE` (500ms) latency tax by design (fire-and-forget on success — see that
+    // constant's doc comment), so this test's wall-clock cost scales linearly with ROUTE_BUDGET;
+    // 20 is enough to demonstrate the linear "N buys N" property without paying that tax 600
+    // times over in CI.
+    const ROUTE_BUDGET: u32 = 20;
+    let rig = stand_up(
+        FederationPolicyMode::Open,
+        Vec::new(),
+        300,
+        ROUTE_BUDGET,
+        1_000,
+        false,
+    )
+    .await;
+
+    let alice = new_acct("org-a.test");
+    let mut ac = alice.connect(&rig.a_c2s_url).await.unwrap();
+    let bob = new_acct("org-b.test");
+    let mut bc = bob.connect(&rig.b_c2s_url).await.unwrap();
+
+    // All ROUTE_BUDGET real messages must deliver: before this task's fix, only ROUTE_BUDGET / 2
+    // of these would have succeeded (the reachability pre-check preceding each route silently
+    // spent a second unit of this same shared budget).
+    for i in 0..ROUTE_BUDGET {
+        let delivered = ac
+            .route_with_hint(bob.pubkey, Some("org-b.test".to_string()), b"hi".to_vec())
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "message {i} of the full {ROUTE_BUDGET}-unit route budget must succeed — the \
+                     documented org-wide route throughput must be genuinely achievable one-for-one, \
+                     not silently halved: {e:?}"
+                )
+            });
+        assert!(delivered);
+        bc.next_deliver().await.unwrap();
+    }
+    // The very next one, having now genuinely exhausted the budget with ROUTE_BUDGET real
+    // deliveries (not ROUTE_BUDGET/2 deliveries plus ROUTE_BUDGET/2 phantom pre-check spends),
+    // must be rejected.
+    let err = ac
+        .route_with_hint(bob.pubkey, Some("org-b.test".to_string()), b"hi".to_vec())
+        .await
+        .unwrap_err();
+    match err {
+        SignalError::Server(body) => assert_eq!(body.code, error_codes::RATE_LIMITED),
+        other => panic!("expected rate_limited once the full budget is spent, got {other:?}"),
+    }
+}
+
+/// Direct regression test for the account-axis half of F4's double-spend, pinned to its actual
+/// mechanism (corrected from this task's initial description): the bug was never "each of the two
+/// parties in a conversation pays twice" — `handle_fed_route`'s own per-account check was always
+/// correctly keyed on the real sender (`req.from`) alone, so a single sender's own budget was
+/// never itself double-spent. The real bug was that `handle_fed_reachability`'s pre-check ALSO
+/// spent the shared `per_origin_account` `RateLimiter`, keyed on `req.target` — the RECIPIENT —
+/// so every real route's own liveness pre-check silently charged a budget shared by, and
+/// indistinguishable from, every OTHER sender addressing that same recipient. A popular/frequently
+/// -messaged recipient's inbound capacity from a given origin was therefore capped at
+/// `fed_per_origin_account_per_min` in aggregate, across ALL senders — not per sender, and not a
+/// budget any single sender's own usage controlled.
+///
+/// Proven directly: exhaust one sender's (alice1's) own per-account budget messaging bob, then
+/// prove a SECOND, previously-silent sender (alice2) — who has sent nothing at all — can still
+/// reach the SAME bob immediately afterward. Pre-fix, alice2's first-ever message would have been
+/// rejected too: alice1's 3 successful sends would have already driven bob's phantom
+/// `(origin_domain, bob)` counter to the same cap via their reachability pre-checks, so alice2's
+/// own pre-check would find that shared counter already exhausted before her own real per-account
+/// counter (never yet touched) was ever consulted.
+#[tokio::test]
+async fn per_account_counters_are_keyed_on_the_real_sender_not_a_shared_recipient_counter() {
+    const ACCOUNT_BUDGET: u32 = 3;
+    let rig = stand_up(
+        FederationPolicyMode::Open,
+        Vec::new(),
+        300,
+        300,
+        ACCOUNT_BUDGET,
+        false,
+    )
+    .await;
+
+    let alice1 = new_acct("org-a.test");
+    let mut ac1 = alice1.connect(&rig.a_c2s_url).await.unwrap();
+    let bob = new_acct("org-b.test");
+    let mut bc = bob.connect(&rig.b_c2s_url).await.unwrap();
+
+    // alice1 spends her own full per-account budget messaging bob.
+    for i in 0..ACCOUNT_BUDGET {
+        let delivered = ac1
+            .route_with_hint(bob.pubkey, Some("org-b.test".to_string()), b"hi".to_vec())
+            .await
+            .unwrap_or_else(|e| panic!("alice1's message {i} must succeed: {e:?}"));
+        assert!(delivered);
+        bc.next_deliver().await.unwrap();
+    }
+    // alice1's OWN next message correctly trips her OWN budget.
+    let err = ac1
+        .route_with_hint(bob.pubkey, Some("org-b.test".to_string()), b"hi".to_vec())
+        .await
+        .unwrap_err();
+    match err {
+        SignalError::Server(body) => assert_eq!(body.code, error_codes::RATE_LIMITED),
+        other => panic!("expected alice1 to be rate_limited on her own budget, got {other:?}"),
+    }
+
+    // alice2 — a wholly distinct account, who has never sent a single message — must still be
+    // able to reach bob right now. This is the actual regression test: a shared, recipient-keyed
+    // phantom counter (the pre-fix bug) would make this fail even though alice2's real per-account
+    // counter has never been touched.
+    let alice2 = new_acct("org-a.test");
+    let mut ac2 = alice2.connect(&rig.a_c2s_url).await.unwrap();
+    let delivered = ac2
+        .route_with_hint(
+            bob.pubkey,
+            Some("org-b.test".to_string()),
+            b"hi from alice2".to_vec(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "alice2 has never sent a message and must not be affected by alice1's usage or by \
+                 alice1's reachability pre-checks against the same recipient: {e:?}"
+            )
+        });
+    assert!(delivered);
+    let msg = bc.next_deliver().await.unwrap();
+    assert_eq!(msg.from, alice2.pubkey);
 }
 
 // -- allowlist rejection, specifically (not just `closed`) --------------------------------------

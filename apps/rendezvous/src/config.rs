@@ -191,17 +191,35 @@ pub struct Federation {
     /// match only, never substring/suffix — `evil-org-b.test` does not match an allowlisted
     /// `org-b.test`.
     pub allowlist: Vec<String>,
-    /// Per-origin-server budget for prekey-fetch requests (task 2.7), fixed one-minute window. See
-    /// [`Federation::default`] for the chosen starting value and its reasoning.
+    /// Per-origin-server budget for prekey-fetch requests (task 2.7), fixed one-minute window. One
+    /// `fed_fetch_bundle` request costs exactly one unit. See [`Federation::default`] for the
+    /// chosen starting value and its reasoning.
     pub fed_fetch_per_origin_per_min: u32,
-    /// Per-origin-server budget for route-reachability requests (task 2.8), fixed one-minute
-    /// window. See [`Federation::default`] for the chosen starting value and its reasoning.
+    /// Per-origin-server budget for real message-routing requests (task 2.8's `fed_route`), fixed
+    /// one-minute window. **True per-message cost (task 3.5 / review finding F4, fixed): one real
+    /// routed message costs exactly one unit of this budget.** Before this task it cost two —
+    /// `route_foreign`'s internal `fed_reachability` liveness pre-check and the `fed_route` it
+    /// precedes both spent this same budget, so ordinary cross-org chat throttled at roughly half
+    /// this value. As of 3.5, `fed_reachability` requests spend no budget at all (see
+    /// `federation::inbound::handle_fed_reachability`'s doc comment for the accounting fix and the
+    /// residual it accepts) — this field's name predates that split and covers `fed_route` alone,
+    /// despite the "per-origin" name not saying so explicitly. See [`Federation::default`] for the
+    /// chosen starting value and its reasoning.
     pub fed_route_per_origin_per_min: u32,
     /// Per-`(origin_domain, origin_account)` budget, shared across both fetch and route requests
     /// (task 2.6/2.7/2.8), fixed one-minute window. The `origin_account` half of this key is
     /// self-asserted by the partner server and not independently verifiable by us (ADR 0017) — see
     /// [`crate::federation::policy`]'s module doc for why that is accepted, not a gap this field
-    /// closes. See [`Federation::default`] for the chosen starting value and its reasoning.
+    /// closes. **True per-message cost on the route dimension (task 3.5, fixed):** one real routed
+    /// message costs exactly one unit, keyed on the SENDER's claimed account (`FedRoute::from`)
+    /// alone — never the recipient's, and never twice. Before this task it could cost the SAME
+    /// account a unit twice per round trip of a two-way conversation (once as `from` when they
+    /// sent, once as the reachability pre-check's `target` when the other side sent to them), and
+    /// always cost the recipient's account a unit it had no way to avoid, purely for being
+    /// addressed. On the fetch dimension this field is unchanged: one `fed_fetch_bundle` request
+    /// still costs one unit, keyed on `req.target` (see `federation::inbound::handle_fed_fetch`'s
+    /// doc comment on that reading). See [`Federation::default`] for the chosen starting value and
+    /// its reasoning.
     pub fed_per_origin_account_per_min: u32,
     /// **`TODO: confirm`** (task 3.2 / review finding F2+N5): how long `run_federation`'s accept
     /// loop gives one inbound connection to complete mTLS + `FedHello` (via
@@ -316,6 +334,21 @@ impl Default for Federation {
             //   more than a modest slice of its origin's own budget above.
             // Operators can raise all three; the failure mode of picking too low is a false-closed
             // rejection an operator notices and raises, not a silent abuse hole.
+            //
+            // **Task 3.5 correction (review finding F4):** the paragraph above was written when a
+            // real `fed_route`'s internal `fed_reachability` liveness pre-check ALSO spent
+            // `fed_route_per_origin_per_min` and `fed_per_origin_account_per_min` (a double-spend
+            // bug, not an intended part of this reasoning) — so, until 3.5 fixed it, the true
+            // achievable throughput for ordinary cross-org chat was roughly HALF of `600`/`30`
+            // (~30 msg/min per account, ≈1 message per 2s), not the number this comment describes.
+            // As of 3.5, `fed_reachability` no longer spends any budget at all (see
+            // `federation::inbound::handle_fed_reachability`'s doc comment), so `600` and `30` now
+            // deliver the full throughput the paragraph above always intended — a real `fed_route`
+            // costs exactly one unit of each, once. The three numbers themselves are UNCHANGED by
+            // 3.5 (this task fixed the accounting, not the values — see the task file's Scope for
+            // the two sanctioned alternatives and why the accounting fix, not doubling these
+            // defaults, was chosen); they are simply, for the first time, honest about what they
+            // actually meter.
             fed_fetch_per_origin_per_min: 300,
             fed_route_per_origin_per_min: 600,
             fed_per_origin_account_per_min: 30,

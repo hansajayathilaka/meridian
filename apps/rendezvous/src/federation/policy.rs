@@ -20,7 +20,15 @@
 //!   [2.7](../../../../docs/tasks/phase-2/2.7-federated-prekey-fetch.md) (prekey fetch) and
 //!   [2.8](../../../../docs/tasks/phase-2/2.8-federated-route-reachability.md) (route
 //!   reachability), which will call [`FederationLimits::check_fetch`]/
-//!   [`FederationLimits::check_route`] from their handler bodies;
+//!   [`FederationLimits::check_route`] from their handler bodies. **Task 3.5 (review finding
+//!   F4):** `check_route` is now called from exactly ONE handler body,
+//!   `federation::inbound::handle_fed_route` — the real `fed_route` delivery path, keyed on
+//!   `req.from` alone. `handle_fed_reachability` (2.8's `fed_reachability` handler) deliberately
+//!   calls neither `check_fetch` nor `check_route` at all; see that function's own doc comment for
+//!   why (it used to call `check_route` too, which meant `route_foreign`'s internal reachability
+//!   pre-check and the real route it precedes both spent the same shared `route_per_origin`
+//!   budget for one logical message, and spent two DIFFERENT `per_origin_account` keys — halving
+//!   real cross-org route throughput against the documented per-minute numbers);
 //! - decide what a rejected client is told — [`Decision`]/[`RejectReason`] carry enough internal
 //!   structure for [2.9](../../../../docs/tasks/phase-2/2.9-federation-error-copy.md) to build
 //!   client-visible error copy from later, but **nothing in this module renders that structure to
@@ -265,8 +273,15 @@ impl FederationLimits {
         self.check(Operation::Fetch, origin_domain, origin_account)
     }
 
-    /// Is a route-reachability request (2.8) from `origin_account`, claimed by `origin_domain`,
-    /// within budget? Same ordering guarantee as [`check_fetch`](Self::check_fetch).
+    /// Is a real message-routing request (2.8's `fed_route`, delivering an envelope) from
+    /// `origin_account`, claimed by `origin_domain`, within budget? Same ordering guarantee as
+    /// [`check_fetch`](Self::check_fetch). Despite the name (kept from 2.8, "route" is the
+    /// operation kind this budget covers, not "route-or-reachability"), task 3.5 (review finding
+    /// F4) made this the ONLY check spent per logical routed message: `handle_fed_route` is now
+    /// this method's sole caller — `handle_fed_reachability`'s internal-liveness-probe path spends
+    /// no budget at all (see that function's doc comment). One real `fed_route` request therefore
+    /// costs exactly one `route_per_origin` unit and one `per_origin_account` unit, keyed on
+    /// `origin_account` = the SENDER (`req.from`) — never doubled, never charged to the recipient.
     pub fn check_route(&self, origin_domain: &str, origin_account: &[u8]) -> Decision {
         self.check(Operation::Route, origin_domain, origin_account)
     }
