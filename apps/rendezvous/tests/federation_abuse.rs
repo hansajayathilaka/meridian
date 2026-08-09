@@ -223,6 +223,7 @@ fn org_b_federation(
         fed_fetch_per_origin_per_min,
         fed_route_per_origin_per_min,
         fed_per_origin_account_per_min,
+        ..Federation::default()
     }
 }
 

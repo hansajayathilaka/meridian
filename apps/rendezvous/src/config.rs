@@ -203,6 +203,25 @@ pub struct Federation {
     /// [`crate::federation::policy`]'s module doc for why that is accepted, not a gap this field
     /// closes. See [`Federation::default`] for the chosen starting value and its reasoning.
     pub fed_per_origin_account_per_min: u32,
+    /// **`TODO: confirm`** (task 3.2 / review finding F2+N5): how long `run_federation`'s accept
+    /// loop gives one inbound connection to complete mTLS + `FedHello` (via
+    /// [`crate::federation::link::with_deadline`]) before dropping it. Not grounded in any prior
+    /// design doc — proposed conservatively (generous relative to a real handshake over any
+    /// reasonable network, tight enough that a silent/hostile peer can't hold a handshake slot for
+    /// long) and left `TODO: confirm` rather than invented as settled. Must be `> 0` — see
+    /// [`Federation::validate`].
+    pub handshake_timeout_ms: u64,
+    /// **`TODO: confirm`** (task 3.2 / F2+N5): the pre-auth handshake-slot cap — how many inbound
+    /// connections may be mid mTLS+`FedHello` handshake at once before further connections are
+    /// dropped (see `federation::inbound::run_federation`'s doc comment for why this is a *separate*
+    /// semaphore from [`Federation::max_links`], not the same permit held across both phases). Same
+    /// "proposed, not grounded" status as `handshake_timeout_ms`. Must be `> 0`.
+    pub max_concurrent_handshakes: u32,
+    /// **`TODO: confirm`** (task 3.2 / F2+N5): the cap on total concurrently *established* (i.e.
+    /// past handshake, actively being [`crate::federation::inbound::serve_link`]'d) federation
+    /// links, across all partners. Same "proposed, not grounded" status as the two fields above.
+    /// Must be `> 0`.
+    pub max_links: u32,
 }
 
 /// Federation admission policy mode (task 2.6). See [`Federation::policy`]. Kept as its own
@@ -280,6 +299,28 @@ impl Default for Federation {
             fed_fetch_per_origin_per_min: 300,
             fed_route_per_origin_per_min: 600,
             fed_per_origin_account_per_min: 30,
+            // `TODO: confirm` (task 3.2, review findings F2/N5): none of these three are grounded
+            // in an existing design doc — picked here, conservatively, purely to stop one
+            // silent/slow inbound s2s connection from wedging the whole federation listener. See
+            // each field's own doc comment for what it bounds; do not treat these as settled
+            // without an explicit sign-off.
+            // - `handshake_timeout_ms = 10_000`: generous relative to any real mTLS+FedHello
+            //   round trip (well under a second on a healthy link) while still being short enough
+            //   that a hostile peer can't tie up a handshake slot for more than ~10s.
+            // - `max_concurrent_handshakes = 64`: bounds how many raw TCP connections may be
+            //   mid-handshake (mTLS not yet verified, `FedHello` not yet exchanged) at once —
+            //   well above the handshake concurrency a handful of legitimate partner orgs would
+            //   ever need at once (ADR 0002's 2-200 small-to-medium-org deployment shape), while
+            //   still capping the worst-case per-connection resource use (one task + one TLS
+            //   handshake buffer each) a single attacker opening many connections at once can
+            //   force.
+            // - `max_links = 256`: the ceiling on total simultaneously *established* links, set
+            //   above `max_concurrent_handshakes` (established links are cheap to hold open — one
+            //   idle task each — unlike an in-progress handshake) and, like the two above, an
+            //   operator-tunable ceiling rather than a throughput target.
+            handshake_timeout_ms: 10_000,
+            max_concurrent_handshakes: 64,
+            max_links: 256,
         }
     }
 }
@@ -418,6 +459,33 @@ impl Federation {
                  federation.discovery = \"static\" (federation_map.toml, which mandates a \
                  pinned_identity per partner) with a private CA, or clear ca_bundle_path to run \
                  SRV discovery in WebPKI mode."
+                    .to_string(),
+            );
+        }
+        // Task 3.2 (F2/N5): all three inbound-hardening knobs are `> 0`-or-bust — a `0` isn't
+        // "the strictest possible setting", it's a config that either wedges every inbound
+        // connection instantly (a 0ms handshake deadline) or admits none at all (a 0-permit
+        // semaphore), neither of which is a real operator intent. Reject both explicitly rather
+        // than let federation silently accept zero inbound connections forever, which an operator
+        // would have a hard time telling apart from "federation is broken."
+        if self.handshake_timeout_ms == 0 {
+            return Err(
+                "federation.handshake_timeout_ms must be greater than 0 (0 would time out every \
+                 inbound handshake instantly)"
+                    .to_string(),
+            );
+        }
+        if self.max_concurrent_handshakes == 0 {
+            return Err(
+                "federation.max_concurrent_handshakes must be greater than 0 (0 would admit no \
+                 inbound handshake at all)"
+                    .to_string(),
+            );
+        }
+        if self.max_links == 0 {
+            return Err(
+                "federation.max_links must be greater than 0 (0 would allow no established \
+                 federation link at all)"
                     .to_string(),
             );
         }
@@ -775,6 +843,89 @@ mod tests {
             .expect("static discovery with a private CA bundle must be accepted");
 
         assert_eq!(config.federation.ca_bundle_path, "/etc/meridian/fed-ca.pem");
+    }
+
+    // -- task 3.2: inbound-handshake-hardening config knobs -----------------------------------
+
+    #[test]
+    fn federation_handshake_defaults_are_positive_and_todo_confirm() {
+        // These three are explicitly `TODO: confirm` (task 3.2) — not grounded in a prior design
+        // doc — but they must still be well-formed (non-zero) out of the box.
+        let f = Federation::default();
+        assert_eq!(f.handshake_timeout_ms, 10_000);
+        assert_eq!(f.max_concurrent_handshakes, 64);
+        assert_eq!(f.max_links, 256);
+    }
+
+    #[test]
+    fn federation_handshake_env_overrides_apply() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__HANDSHAKE_TIMEOUT_MS",
+                    "2500",
+                ),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__MAX_CONCURRENT_HANDSHAKES",
+                    "8",
+                ),
+                ("MERIDIAN_RENDEZVOUS_FEDERATION__MAX_LINKS", "32"),
+            ],
+        );
+        let file = write_toml("");
+
+        let config = Config::load(Some(file.path().to_str().unwrap())).unwrap();
+
+        assert_eq!(config.federation.handshake_timeout_ms, 2500);
+        assert_eq!(config.federation.max_concurrent_handshakes, 8);
+        assert_eq!(config.federation.max_links, 32);
+    }
+
+    #[test]
+    fn federation_handshake_timeout_zero_is_rejected_fail_closed() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[federation]\nhandshake_timeout_ms = 0\n");
+
+        let err = Config::load(Some(file.path().to_str().unwrap()))
+            .expect_err("a 0ms handshake deadline must be rejected, not silently loaded");
+        assert!(err.to_string().contains("handshake_timeout_ms"));
+    }
+
+    #[test]
+    fn federation_max_concurrent_handshakes_zero_is_rejected_fail_closed() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[federation]\nmax_concurrent_handshakes = 0\n");
+
+        let err = Config::load(Some(file.path().to_str().unwrap()))
+            .expect_err("a 0-permit handshake semaphore must be rejected, not silently loaded");
+        assert!(err.to_string().contains("max_concurrent_handshakes"));
+    }
+
+    #[test]
+    fn federation_max_links_zero_is_rejected_fail_closed() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[federation]\nmax_links = 0\n");
+
+        let err = Config::load(Some(file.path().to_str().unwrap()))
+            .expect_err("a 0-permit link semaphore must be rejected, not silently loaded");
+        assert!(err.to_string().contains("max_links"));
+    }
+
+    #[test]
+    fn federation_handshake_env_overrides_reject_bad_int_fail_closed() {
+        // Mirrors `env_overrides_reject_bad_bool_fail_closed` above: a malformed env var must be a
+        // hard error, never a silent fallback to the default.
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[(
+                "MERIDIAN_RENDEZVOUS_FEDERATION__MAX_CONCURRENT_HANDSHAKES",
+                "not-a-number",
+            )],
+        );
+        let file = write_toml("");
+
+        assert!(Config::load(Some(file.path().to_str().unwrap())).is_err());
     }
 
     #[test]

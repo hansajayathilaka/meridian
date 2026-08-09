@@ -30,10 +30,12 @@
 //! this task's listener does is learn and report the peer's authenticated origin domain (SAN/CN of
 //! the validated client cert) so that later policy can act on it.
 
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use meridian_proto::{FedFrame, FedHello, FedOp, FED_VERSION};
 use rustls::pki_types::pem::PemObject;
@@ -51,6 +53,35 @@ use crate::metrics::Metrics;
 /// force an unbounded allocation merely by sending a large length prefix ahead of a short or absent
 /// body. Generous relative to any `FedHello`/`FedRoute`-sized body.
 pub const MAX_FRAME_LEN: usize = 1 << 20; // 1 MiB
+
+/// A deadline (`tokio::time::timeout`) elapsed before `fut` completed. Kept as its own tiny error
+/// type — not folded into [`LinkError`] — because [`with_deadline`] is generic over ANY future, not
+/// just link-establishment ones: task 3.3 (outbound s2s dial timeouts) wraps
+/// [`dial`]/connect-and-write futures in the exact same helper, and a caller composing `with_deadline`
+/// around some other future entirely (not a `Result<_, LinkError>`) still gets a meaningful error.
+#[derive(Debug, thiserror::Error)]
+#[error("operation did not complete within {0:?}")]
+pub struct DeadlineExceeded(pub Duration);
+
+/// Run `fut` to completion, or fail with [`DeadlineExceeded`] once `duration` elapses — a thin,
+/// consistently-typed wrapper around `tokio::time::timeout`.
+///
+/// Shared by both directions of s2s federation:
+/// - inbound (this task, 3.2): [`FederationListener`]'s accept loop wraps
+///   [`FederationListener::finish_handshake`] in `with_deadline(handshake_timeout, ...)` so one
+///   silent/slow peer's mTLS+`FedHello` handshake cannot wedge the whole listener (the raw
+///   `tcp.accept()` itself — [`FederationListener::accept_raw`] — stays outside any deadline: it is
+///   already bounded by the OS accept queue and must never be blocked on a peer's behavior at all).
+/// - outbound (task 3.3, not this task): the dial-out path reuses this same helper rather than
+///   hand-rolling its own `tokio::time::timeout` call with a different error shape.
+pub async fn with_deadline<F, T>(duration: Duration, fut: F) -> Result<T, DeadlineExceeded>
+where
+    F: Future<Output = T>,
+{
+    tokio::time::timeout(duration, fut)
+        .await
+        .map_err(|_elapsed| DeadlineExceeded(duration))
+}
 
 /// Errors establishing or operating an s2s federation link.
 #[derive(Debug, thiserror::Error)]
@@ -429,13 +460,33 @@ impl FederationListener {
         self.tcp.local_addr()
     }
 
-    /// Accept and fully establish one inbound federation link: TCP accept, mTLS handshake (client
-    /// certificate mandatory), origin-domain extraction from the validated client certificate's
-    /// SAN/CN, and the `FedHello` exchange.
-    pub async fn accept(&self) -> Result<(FederationLink, SocketAddr), LinkError> {
-        let (tcp, peer_addr) = self.tcp.accept().await?;
-        // A missing (or otherwise invalid) client certificate is rejected here: `accept` errors
-        // before returning a stream, because `build_server_tls_config` always installs a
+    /// Accept one raw TCP connection — nothing more. Deliberately the *only* work `run_federation`'s
+    /// accept loop (task 3.2) does inline: cheap, and bounded by the OS accept queue rather than by
+    /// anything a peer does after connecting. Everything that CAN block on a hostile/slow peer (the
+    /// mTLS handshake, the `FedHello` exchange) lives in [`Self::finish_handshake`] instead, which
+    /// callers spawn as their own task, typically under [`with_deadline`].
+    pub async fn accept_raw(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        self.tcp.accept().await
+    }
+
+    /// Finish establishing one inbound federation link from an already-`accept_raw`'d TCP stream:
+    /// mTLS handshake (client certificate mandatory), origin-domain extraction from the validated
+    /// client certificate's SAN/CN, and the `FedHello` exchange.
+    ///
+    /// Split out of [`Self::accept`] (task 3.2, F2/N5): this is the part of accepting a connection
+    /// that a hostile or merely slow peer can stall indefinitely (an mTLS handshake that never
+    /// sends a `ClientHello`, a `FedHello` whose length prefix never arrives), so callers that care
+    /// about one such peer never blocking every other inbound connection — i.e. `run_federation` —
+    /// spawn this per-connection and wrap it in [`with_deadline`], rather than `await`ing it inline
+    /// in the accept loop the way [`Self::accept`] still does for callers (tests, mostly) that don't
+    /// need that.
+    pub async fn finish_handshake(
+        &self,
+        tcp: TcpStream,
+        peer_addr: SocketAddr,
+    ) -> Result<(FederationLink, SocketAddr), LinkError> {
+        // A missing (or otherwise invalid) client certificate is rejected here: this errors before
+        // returning a stream, because `build_server_tls_config` always installs a
         // `WebPkiClientVerifier` (never `with_no_client_auth`) — mTLS is mandatory, ADR 0017 C7.
         let tls_stream = self.acceptor.accept(tcp).await?;
 
@@ -465,5 +516,15 @@ impl FederationListener {
             },
             peer_addr,
         ))
+    }
+
+    /// Accept and fully establish one inbound federation link in one call: [`Self::accept_raw`]
+    /// followed immediately by [`Self::finish_handshake`], with no deadline and no concurrency cap.
+    /// Kept for callers (chiefly tests, e.g. `tests/federation_mtls.rs`) that just want one link
+    /// end to end; `run_federation`'s hardened accept loop (task 3.2) calls the two halves
+    /// separately instead, so it is never blocked awaiting one peer's handshake.
+    pub async fn accept(&self) -> Result<(FederationLink, SocketAddr), LinkError> {
+        let (tcp, peer_addr) = self.accept_raw().await?;
+        self.finish_handshake(tcp, peer_addr).await
     }
 }

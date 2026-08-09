@@ -406,20 +406,165 @@ pub async fn bind_federation(state: &AppState) -> Result<FederationListener, Lin
     .await
 }
 
-/// Accept inbound federation links forever, spawning [`serve_link`] per accepted link. A single
-/// failed accept (a peer that dropped mid-handshake, a bad cert, ...) logs to stderr and continues
-/// — it must not take the whole listener down.
-pub async fn run_federation(listener: FederationListener, state: Arc<AppState>) {
-    loop {
-        match listener.accept().await {
-            Ok((link, _peer_addr)) => {
-                let st = state.clone();
-                tokio::spawn(async move { serve_link(link, st).await });
-            }
-            Err(e) => {
-                eprintln!("federation: rejected an inbound s2s connection attempt: {e}");
-            }
+/// Minimum interval between two "dropped for capacity" stderr lines, per [`DropRateLimiter`]
+/// instance (one per [`run_federation`] call — i.e. one per bound listener). Chosen to keep a
+/// sustained flood of over-capacity connection attempts from turning into a comparably-sized flood
+/// of log lines, while still surfacing the condition promptly and periodically (task 3.2 / F2-N5's
+/// "log a rate-limited stderr line" requirement). `TODO: confirm` alongside this task's three
+/// numeric config knobs — not grounded in an existing doc, just a conservative starting point.
+const DROP_LOG_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Coalesces repeated "connection dropped: no free permit" events into at most one stderr line per
+/// [`DROP_LOG_MIN_INTERVAL`], reporting how many were suppressed since the last line. Carries no
+/// peer-identifying state at all (no IP, no cert identity — those are never even looked at on this
+/// path, since the drop happens before or immediately after `accept_raw`, well before any identity
+/// is established) — only a timestamp and a count, so there is nothing raw-identifier-shaped for
+/// `tools/lint-no-raw-id-logging.sh` to ever have to catch here.
+struct DropRateLimiter {
+    state: std::sync::Mutex<(std::time::Instant, u64)>,
+}
+
+impl DropRateLimiter {
+    fn new() -> Self {
+        Self {
+            // Backdated by a full interval so the very first drop ever logs immediately, rather
+            // than needing to wait out one interval before its first line appears.
+            state: std::sync::Mutex::new((std::time::Instant::now() - DROP_LOG_MIN_INTERVAL, 0)),
         }
+    }
+
+    /// Record one dropped connection for `reason` (a static, non-identifying label — e.g.
+    /// `"handshake capacity"`); emit a coalesced stderr line at most once per
+    /// [`DROP_LOG_MIN_INTERVAL`].
+    ///
+    /// **Not** "log the first of every burst immediately, then coalesce the rest": that shape logs
+    /// once per burst rather than once per interval, and under a sustained flood (drops arriving
+    /// faster than they ever go quiet) degenerates back into one line per drop. Instead this is a
+    /// plain fixed-window coalescer keyed on wall-clock time alone: at most one line escapes per
+    /// [`DROP_LOG_MIN_INTERVAL`], and that line reports how many drops (including itself) happened
+    /// since the previous line — a real, constant upper bound on log volume regardless of how
+    /// bursty or sustained the drops are.
+    fn note_drop(&self, reason: &'static str) {
+        let mut guard = self.state.lock().unwrap();
+        let (last_logged, suppressed) = &mut *guard;
+        let now = std::time::Instant::now();
+        if now.duration_since(*last_logged) >= DROP_LOG_MIN_INTERVAL {
+            if *suppressed > 0 {
+                let total = *suppressed + 1;
+                eprintln!(
+                    "federation: dropped {total} inbound s2s connection(s) in the last \
+                     {DROP_LOG_MIN_INTERVAL:?} (rate-limited); most recent reason: {reason}"
+                );
+            } else {
+                eprintln!("federation: dropped an inbound s2s connection (rate-limited): {reason}");
+            }
+            *last_logged = now;
+            *suppressed = 0;
+        } else {
+            *suppressed += 1;
+        }
+    }
+}
+
+/// Accept inbound federation links forever, hardened against one silent/slow/hostile peer wedging
+/// every other partner's connection attempt (task 3.2, review findings F2 + N5).
+///
+/// The loop itself does only [`FederationListener::accept_raw`] — a bare TCP accept, bounded by the
+/// OS accept queue, never by anything a peer does after connecting — then hands each connection off
+/// to its own spawned task and immediately loops back for the next one. Per connection, that task:
+///
+/// 1. Tries to acquire a permit from the **handshake** semaphore
+///    (`federation.max_concurrent_handshakes`). If none is free, the raw connection is dropped
+///    immediately (no bytes are ever sent to it) and a rate-limited, identity-free line is logged
+///    (via [`DropRateLimiter`]) — this is the pre-auth admission control: an unbounded number of
+///    concurrent in-handshake connections is itself the resource-exhaustion surface this task
+///    closes.
+/// 2. Runs [`FederationListener::finish_handshake`] (mTLS + `FedHello`) under
+///    [`crate::federation::link::with_deadline`], bounded by `federation.handshake_timeout_ms`. The
+///    handshake permit is released as soon as this step finishes, one way or another (success,
+///    protocol/TLS error, or deadline).
+/// 3. On a successful handshake, tries to acquire a permit from the separate **link** semaphore
+///    (`federation.max_links`) — deliberately a second semaphore, not the same permit held since
+///    step 1: an in-progress handshake and an established, actively-served link have very different
+///    resource footprints and very different attacker-reachable-before-authentication status, so
+///    they get independently operator-tunable caps. Exhaustion here drops the (already
+///    TLS-authenticated) link the same way — rate-limited, identity-free log line, no reply frame.
+/// 4. Holds the link permit for exactly as long as [`serve_link`] runs, releasing it when the link
+///    closes.
+pub async fn run_federation(listener: FederationListener, state: Arc<AppState>) {
+    let listener = Arc::new(listener);
+    let handshake_timeout =
+        std::time::Duration::from_millis(state.config.federation.handshake_timeout_ms);
+    let handshake_slots = Arc::new(tokio::sync::Semaphore::new(
+        state.config.federation.max_concurrent_handshakes as usize,
+    ));
+    let link_slots = Arc::new(tokio::sync::Semaphore::new(
+        state.config.federation.max_links as usize,
+    ));
+    let drop_log = Arc::new(DropRateLimiter::new());
+
+    loop {
+        let (tcp, peer_addr) = match listener.accept_raw().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                // An OS-level accept failure (e.g. the process is out of file descriptors) —
+                // distinct from, and rarer than, a per-connection handshake failure below. Still
+                // must not take the loop down.
+                eprintln!("federation: accept() failed: {e}");
+                continue;
+            }
+        };
+
+        let Ok(handshake_permit) = handshake_slots.clone().try_acquire_owned() else {
+            // No free handshake slot: drop the raw connection outright (never even reaches the TLS
+            // acceptor) rather than queue it — queueing would just move the same unbounded-wait
+            // problem this task exists to close from "the accept loop blocks" to "an unbounded
+            // number of connections sit half-open waiting for a slot".
+            drop(tcp);
+            drop_log.note_drop("handshake capacity");
+            continue;
+        };
+
+        let listener = listener.clone();
+        let state = state.clone();
+        let link_slots = link_slots.clone();
+        let drop_log = drop_log.clone();
+
+        tokio::spawn(async move {
+            let handshake_result = crate::federation::link::with_deadline(
+                handshake_timeout,
+                listener.finish_handshake(tcp, peer_addr),
+            )
+            .await;
+            // Release the handshake slot the instant the handshake step is over, success or not —
+            // it must never be held for the link's full (potentially very long) subsequent
+            // lifetime, which is exactly what the separate link semaphore below is for.
+            drop(handshake_permit);
+
+            let (link, _peer_addr) = match handshake_result {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    eprintln!("federation: rejected an inbound s2s connection attempt: {e}");
+                    return;
+                }
+                Err(_deadline_exceeded) => {
+                    eprintln!(
+                        "federation: inbound s2s handshake exceeded its {handshake_timeout:?} \
+                         deadline; dropping the connection"
+                    );
+                    return;
+                }
+            };
+
+            let Ok(link_permit) = link_slots.try_acquire_owned() else {
+                drop_log.note_drop("established-link capacity");
+                drop(link); // closes the TLS connection (Drop on the underlying stream)
+                return;
+            };
+
+            serve_link(link, state).await;
+            drop(link_permit);
+        });
     }
 }
 
