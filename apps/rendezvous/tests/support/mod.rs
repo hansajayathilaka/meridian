@@ -228,8 +228,9 @@ impl Acct {
 /// Options for [`boot_federated_pair`]. Defaults reproduce the shape those files used before this
 /// harness existed: A's own outbound policy `open` (most of those files test B's behavior, not A's
 /// own outbound admission — that's `federation_outbound_policy.rs`'s job), B's per-origin rate
-/// limits at their `Federation::default()` values (300/600/30 per minute), no allowlist on either
-/// side.
+/// limits at their `Federation::default()` values (fetch/route/account/reachability =
+/// 300/600/30/600 per minute — reachability must stay `>=` route, task 3.5's throughput-coupling
+/// correction), no allowlist on either side.
 pub struct FederatedPairOpts {
     pub a_domain: String,
     pub b_domain: String,
@@ -262,7 +263,12 @@ impl Default for FederatedPairOpts {
             b_fed_fetch_per_origin_per_min: 300,
             b_fed_route_per_origin_per_min: 600,
             b_fed_per_origin_account_per_min: 30,
-            b_fed_reachability_per_origin_per_min: 300,
+            // Task 3.5 correction: must stay >= b_fed_route_per_origin_per_min — route_foreign's
+            // reachability pre-check spends one reachability unit per real routed message, so a
+            // reachability budget below route's would silently cap real throughput below the
+            // route budget (`Federation::validate`'s cross-field check enforces this in
+            // production; this test-only struct bypasses `validate`, so it must match by hand).
+            b_fed_reachability_per_origin_per_min: 600,
             b_allow_test_tamper: false,
             spawn_b_c2s: true,
         }
