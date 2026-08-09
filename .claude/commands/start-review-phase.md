@@ -11,7 +11,10 @@ contract. Optional scope override: **$ARGUMENTS** (defaults to all build work si
    - **security-reviewer** — anonymity-model "must never" list, key/opacity/logging/metrics invariants.
    - **architect** — ADR drift, dependency-graph and stream-registry contracts.
    - **test-engineer** — coverage gaps across the pyramid + adversarial harnesses.
-   Also collect **decisions made on the fly** during earlier build phases that were never recorded.
+   A phase-wide diff is large enough that dedicated single-lens agents each going deep is worth the
+   extra reads (unlike a single task's `/next-task` Reviews gate, which uses the combined `reviewer`
+   agent — see that skill section). Also collect **decisions made on the fly** during earlier build
+   phases that were never recorded.
 4. Write `docs/tasks/phase-N/review-report.md` from [TEMPLATE-review-report.md](../../docs/tasks/TEMPLATE-review-report.md): each finding with severity (blocking / should-fix / nit), file:line, and recommended fix; unratified decisions (architectural ones → `/adr`); coverage gaps; a verdict.
 5. Add the phase to the master tracker and set ▶ NEXT to `/plan-review-phase`.
 
