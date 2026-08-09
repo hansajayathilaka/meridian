@@ -33,6 +33,7 @@ use meridian_rendezvous::config::{DiscoveryMode, Federation, FederationPolicyMod
 use meridian_rendezvous::federation::inbound::handle_fed_route;
 use meridian_rendezvous::federation::{Discovery, DiscoveryError, Endpoint};
 use meridian_rendezvous::federation::{FederationLimits, FederationPolicy};
+use meridian_rendezvous::metrics::Metrics;
 use meridian_rendezvous::state::Registry;
 use meridian_rendezvous::{AppState, MemoryStore};
 use meridian_signaling::SignalError;
@@ -208,10 +209,12 @@ async fn bs_defense_in_depth_oversized_check_rejects_directly() {
         from: [0x22u8; 32],
         envelope: OpaqueBlob::new(vec![0x41u8; 2 * 1024 * 1024]),
     };
+    let metrics = Metrics::new();
     let err = handle_fed_route(
         &registry,
         &policy,
         &limits,
+        &metrics,
         &["org-a.test".to_string()],
         "org-a.test",
         &req,
@@ -684,4 +687,193 @@ async fn a_refusing_first_endpoint_falls_through_to_a_working_second() {
     assert!(delivered);
     let msg = bc.next_deliver().await.unwrap();
     assert_eq!(msg.blob.as_bytes(), b"failover works");
+}
+
+// -- task 3.8: federated deliveries count in envelopes_routed_total (F8 + N4) -------------------
+
+/// Minimal local mirror of `rendezvous.rs`'s own `http_get` — not shared through `tests/support`
+/// because it's the only file besides `rendezvous.rs` that needs a raw `/metrics` scrape (both
+/// `handle_fed_route`'s c2s router and the plain local one expose `/metrics` on the SAME axum
+/// router, task 2.8's federated-route tests just never previously had a reason to hit it).
+async fn http_get(host: &str, path: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = TcpStream::connect(host).await.unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Read the current value of one **unlabeled** Prometheus sample line (`<name> <value>`, e.g.
+/// `meridian_envelopes_routed_total 3`) out of a rendered `/metrics` body. Panics if the family
+/// isn't rendered at all, or if it turns up carrying a label block (`name{...}`) — this metric must
+/// never grow one (see this section's second test).
+fn metric_value(body: &str, name: &str) -> i64 {
+    let rendered_body = body.split_once("\r\n\r\n").map_or(body, |(_, b)| b);
+    for line in rendered_body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(name) {
+            let rest = rest.trim();
+            assert!(
+                !rest.starts_with('{'),
+                "{name} must never be exported with a label block (found: {line})"
+            );
+            return rest
+                .parse()
+                .unwrap_or_else(|_| panic!("failed to parse metric value from line: {line}"));
+        }
+    }
+    panic!("metric family {name} not found in body:\n{body}");
+}
+
+/// Task 3.8 (F8): a federated delivery — the inbound `fed_route` path, `handle_fed_route` — must
+/// increment `meridian_envelopes_routed_total` exactly once per successfully-delivered message,
+/// mirroring `ws::deliver_one`'s identical accounting for the local (same-server) path. Before this
+/// task's fix, `handle_fed_route` discarded `Registry::send_to`'s return value outright and never
+/// touched the metric at all, so every federated delivery — the entire point of Phase 2 — was
+/// invisible to ops dashboards reading this counter. Two sequential deliveries (not just one) prove
+/// this is a genuine per-delivery increment, not a one-shot fixup that only fires once.
+#[tokio::test]
+async fn federated_delivery_increments_envelopes_routed_total_exactly_once_per_message() {
+    let rig = stand_up(FederationPolicyMode::Open).await;
+    let host = rig
+        .b_c2s_url
+        .strip_prefix("ws://")
+        .expect("spawn_c2s always returns a ws:// URL")
+        .to_string();
+
+    let alice = new_acct("org-a.test");
+    let mut ac = alice.connect(&rig.a_c2s_url).await.unwrap();
+    let bob = new_acct("org-b.test");
+    let mut bc = bob.connect(&rig.b_c2s_url).await.unwrap();
+
+    let before = metric_value(
+        &http_get(&host, "/metrics").await,
+        "meridian_envelopes_routed_total",
+    );
+
+    let delivered = ac
+        .route_with_hint(bob.pubkey, Some("org-b.test".to_string()), b"one".to_vec())
+        .await
+        .unwrap();
+    assert!(delivered, "bob is connected; the route must deliver");
+    bc.next_deliver().await.unwrap();
+
+    let after_one = metric_value(
+        &http_get(&host, "/metrics").await,
+        "meridian_envelopes_routed_total",
+    );
+    assert_eq!(
+        after_one,
+        before + 1,
+        "one federated delivery must increment the counter by exactly one"
+    );
+
+    let delivered2 = ac
+        .route_with_hint(bob.pubkey, Some("org-b.test".to_string()), b"two".to_vec())
+        .await
+        .unwrap();
+    assert!(
+        delivered2,
+        "bob is still connected; the second route must deliver too"
+    );
+    bc.next_deliver().await.unwrap();
+
+    let after_two = metric_value(
+        &http_get(&host, "/metrics").await,
+        "meridian_envelopes_routed_total",
+    );
+    assert_eq!(
+        after_two,
+        before + 2,
+        "a second federated delivery must increment the counter by exactly one more — proving \
+         this is a real per-delivery increment, not a one-shot fixup"
+    );
+}
+
+/// Task 3.8 (Scope's hard "Out" constraint): a federated delivery must introduce no new metric
+/// name and no new label — in particular, no `peer_domain`/per-partner label, which would
+/// materialize the cross-org contact graph this server talks to (anonymity-and-retention.md
+/// must-never #2; 2.4 already settled the identical question the same way for
+/// `meridian_federation_link_up`). Mirrors `rendezvous.rs`'s own
+/// `metrics_endpoint_exposes_allowlisted_names` allowlist-diff pattern (exhaustiveness: every
+/// family actually rendered must be on `tools/metrics-allowlist.txt`), scraped from a real HTTP GET
+/// after a real federated delivery — not merely inferred from source code.
+#[tokio::test]
+async fn federated_delivery_introduces_no_new_metric_name_or_label() {
+    let rig = stand_up(FederationPolicyMode::Open).await;
+    let host = rig
+        .b_c2s_url
+        .strip_prefix("ws://")
+        .expect("spawn_c2s always returns a ws:// URL")
+        .to_string();
+
+    let alice = new_acct("org-a.test");
+    let mut ac = alice.connect(&rig.a_c2s_url).await.unwrap();
+    let bob = new_acct("org-b.test");
+    let mut bc = bob.connect(&rig.b_c2s_url).await.unwrap();
+
+    let delivered = ac
+        .route_with_hint(
+            bob.pubkey,
+            Some("org-b.test".to_string()),
+            b"metrics-allowlist check".to_vec(),
+        )
+        .await
+        .unwrap();
+    assert!(delivered);
+    bc.next_deliver().await.unwrap();
+
+    let body = http_get(&host, "/metrics").await;
+
+    let allowlist_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tools/metrics-allowlist.txt"
+    );
+    let allowlist_text =
+        std::fs::read_to_string(allowlist_path).expect("read tools/metrics-allowlist.txt");
+    let allowlist: std::collections::HashSet<String> = allowlist_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+
+    let rendered_body = body
+        .split_once("\r\n\r\n")
+        .map_or(body.as_str(), |(_, b)| b);
+    let mut rendered = std::collections::HashSet::new();
+    let mut saw_labeled_envelopes_routed = false;
+    for line in rendered_body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let name_and_labels = line.split_whitespace().next().unwrap_or("");
+        if name_and_labels.starts_with("meridian_envelopes_routed_total{") {
+            saw_labeled_envelopes_routed = true;
+        }
+        let name = name_and_labels.split('{').next().unwrap_or(name_and_labels);
+        rendered.insert(name.to_string());
+    }
+
+    assert!(
+        !saw_labeled_envelopes_routed,
+        "meridian_envelopes_routed_total must never carry a label (e.g. peer_domain) — that would \
+         materialize the cross-org contact graph"
+    );
+
+    let leaked: Vec<&String> = rendered.difference(&allowlist).collect();
+    assert!(
+        leaked.is_empty(),
+        "metric families rendered but not in tools/metrics-allowlist.txt: {leaked:?}\nfull body:\n{body}"
+    );
+    assert!(
+        rendered.contains("meridian_envelopes_routed_total"),
+        "the counter this task fixes must actually be rendered"
+    );
 }

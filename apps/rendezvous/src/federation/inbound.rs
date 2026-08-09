@@ -65,6 +65,7 @@ use meridian_proto::{
 use crate::federation::link::{LinkError, MAX_FRAME_LEN};
 use crate::federation::policy::{Decision, FederationLimits, FederationPolicy};
 use crate::federation::{FederationLink, FederationListener};
+use crate::metrics::Metrics;
 use crate::state::{AppState, Registry};
 use crate::store::Store;
 
@@ -175,18 +176,34 @@ pub async fn handle_fed_fetch(
 /// **Fire-and-forget on success** (federation-protocol-v1.md §2): this function's `Ok(())` means
 /// [`serve_link`] sends NO reply frame at all — not even one signalling that the local recipient
 /// was actually connected. `Registry::send_to`'s own return value (`bool`, whether it found a live
-/// connection and enqueued onto it) is deliberately discarded below, not just in the disconnect-race
-/// sense: this also silently swallows an outbound-side delivery failure at B (e.g. a full mpsc
-/// channel to a slow client) exactly as it swallows a target that disconnected between
-/// `route_foreign`'s `reachable_foreign` pre-check (architect decision #3) and this call. Neither
-/// path is reported back across the federation boundary — `route_foreign`'s pre-check is what a
-/// caller relies on for target liveness, not this call's outcome. Both are the same accepted
-/// residual, not a new error this function invents a code for: see this task's "Out: offline
-/// queuing" scope boundary (a defined error at fed_route time, never a queue).
+/// connection and enqueued onto it) is never surfaced back across the federation boundary — not
+/// just in the disconnect-race sense: this also silently swallows an outbound-side delivery
+/// failure at B (e.g. a full mpsc channel to a slow client) exactly as it swallows a target that
+/// disconnected between `route_foreign`'s `reachable_foreign` pre-check (architect decision #3)
+/// and this call. Neither path is reported back to the calling peer — `route_foreign`'s pre-check
+/// is what a caller relies on for target liveness, not this call's outcome. Both are the same
+/// accepted residual, not a new error this function invents a code for: see this task's "Out:
+/// offline queuing" scope boundary (a defined error at fed_route time, never a queue).
+///
+/// **Task 3.8 (review findings F8 + N4).** Two fixes, both local to this function:
+///
+/// 1. **F8**: `Registry::send_to`'s `bool` IS now read (just never relayed to the peer, per the
+///    fire-and-forget note above) so that a successful federated delivery increments
+///    [`Metrics::envelope_routed`] exactly like the local (same-server) path already does in
+///    `ws::deliver_one` — before this fix, every delivery that crossed the federation boundary was
+///    invisible to `meridian_envelopes_routed_total`, silently under-counting exactly the traffic
+///    Phase 2 added. No new metric, no new label: this calls the same existing, unparameterized
+///    counter local routes already use — in particular, deliberately no `peer_domain`/origin label
+///    (that would materialize the cross-org contact graph; anonymity-and-retention.md must-never
+///    #2, already settled the same way for `meridian_federation_link_up` in task 2.4).
+/// 2. **N4**: the oversized check below now measures `req.envelope`'s own byte length directly
+///    instead of re-encoding the whole [`FedFrame`] just to measure it — see that check's own doc
+///    comment for the approximation this introduces.
 pub async fn handle_fed_route(
     registry: &Registry,
     policy: &FederationPolicy,
     limits: &FederationLimits,
+    metrics: &Metrics,
     origin_domains: &[String],
     metering_key: &str,
     req: &FedRoute,
@@ -208,18 +225,23 @@ pub async fn handle_fed_route(
     // ever decoded into a `FedRoute` at all, so this branch is structurally unreachable via that
     // path today — it exists for a non-compliant peer (or a caller that built `req` some other
     // way, e.g. a direct unit test) rather than the wire itself.
-    let out = FedFrame::new(FedOp::Route, 0, req).map_err(|_| FedErr {
-        code: fed_error_codes::BAD_REQUEST.to_string(),
-        msg: "malformed fed_route body".to_string(),
-    })?;
-    let encoded_len = out
-        .to_bytes()
-        .map_err(|_| FedErr {
-            code: fed_error_codes::BAD_REQUEST.to_string(),
-            msg: "malformed fed_route body".to_string(),
-        })?
-        .len();
-    if encoded_len > MAX_FRAME_LEN {
+    //
+    // Task 3.8 (N4): this used to build a full `FedFrame`, CBOR-encode it, and measure THAT — a
+    // full re-encode of the entire frame (re-serializing `req.to`/`req.from`/`req.envelope` all
+    // over again) just to measure a length dominated by `req.envelope`'s own size. Measuring
+    // `req.envelope`'s byte length directly is cheaper and avoids the re-encode entirely.
+    //
+    // This is NOT byte-identical to the old `encoded_len`: the old value also counted the fixed
+    // `to`/`from` fields (32 bytes each) plus CBOR framing/tag overhead for the whole `FedRoute`
+    // struct, so this check is a strictly more permissive approximation — it can let through a
+    // request whose real encoded size is up to roughly that fixed overhead (well under 1 KiB) over
+    // `MAX_FRAME_LEN`, when `req.envelope`'s own length alone sits just at the boundary. That slack
+    // is acceptable here specifically because this check is explicitly defense-in-depth, not the
+    // load-bearing size cap — `link::read_frame`'s own `MAX_FRAME_LEN` check on the real wire path
+    // already rejects an oversized frame before it is ever decoded into a `FedRoute` at all (see
+    // above); this check only ever fires for a non-compliant peer or a caller that built `req`
+    // some other way.
+    if req.envelope.as_bytes().len() > MAX_FRAME_LEN {
         return Err(FedErr {
             code: fed_error_codes::BAD_REQUEST.to_string(),
             msg: "envelope too large to route".to_string(),
@@ -236,9 +258,14 @@ pub async fn handle_fed_route(
             code: fed_error_codes::BAD_REQUEST.to_string(),
             msg: "encode failed".to_string(),
         })?;
-    // Result intentionally discarded (see doc comment above): whether the target was connected is
-    // not reported back across the federation boundary.
-    let _ = registry.send_to(&req.to, Message::Binary(bytes));
+    // Task 3.8 (F8): mirrors `ws::deliver_one`'s identical local-route logic — count a federated
+    // delivery in `envelopes_routed_total` exactly when `Registry::send_to` actually found a live
+    // connection and enqueued onto it. Whether the target was connected is still never reported
+    // back across the federation boundary (see doc comment above) — this only affects the local
+    // metric, not the wire reply (there is none, on either branch).
+    if registry.send_to(&req.to, Message::Binary(bytes)) {
+        metrics.envelope_routed();
+    }
     Ok(())
 }
 
@@ -379,6 +406,7 @@ pub async fn serve_link(mut link: FederationLink, state: Arc<AppState>) {
                     &state.registry,
                     &state.federation.policy,
                     &state.federation.limits,
+                    &state.metrics,
                     &origin_domains,
                     &metering_key,
                     &req,
