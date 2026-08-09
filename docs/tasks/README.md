@@ -16,15 +16,18 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 3, Waves 1–2 are done.** **3.1**–**3.4** all landed
+- **NOW:** **Phase 3, Waves 1–2 done; Wave 3 in progress.** **3.1**–**3.5** all landed
   ([3.1](./phase-3/3.1-outbound-federation-policy.md), [3.2](./phase-3/3.2-inbound-accept-loop-hardening.md),
-  [3.3](./phase-3/3.3-outbound-s2s-timeouts.md), [3.4](./phase-3/3.4-federation-test-support-harness.md)).
-  3.4 (shared s2s test harness, F18): a pure refactor across 11 test files, confirmed byte-identical
-  assertions/config-defaults before vs. after by both review lenses; 4 should-fix hygiene findings
-  (dead code, stale doc comments, a spec/implementation API-shape divergence) closed in the same task
-  — see 3.4's Outcome. Phases 0–2 are **done**.
-- **NEXT:** `/next-task` — Wave 3's **3.5** (fed ratelimit double-spend, F4), then **3.6**/**3.7**/
-  **3.8**/**3.9** in the phase README's dependency order — all now build on 3.4's shared harness.
+  [3.3](./phase-3/3.3-outbound-s2s-timeouts.md), [3.4](./phase-3/3.4-federation-test-support-harness.md),
+  [3.5](./phase-3/3.5-fed-ratelimit-double-spend.md)). 3.5 (fed ratelimit double-spend, F4) took three
+  review rounds: round 1 found the double-spend fix correct; round 2 blocked the exemption as
+  originally shipped (made `FedOp::Reachability` fully unmetered, a real enumeration/DoS surface) and
+  required a dedicated `reachability_per_origin` limiter instead; round 3 caught that dimension's own
+  default (300, below route's 600) recoupling reachability to route throughput via the mandatory
+  1:1 pre-check — fixed by raising the default to 600 and adding fail-closed cross-field validation.
+  See 3.5's Outcome for the full trail. Phases 0–2 are **done**.
+- **NEXT:** `/next-task` — Wave 3's **3.6** (multi-SAN peer identity, F9), then **3.7**/**3.8**/**3.9**
+  in the phase README's dependency order — all build on 3.4's shared harness.
 
 ### Live carry-forwards (not owned by any open task)
 Everything else is owned by a Phase-3 task; these are the exceptions that would otherwise evaporate:
@@ -163,7 +166,7 @@ phase.
 - [x] **3.4** Extract the shared s2s test harness (PKI + server boot) (F18) — [file](./phase-3/3.4-federation-test-support-harness.md)
 
 **Wave 3 — federation server**
-- [~] **3.5** Stop the reachability pre-check double-spending route budgets (F4) — [file](./phase-3/3.5-fed-ratelimit-double-spend.md)
+- [x] **3.5** Stop the reachability pre-check double-spending route budgets (F4) — [file](./phase-3/3.5-fed-ratelimit-double-spend.md)
 - [ ] **3.6** Accept-side peer identity must consider all authenticated SANs (F9) — [file](./phase-3/3.6-multi-san-peer-identity.md)
 - [ ] **3.7** Reuse TLS config + one link per federated message, SRV failover (F10+N2) — [file](./phase-3/3.7-federation-link-reuse.md)
 - [ ] **3.8** Count federated deliveries in `envelopes_routed_total` (F8+N4) — [file](./phase-3/3.8-fed-delivery-metrics.md)
