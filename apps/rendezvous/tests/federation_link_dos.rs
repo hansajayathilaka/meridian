@@ -148,7 +148,7 @@ async fn silent_connection_does_not_wedge_the_listener_for_a_legitimate_dial() {
     let link = dial_result
         .expect("a legitimate dial must complete promptly, not hang behind the silent connection")
         .expect("the legitimate dial itself must succeed (valid cert, matching domain)");
-    assert_eq!(link.peer_domain, "b.federation.test");
+    assert_eq!(link.peer_domains, vec!["b.federation.test".to_string()]);
 }
 
 // -- (b) stalled mid-length-prefix is dropped by the handshake timeout ----------------------
@@ -310,7 +310,7 @@ async fn exhausting_max_concurrent_handshakes_drops_the_next_connection_promptly
         "the listener must go on to serve a legitimate connection once handshake slots free up, \
          not stay wedged by the stalling connections that exhausted max_concurrent_handshakes",
     );
-    assert_eq!(link.peer_domain, "b.federation.test");
+    assert_eq!(link.peer_domains, vec!["b.federation.test".to_string()]);
 
     // The stalling connections stay in scope (and thus open) for the whole test — drop them
     // explicitly at the end so the intent is clear rather than left to an implicit end-of-fn drop.

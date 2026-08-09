@@ -72,17 +72,36 @@ impl TestCa {
     /// every caller in this crate mints at most one identity per domain per directory, so this
     /// never collides.
     pub fn issue(&self, dir: &Path, domain: &str) -> Identity {
-        let mut params =
-            CertificateParams::new(vec![domain.to_string()]).expect("SAN must be a valid DNS name");
-        params.distinguished_name.push(DnType::CommonName, domain);
+        self.issue_multi_san(dir, domain, &[domain])
+    }
+
+    /// Mint a leaf cert with MULTIPLE SAN `dNSName` entries (`domains`, in the given order —
+    /// callers that care about SAN order, e.g. task 3.6's reordering fixtures, control it here),
+    /// signed by this CA, writing cert/key/CA-bundle PEMs under `dir` tagged with `tag` (kept
+    /// separate from `domains` since a multi-SAN cert has no one obvious domain to name files
+    /// after, and two certs with the same SAN VALUES in a different order — task 3.6's
+    /// SAN-reordering-across-renewal fixture — still need distinct filenames). The first entry in
+    /// `domains` is also used as the subject CN, mirroring [`Self::issue`]. Task 3.6 (review
+    /// finding F9): the shared multi-SAN fixture every test in this crate that needs one should
+    /// use, rather than hand-rolling `rcgen::CertificateParams` locally.
+    pub fn issue_multi_san(&self, dir: &Path, tag: &str, domains: &[&str]) -> Identity {
+        assert!(
+            !domains.is_empty(),
+            "issue_multi_san requires at least one SAN"
+        );
+        let dns: Vec<String> = domains.iter().map(|d| d.to_string()).collect();
+        let mut params = CertificateParams::new(dns).expect("SANs must be valid DNS names");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, domains[0]);
         let key = KeyPair::generate().expect("generate leaf key");
         let leaf_cert = params
             .signed_by(&key, &self.cert, &self.key)
             .expect("sign leaf cert");
         Identity {
-            cert_path: write(dir, &format!("{domain}.crt.pem"), &leaf_cert.pem()),
-            key_path: write(dir, &format!("{domain}.key.pem"), &key.serialize_pem()),
-            ca_bundle_path: write(dir, &format!("{domain}.ca.pem"), &self.cert.pem()),
+            cert_path: write(dir, &format!("{tag}.crt.pem"), &leaf_cert.pem()),
+            key_path: write(dir, &format!("{tag}.key.pem"), &key.serialize_pem()),
+            ca_bundle_path: write(dir, &format!("{tag}.ca.pem"), &self.cert.pem()),
         }
     }
 }

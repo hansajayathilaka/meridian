@@ -1,14 +1,24 @@
 //! Server B's inbound handling of federated requests (task 2.7: `fed_fetch_bundle`; task 2.8 adds
 //! `fed_route`/`fed_reachability` to the same [`serve_link`] dispatch loop).
 //!
-//! ## `origin_domain` is always the mTLS-authenticated peer identity
-//! Every function here takes `origin_domain` as an explicit `&str` parameter rather than reading
-//! it off the request body. Callers MUST pass [`FederationLink::peer_domain`] — the
-//! TLS-certificate-derived identity established when the link was accepted — never
-//! `FedFetchBundle::requesting_server` (self-asserted, informational only; see
-//! `meridian_proto::fed`'s module docs and ADR 0017 (a)). [`serve_link`] is the one place that
-//! makes this binding, so nothing downstream of it can accidentally key a policy/rate-limit
-//! decision off attacker-controlled bytes.
+//! ## `origin_domains`/`metering_key` are always the mTLS-authenticated peer identity
+//! Every handler here takes `origin_domains: &[String]` (for the admission decision) and
+//! `metering_key: &str` (for rate-limit keying) as explicit parameters rather than reading
+//! anything off the request body. Callers MUST pass [`FederationLink::peer_domains`]/
+//! [`FederationLink::metering_key`] — the TLS-certificate-derived identity/identities established
+//! when the link was accepted — never `FedFetchBundle::requesting_server` (self-asserted,
+//! informational only; see `meridian_proto::fed`'s module docs and ADR 0017 (a)). [`serve_link`]
+//! is the one place that makes this binding, so nothing downstream of it can accidentally key a
+//! policy/rate-limit decision off attacker-controlled bytes.
+//!
+//! **Task 3.6 (review finding F9):** a partner's client certificate can authenticate more than
+//! one domain (multi-SAN); admission ([`FederationPolicy::admit_any`]) matches against the WHOLE
+//! validated set (so a cert whose allowlisted domain isn't the cert's first SAN is still
+//! correctly admitted), while rate-limit keying uses a single, deterministic
+//! [`FederationLink::metering_key`] (so a cert renewal that reorders — without changing the
+//! values of — the same SAN set doesn't fragment an origin's rate-limit history). These are
+//! deliberately two different values, sourced from the same underlying [`FederationLink`], not
+//! one collapsed parameter — see `link.rs`'s and `policy.rs`'s own doc comments for why.
 //!
 //! ## `origin_account` for the fetch rate limit
 //! [`crate::federation::policy::FederationLimits::check_fetch`] wants a per-*account* rate-limit
@@ -80,10 +90,11 @@ pub async fn handle_fed_fetch(
     policy: &FederationPolicy,
     limits: &FederationLimits,
     server_cfg: &crate::config::Server,
-    origin_domain: &str,
+    origin_domains: &[String],
+    metering_key: &str,
     req: &FedFetchBundle,
 ) -> Result<FedBundle, FedErr> {
-    if let Decision::Reject(_reason) = policy.admit(origin_domain) {
+    if let Decision::Reject(_reason) = policy.admit_any(origin_domains.iter().map(String::as_str)) {
         // `_reason` (Closed vs. NotAllowlisted) is internal detail only — see `policy` module's
         // doc comment on the 2.7/2.8/2.9 boundary. Both collapse to the same client-visible code.
         return Err(FedErr {
@@ -93,7 +104,7 @@ pub async fn handle_fed_fetch(
     }
     // See this module's doc comment: `req.target`, not a requesting-account field that doesn't
     // exist on this request type, is the per-account rate-limit dimension for a fetch.
-    if let Decision::Reject(_reason) = limits.check_fetch(origin_domain, req.target.as_slice()) {
+    if let Decision::Reject(_reason) = limits.check_fetch(metering_key, req.target.as_slice()) {
         return Err(FedErr {
             code: fed_error_codes::RATE_LIMITED.to_string(),
             msg: "too many federated fetch requests".to_string(),
@@ -176,16 +187,17 @@ pub async fn handle_fed_route(
     registry: &Registry,
     policy: &FederationPolicy,
     limits: &FederationLimits,
-    origin_domain: &str,
+    origin_domains: &[String],
+    metering_key: &str,
     req: &FedRoute,
 ) -> Result<(), FedErr> {
-    if let Decision::Reject(_reason) = policy.admit(origin_domain) {
+    if let Decision::Reject(_reason) = policy.admit_any(origin_domains.iter().map(String::as_str)) {
         return Err(FedErr {
             code: fed_error_codes::POLICY_DENIED.to_string(),
             msg: "federation is closed for this origin".to_string(),
         });
     }
-    if let Decision::Reject(_reason) = limits.check_route(origin_domain, req.from.as_slice()) {
+    if let Decision::Reject(_reason) = limits.check_route(metering_key, req.from.as_slice()) {
         return Err(FedErr {
             code: fed_error_codes::RATE_LIMITED.to_string(),
             msg: "too many federated route requests".to_string(),
@@ -275,16 +287,17 @@ pub async fn handle_fed_reachability(
     registry: &Registry,
     policy: &FederationPolicy,
     limits: &FederationLimits,
-    origin_domain: &str,
+    origin_domains: &[String],
+    metering_key: &str,
     req: &FedReachability,
 ) -> Result<FedReachable, FedErr> {
-    if let Decision::Reject(_reason) = policy.admit(origin_domain) {
+    if let Decision::Reject(_reason) = policy.admit_any(origin_domains.iter().map(String::as_str)) {
         return Err(FedErr {
             code: fed_error_codes::POLICY_DENIED.to_string(),
             msg: "federation is closed for this origin".to_string(),
         });
     }
-    if let Decision::Reject(_reason) = limits.check_reachability(origin_domain) {
+    if let Decision::Reject(_reason) = limits.check_reachability(metering_key) {
         return Err(FedErr {
             code: fed_error_codes::RATE_LIMITED.to_string(),
             msg: "too many federated reachability requests".to_string(),
@@ -300,9 +313,11 @@ pub async fn handle_fed_reachability(
 /// `FedOp::Reachability` (2.8 — `Hello` is already consumed by link establishment) are handled;
 /// every other/unknown op still replies `FedErr{bad_request}`.
 pub async fn serve_link(mut link: FederationLink, state: Arc<AppState>) {
-    // `link.peer_domain` is the mTLS-authenticated identity (see this module's doc comment) —
-    // captured once, used for every request on this link, never re-derived from a request body.
-    let origin_domain = link.peer_domain.clone();
+    // `link.peer_domains`/`link.metering_key()` are the mTLS-authenticated identity (see this
+    // module's doc comment) — captured once, used for every request on this link, never
+    // re-derived from a request body.
+    let origin_domains = link.peer_domains.clone();
+    let metering_key = link.metering_key().to_string();
     loop {
         let frame = match link.recv_frame().await {
             Ok(f) => f,
@@ -328,7 +343,8 @@ pub async fn serve_link(mut link: FederationLink, state: Arc<AppState>) {
                     &state.federation.policy,
                     &state.federation.limits,
                     &state.config.server,
-                    &origin_domain,
+                    &origin_domains,
+                    &metering_key,
                     &req,
                 )
                 .await;
@@ -363,7 +379,8 @@ pub async fn serve_link(mut link: FederationLink, state: Arc<AppState>) {
                     &state.registry,
                     &state.federation.policy,
                     &state.federation.limits,
-                    &origin_domain,
+                    &origin_domains,
+                    &metering_key,
                     &req,
                 )
                 .await;
@@ -393,7 +410,8 @@ pub async fn serve_link(mut link: FederationLink, state: Arc<AppState>) {
                     &state.registry,
                     &state.federation.policy,
                     &state.federation.limits,
-                    &origin_domain,
+                    &origin_domains,
+                    &metering_key,
                     &req,
                 )
                 .await;

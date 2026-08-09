@@ -192,6 +192,52 @@ impl FederationPolicy {
             }
         }
     }
+
+    /// May the peer that authenticates as ANY of `origin_domains` federate with us at all? The
+    /// accept-side generalization of [`Self::admit`] (task 3.6, review finding F9): an inbound
+    /// mTLS client certificate can carry more than one SAN, and the domain we actually allowlisted
+    /// is not guaranteed to be the first one a cert's SAN list happens to enumerate — matching
+    /// against a single arbitrarily-chosen entry risks false-rejecting a partner whose certificate
+    /// genuinely, cryptographically authenticates an allowlisted name.
+    ///
+    /// `origin_domains` MUST be exactly the set [`crate::federation::link::FederationLink::peer_domains`]
+    /// carries — the mTLS-validated SAN/CN set rustls's own certificate verification already
+    /// checked — and never anything self-asserted (e.g. `FedHello.domain`, which
+    /// `federation::link`'s own module docs call out as untrusted for this purpose). This method
+    /// does not itself verify anything about `origin_domains`; it only decides policy over
+    /// whatever set its caller hands it, so an incorrectly-sourced set here would be an
+    /// authorization bug at the call site, not in this method.
+    ///
+    /// This is deliberately a **superset** check — admits if ANY entry matches — never a subset
+    /// check: rejecting a cert because ONE of its several SANs isn't individually allowlisted
+    /// would reintroduce a false-reject bug symmetric to the one this method exists to fix. It
+    /// does not, and must not, ever admit a domain that is not itself present in `origin_domains` —
+    /// the fail-closed direction (a cert that does not authenticate the allowlisted name is
+    /// rejected) must never invert into admitting on the strength of anything the cert didn't
+    /// actually assert.
+    ///
+    /// Mirrors [`Self::admit`]'s own match arms rather than delegating to it in a loop, so `Closed`
+    /// and `Open` behave identically regardless of whether `origin_domains` happens to be empty
+    /// (structurally impossible in practice — see `peer_domains`'s own doc comment — but this
+    /// keeps the two methods' semantics visibly in lock-step rather than relying on that
+    /// invariant).
+    pub fn admit_any<'a, I>(&self, origin_domains: I) -> Decision
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        match self {
+            FederationPolicy::Closed => Decision::Reject(RejectReason::Closed),
+            FederationPolicy::Open => Decision::Admit,
+            FederationPolicy::Allowlist(set) => {
+                for domain in origin_domains {
+                    if set.contains(&domain.to_ascii_lowercase()) {
+                        return Decision::Admit;
+                    }
+                }
+                Decision::Reject(RejectReason::NotAllowlisted)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -303,6 +349,14 @@ impl FederationLimits {
 
     /// Is a prekey-fetch request (2.7) from `origin_account`, claimed by `origin_domain`, within
     /// budget? Checks the per-origin-account budget, then the shared per-origin budget.
+    ///
+    /// **Task 3.6 (review finding F9):** for an accept-side link whose certificate authenticates
+    /// more than one domain, `origin_domain` here is expected to be the caller's chosen
+    /// **metering key** (e.g. [`crate::federation::link::FederationLink::metering_key`]'s
+    /// deterministic tie-break across the whole authenticated set), not necessarily every domain
+    /// the peer's cert authenticates — this is purely a bucket-selection choice for rate-limit
+    /// accounting and carries no authorization weight (that's [`FederationPolicy::admit_any`]'s
+    /// job, checked separately, against the full set, before this is ever called).
     pub fn check_fetch(&self, origin_domain: &str, origin_account: &[u8]) -> Decision {
         self.check(Operation::Fetch, origin_domain, origin_account)
     }
@@ -317,6 +371,9 @@ impl FederationLimits {
     /// One real `fed_route` request therefore costs exactly one `route_per_origin` unit and one
     /// `per_origin_account` unit, keyed on `origin_account` = the SENDER (`req.from`) — never
     /// doubled, never charged to the recipient.
+    ///
+    /// `origin_domain` is the caller's metering key, not necessarily the whole authenticated
+    /// domain set — see [`check_fetch`](Self::check_fetch)'s doc comment (task 3.6, F9).
     pub fn check_route(&self, origin_domain: &str, origin_account: &[u8]) -> Decision {
         self.check(Operation::Route, origin_domain, origin_account)
     }
@@ -336,6 +393,9 @@ impl FederationLimits {
     /// per-origin-account fetch-style budget rather than a real second dimension. Always reports
     /// [`RateLimitScope::Origin`] on rejection, never `OriginAccount` — there is no account-scoped
     /// counter here to have been the one that tripped.
+    ///
+    /// `origin_domain` is the caller's metering key, not necessarily the whole authenticated
+    /// domain set — see [`check_fetch`](Self::check_fetch)'s doc comment (task 3.6, F9).
     pub fn check_reachability(&self, origin_domain: &str) -> Decision {
         if !self
             .reachability_per_origin

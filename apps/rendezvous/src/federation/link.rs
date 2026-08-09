@@ -27,8 +27,9 @@
 //! whose client cert chains to the configured trust root is accepted at the TLS layer; *which*
 //! peers are actually allowed to federate at all is a policy decision
 //! ([2.6](../../../../docs/tasks/phase-2/2.6-federation-policy-limits.md), out of scope here). What
-//! this task's listener does is learn and report the peer's authenticated origin domain (SAN/CN of
-//! the validated client cert) so that later policy can act on it.
+//! this task's listener does is learn and report the peer's authenticated origin domain(s) (every
+//! SAN/CN entry on the validated client cert — task 3.6, review finding F9: not just the first)
+//! so that later policy can act on the whole set.
 
 use std::future::Future;
 use std::io;
@@ -400,13 +401,25 @@ async fn exchange_hello<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
 
 /// An established, mutually authenticated s2s link.
 ///
-/// `peer_domain` is the peer's **cryptographically authenticated** origin domain: for a dialed
-/// link this is the caller's own `expected_domain` (proven by the TLS handshake succeeding at
-/// all, per this module's doc comment); for an accepted link it is extracted from the validated
-/// client certificate's SAN/CN. It is NEVER the self-asserted `FedHello.domain` — see the
-/// `exchange_hello` helper's docs.
+/// `peer_domains` are the peer's **cryptographically authenticated** origin domain(s): for a
+/// dialed link this is a single-element vec holding the caller's own `expected_domain` (proven
+/// by the TLS handshake succeeding at all, per this module's doc comment); for an accepted link
+/// it is EVERY SAN `dNSName` (or CN-fallback) entry extracted from the validated client
+/// certificate — a real partner cert can authenticate more than one domain at once (e.g. a
+/// domain-migration/aliasing pattern), and the accept side has no prior "expected domain" to
+/// narrow that down to one (see [`FederationListener::finish_handshake`]'s doc comment). This is
+/// NEVER the self-asserted `FedHello.domain` — see the `exchange_hello` helper's docs.
+///
+/// **Task 3.6 (review finding F9):** this used to be a single `peer_domain: String`, populated
+/// on the accept side by `identities[0]` alone — the first SAN a peer's certificate happened to
+/// list. That both (a) false-rejected a partner whose allowlisted domain wasn't first in SAN
+/// order, and (b) could silently fragment rate-limit history across a cert renewal that
+/// reordered (without changing the values of) the same SAN set. Carrying the whole set here, plus
+/// [`Self::metering_key`]'s deterministic tie-break, fixes both without ever admitting a domain
+/// the certificate does not actually authenticate (authorization below still matches against the
+/// full validated set, never a self-asserted one).
 pub struct FederationLink {
-    pub peer_domain: String,
+    pub peer_domains: Vec<String>,
     stream: TlsStream<TcpStream>,
     metrics: Option<Arc<Metrics>>,
 }
@@ -420,6 +433,24 @@ impl FederationLink {
     /// Receive one [`FedFrame`] from this link.
     pub async fn recv_frame(&mut self) -> Result<FedFrame, LinkError> {
         read_frame(&mut self.stream).await
+    }
+
+    /// A single, deterministic domain string to key per-origin metering (rate-limit buckets) on —
+    /// never for authorization (see [`crate::federation::policy::FederationPolicy::admit_any`],
+    /// which matches against the whole [`Self::peer_domains`] set instead). The
+    /// lexicographically smallest entry: stable across a cert renewal that reorders `peer_domains`
+    /// without changing which domain VALUES are present, so the same underlying partner's
+    /// rate-limit history never fragments merely because a CA (or `rcgen`-style tool) happened to
+    /// re-order SANs on reissue. `peer_domains` is always non-empty by construction (both `dial`
+    /// and `finish_handshake` populate it before returning `Ok`; `peer_identities` itself errors
+    /// out — `LinkError::NoPeerIdentity` — on an empty SAN/CN set), so this never falls back to
+    /// its `unwrap_or_default` empty-string case in practice.
+    pub fn metering_key(&self) -> &str {
+        self.peer_domains
+            .iter()
+            .min()
+            .map(String::as_str)
+            .unwrap_or_default()
     }
 }
 
@@ -505,7 +536,7 @@ pub async fn dial(
         m.federation_link_up();
     }
     Ok(FederationLink {
-        peer_domain: expected_domain.to_string(),
+        peer_domains: vec![expected_domain.to_string()],
         stream,
         metrics,
     })
@@ -582,10 +613,12 @@ impl FederationListener {
                 .cloned()
                 .ok_or(LinkError::NoPeerIdentity)?
         };
-        let identities = peer_identities(&peer_cert)?;
-        // No prior "expected domain" to pin against on the accept side (see module docs) — the
-        // first SAN/CN entry is what this side learns as the peer's authenticated origin domain.
-        let peer_domain = identities[0].clone();
+        // No prior "expected domain" to pin against on the accept side (see module docs) — every
+        // SAN/CN entry the validated cert asserts becomes this side's learned peer identity set
+        // (task 3.6, review finding F9: previously only `identities[0]`, which false-rejected a
+        // multi-SAN partner whose allowlisted domain wasn't first — see `FederationLink`'s doc
+        // comment).
+        let peer_domains = peer_identities(&peer_cert)?;
 
         let mut stream: TlsStream<TcpStream> = tls_stream.into();
         let _peer_asserted_domain = exchange_hello(&mut stream, &self.own_domain).await?;
@@ -595,7 +628,7 @@ impl FederationListener {
         }
         Ok((
             FederationLink {
-                peer_domain,
+                peer_domains,
                 stream,
                 metrics: self.metrics.clone(),
             },

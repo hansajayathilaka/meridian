@@ -205,9 +205,16 @@ async fn bs_defense_in_depth_oversized_check_rejects_directly() {
         from: [0x22u8; 32],
         envelope: OpaqueBlob::new(vec![0x41u8; 2 * 1024 * 1024]),
     };
-    let err = handle_fed_route(&registry, &policy, &limits, "org-a.test", &req)
-        .await
-        .expect_err("an oversized FedRoute body must be rejected");
+    let err = handle_fed_route(
+        &registry,
+        &policy,
+        &limits,
+        &["org-a.test".to_string()],
+        "org-a.test",
+        &req,
+    )
+    .await
+    .expect_err("an oversized FedRoute body must be rejected");
     assert_eq!(err.code, fed_error_codes::BAD_REQUEST);
     // The oversized recipient must never have reached the registry (defense-in-depth means the
     // check runs BEFORE delivery, not merely in addition to it).
