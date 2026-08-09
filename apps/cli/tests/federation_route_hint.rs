@@ -33,24 +33,21 @@
 //! covered same-server by `chat_demo.rs`; this test's whole point is the cross-org **routing** hop
 //! specifically, which a single A→B delivery proves.
 
-use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use meridian_core::identity::{generate_account, parse_id, MemorySecretStore};
 use meridian_core::signaling::{SignalingClient, DEFAULT_OTK_COUNT};
-use meridian_rendezvous::config::{
-    Config, DiscoveryMode, Federation, FederationPolicyMode, Limits, Server, Turn,
-};
-use meridian_rendezvous::federation::inbound::{bind_federation, run_federation};
-use meridian_rendezvous::{serve, AppState, MemoryStore};
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
-use tokio::net::TcpListener;
+use meridian_rendezvous::config::{DiscoveryMode, Federation, FederationPolicyMode};
+use meridian_rendezvous::{AppState, MemoryStore};
 
-const BIN: &str = env!("CARGO_BIN_EXE_meridian");
+mod support;
+use support::{
+    base_config, spawn_c2s, spawn_federation, wait_until, write, write_federation_map, Client,
+    TestCa,
+};
 
 /// Generous but bounded: a genuine "the hint never reached the wire" regression must hang forever
 /// (Bob can never receive locally), so this needs to be long enough to rule out ordinary CI
@@ -58,113 +55,18 @@ const BIN: &str = env!("CARGO_BIN_EXE_meridian");
 /// wedging the whole suite.
 const BOB_DELIVER_TIMEOUT: Duration = Duration::from_secs(20);
 
-// -- PKI test harness (mirrors apps/rendezvous/tests/federation_route.rs /
-//    apps/cli/tests/federation_errors.rs) --------------------------------------------------------
-
-struct TestCa {
-    cert: rcgen::Certificate,
-    key: KeyPair,
-}
-
-fn make_ca(common_name: &str) -> TestCa {
-    let mut params = CertificateParams::new(Vec::<String>::new()).expect("empty SAN list");
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    params
-        .distinguished_name
-        .push(DnType::CommonName, common_name);
-    let key = KeyPair::generate().expect("generate CA key");
-    let cert = params.self_signed(&key).expect("self-sign CA cert");
-    TestCa { cert, key }
-}
-
-fn make_leaf(domain: &str, ca: &TestCa) -> (rcgen::Certificate, KeyPair) {
-    let mut params =
-        CertificateParams::new(vec![domain.to_string()]).expect("SAN must be a valid DNS name");
-    params.distinguished_name.push(DnType::CommonName, domain);
-    let key = KeyPair::generate().expect("generate leaf key");
-    let cert = params
-        .signed_by(&key, &ca.cert, &ca.key)
-        .expect("sign leaf cert");
-    (cert, key)
-}
-
-fn write(dir: &Path, name: &str, contents: &str) -> std::path::PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, contents).unwrap();
-    path
-}
-
-struct Identity {
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
-    ca_bundle_path: std::path::PathBuf,
-}
-
-fn mint_identity(dir: &Path, tag: &str, domain: &str, ca: &TestCa) -> Identity {
-    let (leaf_cert, leaf_key) = make_leaf(domain, ca);
-    Identity {
-        cert_path: write(dir, &format!("{tag}.crt.pem"), &leaf_cert.pem()),
-        key_path: write(dir, &format!("{tag}.key.pem"), &leaf_key.serialize_pem()),
-        ca_bundle_path: write(dir, &format!("{tag}.ca.pem"), &ca.cert.pem()),
-    }
-}
-
-// -- Server harness (mirrors federation_route.rs) -------------------------------------------------
-
-fn base_config(domain: &str) -> Config {
-    Config {
-        server: Server {
-            domain: domain.to_string(),
-            bind: "127.0.0.1:0".to_string(),
-            ..Server::default()
-        },
-        limits: Limits::default(),
-        turn: Turn::default(),
-        federation: Federation::default(),
-    }
-}
-
-async fn spawn_c2s(state: Arc<AppState>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = serve(state, listener).await;
-    });
-    format!("ws://{addr}")
-}
-
-async fn spawn_federation(state: Arc<AppState>) -> SocketAddr {
-    let listener = bind_federation(&state).await.expect("bind s2s listener");
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        run_federation(listener, state).await;
-    });
-    addr
-}
-
-fn write_federation_map(dir: &Path, entries: &[(&str, SocketAddr, &str)]) -> std::path::PathBuf {
-    let mut toml = String::new();
-    for (domain, addr, pin) in entries {
-        toml.push_str(&format!(
-            "[[partner]]\ndomain = \"{domain}\"\nendpoint = \"{addr}\"\npinned_identity = \"{pin}\"\n\n"
-        ));
-    }
-    write(dir, "federation_map.toml", &toml)
-}
-
 /// A (Alice's home server) dials out to B: its own federation identity, a `federation_map.toml`
 /// pointing `org-b.test` at B's already-bound s2s address, `enabled = true`, static discovery.
 /// Only A ever needs to dial in this test (Bob is a raw client, never routes anything back).
 fn org_a_federation(dir: &Path, ca: &TestCa, a_domain: &str, b_fed_addr: SocketAddr) -> Federation {
-    let id = mint_identity(dir, "a", a_domain, ca);
+    let id = ca.issue(dir, "a", a_domain);
     let map_path = write_federation_map(dir, &[("org-b.test", b_fed_addr, "org-b.test")]);
     Federation {
         enabled: true,
         bind: "127.0.0.1:0".to_string(),
-        cert_path: id.cert_path.to_str().unwrap().to_string(),
-        key_path: id.key_path.to_str().unwrap().to_string(),
-        ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
+        cert_path: id.cert_path_str().to_string(),
+        key_path: id.key_path_str().to_string(),
+        ca_bundle_path: id.ca_bundle_path_str().to_string(),
         discovery: DiscoveryMode::Static,
         map_path: map_path.to_str().unwrap().to_string(),
         // A's own OUTBOUND admission policy (task 3.1, review finding F1) — `open`, since this
@@ -178,14 +80,14 @@ fn org_a_federation(dir: &Path, ca: &TestCa, a_domain: &str, b_fed_addr: SocketA
 
 /// B (Bob's home server): accepts inbound federation, `open` policy, never dials out.
 fn org_b_federation(dir: &Path, ca: &TestCa, b_domain: &str) -> Federation {
-    let id = mint_identity(dir, "b", b_domain, ca);
+    let id = ca.issue(dir, "b", b_domain);
     let empty_map = write(dir, "b-federation_map.toml", "");
     Federation {
         enabled: true,
         bind: "127.0.0.1:0".to_string(),
-        cert_path: id.cert_path.to_str().unwrap().to_string(),
-        key_path: id.key_path.to_str().unwrap().to_string(),
-        ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
+        cert_path: id.cert_path_str().to_string(),
+        key_path: id.key_path_str().to_string(),
+        ca_bundle_path: id.ca_bundle_path_str().to_string(),
         discovery: DiscoveryMode::Static,
         map_path: empty_map.to_str().unwrap().to_string(),
         policy: FederationPolicyMode::Open,
@@ -215,129 +117,12 @@ async fn stand_up_two_orgs(dir: &Path, ca: &TestCa) -> (String, String) {
     (a_c2s_url, b_c2s_url)
 }
 
-// -- CLI driver (mirrors apps/cli/tests/chat_demo.rs) ---------------------------------------------
-
-struct Client {
-    home: tempfile::TempDir,
-    work: tempfile::TempDir,
-}
-
-impl Client {
-    fn new() -> Self {
-        Self {
-            home: tempfile::tempdir().unwrap(),
-            work: tempfile::tempdir().unwrap(),
-        }
-    }
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(BIN)
-            .args(args)
-            .current_dir(self.work.path())
-            .env("MERIDIAN_HOME", self.home.path())
-            .env("MERIDIAN_PASSPHRASE", "demo-passphrase")
-            .output()
-            .expect("run meridian")
-    }
-    fn new_account(&self, keyfile: &str, hint: &str) {
-        let out = self.run(&[
-            "id", "new", "--store", "file", "--out", keyfile, "--hint", hint,
-        ]);
-        assert!(out.status.success(), "id new: {}", stderr(&out));
-    }
-    fn id(&self) -> String {
-        let out = self.run(&["id", "show"]);
-        assert!(out.status.success());
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-    fn spawn_chat(&self, server: &str, peer_id: &str) -> ChatProc {
-        let mut child = Command::new(BIN)
-            .args(["chat", peer_id, "--server", server, "--json"])
-            .current_dir(self.work.path())
-            .env("MERIDIAN_HOME", self.home.path())
-            .env("MERIDIAN_PASSPHRASE", "demo-passphrase")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn chat");
-        let stdin = child.stdin.take().unwrap();
-        let out = drain(child.stdout.take().unwrap());
-        let err = drain(child.stderr.take().unwrap());
-        ChatProc {
-            child,
-            stdin: Some(stdin),
-            out,
-            err,
-        }
-    }
-}
-
-struct ChatProc {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    out: Arc<Mutex<String>>,
-    err: Arc<Mutex<String>>,
-}
-
-impl ChatProc {
-    fn send(&mut self, line: &str) {
-        use std::io::Write;
-        if let Some(stdin) = self.stdin.as_mut() {
-            let _ = writeln!(stdin, "{line}");
-            let _ = stdin.flush();
-        }
-    }
-    fn out(&self) -> String {
-        self.out.lock().unwrap().clone()
-    }
-    fn err(&self) -> String {
-        self.err.lock().unwrap().clone()
-    }
-    fn finish(mut self) -> (String, String) {
-        self.stdin.take(); // drop stdin -> EOF -> clean exit
-        let _ = self.child.wait();
-        (self.out(), self.err())
-    }
-}
-
-fn drain<R: std::io::Read + Send + 'static>(stream: R) -> Arc<Mutex<String>> {
-    let buf = Arc::new(Mutex::new(String::new()));
-    let sink = buf.clone();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => sink.lock().unwrap().push_str(&line),
-            }
-        }
-    });
-    buf
-}
-
-fn stderr(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stderr).into_owned()
-}
-
-fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if cond() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(150));
-    }
-    cond()
-}
-
 // -- The test ---------------------------------------------------------------------------------
 
 #[test]
 fn cross_org_chat_route_reaches_a_peer_who_never_connected_to_the_sender_home_server() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
+    let ca = TestCa::new();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (a_c2s_url, b_c2s_url) = rt.block_on(stand_up_two_orgs(dir.path(), &ca));

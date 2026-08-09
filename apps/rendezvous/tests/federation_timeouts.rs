@@ -50,111 +50,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use meridian_identity::{generate_account, KeyHandle, MemorySecretStore};
-use meridian_rendezvous::config::{
-    Config, DiscoveryMode, Federation, FederationPolicyMode, Limits, Server, Turn,
-};
-use meridian_rendezvous::federation::{FederationListener, FederationTlsPaths};
-use meridian_rendezvous::{serve, AppState, MemoryStore};
-use meridian_signaling::{SignalError, SignalingClient};
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+use meridian_rendezvous::config::{DiscoveryMode, Federation, FederationPolicyMode};
+use meridian_rendezvous::federation::FederationListener;
+use meridian_rendezvous::{AppState, MemoryStore};
+use meridian_signaling::SignalError;
 use tokio::net::TcpListener;
 
-// -- PKI test harness (mirrors federation_fetch.rs / federation_link_dos.rs) ----------------
-
-struct TestCa {
-    cert: rcgen::Certificate,
-    key: KeyPair,
-}
-
-fn make_ca(common_name: &str) -> TestCa {
-    let mut params = CertificateParams::new(Vec::<String>::new()).expect("empty SAN list");
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    params
-        .distinguished_name
-        .push(DnType::CommonName, common_name);
-    let key = KeyPair::generate().expect("generate CA key");
-    let cert = params.self_signed(&key).expect("self-sign CA cert");
-    TestCa { cert, key }
-}
-
-fn make_leaf(domain: &str, ca: &TestCa) -> (rcgen::Certificate, KeyPair) {
-    let mut params =
-        CertificateParams::new(vec![domain.to_string()]).expect("SAN must be a valid DNS name");
-    params.distinguished_name.push(DnType::CommonName, domain);
-    let key = KeyPair::generate().expect("generate leaf key");
-    let cert = params
-        .signed_by(&key, &ca.cert, &ca.key)
-        .expect("sign leaf cert");
-    (cert, key)
-}
-
-fn write(dir: &Path, name: &str, contents: &str) -> std::path::PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, contents).unwrap();
-    path
-}
-
-struct Identity {
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
-    ca_bundle_path: std::path::PathBuf,
-}
-
-impl Identity {
-    fn paths(&self) -> FederationTlsPaths<'_> {
-        FederationTlsPaths {
-            cert_path: self.cert_path.to_str().unwrap(),
-            key_path: self.key_path.to_str().unwrap(),
-            ca_bundle_path: self.ca_bundle_path.to_str().unwrap(),
-        }
-    }
-}
-
-fn mint_identity(dir: &Path, tag: &str, domain: &str, ca: &TestCa) -> Identity {
-    let (leaf_cert, leaf_key) = make_leaf(domain, ca);
-    Identity {
-        cert_path: write(dir, &format!("{tag}.crt.pem"), &leaf_cert.pem()),
-        key_path: write(dir, &format!("{tag}.key.pem"), &leaf_key.serialize_pem()),
-        ca_bundle_path: write(dir, &format!("{tag}.ca.pem"), &ca.cert.pem()),
-    }
-}
-
-// -- server harness (mirrors federation_fetch.rs) --------------------------------------------
-
-fn base_config(domain: &str) -> Config {
-    Config {
-        server: Server {
-            domain: domain.to_string(),
-            bind: "127.0.0.1:0".to_string(),
-            ..Server::default()
-        },
-        limits: Limits::default(),
-        turn: Turn::default(),
-        federation: Federation::default(),
-    }
-}
-
-/// Spawn `domain`'s c2s WS listener and return its `ws://` URL.
-async fn spawn_c2s(state: Arc<AppState>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = serve(state, listener).await;
-    });
-    format!("ws://{addr}")
-}
-
-fn write_federation_map(dir: &Path, entries: &[(&str, SocketAddr, &str)]) -> std::path::PathBuf {
-    let mut toml = String::new();
-    for (domain, addr, pin) in entries {
-        toml.push_str(&format!(
-            "[[partner]]\ndomain = \"{domain}\"\nendpoint = \"{addr}\"\npinned_identity = \"{pin}\"\n\n"
-        ));
-    }
-    write(dir, "federation_map.toml", &toml)
-}
+mod support;
+use support::{base_config, new_acct, spawn_c2s, write_federation_map, TestCa};
 
 /// Server A's federation config, with THIS task's two knobs overridden — everything else mirrors
 /// `federation_fetch.rs::org_a_federation`.
@@ -167,14 +70,14 @@ fn org_a_federation(
     connect_timeout_ms: u64,
     request_timeout_ms: u64,
 ) -> Federation {
-    let id = mint_identity(dir, "a", a_domain, ca);
+    let id = ca.issue(dir, a_domain);
     let map_path = write_federation_map(dir, &[(b_domain, b_fed_addr, b_domain)]);
     Federation {
         enabled: true,
         bind: "127.0.0.1:0".to_string(),
-        cert_path: id.cert_path.to_str().unwrap().to_string(),
-        key_path: id.key_path.to_str().unwrap().to_string(),
-        ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
+        cert_path: id.cert_path_str().to_string(),
+        key_path: id.key_path_str().to_string(),
+        ca_bundle_path: id.ca_bundle_path_str().to_string(),
         discovery: DiscoveryMode::Static,
         map_path: map_path.to_str().unwrap().to_string(),
         // A itself must be willing to dial `b_domain` at all — these tests are about A's outbound
@@ -186,36 +89,12 @@ fn org_a_federation(
     }
 }
 
-struct Acct {
-    store: MemorySecretStore,
-    pubkey: [u8; 32],
-    handle: KeyHandle,
-}
-
-fn new_acct(hint: &str) -> Acct {
-    let store = MemorySecretStore::new();
-    let account = generate_account(&store, hint).unwrap();
-    Acct {
-        pubkey: *account.public_key().as_bytes(),
-        handle: account.handle().clone(),
-        store,
-    }
-}
-
-impl Acct {
-    async fn connect(&self, url: &str) -> SignalingClient {
-        SignalingClient::connect(url, &self.store, &self.handle, self.pubkey, None, 1)
-            .await
-            .expect("connect + authenticate to A's own c2s listener")
-    }
-}
-
 // -- (a) TCP accepted, TLS never completed ---------------------------------------------------
 
 #[tokio::test]
 async fn tcp_accept_without_tls_handshake_returns_fed_unreachable_within_bound() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA (3.3 timeouts a)");
+    let ca = TestCa::named("Meridian Test Federation CA (3.3 timeouts a)");
 
     // A raw TCP listener standing in for B's s2s port: accepts every connection, then reads and
     // writes nothing at all — no TLS ServerHello ever arrives. A's raw `TcpStream::connect`
@@ -247,7 +126,10 @@ async fn tcp_accept_without_tls_handshake_returns_fed_unreachable_within_bound()
     let a_c2s_url = spawn_c2s(a_state).await;
 
     let alice = new_acct("org-a.test");
-    let mut ac = alice.connect(&a_c2s_url).await;
+    let mut ac = alice
+        .connect(&a_c2s_url)
+        .await
+        .expect("connect + authenticate to A's own c2s listener");
     let target = [0x55u8; 32];
 
     // Bounded well above what a correctly-timing-out dial needs, well below "looks like a hang".
@@ -273,12 +155,12 @@ async fn tcp_accept_without_tls_handshake_returns_fed_unreachable_within_bound()
 #[tokio::test]
 async fn peer_completes_hello_but_never_replies_returns_fed_unreachable_within_bound() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA (3.3 timeouts b)");
+    let ca = TestCa::named("Meridian Test Federation CA (3.3 timeouts b)");
 
     // B's own HONEST link-establishment identity: mTLS + FedHello complete for real via the same
     // `FederationListener` production code path (task 2.4). What never happens is B replying to
     // the `FedFetchBundle` request that follows — the request is read (consumed), then silence.
-    let b_id = mint_identity(dir.path(), "b", "org-b.test", &ca);
+    let b_id = ca.issue(dir.path(), "org-b.test");
     let b_listener = FederationListener::bind("127.0.0.1:0", &b_id.paths(), "org-b.test", None)
         .await
         .expect("bind B's raw federation listener");
@@ -310,7 +192,10 @@ async fn peer_completes_hello_but_never_replies_returns_fed_unreachable_within_b
     let a_c2s_url = spawn_c2s(a_state).await;
 
     let alice = new_acct("org-a.test");
-    let mut ac = alice.connect(&a_c2s_url).await;
+    let mut ac = alice
+        .connect(&a_c2s_url)
+        .await
+        .expect("connect + authenticate to A's own c2s listener");
     let target = [0x66u8; 32];
 
     let bound = Duration::from_millis(request_timeout_ms + 5_000);
@@ -416,7 +301,7 @@ fn route_foreigns_outbound_send_is_wrapped_under_the_request_deadline() {
 #[tokio::test]
 async fn client_disconnect_mid_wait_does_not_leak_the_blocked_server_task() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA (3.3 timeouts c)");
+    let ca = TestCa::named("Meridian Test Federation CA (3.3 timeouts c)");
 
     // Same black-holed-TCP peer shape as test (a): A's dial genuinely blocks for the full
     // connect/request timeout window, never completing TLS.
@@ -447,7 +332,10 @@ async fn client_disconnect_mid_wait_does_not_leak_the_blocked_server_task() {
     let a_c2s_url = spawn_c2s(a_state).await;
 
     let alice = new_acct("org-a.test");
-    let mut ac = alice.connect(&a_c2s_url).await;
+    let mut ac = alice
+        .connect(&a_c2s_url)
+        .await
+        .expect("connect + authenticate to A's own c2s listener");
     let target = [0x77u8; 32];
 
     assert_eq!(

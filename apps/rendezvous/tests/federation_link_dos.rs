@@ -37,75 +37,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use meridian_rendezvous::config::{
-    Config, DiscoveryMode, Federation, FederationPolicyMode, Limits, Server, Turn,
-};
-use meridian_rendezvous::federation::inbound::{bind_federation, run_federation};
-use meridian_rendezvous::federation::{dial, FederationTimeouts, FederationTlsPaths};
+use meridian_rendezvous::config::{Config, DiscoveryMode, Federation, FederationPolicyMode};
+use meridian_rendezvous::federation::{dial, FederationTimeouts};
 use meridian_rendezvous::{AppState, MemoryStore};
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use tokio::net::TcpStream;
 
-// -- PKI test harness (mirrors apps/rendezvous/tests/federation_mtls.rs) --------------------
-
-struct TestCa {
-    cert: rcgen::Certificate,
-    key: KeyPair,
-}
-
-fn make_ca(common_name: &str) -> TestCa {
-    let mut params = CertificateParams::new(Vec::<String>::new()).expect("empty SAN list");
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    params
-        .distinguished_name
-        .push(DnType::CommonName, common_name);
-    let key = KeyPair::generate().expect("generate CA key");
-    let cert = params.self_signed(&key).expect("self-sign CA cert");
-    TestCa { cert, key }
-}
-
-fn make_leaf(domain: &str, ca: &TestCa) -> (rcgen::Certificate, KeyPair) {
-    let mut params =
-        CertificateParams::new(vec![domain.to_string()]).expect("SAN must be a valid DNS name");
-    params.distinguished_name.push(DnType::CommonName, domain);
-    let key = KeyPair::generate().expect("generate leaf key");
-    let cert = params
-        .signed_by(&key, &ca.cert, &ca.key)
-        .expect("sign leaf cert");
-    (cert, key)
-}
-
-fn write(dir: &Path, name: &str, contents: &str) -> std::path::PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, contents).unwrap();
-    path
-}
-
-struct Identity {
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
-    ca_bundle_path: std::path::PathBuf,
-}
-
-impl Identity {
-    fn paths(&self) -> FederationTlsPaths<'_> {
-        FederationTlsPaths {
-            cert_path: self.cert_path.to_str().unwrap(),
-            key_path: self.key_path.to_str().unwrap(),
-            ca_bundle_path: self.ca_bundle_path.to_str().unwrap(),
-        }
-    }
-}
-
-fn mint_identity(dir: &Path, tag: &str, domain: &str, ca: &TestCa) -> Identity {
-    let (leaf_cert, leaf_key) = make_leaf(domain, ca);
-    Identity {
-        cert_path: write(dir, &format!("{tag}.crt.pem"), &leaf_cert.pem()),
-        key_path: write(dir, &format!("{tag}.key.pem"), &leaf_key.serialize_pem()),
-        ca_bundle_path: write(dir, &format!("{tag}.ca.pem"), &ca.cert.pem()),
-    }
-}
+mod support;
+use support::{spawn_federation, write, Identity, TestCa};
 
 // -- server harness ------------------------------------------------------------------------
 
@@ -119,14 +57,14 @@ fn federation_config_full(
     max_concurrent_handshakes: u32,
     max_links: u32,
 ) -> (Federation, Identity) {
-    let id = mint_identity(dir, "b", domain, ca);
+    let id = ca.issue(dir, domain);
     let empty_map = write(dir, "empty-federation_map.toml", "");
     let federation = Federation {
         enabled: true,
         bind: "127.0.0.1:0".to_string(),
-        cert_path: id.cert_path.to_str().unwrap().to_string(),
-        key_path: id.key_path.to_str().unwrap().to_string(),
-        ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
+        cert_path: id.cert_path_str().to_string(),
+        key_path: id.key_path_str().to_string(),
+        ca_bundle_path: id.ca_bundle_path_str().to_string(),
         discovery: DiscoveryMode::Static,
         map_path: empty_map.to_str().unwrap().to_string(),
         policy: FederationPolicyMode::Open,
@@ -161,16 +99,7 @@ fn federation_config(
 }
 
 fn base_config(domain: &str, federation: Federation) -> Config {
-    Config {
-        server: Server {
-            domain: domain.to_string(),
-            bind: "127.0.0.1:0".to_string(),
-            ..Server::default()
-        },
-        limits: Limits::default(),
-        turn: Turn::default(),
-        federation,
-    }
+    support::config_with_federation(domain, federation)
 }
 
 /// Bind B's real hardened accept loop (`bind_federation` + `run_federation`, task 3.2) and start
@@ -178,12 +107,7 @@ fn base_config(domain: &str, federation: Federation) -> Config {
 async fn spawn_hardened_listener(config: Config) -> SocketAddr {
     let store = Arc::new(MemoryStore::new());
     let state = AppState::new(config, store);
-    let listener = bind_federation(&state).await.expect("bind s2s listener");
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        run_federation(listener, state).await;
-    });
-    addr
+    spawn_federation(state).await
 }
 
 // -- (a) a silent connection must not wedge the accept loop ---------------------------------
@@ -191,7 +115,7 @@ async fn spawn_hardened_listener(config: Config) -> SocketAddr {
 #[tokio::test]
 async fn silent_connection_does_not_wedge_the_listener_for_a_legitimate_dial() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA (3.2 dos a)");
+    let ca = TestCa::named("Meridian Test Federation CA (3.2 dos a)");
     let (b_federation, _b_id) = federation_config(dir.path(), &ca, "b.federation.test", 5_000, 4);
     let addr = spawn_hardened_listener(base_config("b.federation.test", b_federation)).await;
 
@@ -207,7 +131,7 @@ async fn silent_connection_does_not_wedge_the_listener_for_a_legitimate_dial() {
     // is genuinely non-blocking per-connection (task 3.2), this completes quickly regardless of the
     // still-open, still-silent connection above. Bounded well under this test's own timeout so a
     // regression to the old wedging behavior fails loudly rather than hanging the suite.
-    let a = mint_identity(dir.path(), "a", "a.federation.test", &ca);
+    let a = ca.issue(dir.path(), "a.federation.test");
     let dial_result = tokio::time::timeout(
         Duration::from_secs(5),
         dial(
@@ -232,7 +156,7 @@ async fn silent_connection_does_not_wedge_the_listener_for_a_legitimate_dial() {
 #[tokio::test]
 async fn connection_stalled_mid_length_prefix_is_dropped_by_the_handshake_timeout() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA (3.2 dos b)");
+    let ca = TestCa::named("Meridian Test Federation CA (3.2 dos b)");
     let handshake_timeout_ms = 300;
     let (b_federation, _b_id) = federation_config(
         dir.path(),
@@ -245,7 +169,7 @@ async fn connection_stalled_mid_length_prefix_is_dropped_by_the_handshake_timeou
 
     // A real client identity, signed by the same CA B trusts — so the TLS handshake itself
     // completes fine; what stalls is what comes AFTER it (the FedHello length-prefix read).
-    let a = mint_identity(dir.path(), "a", "a.federation.test", &ca);
+    let a = ca.issue(dir.path(), "a.federation.test");
     let client_tls = meridian_rendezvous::federation::link::build_client_tls_config(&a.paths())
         .expect("build client tls config");
     let connector = tokio_rustls::TlsConnector::from(client_tls);
@@ -305,7 +229,7 @@ async fn connection_stalled_mid_length_prefix_is_dropped_by_the_handshake_timeou
 #[tokio::test]
 async fn exhausting_max_concurrent_handshakes_drops_the_next_connection_promptly_then_recovers() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA (3.2 dos c)");
+    let ca = TestCa::named("Meridian Test Federation CA (3.2 dos c)");
     let handshake_timeout_ms = 250;
     let max_concurrent_handshakes = 2;
     let (b_federation, _b_id) = federation_config(
@@ -361,7 +285,7 @@ async fn exhausting_max_concurrent_handshakes_drops_the_next_connection_promptly
     // A legitimate dial, retried with a short backoff, must eventually succeed once the stallers'
     // handshake slots are reclaimed by `handshake_timeout_ms`. Bounded well above the handshake
     // timeout so this both proves recovery AND stays well under this task's ~15s suite budget.
-    let a = mint_identity(dir.path(), "a", "a.federation.test", &ca);
+    let a = ca.issue(dir.path(), "a.federation.test");
     let overall_budget = Duration::from_millis(handshake_timeout_ms * 10);
     let outcome = tokio::time::timeout(overall_budget, async {
         loop {
@@ -409,7 +333,7 @@ async fn exhausting_max_concurrent_handshakes_drops_the_next_connection_promptly
 #[tokio::test]
 async fn exhausting_max_links_drops_the_next_link_promptly_after_a_successful_handshake() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA (3.2 dos link-cap)");
+    let ca = TestCa::named("Meridian Test Federation CA (3.2 dos link-cap)");
     let max_links = 2;
     let (b_federation, _b_id) = federation_config_full(
         dir.path(),
@@ -429,12 +353,7 @@ async fn exhausting_max_links_drops_the_next_link_promptly_after_a_successful_ha
     // semaphore itself.
     let mut links = Vec::new();
     for i in 0..max_links {
-        let a = mint_identity(
-            dir.path(),
-            &format!("a{i}"),
-            &format!("a{i}.federation.test"),
-            &ca,
-        );
+        let a = ca.issue(dir.path(), &format!("a{i}.federation.test"));
         let link = dial(
             addr,
             "b.federation.test",
@@ -458,7 +377,7 @@ async fn exhausting_max_links_drops_the_next_link_promptly_after_a_successful_ha
     // untouched by this test. Only after `finish_handshake` returns does the link-cap check happen
     // — and with both permits already held by the two links above, it fails, so the server drops
     // this link immediately afterward, before `serve_link` ever runs and before any reply frame.
-    let over = mint_identity(dir.path(), "over", "over.federation.test", &ca);
+    let over = ca.issue(dir.path(), "over.federation.test");
     let mut over_link = dial(
         addr,
         "b.federation.test",

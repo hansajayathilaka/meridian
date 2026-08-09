@@ -25,137 +25,20 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use meridian_identity::{generate_account, KeyHandle, MemorySecretStore};
 use meridian_proto::{error_codes, fed_error_codes, FedRoute, OpaqueBlob};
-use meridian_rendezvous::config::{
-    Config, DiscoveryMode, Federation, FederationPolicyMode, Limits, Server, Turn,
-};
-use meridian_rendezvous::federation::inbound::{bind_federation, handle_fed_route, run_federation};
+use meridian_rendezvous::config::{DiscoveryMode, Federation, FederationPolicyMode};
+use meridian_rendezvous::federation::inbound::handle_fed_route;
 use meridian_rendezvous::federation::{FederationLimits, FederationPolicy};
 use meridian_rendezvous::state::Registry;
-use meridian_rendezvous::{serve, AppState, MemoryStore};
-use meridian_signaling::{SignalError, SignalingClient};
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+use meridian_rendezvous::{AppState, MemoryStore};
+use meridian_signaling::SignalError;
 use tokio::net::TcpListener;
 
-// -- PKI test harness (mirrors apps/rendezvous/tests/federation_mtls.rs / federation_fetch.rs) ---
-
-struct TestCa {
-    cert: rcgen::Certificate,
-    key: KeyPair,
-}
-
-fn make_ca(common_name: &str) -> TestCa {
-    let mut params = CertificateParams::new(Vec::<String>::new()).expect("empty SAN list");
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    params
-        .distinguished_name
-        .push(DnType::CommonName, common_name);
-    let key = KeyPair::generate().expect("generate CA key");
-    let cert = params.self_signed(&key).expect("self-sign CA cert");
-    TestCa { cert, key }
-}
-
-fn make_leaf(domain: &str, ca: &TestCa) -> (rcgen::Certificate, KeyPair) {
-    let mut params =
-        CertificateParams::new(vec![domain.to_string()]).expect("SAN must be a valid DNS name");
-    params.distinguished_name.push(DnType::CommonName, domain);
-    let key = KeyPair::generate().expect("generate leaf key");
-    let cert = params
-        .signed_by(&key, &ca.cert, &ca.key)
-        .expect("sign leaf cert");
-    (cert, key)
-}
-
-fn write(dir: &Path, name: &str, contents: &str) -> std::path::PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, contents).unwrap();
-    path
-}
-
-struct Identity {
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
-    ca_bundle_path: std::path::PathBuf,
-}
-
-fn mint_identity(dir: &Path, tag: &str, domain: &str, ca: &TestCa) -> Identity {
-    let (leaf_cert, leaf_key) = make_leaf(domain, ca);
-    Identity {
-        cert_path: write(dir, &format!("{tag}.crt.pem"), &leaf_cert.pem()),
-        key_path: write(dir, &format!("{tag}.key.pem"), &leaf_key.serialize_pem()),
-        ca_bundle_path: write(dir, &format!("{tag}.ca.pem"), &ca.cert.pem()),
-    }
-}
-
-// -- Server harness ----------------------------------------------------------------------------
-
-fn base_config(domain: &str) -> Config {
-    Config {
-        server: Server {
-            domain: domain.to_string(),
-            bind: "127.0.0.1:0".to_string(),
-            ..Server::default()
-        },
-        limits: Limits::default(),
-        turn: Turn::default(),
-        federation: Federation::default(),
-    }
-}
-
-/// Spawn `domain`'s c2s WS listener and return its `ws://` URL.
-async fn spawn_c2s(state: Arc<AppState>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = serve(state, listener).await;
-    });
-    format!("ws://{addr}")
-}
-
-/// Bind `domain`'s s2s federation listener and start serving it. Returns the bound address.
-async fn spawn_federation(state: Arc<AppState>) -> SocketAddr {
-    let listener = bind_federation(&state).await.expect("bind s2s listener");
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        run_federation(listener, state).await;
-    });
-    addr
-}
-
-struct Acct {
-    store: MemorySecretStore,
-    pubkey: [u8; 32],
-    handle: KeyHandle,
-}
-
-fn new_acct(hint: &str) -> Acct {
-    let store = MemorySecretStore::new();
-    let account = generate_account(&store, hint).unwrap();
-    Acct {
-        pubkey: *account.public_key().as_bytes(),
-        handle: account.handle().clone(),
-        store,
-    }
-}
-
-impl Acct {
-    async fn connect(&self, url: &str) -> Result<SignalingClient, SignalError> {
-        SignalingClient::connect(url, &self.store, &self.handle, self.pubkey, None, 1).await
-    }
-}
-
-/// Build a `federation_map.toml` (private-CA mode, task 2.5's schema) pointing `domain` at `addr`.
-fn write_federation_map(dir: &Path, entries: &[(&str, SocketAddr, &str)]) -> std::path::PathBuf {
-    let mut toml = String::new();
-    for (domain, addr, pin) in entries {
-        toml.push_str(&format!(
-            "[[partner]]\ndomain = \"{domain}\"\nendpoint = \"{addr}\"\npinned_identity = \"{pin}\"\n\n"
-        ));
-    }
-    write(dir, "federation_map.toml", &toml)
-}
+mod support;
+use support::{
+    base_config, boot_federated_pair, new_acct, spawn_c2s, write_federation_map, FederatedPairOpts,
+    TestCa,
+};
 
 /// A dials out to B: A's own federation identity, a `federation_map.toml` pointing `b_domain` at
 /// `b_fed_addr` pinned to `b_pin`, `Federation::enabled = true`, `discovery = "static"`.
@@ -167,14 +50,14 @@ fn org_a_federation(
     b_fed_addr: SocketAddr,
     b_pin: &str,
 ) -> Federation {
-    let id = mint_identity(dir, "a", a_domain, ca);
+    let id = ca.issue(dir, a_domain);
     let map_path = write_federation_map(dir, &[(b_domain, b_fed_addr, b_pin)]);
     Federation {
         enabled: true,
         bind: "127.0.0.1:0".to_string(),
-        cert_path: id.cert_path.to_str().unwrap().to_string(),
-        key_path: id.key_path.to_str().unwrap().to_string(),
-        ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
+        cert_path: id.cert_path_str().to_string(),
+        key_path: id.key_path_str().to_string(),
+        ca_bundle_path: id.ca_bundle_path_str().to_string(),
         discovery: DiscoveryMode::Static,
         map_path: map_path.to_str().unwrap().to_string(),
         // (task 3.1) `Federation::default`'s `policy` is `Closed` — the fail-closed default. This
@@ -183,31 +66,6 @@ fn org_a_federation(
         // `tests/federation_outbound_policy.rs`), so A itself must be willing to dial `b_domain` at
         // all for any of them to reach B in the first place.
         policy: FederationPolicyMode::Open,
-        ..Federation::default()
-    }
-}
-
-/// B's own federation identity + admission policy — B never dials out in these tests.
-fn org_b_federation(
-    dir: &Path,
-    ca: &TestCa,
-    b_domain: &str,
-    policy: FederationPolicyMode,
-) -> Federation {
-    let id = mint_identity(dir, "b", b_domain, ca);
-    let empty_map = write(dir, "b-federation_map.toml", "");
-    Federation {
-        enabled: true,
-        bind: "127.0.0.1:0".to_string(),
-        cert_path: id.cert_path.to_str().unwrap().to_string(),
-        key_path: id.key_path.to_str().unwrap().to_string(),
-        ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
-        discovery: DiscoveryMode::Static,
-        map_path: empty_map.to_str().unwrap().to_string(),
-        policy,
-        fed_fetch_per_origin_per_min: 300,
-        fed_route_per_origin_per_min: 600,
-        fed_per_origin_account_per_min: 30,
         ..Federation::default()
     }
 }
@@ -222,34 +80,18 @@ struct Rig {
 }
 
 async fn stand_up(policy: FederationPolicyMode) -> Rig {
-    let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
-
-    let mut b_config = base_config("org-b.test");
-    b_config.federation = org_b_federation(dir.path(), &ca, "org-b.test", policy);
-    let b_store = Arc::new(MemoryStore::new());
-    let b_state = AppState::new(b_config, b_store);
-    let b_fed_addr = spawn_federation(b_state.clone()).await;
-    let b_c2s_url = spawn_c2s(b_state.clone()).await;
-
-    let mut a_config = base_config("org-a.test");
-    a_config.federation = org_a_federation(
-        dir.path(),
-        &ca,
-        "org-a.test",
-        "org-b.test",
-        b_fed_addr,
-        "org-b.test",
-    );
-    let a_store = Arc::new(MemoryStore::new());
-    let a_state = AppState::new(a_config, a_store);
-    let a_c2s_url = spawn_c2s(a_state).await;
-
+    let pair = boot_federated_pair(FederatedPairOpts {
+        b_policy: policy,
+        ..Default::default()
+    })
+    .await;
     Rig {
-        b_state,
-        a_c2s_url,
-        b_c2s_url,
-        _dir: dir,
+        b_state: pair.b_state,
+        a_c2s_url: pair.a_c2s_url,
+        b_c2s_url: pair
+            .b_c2s_url
+            .expect("boot_federated_pair spawns B's c2s by default"),
+        _dir: pair.dir,
     }
 }
 
@@ -304,7 +146,7 @@ async fn federated_route_delivers_byte_identical_envelope() {
 #[tokio::test]
 async fn oversized_envelope_is_rejected_before_any_dial() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
+    let ca = TestCa::new();
 
     // An address nothing is listening on: bind an ephemeral port, then drop the listener.
     let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();

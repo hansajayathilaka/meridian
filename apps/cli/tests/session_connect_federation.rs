@@ -39,22 +39,12 @@
 
 #![cfg(feature = "webrtc")]
 
-use std::io::{BufRead, BufReader};
-use std::net::SocketAddr;
-use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use meridian_rendezvous::config::{
-    Config, DiscoveryMode, Federation, FederationPolicyMode, Limits, Server, Turn,
-};
-use meridian_rendezvous::federation::inbound::{bind_federation, run_federation};
-use meridian_rendezvous::{serve, AppState, MemoryStore};
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
-use tokio::net::TcpListener;
-
-const BIN: &str = env!("CARGO_BIN_EXE_meridian");
+mod support;
+use support::{drain, Client};
 
 /// Bound for waiting on a child `session connect` process to exit. Must stay strictly greater
 /// than `meridian_core::session::ANSWER_TIMEOUT` (30s) — see `session_connect_webrtc.rs`'s
@@ -62,264 +52,37 @@ const BIN: &str = env!("CARGO_BIN_EXE_meridian");
 /// zero-margin race that a loaded CI runner can lose.
 const PROCESS_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
-// -- PKI test harness (mirrors apps/cli/tests/federation_route_hint.rs /
-//    apps/rendezvous/tests/federation_route.rs) -------------------------------------------------
-
-struct TestCa {
-    cert: rcgen::Certificate,
-    key: KeyPair,
-}
-
-fn make_ca(common_name: &str) -> TestCa {
-    let mut params = CertificateParams::new(Vec::<String>::new()).expect("empty SAN list");
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    params
-        .distinguished_name
-        .push(DnType::CommonName, common_name);
-    let key = KeyPair::generate().expect("generate CA key");
-    let cert = params.self_signed(&key).expect("self-sign CA cert");
-    TestCa { cert, key }
-}
-
-fn make_leaf(domain: &str, ca: &TestCa) -> (rcgen::Certificate, KeyPair) {
-    let mut params =
-        CertificateParams::new(vec![domain.to_string()]).expect("SAN must be a valid DNS name");
-    params.distinguished_name.push(DnType::CommonName, domain);
-    let key = KeyPair::generate().expect("generate leaf key");
-    let cert = params
-        .signed_by(&key, &ca.cert, &ca.key)
-        .expect("sign leaf cert");
-    (cert, key)
-}
-
-fn write(dir: &Path, name: &str, contents: &str) -> std::path::PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, contents).unwrap();
-    path
-}
-
-struct Identity {
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
-    ca_bundle_path: std::path::PathBuf,
-}
-
-fn mint_identity(dir: &Path, tag: &str, domain: &str, ca: &TestCa) -> Identity {
-    let (leaf_cert, leaf_key) = make_leaf(domain, ca);
-    Identity {
-        cert_path: write(dir, &format!("{tag}.crt.pem"), &leaf_cert.pem()),
-        key_path: write(dir, &format!("{tag}.key.pem"), &leaf_key.serialize_pem()),
-        ca_bundle_path: write(dir, &format!("{tag}.ca.pem"), &ca.cert.pem()),
-    }
-}
-
-// -- Server harness -------------------------------------------------------------------------------
-
-fn base_config(domain: &str) -> Config {
-    Config {
-        server: Server {
-            domain: domain.to_string(),
-            bind: "127.0.0.1:0".to_string(),
-            ..Server::default()
-        },
-        limits: Limits::default(),
-        turn: Turn::default(),
-        federation: Federation::default(),
-    }
-}
-
-async fn spawn_c2s(state: Arc<AppState>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = serve(state, listener).await;
-    });
-    format!("ws://{addr}")
-}
-
-async fn spawn_federation(state: Arc<AppState>) -> SocketAddr {
-    let listener = bind_federation(&state).await.expect("bind s2s listener");
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        run_federation(listener, state).await;
-    });
-    addr
-}
-
-/// Bind an ephemeral loopback listener purely to learn a free port, then release it immediately.
-/// Needed because (unlike the one-way harness in `federation_route_hint.rs`) **both** orgs here
-/// dial **each other**, so each side's `federation_map.toml` must name the other's s2s address
-/// before either `AppState` exists — and `StaticMap` is loaded once, at `AppState::new` time
-/// (`apps/rendezvous/src/state.rs`), not re-read later. Picking two real, currently-free loopback
-/// ports up front (then handing the same fixed addresses to `federation.bind` below) breaks that
-/// chicken-and-egg cycle at the cost of the usual tiny (and in practice negligible, single-host
-/// test) TOCTOU port-reuse window.
-async fn free_loopback_addr() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap()
-}
-
-fn write_federation_map(dir: &Path, entries: &[(&str, SocketAddr, &str)]) -> std::path::PathBuf {
-    let mut toml = String::new();
-    for (domain, addr, pin) in entries {
-        toml.push_str(&format!(
-            "[[partner]]\ndomain = \"{domain}\"\nendpoint = \"{addr}\"\npinned_identity = \"{pin}\"\n\n"
-        ));
-    }
-    write(dir, "federation_map.toml", &toml)
-}
-
-/// Build one org's federation config, bound at a pre-chosen fixed address and dialing out to
-/// whichever `partners` are named — unlike `federation_route_hint.rs`'s asymmetric
-/// `org_a_federation`/`org_b_federation` (only A ever dials), both orgs in this test use this same
-/// helper: both accept inbound AND dial out, since `session connect`'s SDP offer/answer exchange
-/// needs to cross the federation boundary in both directions.
-fn federation_config(
-    dir: &Path,
-    ca: &TestCa,
-    tag: &str,
-    domain: &str,
-    bind_addr: SocketAddr,
-    partners: &[(&str, SocketAddr, &str)],
-) -> Federation {
-    let id = mint_identity(dir, tag, domain, ca);
-    let map_path = write_federation_map(dir, partners);
-    Federation {
-        enabled: true,
-        bind: bind_addr.to_string(),
-        cert_path: id.cert_path.to_str().unwrap().to_string(),
-        key_path: id.key_path.to_str().unwrap().to_string(),
-        ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
-        discovery: DiscoveryMode::Static,
-        map_path: map_path.to_str().unwrap().to_string(),
-        policy: FederationPolicyMode::Open,
-        fed_fetch_per_origin_per_min: 300,
-        fed_route_per_origin_per_min: 600,
-        fed_per_origin_account_per_min: 30,
-        ..Federation::default()
-    }
-}
-
-/// Stands up org-a and org-b, each federating to the other (mutual dial), returning both c2s URLs.
-async fn stand_up_two_orgs_bidirectional(dir: &Path, ca: &TestCa) -> (String, String) {
-    let a_fed_addr = free_loopback_addr().await;
-    let b_fed_addr = free_loopback_addr().await;
-
-    let mut a_config = base_config("org-a.test");
-    a_config.federation = federation_config(
-        dir,
-        ca,
-        "a",
-        "org-a.test",
-        a_fed_addr,
-        &[("org-b.test", b_fed_addr, "org-b.test")],
-    );
-    let a_store = Arc::new(MemoryStore::new());
-    let a_state = AppState::new(a_config, a_store);
-    let a_fed_bound = spawn_federation(a_state.clone()).await;
-    assert_eq!(
-        a_fed_bound, a_fed_addr,
-        "org-a's s2s listener must bind the pre-chosen address"
-    );
-    let a_c2s_url = spawn_c2s(a_state).await;
-
-    let mut b_config = base_config("org-b.test");
-    b_config.federation = federation_config(
-        dir,
-        ca,
-        "b",
-        "org-b.test",
-        b_fed_addr,
-        &[("org-a.test", a_fed_addr, "org-a.test")],
-    );
-    let b_store = Arc::new(MemoryStore::new());
-    let b_state = AppState::new(b_config, b_store);
-    let b_fed_bound = spawn_federation(b_state.clone()).await;
-    assert_eq!(
-        b_fed_bound, b_fed_addr,
-        "org-b's s2s listener must bind the pre-chosen address"
-    );
-    let b_c2s_url = spawn_c2s(b_state).await;
-
-    (a_c2s_url, b_c2s_url)
-}
-
 // -- CLI driver (mirrors apps/cli/tests/session_connect_webrtc.rs) ---------------------------------
+//
+// `session connect`'s spawn/wait shape (JSON-streamed subprocess, bounded wait) is specific to
+// this file — `support::Client` only provides `spawn_chat` (used by `federation_route_hint.rs`),
+// so this file layers its own `spawn_connect`/`ConnectProc` on top of the shared `Client`/`drain`.
 
-struct Client {
-    home: tempfile::TempDir,
-    work: tempfile::TempDir,
-}
-
-impl Client {
-    fn new() -> Self {
-        Self {
-            home: tempfile::tempdir().unwrap(),
-            work: tempfile::tempdir().unwrap(),
-        }
-    }
-
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(BIN)
-            .args(args)
-            .current_dir(self.work.path())
-            .env("MERIDIAN_HOME", self.home.path())
-            .env("MERIDIAN_PASSPHRASE", "demo-passphrase")
-            .output()
-            .expect("run meridian")
-    }
-
-    /// Each account's own `--hint` names its OWN home org (never the peer's) — exactly like
-    /// `federation_route_hint.rs`'s `new_account`, and unlike `session_connect_webrtc.rs`'s
-    /// single-server test (which hardcodes `"localhost"` for both sides since there is only one
-    /// server there).
-    fn new_account(&self, keyfile: &str, own_domain_hint: &str) {
-        let out = self.run(&[
-            "id",
-            "new",
-            "--store",
-            "file",
-            "--out",
-            keyfile,
-            "--hint",
-            own_domain_hint,
-        ]);
-        assert!(out.status.success(), "id new: {}", stderr(&out));
-    }
-
-    fn id(&self) -> String {
-        let out = self.run(&["id", "show"]);
-        assert!(out.status.success());
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
-    /// Spawn `session connect <peer_id> --server <server> --transport webrtc --json` as a real
-    /// child process, talking only to this client's own home server (`server`) — the peer id's
-    /// `@domain` is the only thing that ever names the other org.
-    fn spawn_connect(&self, server: &str, peer_id: &str) -> ConnectProc {
-        let mut child = Command::new(BIN)
-            .args([
-                "session",
-                "connect",
-                peer_id,
-                "--server",
-                server,
-                "--transport",
-                "webrtc",
-                "--json",
-            ])
-            .current_dir(self.work.path())
-            .env("MERIDIAN_HOME", self.home.path())
-            .env("MERIDIAN_PASSPHRASE", "demo-passphrase")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn session connect");
-        let out = drain(child.stdout.take().unwrap());
-        let err = drain(child.stderr.take().unwrap());
-        ConnectProc { child, out, err }
-    }
+/// Spawn `session connect <peer_id> --server <server> --transport webrtc --json` as a real child
+/// process, talking only to `client`'s own home server (`server`) — the peer id's `@domain` is the
+/// only thing that ever names the other org.
+fn spawn_connect(client: &Client, server: &str, peer_id: &str) -> ConnectProc {
+    let mut child = Command::new(support::BIN)
+        .args([
+            "session",
+            "connect",
+            peer_id,
+            "--server",
+            server,
+            "--transport",
+            "webrtc",
+            "--json",
+        ])
+        .current_dir(client.work.path())
+        .env("MERIDIAN_HOME", client.home.path())
+        .env("MERIDIAN_PASSPHRASE", "demo-passphrase")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn session connect");
+    let out = drain(child.stdout.take().unwrap());
+    let err = drain(child.stderr.take().unwrap());
+    ConnectProc { child, out, err }
 }
 
 /// A running `session connect` subprocess with its stdout/stderr accumulated by reader threads.
@@ -360,36 +123,13 @@ impl ConnectProc {
     }
 }
 
-fn drain<R: std::io::Read + Send + 'static>(stream: R) -> Arc<Mutex<String>> {
-    let buf = Arc::new(Mutex::new(String::new()));
-    let sink = buf.clone();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => sink.lock().unwrap().push_str(&line),
-            }
-        }
-    });
-    buf
-}
-
-fn stderr(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stderr).into_owned()
-}
-
 // -- The test ---------------------------------------------------------------------------------
 
 #[test]
 fn two_processes_on_two_federated_orgs_establish_a_real_p2p_session() {
-    let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
-
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (a_c2s_url, b_c2s_url) = rt.block_on(stand_up_two_orgs_bidirectional(dir.path(), &ca));
+    let pair = rt.block_on(support::boot_federated_pair_bidirectional());
+    let (a_c2s_url, b_c2s_url) = (pair.a_c2s_url.clone(), pair.b_c2s_url.clone());
 
     // Alice: a real account on org-a. Bob: a real account on org-b. Neither ever connects to the
     // other's home server — the routing invariant this test is built around: each side's
@@ -405,8 +145,8 @@ fn two_processes_on_two_federated_orgs_establish_a_real_p2p_session() {
 
     // Both sides must be live at the same time (no mailbox for the offer/answer exchange), so
     // spawn both concurrently and wait for both, mirroring `session_connect_webrtc.rs`.
-    let a = alice.spawn_connect(&a_c2s_url, &bob_id);
-    let b = bob.spawn_connect(&b_c2s_url, &alice_id);
+    let a = spawn_connect(&alice, &a_c2s_url, &bob_id);
+    let b = spawn_connect(&bob, &b_c2s_url, &alice_id);
 
     let (a_ok, a_out, a_err) = a.wait(PROCESS_WAIT_TIMEOUT);
     let (b_ok, b_out, b_err) = b.wait(PROCESS_WAIT_TIMEOUT);

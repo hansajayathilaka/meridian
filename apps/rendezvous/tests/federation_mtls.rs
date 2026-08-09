@@ -20,86 +20,11 @@ use meridian_rendezvous::federation::{
     dial, FederationListener, FederationTimeouts, FederationTlsPaths, LinkError,
 };
 use meridian_rendezvous::metrics::Metrics;
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::CertificateDer;
 
-// -- PKI test harness ---------------------------------------------------------
-
-/// A minted CA: its self-signed `rcgen::Certificate` (used as the `signed_by` issuer) and key.
-struct TestCa {
-    cert: rcgen::Certificate,
-    key: KeyPair,
-}
-
-fn make_ca(common_name: &str) -> TestCa {
-    let mut params = CertificateParams::new(Vec::<String>::new()).expect("empty SAN list");
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    params
-        .distinguished_name
-        .push(DnType::CommonName, common_name);
-    let key = KeyPair::generate().expect("generate CA key");
-    let cert = params.self_signed(&key).expect("self-sign CA cert");
-    TestCa { cert, key }
-}
-
-/// Mint a leaf cert for `domain` (used as both the SAN dNSName and the CN), signed by `ca`.
-fn make_leaf(domain: &str, ca: &TestCa) -> (rcgen::Certificate, KeyPair) {
-    let mut params =
-        CertificateParams::new(vec![domain.to_string()]).expect("SAN must be a valid DNS name");
-    params.distinguished_name.push(DnType::CommonName, domain);
-    let key = KeyPair::generate().expect("generate leaf key");
-    let cert = params
-        .signed_by(&key, &ca.cert, &ca.key)
-        .expect("sign leaf cert");
-    (cert, key)
-}
-
-/// A minted identity's cert+key PEM files, written under `dir`, plus the CA bundle PEM it was
-/// signed under (also written under `dir`) — everything [`FederationTlsPaths`] needs.
-struct Identity {
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
-    ca_bundle_path: std::path::PathBuf,
-}
-
-impl Identity {
-    fn paths(&self) -> FederationTlsPaths<'_> {
-        FederationTlsPaths {
-            cert_path: self.cert_path.to_str().unwrap(),
-            key_path: self.key_path.to_str().unwrap(),
-            ca_bundle_path: self.ca_bundle_path.to_str().unwrap(),
-        }
-    }
-
-    /// Same identity, but as a WebPKI-mode path set (empty `ca_bundle_path` — trust the OS/system
-    /// store, which the WebPKI tests point at this identity's CA via `SSL_CERT_FILE`).
-    fn webpki_paths(&self) -> FederationTlsPaths<'_> {
-        FederationTlsPaths {
-            cert_path: self.cert_path.to_str().unwrap(),
-            key_path: self.key_path.to_str().unwrap(),
-            ca_bundle_path: "",
-        }
-    }
-}
-
-fn write(dir: &Path, name: &str, contents: &str) -> std::path::PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, contents).unwrap();
-    path
-}
-
-/// Mint a leaf identity for `domain` signed by `ca`, writing cert/key/CA-bundle PEMs under `dir`.
-/// `tag` disambiguates filenames when several identities share one tempdir.
-fn mint_identity(dir: &Path, tag: &str, domain: &str, ca: &TestCa) -> Identity {
-    let (leaf_cert, leaf_key) = make_leaf(domain, ca);
-    Identity {
-        cert_path: write(dir, &format!("{tag}.crt.pem"), &leaf_cert.pem()),
-        key_path: write(dir, &format!("{tag}.key.pem"), &leaf_key.serialize_pem()),
-        ca_bundle_path: write(dir, &format!("{tag}.ca.pem"), &ca.cert.pem()),
-    }
-}
+mod support;
+use support::{write, Identity, TestCa};
 
 // -- SSL_CERT_FILE guard (WebPKI-mode tests) -----------------------------------
 
@@ -146,9 +71,9 @@ async fn bind_listener(
 #[tokio::test]
 async fn happy_path_private_ca_mode() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
-    let a = mint_identity(dir.path(), "a", "a.federation.test", &ca);
-    let b = mint_identity(dir.path(), "b", "b.federation.test", &ca);
+    let ca = TestCa::named("Meridian Test Federation CA");
+    let a = ca.issue(dir.path(), "a.federation.test");
+    let b = ca.issue(dir.path(), "b.federation.test");
 
     let metrics = Arc::new(Metrics::new());
     let (listener, addr) =
@@ -195,9 +120,9 @@ async fn happy_path_private_ca_mode() {
 #[tokio::test]
 async fn happy_path_webpki_mode() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA (WebPKI-mode fixture)");
-    let a = mint_identity(dir.path(), "a", "a.federation.test", &ca);
-    let b = mint_identity(dir.path(), "b", "b.federation.test", &ca);
+    let ca = TestCa::named("Meridian Test Federation CA (WebPKI-mode fixture)");
+    let a = ca.issue(dir.path(), "a.federation.test");
+    let b = ca.issue(dir.path(), "b.federation.test");
 
     // WebPKI mode: no `ca_bundle_path`, validate against the OS/system trust store — pointed at
     // our test CA via SSL_CERT_FILE (rustls-native-certs' documented override), never a real
@@ -231,14 +156,14 @@ async fn happy_path_webpki_mode() {
 #[tokio::test]
 async fn untrusted_ca_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let legit_ca = make_ca("Meridian Test Federation CA (legit)");
-    let rogue_ca = make_ca("Not The Federation CA");
+    let legit_ca = TestCa::named("Meridian Test Federation CA (legit)");
+    let rogue_ca = TestCa::named("Not The Federation CA");
 
     // The listener only trusts `legit_ca` and presents a `legit_ca`-signed identity.
-    let b = mint_identity(dir.path(), "b", "b.federation.test", &legit_ca);
+    let b = legit_ca.issue(dir.path(), "b.federation.test");
     // The dialer presents a cert for the SAME domain name, but signed by a CA the listener never
     // enrolled — the private-CA impersonation hole ADR 0017 (a) exists to close.
-    let a_rogue = mint_identity(dir.path(), "a-rogue", "a.federation.test", &rogue_ca);
+    let a_rogue = rogue_ca.issue(dir.path(), "a.federation.test");
     // Dialer still needs to trust the listener's (legit) CA to get far enough to present its own
     // (rogue) client cert — otherwise this test would fail for the wrong reason (server-cert
     // rejection, not client-cert rejection).
@@ -277,11 +202,11 @@ async fn untrusted_ca_is_rejected() {
 #[tokio::test]
 async fn valid_cert_for_wrong_domain_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
+    let ca = TestCa::named("Meridian Test Federation CA");
     // The listener's cert is validly signed by the shared CA, but for "wrong.federation.test" —
     // NOT the domain the dialer intends to reach.
-    let wrong_domain_server = mint_identity(dir.path(), "wrong", "wrong.federation.test", &ca);
-    let a = mint_identity(dir.path(), "a", "a.federation.test", &ca);
+    let wrong_domain_server = ca.issue(dir.path(), "wrong.federation.test");
+    let a = ca.issue(dir.path(), "a.federation.test");
 
     let (listener, addr) =
         bind_listener(&wrong_domain_server.paths(), "wrong.federation.test", None).await;
@@ -340,8 +265,8 @@ async fn valid_cert_for_wrong_domain_is_rejected() {
 #[tokio::test]
 async fn missing_client_cert_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
-    let b = mint_identity(dir.path(), "b", "b.federation.test", &ca);
+    let ca = TestCa::named("Meridian Test Federation CA");
+    let b = ca.issue(dir.path(), "b.federation.test");
 
     let (listener, addr) = bind_listener(&b.paths(), "b.federation.test", None).await;
     let accept_task = tokio::spawn(async move { listener.accept().await });
@@ -404,8 +329,8 @@ async fn missing_client_cert_is_rejected() {
 /// One otherwise-valid identity (leaf cert + key + the CA bundle it was signed under), for the
 /// fail-closed tests below to selectively swap one path out to something broken.
 fn valid_identity(dir: &Path) -> Identity {
-    let ca = make_ca("Meridian Test Federation CA (fail-closed fixtures)");
-    mint_identity(dir, "fail-closed", "fail-closed.federation.test", &ca)
+    let ca = TestCa::named("Meridian Test Federation CA (fail-closed fixtures)");
+    ca.issue(dir, "fail-closed.federation.test")
 }
 
 #[test]
