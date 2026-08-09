@@ -235,9 +235,10 @@ pub fn write_federation_map(dir: &Path, entries: &[(&str, SocketAddr, &str)]) ->
 /// `Arc::get_mut` — the only way to reach `FederationRuntime::discovery` with a test-controlled
 /// [`Discovery`] impl, since [`AppState::new`] always builds a config-driven one internally. Must
 /// be called before the returned `Arc` is cloned anywhere (no live listener spawned on it yet).
-/// Originally local to `federation_outbound_policy.rs` (task 3.1); promoted here (task 3.7) for a
-/// second caller (`federation_route.rs`'s SRV-failover test) that needs the same seam to inject a
-/// multi-`Endpoint`, call-observing `Discovery` stand-in.
+/// Originally local to `federation_outbound_policy.rs` (task 3.1); moved here (task 3.7, review
+/// follow-up) once `federation_route.rs`'s SRV-failover test needed the same seam to inject a
+/// multi-`Endpoint`, call-observing `Discovery` stand-in — `federation_outbound_policy.rs` now
+/// imports this copy instead of keeping its own.
 pub fn install_discovery(state: &mut Arc<AppState>, discovery: Arc<dyn Discovery>) {
     Arc::get_mut(state)
         .expect("AppState must still be uniquely owned (not yet cloned/spawned)")

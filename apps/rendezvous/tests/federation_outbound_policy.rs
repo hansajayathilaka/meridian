@@ -40,8 +40,8 @@ use tokio::net::TcpListener;
 
 mod support;
 use support::{
-    base_config, boot_federated_pair, new_acct, spawn_c2s, write_federation_map, FederatedPairOpts,
-    TestCa,
+    base_config, boot_federated_pair, install_discovery, new_acct, spawn_c2s, write_federation_map,
+    FederatedPairOpts, TestCa,
 };
 
 /// Build A's [`Federation`] config: `enabled = true`, `discovery = "static"`, a map entry pointing
@@ -221,17 +221,6 @@ impl Discovery for CountingDiscovery {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(vec![self.endpoint.clone()])
     }
-}
-
-/// Installs `discovery` into a freshly-built (not yet cloned/spawned) [`AppState`], via
-/// `Arc::get_mut` — the only way to reach `FederationRuntime::discovery` with a test-controlled
-/// [`Discovery`] impl, since [`AppState::new`] always builds a config-driven one internally. Must
-/// be called before the returned `Arc` is cloned anywhere (no live listener spawned on it yet).
-fn install_discovery(state: &mut Arc<AppState>, discovery: Arc<dyn Discovery>) {
-    Arc::get_mut(state)
-        .expect("AppState must still be uniquely owned (not yet cloned/spawned)")
-        .federation
-        .discovery = Some(discovery);
 }
 
 #[tokio::test]
