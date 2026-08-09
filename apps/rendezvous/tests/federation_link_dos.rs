@@ -41,7 +41,7 @@ use meridian_rendezvous::config::{
     Config, DiscoveryMode, Federation, FederationPolicyMode, Limits, Server, Turn,
 };
 use meridian_rendezvous::federation::inbound::{bind_federation, run_federation};
-use meridian_rendezvous::federation::{dial, FederationTlsPaths};
+use meridian_rendezvous::federation::{dial, FederationTimeouts, FederationTlsPaths};
 use meridian_rendezvous::{AppState, MemoryStore};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use tokio::net::TcpStream;
@@ -216,6 +216,7 @@ async fn silent_connection_does_not_wedge_the_listener_for_a_legitimate_dial() {
             &a.paths(),
             "a.federation.test",
             None,
+            FederationTimeouts::default(),
         ),
     )
     .await;
@@ -370,6 +371,7 @@ async fn exhausting_max_concurrent_handshakes_drops_the_next_connection_promptly
                 &a.paths(),
                 "a.federation.test",
                 None,
+                FederationTimeouts::default(),
             )
             .await;
             if let Ok(link) = attempt {
@@ -439,6 +441,7 @@ async fn exhausting_max_links_drops_the_next_link_promptly_after_a_successful_ha
             &a.paths(),
             &format!("a{i}.federation.test"),
             None,
+            FederationTimeouts::default(),
         )
         .await
         .expect("legitimate dial completes while link slots remain");
@@ -462,6 +465,7 @@ async fn exhausting_max_links_drops_the_next_link_promptly_after_a_successful_ha
         &over.paths(),
         "over.federation.test",
         None,
+        FederationTimeouts::default(),
     )
     .await
     .expect(

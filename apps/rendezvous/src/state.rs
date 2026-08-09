@@ -135,6 +135,10 @@ pub struct FederationRuntime {
     pub discovery: Option<Arc<dyn federation::Discovery>>,
     pub policy: federation::FederationPolicy,
     pub limits: federation::FederationLimits,
+    /// Outbound dial/exchange timeout budget (task 3.3, review finding F3): read by
+    /// `federation::outbound::dial_foreign`'s `link::dial` call and by `fetch_foreign_bundle`'s /
+    /// `reachable_foreign`'s own per-exchange `send_frame`/`recv_frame` waits.
+    pub timeouts: federation::FederationTimeouts,
 }
 
 /// Build the [`FederationRuntime`] this config describes. Fails closed and loudly (`panic!`,
@@ -177,6 +181,7 @@ fn build_federation_runtime(config: &Config) -> FederationRuntime {
         discovery,
         policy: config.federation.to_policy(),
         limits: config.federation.to_limits(),
+        timeouts: config.federation.to_timeouts(),
     }
 }
 

@@ -53,7 +53,7 @@ pub use discovery::{
     StaticMap,
 };
 pub use link::{
-    dial, with_deadline, DeadlineExceeded, FederationLink, FederationListener, FederationTlsPaths,
-    LinkError,
+    dial, with_deadline, DeadlineExceeded, FederationLink, FederationListener, FederationTimeouts,
+    FederationTlsPaths, LinkError,
 };
 pub use policy::{Decision, FederationLimits, FederationPolicy, RateLimitScope, RejectReason};

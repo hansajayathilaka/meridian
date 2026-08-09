@@ -115,21 +115,17 @@ pub async fn fetch_foreign_bundle(
     };
     let out = FedFrame::new(FedOp::FetchBundle, 1, &req)
         .map_err(|e| FetchForeignError::Protocol(e.to_string()))?;
-    fed_link
-        .send_frame(&out)
+    // Task 3.3 (F3): bounded under `state.federation.timeouts.request` — a foreign server that
+    // completed `FedHello` but never reads/answers this request can no longer hang this call, or
+    // this connection's server-side task, forever.
+    let request_timeout = state.federation.timeouts.request;
+    with_request_deadline(request_timeout, &expected_domain, fed_link.send_frame(&out))
         .await
-        .map_err(|source| FetchForeignError::Dial {
-            domain: expected_domain.to_string(),
-            source,
-        })?;
+        .map_err(convert_dial_error)?;
 
-    let reply = fed_link
-        .recv_frame()
+    let reply = with_request_deadline(request_timeout, &expected_domain, fed_link.recv_frame())
         .await
-        .map_err(|source| FetchForeignError::Dial {
-            domain: expected_domain.to_string(),
-            source,
-        })?;
+        .map_err(convert_dial_error)?;
 
     match reply.op {
         FedOp::Bundle => reply
@@ -352,12 +348,17 @@ async fn dial_foreign(
         .unwrap_or(hint_domain)
         .to_string();
 
+    // Task 3.3 (F3): `dial` itself bounds its own connect/TLS/hello steps against
+    // `state.federation.timeouts` — see `link::dial`'s doc comment. A black-holed `hint_domain`
+    // (accepts TCP, then silence; or completes TLS+FedHello, then never answers a later request)
+    // can no longer hang this call, and thus never leaks the task awaiting it, forever.
     let fed_link = link::dial(
         addr,
         &expected_domain,
         &state.federation.tls.as_paths(),
         &state.federation.own_domain,
         Some(state.metrics.clone()),
+        state.federation.timeouts,
     )
     .await
     .map_err(|source| RouteForeignError::Dial {
@@ -366,6 +367,42 @@ async fn dial_foreign(
     })?;
 
     Ok((fed_link, expected_domain))
+}
+
+/// Await one outbound s2s exchange step (`send_frame`/`recv_frame`) over an already-established
+/// [`FederationLink`] under `timeout`, folding a deadline expiry into the SAME
+/// `RouteForeignError::Dial { source: LinkError::Timeout, .. }` shape a timed-out [`dial`] itself
+/// would have produced (task 3.3, review finding F3) — so a caller downstream (`ws.rs`) cannot
+/// distinguish "the connect/TLS/hello step timed out inside `dial`" from "the actual
+/// fed_fetch_bundle/fed_reachability round trip itself timed out": both collapse to the identical
+/// `Dial{..}` variant, which already maps to the client-visible `fed_unreachable` code — no new
+/// error shape, and no new observable signal, for either failure mode.
+///
+/// Returns [`RouteForeignError`] (not [`FetchForeignError`]) even though [`fetch_foreign_bundle`]
+/// is one of the two callers: `convert_dial_error`'s existing `Dial` mapping already handles this
+/// exact shape, so `fetch_foreign_bundle` reuses it via `.map_err(convert_dial_error)` rather than
+/// this function needing a second, near-identical copy.
+async fn with_request_deadline<F, T>(
+    timeout: std::time::Duration,
+    expected_domain: &str,
+    fut: F,
+) -> Result<T, RouteForeignError>
+where
+    F: std::future::Future<Output = Result<T, LinkError>>,
+{
+    match link::with_deadline(timeout, fut).await {
+        Ok(inner) => inner.map_err(|source| RouteForeignError::Dial {
+            domain: expected_domain.to_string(),
+            source,
+        }),
+        Err(link::DeadlineExceeded(duration)) => Err(RouteForeignError::Dial {
+            domain: expected_domain.to_string(),
+            source: LinkError::Timeout {
+                phase: "request",
+                duration,
+            },
+        }),
+    }
 }
 
 /// Server A's outbound path for a client's `RouteBody{to, to_hint}` naming a foreign account:
@@ -477,21 +514,13 @@ pub async fn reachable_foreign(
     let req = FedReachability { target };
     let out = FedFrame::new(FedOp::Reachability, 1, &req)
         .map_err(|e| RouteForeignError::Protocol(e.to_string()))?;
-    fed_link
-        .send_frame(&out)
-        .await
-        .map_err(|source| RouteForeignError::Dial {
-            domain: expected_domain.clone(),
-            source,
-        })?;
+    // Task 3.3 (F3): same bounded-wait treatment as `fetch_foreign_bundle`'s identical shape —
+    // see `with_request_deadline`'s doc comment.
+    let request_timeout = state.federation.timeouts.request;
+    with_request_deadline(request_timeout, &expected_domain, fed_link.send_frame(&out)).await?;
 
-    let reply = fed_link
-        .recv_frame()
-        .await
-        .map_err(|source| RouteForeignError::Dial {
-            domain: expected_domain,
-            source,
-        })?;
+    let reply =
+        with_request_deadline(request_timeout, &expected_domain, fed_link.recv_frame()).await?;
 
     match reply.op {
         FedOp::Reachable => {

@@ -222,6 +222,26 @@ pub struct Federation {
     /// links, across all partners. Same "proposed, not grounded" status as the two fields above.
     /// Must be `> 0`.
     pub max_links: u32,
+    /// **`TODO: confirm`** (task 3.3 / review finding F3): how long the OUTBOUND
+    /// [`crate::federation::link::dial`]'s raw `TcpStream::connect` step may take before giving
+    /// up — the dial-side analogue of `handshake_timeout_ms` above, which bounds the INBOUND
+    /// accept side instead. Not grounded in a prior design doc; proposed conservatively (generous
+    /// relative to any real TCP handshake over a reasonable network, tight enough that a
+    /// black-holed partner — one that never even completes the three-way handshake — can't hold a
+    /// pinned outbound task open for long). Must be `> 0` — see [`Federation::validate`].
+    pub connect_timeout_ms: u64,
+    /// **`TODO: confirm`** (task 3.3 / F3): how long EACH subsequent outbound step may take
+    /// before giving up — `dial`'s TLS handshake, `dial`'s `FedHello` exchange (two independent
+    /// deadlines inside `dial` itself), and, reused by [`crate::federation::outbound`], each
+    /// individual s2s request/reply exchange over an already-established link
+    /// (`fetch_foreign_bundle`'s and `reachable_foreign`'s reply receives). One shared knob across
+    /// all of these post-connect steps, mirroring `handshake_timeout_ms`'s single knob for the
+    /// whole inbound mTLS+`FedHello` handshake rather than a separate knob per step. Same
+    /// "proposed, not grounded" status as `connect_timeout_ms`. Must be `> 0`.
+    ///
+    /// Deliberately does NOT bound [`crate::federation::outbound::ROUTE_REPLY_GRACE`] — that
+    /// constant's value is task 3.20's, untouched here.
+    pub request_timeout_ms: u64,
 }
 
 /// Federation admission policy mode (task 2.6). See [`Federation::policy`]. Kept as its own
@@ -321,6 +341,22 @@ impl Default for Federation {
             handshake_timeout_ms: 10_000,
             max_concurrent_handshakes: 64,
             max_links: 256,
+            // `TODO: confirm` (task 3.3, review finding F3): the OUTBOUND (dial-side) mirror of
+            // the three inbound-hardening knobs just above — same "not grounded in a prior design
+            // doc, proposed conservatively" status. See each field's own doc comment for what it
+            // bounds.
+            // - `connect_timeout_ms = 5_000`: generous relative to any real TCP three-way
+            //   handshake over any reasonable network (typically well under a second), while
+            //   still bounding how long a black-holed partner (accepts TCP, then silence) can
+            //   hold a pinned outbound task open.
+            // - `request_timeout_ms = 10_000`: matches `handshake_timeout_ms`'s value (the
+            //   INBOUND side's equivalent budget for a full mTLS+FedHello handshake) since this
+            //   knob covers the analogous OUTBOUND steps (TLS handshake, FedHello exchange) plus
+            //   one additional real wire round trip for the actual fed request/reply, which
+            //   `ROUTE_REPLY_GRACE`'s much smaller 500ms is scoped to cover on its own for the
+            //   fire-and-forget `fed_route` case specifically (task 3.20, untouched here).
+            connect_timeout_ms: 5_000,
+            request_timeout_ms: 10_000,
         }
     }
 }
@@ -347,6 +383,16 @@ impl Federation {
             self.fed_route_per_origin_per_min,
             self.fed_per_origin_account_per_min,
         )
+    }
+
+    /// Build the [`crate::federation::link::FederationTimeouts`] `dial` (and
+    /// `federation::outbound`'s per-exchange waits) read from (task 3.3). Same config-owns-parsing
+    /// / domain-module-owns-the-runtime-type split as [`Self::to_policy`]/[`Self::to_limits`].
+    pub fn to_timeouts(&self) -> crate::federation::link::FederationTimeouts {
+        crate::federation::link::FederationTimeouts {
+            connect: std::time::Duration::from_millis(self.connect_timeout_ms),
+            request: std::time::Duration::from_millis(self.request_timeout_ms),
+        }
     }
 }
 
@@ -486,6 +532,22 @@ impl Federation {
             return Err(
                 "federation.max_links must be greater than 0 (0 would allow no established \
                  federation link at all)"
+                    .to_string(),
+            );
+        }
+        // Task 3.3 (F3): the OUTBOUND mirror of the same "0 isn't the strictest possible
+        // setting, it's a config that either wedges/refuses every dial instantly" reasoning above.
+        if self.connect_timeout_ms == 0 {
+            return Err(
+                "federation.connect_timeout_ms must be greater than 0 (0 would time out every \
+                 outbound TCP connect instantly)"
+                    .to_string(),
+            );
+        }
+        if self.request_timeout_ms == 0 {
+            return Err(
+                "federation.request_timeout_ms must be greater than 0 (0 would time out every \
+                 outbound TLS handshake, FedHello exchange, and fed request/reply instantly)"
                     .to_string(),
             );
         }
@@ -926,6 +988,66 @@ mod tests {
         let file = write_toml("");
 
         assert!(Config::load(Some(file.path().to_str().unwrap())).is_err());
+    }
+
+    // -- task 3.3: outbound dial timeout config knobs ------------------------------------------
+
+    #[test]
+    fn federation_dial_timeout_defaults_are_positive_and_todo_confirm() {
+        // Explicitly `TODO: confirm` (task 3.3) — not grounded in a prior design doc — but must
+        // still be well-formed (non-zero) out of the box.
+        let f = Federation::default();
+        assert_eq!(f.connect_timeout_ms, 5_000);
+        assert_eq!(f.request_timeout_ms, 10_000);
+    }
+
+    #[test]
+    fn federation_dial_timeout_env_overrides_apply() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[
+                ("MERIDIAN_RENDEZVOUS_FEDERATION__CONNECT_TIMEOUT_MS", "1500"),
+                ("MERIDIAN_RENDEZVOUS_FEDERATION__REQUEST_TIMEOUT_MS", "3000"),
+            ],
+        );
+        let file = write_toml("");
+
+        let config = Config::load(Some(file.path().to_str().unwrap())).unwrap();
+
+        assert_eq!(config.federation.connect_timeout_ms, 1500);
+        assert_eq!(config.federation.request_timeout_ms, 3000);
+    }
+
+    #[test]
+    fn federation_connect_timeout_zero_is_rejected_fail_closed() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[federation]\nconnect_timeout_ms = 0\n");
+
+        let err = Config::load(Some(file.path().to_str().unwrap()))
+            .expect_err("a 0ms connect deadline must be rejected, not silently loaded");
+        assert!(err.to_string().contains("connect_timeout_ms"));
+    }
+
+    #[test]
+    fn federation_request_timeout_zero_is_rejected_fail_closed() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[federation]\nrequest_timeout_ms = 0\n");
+
+        let err = Config::load(Some(file.path().to_str().unwrap()))
+            .expect_err("a 0ms request deadline must be rejected, not silently loaded");
+        assert!(err.to_string().contains("request_timeout_ms"));
+    }
+
+    #[test]
+    fn federation_to_timeouts_matches_configured_millis() {
+        let f = Federation {
+            connect_timeout_ms: 111,
+            request_timeout_ms: 222,
+            ..Federation::default()
+        };
+        let timeouts = f.to_timeouts();
+        assert_eq!(timeouts.connect, std::time::Duration::from_millis(111));
+        assert_eq!(timeouts.request, std::time::Duration::from_millis(222));
     }
 
     #[test]

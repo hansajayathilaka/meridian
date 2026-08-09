@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use meridian_proto::{FedFrame, FedOp, FedReachability};
 use meridian_rendezvous::federation::link::{build_client_tls_config, build_server_tls_config};
-use meridian_rendezvous::federation::{dial, FederationListener, FederationTlsPaths, LinkError};
+use meridian_rendezvous::federation::{
+    dial, FederationListener, FederationTimeouts, FederationTlsPaths, LinkError,
+};
 use meridian_rendezvous::metrics::Metrics;
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::pem::PemObject;
@@ -160,6 +162,7 @@ async fn happy_path_private_ca_mode() {
         &a.paths(),
         "a.federation.test",
         Some(metrics.clone()),
+        FederationTimeouts::default(),
     )
     .await
     .expect("dial succeeds under a shared private CA with matching pinned domain");
@@ -210,6 +213,7 @@ async fn happy_path_webpki_mode() {
         &a.webpki_paths(),
         "a.federation.test",
         None,
+        FederationTimeouts::default(),
     )
     .await
     .expect("WebPKI-mode dial succeeds when SSL_CERT_FILE trusts the issuing CA");
@@ -253,6 +257,7 @@ async fn untrusted_ca_is_rejected() {
         &a_dial_paths,
         "a.federation.test",
         None,
+        FederationTimeouts::default(),
     )
     .await;
     assert!(
@@ -291,6 +296,7 @@ async fn valid_cert_for_wrong_domain_is_rejected() {
         &a.paths(),
         "a.federation.test",
         None,
+        FederationTimeouts::default(),
     )
     .await;
     let err = dial_result

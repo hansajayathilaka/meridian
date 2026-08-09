@@ -107,6 +107,74 @@ pub enum LinkError {
     Handshake(String),
     #[error("frame of {0} bytes exceeds the {MAX_FRAME_LEN}-byte limit")]
     FrameTooLarge(usize),
+    /// (task 3.3, review finding F3) One step of the OUTBOUND dial/exchange path — `phase` is a
+    /// static, non-identifying label (`"connect"` | `"tls"` | `"hello"` | `"request"`), never
+    /// anything derived from the peer's address/domain, mirroring `inbound.rs`'s `DropRateLimiter`
+    /// convention of static reason strings only — did not complete within `duration`. Kept as a
+    /// single variant covering every phase (rather than one variant per phase) because every
+    /// caller (`ws.rs`'s `federated_fetch_error_reply`/`federated_route_error_reply`) already
+    /// treats every other `Dial{source: LinkError, ..}` outcome identically (`FED_UNREACHABLE`) —
+    /// a genuinely different variant per phase would add no client-visible distinction, only more
+    /// match arms to keep in sync.
+    #[error("dial timed out during {phase} after {duration:?}")]
+    Timeout {
+        phase: &'static str,
+        duration: Duration,
+    },
+}
+
+/// Outbound dial timeout budget (task 3.3, review finding F3): bounds how long [`dial`] — and,
+/// reused by [`crate::federation::outbound`], each individual s2s request/reply exchange over an
+/// already-established link (`fetch_foreign_bundle`, `reachable_foreign`) — will wait at each
+/// step before giving up, so a black-holed partner (one that accepts a TCP connection but never
+/// completes TLS, or completes the handshake but never answers) cannot hang the originating
+/// client's WebSocket session or leak a pinned task plus TLS link forever.
+///
+/// The concrete default values (`config::Federation::connect_timeout_ms`/`request_timeout_ms`)
+/// are `TODO: confirm` there, not here — this type only carries whatever the caller resolved.
+#[derive(Clone, Copy, Debug)]
+pub struct FederationTimeouts {
+    /// Bounds the raw `TcpStream::connect` step only — before any TLS byte is exchanged.
+    pub connect: Duration,
+    /// Bounds EACH of `dial`'s TLS-handshake and `FedHello`-exchange steps (two separate
+    /// deadlines, not one shared budget spanning both), and each individual outbound s2s
+    /// request/reply exchange over an already-established link. One shared knob across all of
+    /// these post-connect steps, mirroring `Federation::handshake_timeout_ms`'s single knob for
+    /// the whole INBOUND mTLS+`FedHello` handshake, rather than a separate knob per step.
+    pub request: Duration,
+}
+
+impl Default for FederationTimeouts {
+    /// Mirrors `config::Federation::default`'s `connect_timeout_ms = 5_000` /
+    /// `request_timeout_ms = 10_000` — kept in sync manually since this type has no dependency on
+    /// `crate::config` (same split as `FederationTlsPaths`/`config::Federation`'s TLS-path
+    /// fields). Used by tests that don't care about this task's specific timeout values; `dial`'s
+    /// real callers always pass an explicit value resolved from config.
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_millis(5_000),
+            request: Duration::from_millis(10_000),
+        }
+    }
+}
+
+/// Await one phase of [`dial`]'s connect/TLS/hello sequence under `duration`, collapsing BOTH "the
+/// phase's own operation failed" and "the phase's deadline elapsed" into a single [`LinkError`] —
+/// callers need only one `?`, and a deadline expiry becomes [`LinkError::Timeout`] tagged with
+/// `phase` rather than a bare [`DeadlineExceeded`] that would need re-wrapping at every call site.
+async fn dial_phase<F, T, E>(
+    duration: Duration,
+    phase: &'static str,
+    fut: F,
+) -> Result<T, LinkError>
+where
+    F: Future<Output = Result<T, E>>,
+    LinkError: From<E>,
+{
+    match with_deadline(duration, fut).await {
+        Ok(inner) => inner.map_err(LinkError::from),
+        Err(DeadlineExceeded(duration)) => Err(LinkError::Timeout { phase, duration }),
+    }
 }
 
 /// PEM file paths for this rendezvous's own federation identity and trust root. Mirrors
@@ -374,23 +442,35 @@ impl Drop for FederationLink {
 /// explicit parameter since discovery doesn't exist yet. `own_domain` is this server's own
 /// self-asserted `FedHello.domain` (diagnostic only). `metrics`, if given, is updated for the
 /// link's lifetime (see [`FederationLink`]'s `Drop` impl).
+///
+/// **Task 3.3 (review finding F3, blocking):** every step that can block on a black-holed or
+/// merely slow partner — the raw `TcpStream::connect`, the TLS handshake, and the `FedHello`
+/// exchange — runs under [`dial_phase`]/[`with_deadline`], bounded by `timeouts.connect` (the
+/// first step) or `timeouts.request` (the latter two, each its own independent deadline). Without
+/// this, a partner that merely accepts a TCP connection and goes silent — never completing TLS —
+/// would hang this call, and the pinned task plus TLS-layer resources awaiting it, forever; a
+/// deadline that elapses at any of the three steps surfaces as [`LinkError::Timeout`], which
+/// `federation::outbound`'s callers already fold into the same client-visible `fed_unreachable`
+/// outcome as every other dial failure (see `outbound.rs`'s `Dial` error variant).
 pub async fn dial(
     addr: SocketAddr,
     expected_domain: &str,
     paths: &FederationTlsPaths<'_>,
     own_domain: &str,
     metrics: Option<Arc<Metrics>>,
+    timeouts: FederationTimeouts,
 ) -> Result<FederationLink, LinkError> {
     let tls_config = build_client_tls_config(paths)?;
     let connector = TlsConnector::from(tls_config);
-    let tcp = TcpStream::connect(addr).await?;
+    let tcp = dial_phase(timeouts.connect, "connect", TcpStream::connect(addr)).await?;
     let server_name = ServerName::try_from(expected_domain.to_string())
         .map_err(|e| LinkError::Cert(format!("invalid domain {expected_domain:?}: {e}")))?;
 
     // The handshake itself is the primary enforcement of the domain pin: rustls's hostname
     // verification rejects a cert that chains to the trust root but whose SAN doesn't cover
     // `server_name` before `connect` ever returns Ok.
-    let tls_stream = connector.connect(server_name, tcp).await?;
+    let tls_stream =
+        dial_phase(timeouts.request, "tls", connector.connect(server_name, tcp)).await?;
 
     // Belt-and-suspenders re-check (see module docs): re-extract the peer's SAN/CN and re-assert
     // it covers `expected_domain` explicitly, rather than relying solely on the above having
@@ -414,7 +494,12 @@ pub async fn dial(
     }
 
     let mut stream: TlsStream<TcpStream> = tls_stream.into();
-    let _peer_asserted_domain = exchange_hello(&mut stream, own_domain).await?;
+    let _peer_asserted_domain = dial_phase(
+        timeouts.request,
+        "hello",
+        exchange_hello(&mut stream, own_domain),
+    )
+    .await?;
 
     if let Some(m) = &metrics {
         m.federation_link_up();
