@@ -19,21 +19,17 @@ jobs:
   capacity-5k:
     name: 5k-connection capacity test (--ignored)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
-      # GitHub-hosted runners default to a much lower open-file soft limit than the ~10k+2*5000
-      # this test needs (apps/rendezvous/tests/rendezvous.rs::preflight_fd_limit computes the exact
-      # requirement and refuses to run rather than fail with an opaque EMFILE partway through).
-      - name: Raise open-file limit
-        run: ulimit -n 20000 && ulimit -n
-
-      # The exact invocation the test's own doc comment names (rendezvous.rs, above
-      # capacity_concurrent_connections): release build, `--ignored` filtered to `capacity` so this
-      # does not also pick up other #[ignore]d tests in the same package (e.g.
-      # federation_discovery.rs's airgap_probe_static_map_resolve, which is meant to be invoked only
-      # as an LD_PRELOAD subprocess by its own harness, not directly here).
+      # GitHub Actions runs each `run:` block in its own fresh shell, so a `ulimit` raised in one
+      # step does NOT persist into the next — the ulimit that actually matters is the one applied
+      # inline, in the same step as the `cargo test` invocation below (apps/rendezvous/tests/
+      # rendezvous.rs::preflight_fd_limit computes the exact >10k+2*5000 requirement this test
+      # needs and refuses to run rather than fail with an opaque EMFILE partway through).
       - name: Capacity test (5k concurrent WSS connections)
         run: |
           ulimit -n 20000

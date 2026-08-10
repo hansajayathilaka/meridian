@@ -42,6 +42,11 @@ Everything else is owned by a Phase-3 task; these are the exceptions that would 
   regression, deliberately not scoped into Phase 3.
 - **If `relay_rewrite.rs` ever flakes in CI**, widen its `SIDE_TIMEOUT`, **never** `ANSWER_TIMEOUT` —
   the test burns ~31 s real time with only ~4–5 s slack over the 30 s timeout it is exercising.
+- **A human must confirm branch protection on `main` actually requires `ci.yml` to pass before
+  merge** (`docs/operations/docker-image.md` §1) — no tool available to an agent session can read
+  GitHub's branch-protection/ruleset config. 3.12 landed the pre-merge docker build gate itself but
+  left this one sub-item open by design rather than guessing; check GitHub Settings → Branches/
+  Rulesets and update that doc's `TODO: confirm` once observed.
 
 > **Keep this section short.** Per-task outcomes, review sign-offs, and the decisions behind them
 > live in each task file's **Outcome** section (and the phase README) — not here. This block carries
