@@ -113,6 +113,25 @@ verbatim, not redefined for federation.
 failure is reported only via `FedErr` echoing the route's `id`. There is deliberately no
 `FedRouteOk` — do not add one.
 
+**The fixed-latency-tax / reply-wait this implies, and its measured bound (task 3.20).** Because
+there is no `FedRouteOk`, the dialing side (`route_foreign`,
+`apps/rendezvous/src/federation/outbound.rs`) has no positive signal that a route succeeded — it
+can only wait a bounded window (`ROUTE_REPLY_GRACE`) for a possible `FedErr` and, if nothing arrives
+in time, treat that as success. Every successful federated route pays this wait as a fixed latency
+tax before the client's request resolves, and the window necessarily trades off against a real
+residual: a genuine `FedErr` that crosses the wire slower than the window (real congestion, an
+overloaded peer) is reported to the client as a false-positive delivery confirmation instead. Task
+2.8 shipped this window as an unmeasured 500ms guess and recorded the tension as an open follow-up;
+task 3.20 measured the real reply-RTT (N=200 samples, over a real two-server mTLS link, isolating
+the exact span this window bounds: `p50≈88ms`, `p99≈92ms`, `max≈93ms` — see
+`ROUTE_REPLY_GRACE`'s own doc comment in `outbound.rs` for the full measurement, including a
+same-implementation finding — missing `TCP_NODELAY` — that explains why this is tens of
+milliseconds even on loopback, not fractions of one) and tightened `ROUTE_REPLY_GRACE` to **300ms**
+(measured max rounded up, ×3 real-network headroom) accordingly. This narrows, but by design does
+**not** close, the false-positive residual described above — closing it outright would need this
+section's "do not add a `FedRouteOk`" decision reopened via an ADR, not a unilateral change to the
+window alone.
+
 **`FedHello.domain` and `FedFetchBundle.requesting_server` are self-asserted / informational only,
 never authoritative.** Both exist purely as diagnostic/logging aids (e.g. surfacing a
 domain-mismatch warning in an operator's logs). The mTLS peer identity established at the

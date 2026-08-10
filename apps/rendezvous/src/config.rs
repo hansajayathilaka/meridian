@@ -460,8 +460,8 @@ impl Default for Federation {
             //   INBOUND side's equivalent budget for a full mTLS+FedHello handshake) since this
             //   knob covers the analogous OUTBOUND steps (TLS handshake, FedHello exchange) plus
             //   one additional real wire round trip for the actual fed request/reply, which
-            //   `ROUTE_REPLY_GRACE`'s much smaller 500ms is scoped to cover on its own for the
-            //   fire-and-forget `fed_route` case specifically (task 3.20, untouched here).
+            //   `ROUTE_REPLY_GRACE`'s much smaller 300ms (measured + tightened by task 3.20) is
+            //   scoped to cover on its own for the fire-and-forget `fed_route` case specifically.
             connect_timeout_ms: 5_000,
             request_timeout_ms: 10_000,
         }

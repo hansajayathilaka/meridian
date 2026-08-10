@@ -296,8 +296,9 @@ async fn sustained_cross_org_messages_under_budget_all_succeed() {
 /// doc comment and `Federation::validate` for that coupling).
 ///
 /// Uses a scaled-down pair of limits (rather than the full shipped defaults) purely to keep this
-/// test fast — each successful `fed_route` pays a fixed `ROUTE_REPLY_GRACE` (500ms) latency tax by
-/// design (fire-and-forget on success), so wall-clock cost scales linearly with the route budget
+/// test fast — each successful `fed_route` pays a fixed `ROUTE_REPLY_GRACE` (300ms, task 3.20)
+/// latency tax by design (fire-and-forget on success), so wall-clock cost scales linearly with
+/// the route budget
 /// exercised. **Critically, unlike this test's pre-re-review version, the scaled-down reachability
 /// budget is DERIVED from the real shipped defaults' ratio, not hand-picked.** The bug this
 /// specifically guards against: the previous version fixed `ROUTE_BUDGET = 20` while leaving
