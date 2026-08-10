@@ -12,6 +12,23 @@
 # (the default is already empty) — trust falls back to the OS/system store (WebPKI mode), which is
 # why `rendezvous-a`/`rendezvous-b` get this demo's private CA installed via the
 # `meridian-demo-ca` volume + demo-entrypoint.sh's `update-ca-certificates` step below.
+#
+# WARNING (task 3.16 / review finding F6, ADR 0017 (a)/C4): this installs a PRIVATE CA into the
+# container OS trust store and then runs SRV discovery (unpinned WebPKI trust) against it. That
+# is exactly the pattern ADR 0017 (a) rejects ("Option A") when the CA is shared by more than one
+# org: any org enrolled under the CA could present a cert whose SAN matches a victim partner's
+# domain and be accepted as that partner, because SRV-resolved endpoints never carry a
+# `pinned_identity`. `Federation::validate` CANNOT catch this — it only ever sees
+# `ca_bundle_path` (empty here, by construction), never whether the OS trust store itself has had
+# a private CA installed out-of-band, so no startup warning fires either.
+#
+# This demo is safe ONLY because the CA is single-purpose, ephemeral (this container network
+# alone), and shared by exactly two cooperative demo orgs with nothing at stake — it is not a
+# stand-in for a real multi-org deployment. DO NOT copy this pattern (private CA in the OS trust
+# store + `discovery = "srv"`) into a production deployment that federates a private CA across
+# independent, mutually-distrusting orgs. Use `discovery = "static"` with a `federation_map.toml`
+# `pinned_identity` per partner instead (see `docker-compose.static.yml` in this directory, and
+# docs/operations/deployment.md §9.2).
 services:
   dns:
     build: ./dns

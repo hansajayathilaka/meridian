@@ -616,6 +616,37 @@ impl Federation {
                     .to_string(),
             );
         }
+        // Investigated (task 3.16 / review finding F6) and rejected as not reliably detectable: a
+        // startup warning when `discovery = "srv"` is configured and the resolved trust anchor is
+        // a private (non-public) CA installed directly into the OS/system trust store, rather than
+        // supplied via `ca_bundle_path` (the check just above only ever sees the latter). This is
+        // the same ADR 0017 (a)/C4 impersonation hole under a *shared, multi-org* private CA —
+        // `demo/two-orgs`'s SRV profile models exactly this pattern via `update-ca-certificates`
+        // (see its `docker-compose.srv.yml`/`demo-entrypoint.sh` header comments) — but it is not
+        // implemented here because it is not reliably detectable from this function, or from
+        // anywhere in this process:
+        // - `validate` is a pure, filesystem/network-free check over parsed config fields (see
+        //   this fn's own doc comment); a private CA installed into the OS store is populated
+        //   out-of-band (by `update-ca-certificates` or equivalent) and leaves no trace in `self`
+        //   at all — there is no field to key a check on.
+        // - Even reading the OS trust store at runtime (as
+        //   [`crate::federation::link::load_root_store`] does, at dial/listen time, not at config
+        //   validation) would not distinguish "private CA" from "public CA": `rustls-native-certs`
+        //   returns a flat list of trusted root certificates with no provenance/flag saying which
+        //   entries a CA/Browser-Forum-audited public root program issued versus which an operator
+        //   (or an MDM policy, corporate TLS-inspecting proxy, or this very demo) added locally.
+        //   There is no authoritative, always-in-sync "list of legitimate public roots" to diff
+        //   against from inside this process — bundling one (e.g. `webpki-roots`, Mozilla's
+        //   curated list) would routinely mismatch real OS-native stores (which legitimately carry
+        //   extra vendor/regional/enterprise roots absent from any such bundle), producing a
+        //   warning that fires on ordinary, benign production hosts as often as on the actual
+        //   hazard. A check that noisy trains operators to ignore it, which is worse than no check
+        //   — see this task's own Risks/notes: "do not fake a check that gives false assurance."
+        // Mitigation is therefore documentation-only, not runtime detection: ADR 0017 (a)'s
+        // clarifying note (task 3.16), `docs/operations/deployment.md` §9.2, and the demo's own
+        // compose/entrypoint header comments all state that a private CA trust anchor requires
+        // `discovery = "static"` with a mandatory `pinned_identity`, regardless of how the CA
+        // became a trust anchor (`ca_bundle_path` or the OS store).
         // Task 3.2 (F2/N5): all three inbound-hardening knobs are `> 0`-or-bust — a `0` isn't
         // "the strictest possible setting", it's a config that either wedges every inbound
         // connection instantly (a 0ms handshake deadline) or admits none at all (a 0-permit
