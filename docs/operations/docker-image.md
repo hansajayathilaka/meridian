@@ -3,7 +3,8 @@
 <!-- Source: this decision (GitHub Container Registry publish pipeline). -->
 > **Nav:** [docs index](../INDEX.md) · [operations index](./README.md) · [deployment](./deployment.md) ·
 > [rendezvous-protocol-v1 §5 (full config surface)](../api/rendezvous-protocol-v1.md#5-config-surface-the-92-subset) ·
-> [ADR 0018 (figment config loading)](../adr/0018-rendezvous-config-loading.md)
+> [ADR 0018 (figment config loading)](../adr/0018-rendezvous-config-loading.md) ·
+> [ADR 0019 (image distribution + signing)](../adr/0019-container-image-distribution.md)
 
 ## 1. What publishes it
 
@@ -16,6 +17,12 @@ exhaustive by construction: the rendezvous server depends on nothing else in the
 enforced by [`tools/lint-server-no-core.sh`](../../tools/lint-server-no-core.sh) — so a merge
 touching any other crate cannot change the image and is skipped rather than publishing an identical
 rebuild.
+
+The `ghcr.io` channel, the `:latest` + `:<short-sha>` tag policy, and the decision to defer image
+signing/provenance for now (with a named residual and reopening trigger) are ratified in
+[ADR 0019](../adr/0019-container-image-distribution.md) — read it before assuming a pulled image is
+anything more than "built by this repo's CI from *some* commit"; there is currently no cryptographic
+way to confirm which one.
 
 The job does **not** re-run the test suite itself; it relies on branch protection already having
 required [`ci.yml`](../../.github/workflows/ci.yml) to pass before a PR can merge to `main`.
