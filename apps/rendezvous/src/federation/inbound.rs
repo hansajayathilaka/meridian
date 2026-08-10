@@ -335,7 +335,8 @@ pub async fn handle_fed_reachability(
     })
 }
 
-/// Serve one already-established inbound [`FederationLink`] until it closes or errors: read
+/// Serve one already-established inbound [`FederationLink`] until it closes, errors, or sits idle
+/// past `federation.serve_idle_timeout_ms` (task 3.23) waiting for the peer's next frame: read
 /// frames, dispatch by [`FedOp`], reply. `FedOp::FetchBundle` (2.7), `FedOp::Route` and
 /// `FedOp::Reachability` (2.8 — `Hello` is already consumed by link establishment) are handled;
 /// every other/unknown op still replies `FedErr{bad_request}`.
@@ -345,11 +346,28 @@ pub async fn serve_link(mut link: FederationLink, state: Arc<AppState>) {
     // re-derived from a request body.
     let origin_domains = link.peer_domains.clone();
     let metering_key = link.metering_key().to_string();
+    // Task 3.23: computed once, before the loop, not per-iteration — mirrors `run_federation`'s
+    // own `handshake_timeout`, which is likewise read from config once rather than on every pass.
+    let idle_timeout =
+        std::time::Duration::from_millis(state.config.federation.serve_idle_timeout_ms);
     loop {
-        let frame = match link.recv_frame().await {
-            Ok(f) => f,
-            Err(_) => return, // link closed or errored — nothing more to serve
-        };
+        let frame =
+            match crate::federation::link::with_deadline(idle_timeout, link.recv_frame()).await {
+                Ok(Ok(f)) => f,
+                Ok(Err(_)) => return, // link closed or errored — nothing more to serve
+                // Task 3.23 (found during 3.22's coverage work): an already-handshaked peer that
+                // stalls or trickles a frame indefinitely must not hold this link's `max_links`
+                // permit forever. `serve_idle_timeout_ms` is a DELIBERATELY separate config knob from
+                // `handshake_timeout_ms` (bounds the PRE-AUTH mTLS+FedHello handshake — never reached
+                // by an already-established link like this one) and from `request_timeout_ms` (bounds
+                // an OUTBOUND request/reply round trip this server itself initiates, not an inbound
+                // peer's next frame on a link it already holds) — see
+                // `Federation::serve_idle_timeout_ms`'s own doc comment for the full reasoning.
+                // Dropping here, with no reply frame, is the same "link closed, nothing more to
+                // serve" shape as the arm above: the caller (`run_federation`) releases the
+                // `max_links` permit the instant this function returns.
+                Err(_deadline_exceeded) => return,
+            };
         match frame.op {
             FedOp::FetchBundle => {
                 let req: FedFetchBundle = match frame.decode() {

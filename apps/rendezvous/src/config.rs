@@ -290,6 +290,42 @@ pub struct Federation {
     /// Deliberately does NOT bound [`crate::federation::outbound::ROUTE_REPLY_GRACE`] — that
     /// constant's value is task 3.20's, untouched here.
     pub request_timeout_ms: u64,
+    /// **`TODO: confirm`** (task 3.23 / found during 3.22's coverage work, not part of the
+    /// original phase-2 report): how long [`crate::federation::inbound::serve_link`]'s main loop
+    /// may sit idle, waiting for the PEER'S NEXT frame on an already-established,
+    /// already-authenticated link, before this server gives up on that read (via
+    /// [`crate::federation::link::with_deadline`]) and drops the link.
+    ///
+    /// Deliberately a THIRD, independent timeout knob — not a reuse of either sibling above, both
+    /// of which bound a genuinely different phase of the connection's lifecycle:
+    /// - [`Federation::handshake_timeout_ms`] bounds the PRE-AUTH mTLS+`FedHello` handshake — a
+    ///   link that has not been authenticated at all yet. `serve_link` is never even reached until
+    ///   that handshake has already succeeded, so this field's deadline starts from a position
+    ///   `handshake_timeout_ms` never has to reason about.
+    /// - [`Federation::request_timeout_ms`] bounds a single OUTBOUND request/reply round trip THIS
+    ///   server itself initiates (`dial`'s post-connect steps, `fetch_foreign_bundle`,
+    ///   `reachable_foreign`) — this server is the one waiting on its own outgoing call.
+    /// - This field bounds neither: it is the INBOUND, accept side's idle wait between requests on
+    ///   a link this server is *serving*, for a peer that may legitimately go quiet for a while
+    ///   between real requests, or may never send another frame at all (task 3.22's
+    ///   `slow_loris_after_link_established_reveals_no_idle_read_deadline` demonstrated exactly
+    ///   this gap before this field existed — an admitted-but-stalling peer could hold a
+    ///   `max_links` permit indefinitely with no deadline of any kind covering this phase).
+    ///   Reusing either sibling's knob would either be wrong in kind (this isn't a handshake) or
+    ///   silently couple an unrelated inbound idle budget to an outbound request-timeout tuning
+    ///   decision that has nothing to do with it.
+    ///
+    /// `TODO: confirm`: not grounded in a prior design doc, same status as its siblings above.
+    /// Proposed default derived from [`Federation::request_timeout_ms`]'s own existing precedent
+    /// (`10_000`ms) rather than an unrelated guess: once a link is established, a genuine reply
+    /// from the peer on it should be about as fast as this server's own outbound request/reply
+    /// exchange over an equivalently-established link — both are a single wire round trip between
+    /// two already-mTLS-authenticated peers, with no repeated handshake cost on either side — so
+    /// `request_timeout_ms`'s value is the closest available comparison point for "how long should
+    /// one wire exchange on an established link take". Must be `> 0` — see [`Federation::validate`]
+    /// (same "0 isn't the strictest setting, it's a config that drops every established link
+    /// instantly" reasoning as `handshake_timeout_ms`/`request_timeout_ms`).
+    pub serve_idle_timeout_ms: u64,
 }
 
 /// Federation admission policy mode (task 2.6). See [`Federation::policy`]. Kept as its own
@@ -464,6 +500,21 @@ impl Default for Federation {
             //   scoped to cover on its own for the fire-and-forget `fed_route` case specifically.
             connect_timeout_ms: 5_000,
             request_timeout_ms: 10_000,
+            // `TODO: confirm` (task 3.23 / found during 3.22's coverage work): the accept-side
+            // idle-read deadline for `serve_link`'s main loop — see that field's own doc comment
+            // for why this is a THIRD, independent knob rather than a reuse of
+            // `handshake_timeout_ms` (bounds the pre-auth handshake, a different phase) or
+            // `request_timeout_ms` (bounds an outbound request/reply round trip this server
+            // itself initiates, not an inbound peer's next frame on a link it already holds).
+            // - `serve_idle_timeout_ms = 10_000`: matches `request_timeout_ms`'s value rather
+            //   than inventing an unrelated number — once a link is established, a genuine reply
+            //   from the peer on it should be about as fast as this server's own outbound
+            //   request/reply exchange over an equivalently-established link (a single wire round
+            //   trip between two already-mTLS-authenticated peers, no handshake cost on either
+            //   side) — `request_timeout_ms`'s existing precedent is the closest available
+            //   comparison point for "how long should one wire exchange on an established link
+            //   take", not a fresh guess.
+            serve_idle_timeout_ms: 10_000,
         }
     }
 }
@@ -707,6 +758,15 @@ impl Federation {
             return Err(
                 "federation.request_timeout_ms must be greater than 0 (0 would time out every \
                  outbound TLS handshake, FedHello exchange, and fed request/reply instantly)"
+                    .to_string(),
+            );
+        }
+        // Task 3.23: the accept-side idle-read deadline gets the same "0 isn't the strictest
+        // possible setting" fail-closed treatment as its two siblings above.
+        if self.serve_idle_timeout_ms == 0 {
+            return Err(
+                "federation.serve_idle_timeout_ms must be greater than 0 (0 would time out every \
+                 established inbound link's idle read instantly)"
                     .to_string(),
             );
         }
@@ -1286,6 +1346,42 @@ mod tests {
         let timeouts = f.to_timeouts();
         assert_eq!(timeouts.connect, std::time::Duration::from_millis(111));
         assert_eq!(timeouts.request, std::time::Duration::from_millis(222));
+    }
+
+    // -- task 3.23: serve_link idle-read deadline config knob ----------------------------------
+
+    #[test]
+    fn federation_serve_idle_timeout_default_is_positive_and_todo_confirm() {
+        // `TODO: confirm` (task 3.23) — not grounded in a prior design doc — but must still be
+        // well-formed (non-zero) out of the box.
+        let f = Federation::default();
+        assert_eq!(f.serve_idle_timeout_ms, 10_000);
+    }
+
+    #[test]
+    fn federation_serve_idle_timeout_env_override_applies() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[(
+                "MERIDIAN_RENDEZVOUS_FEDERATION__SERVE_IDLE_TIMEOUT_MS",
+                "4000",
+            )],
+        );
+        let file = write_toml("");
+
+        let config = Config::load(Some(file.path().to_str().unwrap())).unwrap();
+
+        assert_eq!(config.federation.serve_idle_timeout_ms, 4000);
+    }
+
+    #[test]
+    fn federation_serve_idle_timeout_zero_is_rejected_fail_closed() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[federation]\nserve_idle_timeout_ms = 0\n");
+
+        let err = Config::load(Some(file.path().to_str().unwrap()))
+            .expect_err("a 0ms idle-read deadline must be rejected, not silently loaded");
+        assert!(err.to_string().contains("serve_idle_timeout_ms"));
     }
 
     #[test]
