@@ -61,7 +61,7 @@ the two `link.rs` edits and let 3.3 reuse 3.2's `with_deadline` helper)
 - [ ] **3.9** Resolve the dead per-partner `policy` field in `federation_map.toml` (F7) — [file](./3.9-federation-map-policy-field.md)
 
 **Wave 4 — parallel track** (core client + CI; no federation-server contention, can run alongside wave 3)
-- [ ] **3.10** Bound `pending_requests` against a stranger flood (F5) — [file](./3.10-message-request-flood-bound.md)
+- [~] **3.10** Bound `pending_requests` against a stranger flood (F5) — [file](./3.10-message-request-flood-bound.md)
 - [ ] **3.11** Thread first-contact state into `decide_open` (ctrl-frame gate) (F11) — [file](./3.11-first-contact-ctrl-gate.md)
 - [ ] **3.12** Build the rendezvous image pre-merge + schedule the `--ignored` runner (F12) — [file](./3.12-ci-docker-build-gate.md)
 - [ ] **3.13** Test the `wss://` crypto-provider install (F13) — [file](./3.13-wss-crypto-provider-test.md)
