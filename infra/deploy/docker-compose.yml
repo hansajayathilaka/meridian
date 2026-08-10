@@ -22,7 +22,12 @@ services:
     image: coturn/coturn:latest
     # coturn and the rendezvous share ONE secret (the REST/use-auth-secret mechanism); credentials
     # are ephemeral per-session HMAC tokens, never static per-user secrets (../coturn/turnserver.conf).
-    command: ["-c", "/etc/coturn/turnserver.conf", "--static-auth-secret=${TURN_SHARED_SECRET:?set TURN_SHARED_SECRET}"]
+    # --realm defaults to TURN_DOMAIN (falls back to turn.example.com for a bare local-dev
+    # run) — coturn's turnserver.conf leaves `realm=` commented out for the same reason
+    # static-auth-secret is: its file-parser consumes everything after the directive, so a
+    # live placeholder there would boot coturn with the literal placeholder as its realm
+    # (review finding F19).
+    command: ["-c", "/etc/coturn/turnserver.conf", "--static-auth-secret=${TURN_SHARED_SECRET:?set TURN_SHARED_SECRET}", "--realm=${TURN_DOMAIN:-turn.example.com}"]
     volumes:
       - ../coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
       # - ./certs:/etc/coturn/certs:ro           # TODO: turns: TLS material (private CA air-gapped)
