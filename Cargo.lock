@@ -2327,7 +2327,9 @@ dependencies = [
  "hex",
  "keyring",
  "meridian-core",
+ "meridian-proto",
  "meridian-rendezvous",
+ "meridian-signaling",
  "rcgen",
  "rpassword",
  "rustls",
@@ -2335,6 +2337,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -2416,6 +2419,7 @@ dependencies = [
  "ciborium",
  "hex",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -2465,6 +2469,7 @@ dependencies = [
  "meridian-identity",
  "meridian-proto",
  "meridian-store",
+ "rustls",
  "serde",
  "thiserror 2.0.18",
  "tokio",

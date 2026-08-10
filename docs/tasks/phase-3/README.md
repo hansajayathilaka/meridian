@@ -68,16 +68,22 @@ the two `link.rs` edits and let 3.3 reuse 3.2's `with_deadline` helper)
 - [x] **3.14** Conformance vectors for the c2s hint extension (F20) — [file](./3.14-c2s-hint-conformance-vectors.md)
 
 **Wave 5 — docs, ops, ratification**
-- [ ] **3.15** Doc-sync the federation wire/deploy facts (F14+F15) — [file](./3.15-federation-protocol-doc-sync.md)
-- [ ] **3.16** Warn on private-CA trust anchors under SRV discovery (F6) — [file](./3.16-private-ca-srv-hazard.md)
-- [ ] **3.17** Give the production stack a federation surface with a C7 guard-rail (F17) — [file](./3.17-dokploy-federation-surface.md)
-- [ ] **3.18** Fix the live coturn `realm` placeholder (F19) — [file](./3.18-coturn-realm-placeholder.md)
-- [ ] **3.19** ADR 0019 — container image distribution + signing (F16 remainder) — [file](./3.19-adr-image-distribution-signing.md)
+- [x] **3.15** Doc-sync the federation wire/deploy facts (F14+F15) — [file](./3.15-federation-protocol-doc-sync.md)
+- [x] **3.16** Warn on private-CA trust anchors under SRV discovery (F6) — [file](./3.16-private-ca-srv-hazard.md)
+- [x] **3.17** Give the production stack a federation surface with a C7 guard-rail (F17) — [file](./3.17-dokploy-federation-surface.md)
+- [x] **3.18** Fix the live coturn `realm` placeholder (F19) — [file](./3.18-coturn-realm-placeholder.md)
+- [x] **3.19** ADR 0019 — container image distribution + signing (F16 remainder) — [file](./3.19-adr-image-distribution-signing.md)
 
 **Wave 6 — last** (depend on everything settling)
-- [ ] **3.20** Resolve the `ROUTE_REPLY_GRACE` false-positive-success residual (may yield ADR 0020) — [file](./3.20-route-reply-grace-residual.md)
-- [ ] **3.21** Nit sweep (N1, N3) — [file](./3.21-phase-3-nit-sweep.md)
-- [ ] **3.22** s2s framing adversarial suite (**optional — first to cut**) — [file](./3.22-s2s-framing-adversarial.md)
+- [x] **3.20** Resolve the `ROUTE_REPLY_GRACE` false-positive-success residual (may yield ADR 0020) — [file](./3.20-route-reply-grace-residual.md)
+- [x] **3.21** Nit sweep (N1, N3) — [file](./3.21-phase-3-nit-sweep.md)
+- [x] **3.22** s2s framing adversarial suite (**optional — first to cut**) — [file](./3.22-s2s-framing-adversarial.md)
+
+**Wave 7 — found during 3.22, not part of the original report**
+- [ ] **3.23** Bound `serve_link`'s idle read — no deadline lets a handshaked peer hold a
+  `max_links` slot forever; in default WebPKI mode this is exploitable by any public-CA
+  cert-holder, not gated by federation policy at all (severity refined by 3.22's security review)
+  — [file](./3.23-serve-link-idle-read-deadline.md)
 
 ### Findings with no task, and why
 - **"Fine as-is" ratification list** (zero s2s replay dedup, per-request reachability, the two-orgs

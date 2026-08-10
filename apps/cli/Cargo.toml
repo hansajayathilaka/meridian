@@ -41,6 +41,11 @@ tokio = { workspace = true, features = ["rt", "macros", "net", "sync", "time", "
 # Task 2.9: two-org in-process s2s mTLS harness for the federation-error acceptance test
 # (mirrors apps/rendezvous/tests/federation_fetch.rs's PKI fixture).
 rcgen = "0.13"
+# Task 3.21 (N1 test): `federation_errors.rs`'s rogue-B scenario speaks the real s2s wire types
+# (`FedFrame`/`FedErr`/`FedOp`/`fed_error_codes`) directly to prove a hostile FedErr.msg cannot
+# survive into client-visible copy — not re-exported by `meridian-rendezvous`/`meridian-core`, so
+# this crate needs its own (dev-only) edge onto the wire-type source of truth.
+meridian-proto = { path = "../proto" }
 # T3.13/F13: `apps/cli/tests/wss_tls.rs` connects `SignalingClient::connect_with_test_ca_pem`
 # (test-support-gated) to a real self-signed TLS WebSocket listener, proving the crypto-provider
 # install in `meridian_signaling::install_crypto_provider` actually unblocks a `wss://` handshake.

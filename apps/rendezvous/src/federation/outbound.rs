@@ -255,23 +255,71 @@ pub enum RouteForeignError {
 /// binding wire decision, a bounded wait is the only available way to turn "nothing else is
 /// coming" into a return value in finite time; it is not an invented deviation from the protocol.
 ///
+/// **`pub`, not merely crate-private:** so `apps/rendezvous/tests/federation_route.rs`'s boundary
+/// test (task 3.20) can size its injected delay relative to this constant's REAL value instead of
+/// hand-duplicating the number — a copy would silently drift the day this value changes again.
+///
+/// **Measured (task 3.20), not guessed — this is the follow-up task 2.8's residual note (below)
+/// named.** `apps/rendezvous/tests/federation_route.rs::measure_route_reply_rtt_distribution`
+/// times exactly the span this constant bounds — from finishing the `FedRoute` write to finishing
+/// the `FedErr` read — over the SAME two-real-server-over-real-mTLS harness every test in that file
+/// uses, one link dialed once and reused for every sample (so dial/TLS cost is never in the
+/// numbers), against a `Closed`-policy B whose `handle_fed_route` rejects on its very first,
+/// purely in-process check (no rate limiter, no registry lookup) — i.e. the exact "B's processing
+/// cost is ~0, wire RTT is what dominates" case the residual note below describes. N=200 samples,
+/// taken **after** both of this constant's stated dependencies (task 3.3's timeout framework, task
+/// 3.7's link-reuse-per-message change) had already landed, per this task's own Risk note:
+///
+/// ```text
+/// min=87.1ms  p50=88.0ms  mean=88.1ms  p95=88.2ms  p99=92.1ms  max=92.9ms
+/// ```
+///
+/// **This is surprising — not "sub-millisecond loopback" — and the reason is a real, separate
+/// finding, recorded here rather than silently folded into the constant alone:** neither
+/// [`dial`](crate::federation::link::dial) nor
+/// [`FederationListener::bind`](crate::federation::link::FederationListener::bind) ever sets
+/// `TCP_NODELAY` on the underlying `TcpStream`, so `link.rs`'s `write_frame` — which issues two
+/// separate `write_all` calls per frame (the 4-byte length prefix, then the CBOR body) before one
+/// `flush` — lets Nagle's algorithm hold the second write back waiting for the first's ACK, which
+/// the peer's own delayed-ACK timer (a standard OS TCP behavior, commonly ~40ms) doesn't send
+/// promptly either; two such frames crossing (the `FedRoute` request, the `FedErr` reply) compound
+/// into the ~87–93ms floor measured above even on loopback, where physical transit time is
+/// negligible. This is a genuine property of the CURRENT implementation, not measurement noise —
+/// the near-zero spread (min to p99 is under 6ms) is consistent with a fixed protocol-level
+/// interaction, not queuing/scheduling jitter. Fixing it (a `set_nodelay(true)` call in `link.rs`)
+/// is out of this task's file-scope (`outbound.rs`/`federation_route.rs`/
+/// `federation-protocol-v1.md` only) and is left as a `TODO: confirm`-style follow-up, not
+/// something this task's Scope covers — but it directly explains why this measurement is tens of
+/// milliseconds, not fractions of one, and why the tightened value below already has to budget for
+/// it as a standing cost of THIS implementation, independent of physical network distance.
+///
 /// **Residual, recorded rather than silently accepted (architect + security-reviewer + code-reviewer,
-/// task 2.8):** `handle_fed_route`'s own checks (policy admission, an in-memory rate limiter, a
-/// `Registry` push) are purely in-process with no I/O of their own, so a genuine `FedErr` costs
-/// essentially zero *processing* time on B's side — but this bound also has to cover one real wire
-/// round trip for that reply to travel back over the already-established TLS link, which this
-/// constant's value does not explicitly model. Two failure directions are in tension, and neither
-/// reviewer proposed a specific better number, so none is guessed here: (a) too short risks a
-/// genuine policy/rate-limit rejection arriving after the window elapses under real packet
-/// loss/congestion, which `route_foreign` would then report as success — a false-positive delivery
-/// confirmation, strictly worse than a false negative; (b) every SUCCESSFUL federated route pays
-/// this as a fixed latency tax, since the happy path is only ever detected by the wait running to
-/// completion, never by an explicit ack. 500ms is a defensible heuristic for the common case, not
-/// a value derived from a measured RTT distribution. Revisiting this — either tightening the bound
-/// with real measurements, or reopening federation-protocol-v1.md's "do not add a `FedRouteOk`"
-/// decision, which needs a protocol revision, not a unilateral change here — is left as an
-/// explicit follow-up, not resolved by this task.
-const ROUTE_REPLY_GRACE: Duration = Duration::from_millis(500);
+/// task 2.8; re-measured and re-justified, not closed, by task 3.20):** two failure directions are
+/// in tension: (a) too short risks a genuine policy/rate-limit rejection arriving after the window
+/// elapses under real packet loss/congestion, which `route_foreign` would then report as success —
+/// a false-positive delivery confirmation, strictly worse than a false negative; (b) every
+/// SUCCESSFUL federated route pays this as a fixed latency tax, since the happy path is only ever
+/// detected by the wait running to completion, never by an explicit ack. Because (a) is the
+/// strictly worse direction, this tightening is deliberately conservative rather than aggressive:
+/// round the measured max (92.9ms) up to 100ms, then apply a 3× real-network-headroom multiplier —
+/// this measurement is same-host loopback; a real cross-org federation link (ADR 0002's bilateral
+/// model has no geographic restriction) legitimately adds real WAN RTT and congestion on top of the
+/// fixed Nagle/delayed-ACK cost documented above, which this measurement cannot capture — giving
+/// **300ms**. That is a real, measured 40% reduction in the latency tax every successful federated
+/// route pays (direction (b)) relative to the original unmeasured 500ms guess, while still keeping
+/// **over 3.2× the measured max** — comfortably more headroom over a real reply than
+/// `request_timeout_ms`'s own "TLS handshake + `FedHello` + one round trip" budget keeps over ITS
+/// components (see that field's doc comment) — for direction (a). It does **not** close the
+/// residual outright: a `FedErr` that is genuinely in flight but crosses the wire slower than
+/// 300ms (real congestion, an overloaded peer, a slow path) is still reported as success — see
+/// `apps/rendezvous/tests/federation_route.rs::fed_err_delayed_past_route_reply_grace_is_still_reported_as_false_success`,
+/// the boundary test task 2.8's own residual note asked for and task 3.20 delivers, which pins
+/// this exact behavior at the new value. Closing it outright needs
+/// federation-protocol-v1.md's "do not add a `FedRouteOk`" decision reopened — a protocol revision
+/// via an ADR, the architect reviewer's call, not a unilateral change here (task 3.20's own Scope
+/// "Out" boundary) — so it stays a documented, measured, bounded residual rather than an
+/// unmeasured, unbounded one.
+pub const ROUTE_REPLY_GRACE: Duration = Duration::from_millis(300);
 
 /// Resolve `hint_domain` and dial the FIRST candidate [`Endpoint`] that succeeds, exactly as
 /// [`fetch_foreign_bundle`] does (same discovery lookup, same `pinned_identity`-over-`hint_domain`

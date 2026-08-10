@@ -25,6 +25,16 @@ services:
       # rendezvous.<yourdomain> over 443 via Dokploy's Domain UI pointed at container port 8443
       # instead — see docs/operations/docker-image.md §6.
       - "${RENDEZVOUS_PORT:-8443}:8443"
+      # --- Federation (s2s mTLS, ADR 0017/ADR 0002) — OFF by default. Uncomment this line only
+      # alongside the `environment:` federation block below (where you set
+      # FEDERATION__ENABLED to true). Publish as RAW TCP passthrough ONLY — a
+      # bare Docker port mapping exactly like the line above. Do NOT expose 8444 via Dokploy's
+      # Domain/Traefik UI the way 8443 is exposed above: ADR 0017 C7 requires s2s mTLS to terminate
+      # IN-PROCESS in the rendezvous binary, never at a proxy/VIP — the opposite of 8443/c2s, which
+      # is correctly proxy-terminated by design (ADR 0008) because c2s identity comes from the
+      # post-TLS `Auth` signature, not the TLS layer itself. See docs/operations/docker-image.md §6
+      # before uncommenting.
+      # - "${MERIDIAN_FEDERATION_PORT:-8444}:8444"
     volumes:
       # Holds the SQLite file backing MERIDIAN_RENDEZVOUS_SERVER__DATABASE_URL below — survives
       # container recreation/redeploys. In Dokploy's UI this shows up as a mountable volume too.
@@ -51,6 +61,40 @@ services:
       # this var directly to add a third entry.
       MERIDIAN_RENDEZVOUS_TURN__URLS: ${MERIDIAN_RENDEZVOUS_TURN__URLS:-["turn:${TURN_DOMAIN:-turn.example.com}:3478?transport=udp","turn:${TURN_DOMAIN:-turn.example.com}:3478?transport=tcp"]}
       MERIDIAN_RENDEZVOUS_TURN__TTL_SECS: ${MERIDIAN_RENDEZVOUS_TURN__TTL_SECS:-120}
+      # --- [federation] — s2s federation (ADR 0017/ADR 0002), OFF by default -------------------
+      # Every var below is commented out on purpose: federation.enabled defaults to false, so none
+      # of this is read unless you uncomment MERIDIAN_RENDEZVOUS_FEDERATION__ENABLED too. If you do
+      # enable it, ALSO uncomment the raw-TCP port publish in `ports:` above — never route 8444
+      # through Dokploy's Domain/Traefik UI (ADR 0017 C7; see docs/operations/docker-image.md §6 and
+      # docs/operations/deployment.md §9.2 for the full rationale and the c2s/8443 contrast).
+      # MERIDIAN_RENDEZVOUS_FEDERATION__ENABLED: ${MERIDIAN_RENDEZVOUS_FEDERATION__ENABLED:-false}
+      # 0.0.0.0, not the code's 127.0.0.1 default — must be reachable via the Docker port mapping
+      # above, same reason MERIDIAN_RENDEZVOUS_SERVER__BIND is baked to 0.0.0.0:8443 in the image's
+      # rendezvous.example.toml (apps/rendezvous/rendezvous.example.toml) for the c2s listener.
+      # MERIDIAN_RENDEZVOUS_FEDERATION__BIND: ${MERIDIAN_RENDEZVOUS_FEDERATION__BIND:-0.0.0.0:8444}
+      # This org's federation identity cert/key — one mTLS identity used both as server cert
+      # (inbound links) and client cert (outbound links). Provisioned out of band; never committed.
+      # Mount them into the container (e.g. a `./certs:/etc/meridian/fed:ro` volume) and point these
+      # at the mounted paths.
+      # MERIDIAN_RENDEZVOUS_FEDERATION__CERT_PATH: ${MERIDIAN_RENDEZVOUS_FEDERATION__CERT_PATH:-}
+      # MERIDIAN_RENDEZVOUS_FEDERATION__KEY_PATH: ${MERIDIAN_RENDEZVOUS_FEDERATION__KEY_PATH:-}
+      # Empty ⇒ WebPKI (validate partner certs against the system trust store). Non-empty ⇒
+      # private-CA / air-gap mode — trust ONLY the CAs in this bundle (ADR 0017 (a)/C3/C4). Read
+      # deployment.md §9.2 before pairing a private CA with `discovery = srv`: config validation
+      # rejects `ca_bundle_path` combined with `srv`, but a private CA installed straight into the
+      # OS/container trust store instead is NOT caught at config-load time.
+      # MERIDIAN_RENDEZVOUS_FEDERATION__CA_BUNDLE_PATH: ${MERIDIAN_RENDEZVOUS_FEDERATION__CA_BUNDLE_PATH:-}
+      # `static` (air-gap; federation_map.toml only, no DNS) or `srv` (DNS SRV, refuses to fall back
+      # to A/AAAA). Defaults to `static` — the fail-closed choice.
+      # MERIDIAN_RENDEZVOUS_FEDERATION__DISCOVERY: ${MERIDIAN_RENDEZVOUS_FEDERATION__DISCOVERY:-static}
+      # Only read when DISCOVERY=static. Mount your federation_map.toml and point this at it.
+      # MERIDIAN_RENDEZVOUS_FEDERATION__MAP_PATH: ${MERIDIAN_RENDEZVOUS_FEDERATION__MAP_PATH:-}
+      # `open` | `allowlist` | `closed`. Defaults to `closed` — federation is untrusted-by-default;
+      # an operator must explicitly widen it.
+      # MERIDIAN_RENDEZVOUS_FEDERATION__POLICY: ${MERIDIAN_RENDEZVOUS_FEDERATION__POLICY:-closed}
+      # Only read when POLICY=allowlist. JSON array syntax, e.g. ["org-b.example"] — NOT
+      # comma-separated.
+      # MERIDIAN_RENDEZVOUS_FEDERATION__ALLOWLIST: ${MERIDIAN_RENDEZVOUS_FEDERATION__ALLOWLIST:-[]}
 
   coturn:
     image: ${COTURN_IMAGE:-coturn/coturn:latest}   # pin a specific tag for reproducible prod deploys

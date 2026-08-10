@@ -94,6 +94,25 @@ concrete source now that "origin" can mean a party server A never authenticated 
    matches the domain A meant to reach), differing only in what the trusted root and the "domain A
    meant to reach" are configured from (system store + hint vs. private CA + static-map pin).
 
+**Clarifying note (task 3.16 / review finding F6) — the rule above applies regardless of *how* a
+private CA becomes a trust anchor, not only via `federation.ca_bundle_path`.** From the peer-
+authentication perspective in this decision, "WebPKI mode" means "trust whatever the OS/system trust
+store trusts" — full stop. It has no way to distinguish a public root that a CA/Browser-Forum-audited
+authority issued under external domain-validation discipline from a private CA an operator installed
+into that same OS trust store out-of-band (e.g. `update-ca-certificates`), because both end up as
+ordinary entries in the same store. If a private CA — in particular one **shared across more than one
+org**, the scenario this decision is about — is trusted via the OS store while `discovery = "srv"` is
+also configured, the result is exactly Option A above: any org enrolled under that CA can present a
+cert whose SAN matches a victim domain and be accepted as that org, because SRV-resolved endpoints
+never carry a `pinned_identity` (no per-partner name check exists to catch it). **A private CA is only
+a safe federation trust anchor when paired with `discovery = "static"` and the mandatory
+`pinned_identity` per partner (C4) — never `discovery = "srv"` — no matter which mechanism installed
+that CA as a trust root.** `Federation::validate` (`apps/rendezvous/src/config.rs`) fails closed on
+`discovery = "srv"` combined with a non-empty `federation.ca_bundle_path`, but it has no visibility
+into a private CA installed into the *system* trust store instead (that happens out-of-band, invisible
+to the Rust process's config); this is a documentation-only mitigation for that path, not a runtime
+check — see the task file for why a reliable runtime check is not possible.
+
 ## (b) Cross-org `from` attestation
 
 **Options.**
@@ -197,7 +216,9 @@ rejected. **A map entry missing or malformed its pinned identity is a fail-close
 alone if per-entry config is hot-reloadable), never silently fall back to "chains to the trusted CA"
 with no name check. A permissive fallback here would reopen exactly the impersonation hole this ADR
 exists to close. This is a schema requirement handed to
-[2.5](../tasks/phase-2/2.5-federation-discovery.md).
+[2.5](../tasks/phase-2/2.5-federation-discovery.md). **This requirement — private CA ⇒
+`discovery = "static"` + a pinned identity per partner — holds regardless of how the CA was installed
+as a trust anchor; see the clarifying note under (a) above (task 3.16).**
 
 **C5 — Rate limiting keys "origin server" to the mTLS peer identity from (a) and "origin account" to the
 `from` from (b)**, per (c); per-server limits are the enforced backstop and must not be bypassable by
@@ -244,6 +265,15 @@ identity check and must not be delegated.
 > **R4 — Per-account rate-limit fairness is not a security guarantee.** As stated in (c), the "origin
 > account" axis is server testimony; a malicious B can spread its own traffic across fabricated account
 > labels to blunt per-account throttling. The per-server ceiling is the actual enforced bound.
+
+> **R5 — A private CA installed into the OS trust store, not just `federation.ca_bundle_path`, is
+> indistinguishable from a public root to WebPKI-mode peer verification.** See the (a) clarifying note
+> (task 3.16 / F6): `Federation::validate` fails closed on `discovery = "srv"` combined with a
+> non-empty `ca_bundle_path`, but has no visibility into a private CA an operator installed into the
+> system trust store out-of-band, which reopens Option A under a private CA shared across more than
+> one org. No reliable runtime check exists (verified: neither config validation nor the OS trust
+> store itself carries provenance). Mitigation is documentation-only — operators must use
+> `discovery = "static"` + pinned identity (C4) for any private-CA trust anchor, however installed.
 
 ## Consequences
 

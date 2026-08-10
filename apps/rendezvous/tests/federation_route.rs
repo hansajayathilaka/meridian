@@ -26,13 +26,18 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use meridian_proto::{error_codes, fed_error_codes, FedRoute, OpaqueBlob};
+use meridian_proto::{
+    error_codes, fed_error_codes, FedErr, FedFrame, FedOp, FedReachable, FedRoute, OpaqueBlob,
+};
 use meridian_rendezvous::config::{DiscoveryMode, Federation, FederationPolicyMode};
 use meridian_rendezvous::federation::inbound::handle_fed_route;
-use meridian_rendezvous::federation::{Discovery, DiscoveryError, Endpoint};
-use meridian_rendezvous::federation::{FederationLimits, FederationPolicy};
+use meridian_rendezvous::federation::outbound::ROUTE_REPLY_GRACE;
+use meridian_rendezvous::federation::FederationTimeouts;
+use meridian_rendezvous::federation::{dial, Discovery, DiscoveryError, Endpoint};
+use meridian_rendezvous::federation::{FederationLimits, FederationListener, FederationPolicy};
 use meridian_rendezvous::metrics::Metrics;
 use meridian_rendezvous::state::Registry;
 use meridian_rendezvous::{AppState, MemoryStore};
@@ -875,5 +880,223 @@ async fn federated_delivery_introduces_no_new_metric_name_or_label() {
     assert!(
         rendered.contains("meridian_envelopes_routed_total"),
         "the counter this task fixes must actually be rendered"
+    );
+}
+
+// -- task 3.20: ROUTE_REPLY_GRACE — measure, then pin the residual ------------------------------
+
+/// Measures the real `FedRoute` reply-RTT distribution this task's `ROUTE_REPLY_GRACE` tightening
+/// is grounded on, over the SAME two-real-server-over-real-mTLS harness every other test in this
+/// file uses (`FederationListener`/`link::dial`, i.e. exactly what `route_foreign` itself drives —
+/// never a mock of the wire protocol).
+///
+/// **What this measures, precisely:** the span from finishing the write of a `FedRoute` frame to
+/// finishing the read of B's `FedErr` reply — the exact interval `ROUTE_REPLY_GRACE` bounds inside
+/// `route_foreign` (see that constant's doc comment). B's federation policy is `Closed`, so every
+/// `FedRoute` this test sends is rejected by `handle_fed_route`'s very first check
+/// (`policy.admit_any`) before it ever reaches the rate limiter or the registry — a real,
+/// in-process-cheap `FedErr{policy_denied}`, i.e. the SAME "processing cost ~0, wire RTT is what
+/// dominates" case the residual's own risk note describes. One link is dialed once and reused for
+/// all `N` requests (not re-dialed per request): `ROUTE_REPLY_GRACE` only ever bounds the
+/// post-dial reply wait, never the dial itself, so re-paying dial/TLS cost per sample would measure
+/// the wrong span.
+///
+/// **`#[ignore]`:** this is a measurement bench, not a correctness assertion — run manually with
+/// `cargo test --release -p meridian-rendezvous --test federation_route -- --ignored --nocapture
+/// measure_route_reply_rtt_distribution` and read the printed distribution off stdout. Left in the
+/// tree (rather than deleted after one manual run) so the measurement can be re-taken if the system
+/// under test changes again, exactly as task 3.20's own Risk note anticipates ("measuring before
+/// [3.3/3.7] land would measure the wrong system" — the inverse is also true: a future change to
+/// the outbound path invalidates this number too, and this is how to retake it).
+#[tokio::test]
+#[ignore = "manual measurement bench (task 3.20) — not a correctness assertion; run with --ignored --nocapture"]
+async fn measure_route_reply_rtt_distribution() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = TestCa::new();
+
+    let b_id = ca.issue(dir.path(), "org-b.test");
+    let b_empty_map = write_federation_map(dir.path(), &[]);
+    let b_federation = Federation {
+        enabled: true,
+        bind: "127.0.0.1:0".to_string(),
+        cert_path: b_id.cert_path_str().to_string(),
+        key_path: b_id.key_path_str().to_string(),
+        ca_bundle_path: b_id.ca_bundle_path_str().to_string(),
+        discovery: DiscoveryMode::Static,
+        map_path: b_empty_map.to_str().unwrap().to_string(),
+        // Closed: `handle_fed_route` rejects on its very first, purely in-process check, so the
+        // reply is genuinely cheap to produce — isolating wire RTT as the dominant cost, exactly
+        // the scenario `ROUTE_REPLY_GRACE`'s residual is about.
+        policy: FederationPolicyMode::Closed,
+        ..Federation::default()
+    };
+    let mut b_config = base_config("org-b.test");
+    b_config.federation = b_federation;
+    let b_store = Arc::new(MemoryStore::new());
+    let b_state = AppState::new(b_config, b_store);
+    let b_fed_addr = spawn_federation(b_state).await;
+
+    let a_id = ca.issue(dir.path(), "org-a.test");
+    let client_tls = a_id.client_tls();
+    let mut link = dial(
+        b_fed_addr,
+        "org-b.test",
+        client_tls,
+        "org-a.test",
+        None,
+        FederationTimeouts::default(),
+    )
+    .await
+    .expect("real mTLS dial to B must succeed");
+
+    const N: usize = 200;
+    let mut samples: Vec<Duration> = Vec::with_capacity(N);
+    for i in 0..N {
+        let req = FedRoute {
+            to: [0x11u8; 32],
+            from: [0x22u8; 32],
+            envelope: OpaqueBlob::new(format!("rtt sample {i}").into_bytes()),
+        };
+        let out = FedFrame::new(FedOp::Route, i as u64, &req).unwrap();
+        let start = std::time::Instant::now();
+        link.send_frame(&out).await.expect("send FedRoute");
+        let reply = link.recv_frame().await.expect("recv reply");
+        samples.push(start.elapsed());
+        assert_eq!(
+            reply.op,
+            FedOp::Err,
+            "B's Closed policy must reject every request with FedErr, sample {i}"
+        );
+    }
+
+    samples.sort();
+    let min = samples[0];
+    let max = samples[N - 1];
+    let p50 = samples[N / 2];
+    let p95 = samples[N * 95 / 100];
+    let p99 = samples[N * 99 / 100];
+    let sum: Duration = samples.iter().sum();
+    let mean = sum / N as u32;
+    println!(
+        "ROUTE_REPLY_GRACE reply-RTT measurement (task 3.20): N={N} min={min:?} p50={p50:?} \
+         mean={mean:?} p95={p95:?} p99={p99:?} max={max:?}"
+    );
+}
+
+/// A synthetic stand-in for B that speaks the real wire protocol (`FederationListener`/
+/// `FederationLink` — the same types `route_foreign`/`handle_fed_route` themselves use, not a mock
+/// of the protocol) but delays its `FedRoute` → `FedErr` reply by `delay` — simulating exactly the
+/// "B genuinely answered, but the reply crossed the wire late (congestion/loss)" scenario
+/// `ROUTE_REPLY_GRACE`'s doc comment describes, without needing a delay hook wired into production
+/// `handle_fed_route`/`serve_link` (out of this task's file-scope: only `outbound.rs`,
+/// `federation_route.rs`, and `federation-protocol-v1.md` are touched by task 3.20). Confirms
+/// `FedReachability` immediately with `connected: true` (so `route_foreign`'s own pre-check passes
+/// and it proceeds to send the real `FedRoute`, exactly as it would against a live, reachable B),
+/// then, on the `FedRoute` itself, sleeps `delay` before replying `FedErr` — both handled over the
+/// ONE link `dial_foreign` establishes, matching task 3.7's single-link-per-message shape.
+async fn spawn_delayed_fed_err_responder(
+    dir: &Path,
+    ca: &TestCa,
+    domain: &str,
+    delay: Duration,
+) -> SocketAddr {
+    let id = ca.issue(dir, domain);
+    let listener = FederationListener::bind("127.0.0.1:0", &id.paths(), domain, None)
+        .await
+        .expect("bind synthetic delayed-B listener");
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut link, _peer_addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(_) => return,
+        };
+        loop {
+            let frame = match link.recv_frame().await {
+                Ok(f) => f,
+                Err(_) => return,
+            };
+            match frame.op {
+                FedOp::Reachability => {
+                    let reply = FedReachable { connected: true };
+                    if let Ok(out) = FedFrame::new(FedOp::Reachable, frame.id, &reply) {
+                        let _ = link.send_frame(&out).await;
+                    }
+                }
+                FedOp::Route => {
+                    tokio::time::sleep(delay).await;
+                    let err = FedErr {
+                        code: fed_error_codes::POLICY_DENIED.to_string(),
+                        msg: "synthetic delayed rejection (task 3.20 ROUTE_REPLY_GRACE boundary \
+                              test)"
+                            .to_string(),
+                    };
+                    if let Ok(out) = FedFrame::new(FedOp::Err, frame.id, &err) {
+                        let _ = link.send_frame(&out).await;
+                    }
+                    return;
+                }
+                _ => return,
+            }
+        }
+    });
+    addr
+}
+
+/// The boundary test the task's own Risks note names as missing: a `FedErr` reply that is genuine
+/// (B really did reject) but crosses the wire slower than `ROUTE_REPLY_GRACE` is STILL reported to
+/// the client as a successful delivery — `route_foreign`'s reply wait has already elapsed and
+/// returned `Ok(())` by the time it arrives, and the late frame is simply never read.
+///
+/// This is the residual task 3.20 measures and tightens the WINDOW on, but — per the task's own
+/// Scope "Out" boundary — does **not** structurally close: closing it outright needs
+/// `federation-protocol-v1.md`'s "do not add a `FedRouteOk`" decision reopened via an ADR (the
+/// architect reviewer's call, not something to do unilaterally here). `delay` is set to
+/// `ROUTE_REPLY_GRACE + 100ms`: comfortably past the tightened window (itself sized off this task's
+/// own measured p99 — see `measure_route_reply_rtt_distribution`), proving the residual is real at
+/// the NEW value, not merely a leftover artifact of the old 500ms guess.
+#[tokio::test]
+async fn fed_err_delayed_past_route_reply_grace_is_still_reported_as_false_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = TestCa::new();
+
+    let delay = ROUTE_REPLY_GRACE + Duration::from_millis(100);
+    let b_addr = spawn_delayed_fed_err_responder(dir.path(), &ca, "org-b.test", delay).await;
+
+    let mut a_config = base_config("org-a.test");
+    a_config.federation = org_a_federation(
+        dir.path(),
+        &ca,
+        "org-a.test",
+        "org-b.test",
+        b_addr,
+        "org-b.test",
+    );
+    let a_store = Arc::new(MemoryStore::new());
+    let a_state = AppState::new(a_config, a_store);
+    let a_c2s_url = spawn_c2s(a_state).await;
+
+    let alice = new_acct("org-a.test");
+    let mut ac = alice.connect(&a_c2s_url).await.unwrap();
+    let target = [0x99u8; 32];
+
+    let delivered = ac
+        .route_with_hint(
+            target,
+            Some("org-b.test".to_string()),
+            b"late fed_err".to_vec(),
+        )
+        .await
+        .expect(
+            "ROUTE_REPLY_GRACE's residual (task 3.20, still open by design — see this test's own \
+             doc comment): a FedErr arriving after the window must not surface as a client-visible \
+             error at all, since route_foreign has already returned Ok(()) by the time it arrives",
+        );
+    assert!(
+        delivered,
+        "a genuine FedErr delayed past ROUTE_REPLY_GRACE is STILL reported as a false-positive \
+         delivery confirmation at the NEW, tightened value — this is the documented residual task \
+         3.20 measures and narrows the window on, not one it closes outright (that needs \
+         federation-protocol-v1.md's 'no FedRouteOk' decision reopened via an ADR, out of this \
+         task's scope)"
     );
 }

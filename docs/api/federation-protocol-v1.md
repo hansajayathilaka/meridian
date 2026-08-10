@@ -51,6 +51,23 @@ listener/dialer; this task (2.2) only fixes the shape.
 All 32-byte keys are encoded as **CBOR byte strings** (major type 2), not integer arrays, exactly
 like the c2s protocol.
 
+**Frame ceiling: `MAX_FRAME_LEN = 1 MiB`** (`apps/rendezvous/src/federation/link.rs`). This is
+enforced on the wire's u32-LE length prefix *before* any receive buffer is allocated — even an
+already-mTLS-authenticated peer must not be able to force an unbounded allocation merely by
+sending a large length prefix ahead of a short or absent body (task 2.4/3.7). The **same constant**
+is reused, defense-in-depth, as the ceiling on a decoded `FedRoute.envelope`'s own byte length
+(`fed_route`'s handler, task 2.8): a compliant peer's frame already can't exceed `MAX_FRAME_LEN` on
+the wire, so this second check only ever fires for a non-compliant peer or a caller that built the
+request some other way (e.g. a direct unit test) — the load-bearing enforcement is the wire-level
+length-prefix check, not this one. There is one constant, not two independently-tunable limits.
+
+**Default federation port: `8444`.** Chosen adjacent to c2s's WSS default (`8443`, see
+[rendezvous-protocol-v1.md §1](./rendezvous-protocol-v1.md#1-transport--framing)) so both listeners
+can run on the same host with no config edit and no ambiguity about which port is which. It is
+**not an IANA-registered service port**; operators are free to override it via `federation.bind` /
+`MERIDIAN_RENDEZVOUS_FEDERATION__BIND` (see the deployment note in
+[deployment.md §9.2](../operations/deployment.md#92-config-surface-deliberately-small)).
+
 ### `FedOp` is its own enum
 
 `FedOp` is a **distinct enum from the c2s [`Op`](./rendezvous-protocol-v1.md)**, never a reuse of
@@ -96,6 +113,25 @@ verbatim, not redefined for federation.
 failure is reported only via `FedErr` echoing the route's `id`. There is deliberately no
 `FedRouteOk` — do not add one.
 
+**The fixed-latency-tax / reply-wait this implies, and its measured bound (task 3.20).** Because
+there is no `FedRouteOk`, the dialing side (`route_foreign`,
+`apps/rendezvous/src/federation/outbound.rs`) has no positive signal that a route succeeded — it
+can only wait a bounded window (`ROUTE_REPLY_GRACE`) for a possible `FedErr` and, if nothing arrives
+in time, treat that as success. Every successful federated route pays this wait as a fixed latency
+tax before the client's request resolves, and the window necessarily trades off against a real
+residual: a genuine `FedErr` that crosses the wire slower than the window (real congestion, an
+overloaded peer) is reported to the client as a false-positive delivery confirmation instead. Task
+2.8 shipped this window as an unmeasured 500ms guess and recorded the tension as an open follow-up;
+task 3.20 measured the real reply-RTT (N=200 samples, over a real two-server mTLS link, isolating
+the exact span this window bounds: `p50≈88ms`, `p99≈92ms`, `max≈93ms` — see
+`ROUTE_REPLY_GRACE`'s own doc comment in `outbound.rs` for the full measurement, including a
+same-implementation finding — missing `TCP_NODELAY` — that explains why this is tens of
+milliseconds even on loopback, not fractions of one) and tightened `ROUTE_REPLY_GRACE` to **300ms**
+(measured max rounded up, ×3 real-network headroom) accordingly. This narrows, but by design does
+**not** close, the false-positive residual described above — closing it outright would need this
+section's "do not add a `FedRouteOk`" decision reopened via an ADR, not a unilateral change to the
+window alone.
+
 **`FedHello.domain` and `FedFetchBundle.requesting_server` are self-asserted / informational only,
 never authoritative.** Both exist purely as diagnostic/logging aids (e.g. surfacing a
 domain-mismatch warning in an operator's logs). The mTLS peer identity established at the
@@ -128,6 +164,25 @@ Stable `code` strings used in `FedErr` (`apps/proto/src/fed.rs::fed_error_codes`
 | `rate_limited` | federation-edge rate limits exceeded (keyed per ADR 0017 C5) | [2.6](../tasks/phase-2/2.6-federation-policy-limits.md) |
 | `not_found` | `FetchBundle`'s target is not an account this org is authoritative for | [2.7](../tasks/phase-2/2.7-federated-prekey-fetch.md) |
 | `bad_request` | malformed frame or body | any handler |
+
+**`FetchBundle`'s per-account rate-limit axis is keyed on `req.target`, not on an asserted
+`from`.** §0/ADR 0017 C5 says the "origin account" rate-limit axis keys on the asserted `from` —
+but `FedFetchBundle`'s body (§2) carries no requesting-account field at all, unlike `FedRoute`,
+which does carry `from`. There is nothing else request-shaped to key a per-account dimension on,
+so `handle_fed_fetch` (task 2.7) instead keys it on `req.target` — the account *being fetched* —
+bounding how many times per minute a single foreign origin may query for the *same* target, on top
+of the aggregate per-origin budget (`rate_limited`, above). This is a deliberate reading of an
+underspecified wire shape, not a wire change: `FedFetchBundle` is reused verbatim. **Residual:**
+keying on `req.target` bounds repeated queries against *one* target, but gives no defense against a
+malicious/compromised origin spraying requests across many distinct (real or fabricated) targets —
+each fresh target starts its own per-account counter at zero. This is not a hard hole: the 256-bit
+keyspace already makes target-guessing useless for enumeration, and the aggregate per-origin budget
+still bounds total throughput regardless of how targets are varied — but the per-account
+dimension's real guarantee is narrower than "bounds one origin's total fetch volume": it only
+bounds volume against a single repeatedly-queried target (see
+`apps/rendezvous/src/federation/inbound.rs`'s module doc comment and
+`federation_fetch.rs::bs_federation_edge_rate_limit_trips_through_the_real_path` for the
+demonstrating test).
 
 ## 5. What two federating orgs may learn
 
