@@ -16,22 +16,22 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 3 Wave 3 is done** (3.5–3.8; Waves 1–2 were already done); **Wave 4 is nearly
-  done** (3.10–3.13 landed, only 3.14 left). **3.1**–**3.8** and **3.10**–**3.13** all landed
-  ([3.1](./phase-3/3.1-outbound-federation-policy.md), [3.2](./phase-3/3.2-inbound-accept-loop-hardening.md),
-  [3.3](./phase-3/3.3-outbound-s2s-timeouts.md), [3.4](./phase-3/3.4-federation-test-support-harness.md),
-  [3.5](./phase-3/3.5-fed-ratelimit-double-spend.md), [3.6](./phase-3/3.6-multi-san-peer-identity.md),
-  [3.7](./phase-3/3.7-federation-link-reuse.md), [3.8](./phase-3/3.8-fed-delivery-metrics.md),
-  [3.10](./phase-3/3.10-message-request-flood-bound.md), [3.11](./phase-3/3.11-first-contact-ctrl-gate.md),
-  [3.12](./phase-3/3.12-ci-docker-build-gate.md), [3.13](./phase-3/3.13-wss-crypto-provider-test.md)).
+- **NOW:** **Phase 3 Wave 3 is (all but 3.9) done and Wave 4 is fully done.** **3.1**–**3.8** and
+  **3.10**–**3.14** all landed ([3.1](./phase-3/3.1-outbound-federation-policy.md),
+  [3.2](./phase-3/3.2-inbound-accept-loop-hardening.md), [3.3](./phase-3/3.3-outbound-s2s-timeouts.md),
+  [3.4](./phase-3/3.4-federation-test-support-harness.md), [3.5](./phase-3/3.5-fed-ratelimit-double-spend.md),
+  [3.6](./phase-3/3.6-multi-san-peer-identity.md), [3.7](./phase-3/3.7-federation-link-reuse.md),
+  [3.8](./phase-3/3.8-fed-delivery-metrics.md), [3.10](./phase-3/3.10-message-request-flood-bound.md),
+  [3.11](./phase-3/3.11-first-contact-ctrl-gate.md), [3.12](./phase-3/3.12-ci-docker-build-gate.md),
+  [3.13](./phase-3/3.13-wss-crypto-provider-test.md), [3.14](./phase-3/3.14-c2s-hint-conformance-vectors.md)).
   3.5 (fed ratelimit double-spend, F4) took three review rounds — see its Outcome. 3.6/3.7/3.8/3.11
-  each closed with only trivial/zero findings; 3.13's combined review independently reproduced its
-  mutation-check by disabling the fix itself, zero blocking findings. Phases 0–2 are **done**.
-- **NEXT:** `/next-task` — **3.14** (c2s hint conformance vectors, F20) is the last item in Wave 4.
-  **3.9** (dead per-partner `policy` field in `federation_map.toml`, F7) is the next item in Wave 3,
-  but per its own file needs an **architect decision** before implementation (three materially
-  different fixes on the table, no default named — see
-  [phase-3/README.md](./phase-3/README.md#adr-obligations)); this is a genuine pre-implementation
+  each closed with only trivial/zero findings; 3.13 and 3.14's combined reviews each independently
+  reproduced their own mutation-checks (disabling the fix / corrupting a fixture byte) rather than
+  taking the implementer's account on trust, both zero blocking findings. Phases 0–2 are **done**.
+- **NEXT:** `/next-task` — **3.9** (dead per-partner `policy` field in `federation_map.toml`, F7) is
+  the last item in Wave 3 and the only thing before Wave 5, but per its own file needs an **architect
+  decision** before implementation (three materially different fixes on the table, no default named —
+  see [phase-3/README.md](./phase-3/README.md#adr-obligations)); this is a genuine pre-implementation
   escalation, not a normal review gate.
 
 ### Live carry-forwards (not owned by any open task)
@@ -187,7 +187,7 @@ phase.
 - [x] **3.11** Thread first-contact state into `decide_open` (ctrl-frame gate) (F11) — [file](./phase-3/3.11-first-contact-ctrl-gate.md)
 - [x] **3.12** Build the rendezvous image pre-merge + schedule the `--ignored` runner (F12) — [file](./phase-3/3.12-ci-docker-build-gate.md)
 - [x] **3.13** Test the `wss://` crypto-provider install (F13) — [file](./phase-3/3.13-wss-crypto-provider-test.md)
-- [ ] **3.14** Conformance vectors for the c2s hint extension (F20) — [file](./phase-3/3.14-c2s-hint-conformance-vectors.md)
+- [x] **3.14** Conformance vectors for the c2s hint extension (F20) — [file](./phase-3/3.14-c2s-hint-conformance-vectors.md)
 
 **Wave 5 — docs, ops, ratification**
 - [ ] **3.15** Doc-sync the federation wire/deploy facts (F14+F15) — [file](./phase-3/3.15-federation-protocol-doc-sync.md)
