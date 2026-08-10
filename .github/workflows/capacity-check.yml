@@ -1,0 +1,40 @@
+# Scheduled runner for meridian-rendezvous's #[ignore]d 5k-connection capacity test (task 1.19 /
+# F12). This test is `#[ignore]`d because it is not runnable in the default CI sandbox — it drives
+# both ends of every connection in-process, so 5,000 connections need >10k file descriptors, more
+# than a typical CI runner's default fd limit — so it has no scheduled runner today outside this
+# workflow. See apps/rendezvous/tests/rendezvous.rs::capacity_concurrent_connections and
+# docs/tasks/phase-1/1.19-capacity-test-5k.md for the full history (2k demonstrated in a 4096-fd
+# sandbox; 5k neither demonstrated nor disproven there).
+name: capacity-check
+
+on:
+  schedule:
+    # TODO: confirm desired cadence — weekly (Monday 06:00 UTC) chosen as a reasonable default;
+    # no cadence is specified anywhere in docs/operations/. Revisit once there's an on-call rotation
+    # to actually action a red run (docs/operations/runbook.md's own on-call TODO).
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  capacity-5k:
+    name: 5k-connection capacity test (--ignored)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # GitHub-hosted runners default to a much lower open-file soft limit than the ~10k+2*5000
+      # this test needs (apps/rendezvous/tests/rendezvous.rs::preflight_fd_limit computes the exact
+      # requirement and refuses to run rather than fail with an opaque EMFILE partway through).
+      - name: Raise open-file limit
+        run: ulimit -n 20000 && ulimit -n
+
+      # The exact invocation the test's own doc comment names (rendezvous.rs, above
+      # capacity_concurrent_connections): release build, `--ignored` filtered to `capacity` so this
+      # does not also pick up other #[ignore]d tests in the same package (e.g.
+      # federation_discovery.rs's airgap_probe_static_map_resolve, which is meant to be invoked only
+      # as an LD_PRELOAD subprocess by its own harness, not directly here).
+      - name: Capacity test (5k concurrent WSS connections)
+        run: |
+          ulimit -n 20000
+          cargo test --release -p meridian-rendezvous -- --ignored capacity

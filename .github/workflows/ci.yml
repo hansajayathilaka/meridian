@@ -151,6 +151,106 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --workspace --release
 
+  docker-build:
+    name: Docker build gate (apps/rendezvous/Dockerfile)
+    # F12 (Phase-3 review) / task 3.12: docker-publish.yml only builds + pushes AFTER a merge to
+    # main, so a broken Dockerfile/entrypoint (bad COPY path, a cargo build regression under the
+    # `sqlite` feature, a privilege-drop or chown mistake) was only ever discovered post-merge.
+    # This job builds the exact same file on every PR — before merge — but never pushes and never
+    # sees a registry credential: no `docker/login-action`, no `packages: write` permission below,
+    # and (unlike docker-publish.yml) no GITHUB_TOKEN login step at all. Keep it that way — this
+    # gate must not become a second path that can leak the publish credential.
+    needs: lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # Build-only, no push, no registry login. --load pulls the image into the local docker
+      # engine so the smoke-test steps below can run it.
+      - name: docker build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/rendezvous/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: meridian-rendezvous:ci-gate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Smoke test: the image must actually bind and must actually drop root before running
+      # application code (docker-entrypoint.sh's whole job — see docs/operations/docker-image.md
+      # §1). No plaintext ever crosses this box, so nothing here inspects request/response bodies;
+      # it only checks that the container comes up and that PID 1 is the unprivileged `meridian`
+      # user, not root.
+      - name: docker run smoke test (bind + privilege drop)
+        run: |
+          set -euo pipefail
+          docker run -d --name rendezvous-smoke \
+            -e MERIDIAN_RENDEZVOUS_SERVER__DOMAIN=localhost \
+            -e MERIDIAN_RENDEZVOUS_SERVER__ADMISSION=open \
+            -e MERIDIAN_RENDEZVOUS_SERVER__DATABASE_URL=sqlite:///data/rendezvous.db \
+            -v rendezvous-smoke-data:/data \
+            -p 18443:8443 \
+            meridian-rendezvous:ci-gate
+
+          # Wait for docker's own HEALTHCHECK (curl /healthz inside the container) to go healthy,
+          # rather than polling from the runner — this also exercises the HEALTHCHECK instruction
+          # itself, not just the server.
+          for i in $(seq 1 30); do
+            status="$(docker inspect --format='{{.State.Health.Status}}' rendezvous-smoke || echo unknown)"
+            if [ "$status" = "healthy" ]; then
+              break
+            fi
+            if [ "$status" = "unhealthy" ] || [ "$(docker inspect --format='{{.State.Running}}' rendezvous-smoke)" != "true" ]; then
+              echo "::error::container did not come up healthy (status=$status) — see logs below" >&2
+              docker logs rendezvous-smoke >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+          status="$(docker inspect --format='{{.State.Health.Status}}' rendezvous-smoke || echo unknown)"
+          if [ "$status" != "healthy" ]; then
+            echo "::error::container never became healthy within 30s (status=$status)" >&2
+            docker logs rendezvous-smoke >&2 || true
+            exit 1
+          fi
+
+          # PID 1 inside the container must be the unprivileged `meridian` (uid 10001), never root
+          # — `docker exec` on its own is not proof of this: a fresh exec session defaults to
+          # root (no `USER` instruction in the image; gosu only affects the entrypoint's own
+          # exec'd process), so this must read the actual PID 1's uid from /proc, not run
+          # `whoami` in a new exec session.
+          uid="$(docker exec rendezvous-smoke sh -c 'cat /proc/1/status' | awk '/^Uid:/{print $2}')"
+          echo "PID 1 uid inside container: $uid"
+          if [ "$uid" != "10001" ]; then
+            echo "::error::container's PID 1 is not running as the unprivileged meridian user (uid 10001); got uid=$uid — privilege drop is broken" >&2
+            docker logs rendezvous-smoke >&2 || true
+            exit 1
+          fi
+
+          # /data must have been chowned to meridian by docker-entrypoint.sh, or SQLite would fail
+          # to open its file there (code 14 SQLITE_CANTOPEN, docs/operations/docker-image.md §1).
+          owner="$(docker exec rendezvous-smoke stat -c '%U' /data)"
+          if [ "$owner" != "meridian" ]; then
+            echo "::error::/data is not owned by meridian after entrypoint chown; got owner=$owner" >&2
+            exit 1
+          fi
+
+          curl -fsS http://127.0.0.1:18443/healthz
+          echo
+          echo "OK: container bound, healthz responded, PID 1 runs as meridian (uid 10001), /data is meridian-owned."
+
+      - name: cleanup
+        if: always()
+        run: |
+          docker rm -f rendezvous-smoke >/dev/null 2>&1 || true
+          docker volume rm rendezvous-smoke-data >/dev/null 2>&1 || true
+
   coverage:
     name: Coverage (measurement only, non-blocking)
     needs: test
