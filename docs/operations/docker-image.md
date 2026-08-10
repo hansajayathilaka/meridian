@@ -162,7 +162,7 @@ Every var maps 1:1 onto a config key documented in §3 above — the compose fil
 through `${VAR:-default}` interpolation so Dokploy's flat env-var UI is the single place you edit
 config, with no image rebuild and no editing the compose file itself for routine changes.
 
-Two things that don't reduce to "just set an env var," both called out in comments in the compose
+Three things that don't reduce to "just set an env var," each called out in comments in the compose
 file itself:
 
 - **Exposing the domain.** The compose file publishes the rendezvous container's port 8443 to the
@@ -173,6 +173,24 @@ file itself:
   Dokploy's own Traefik already owns host port 443, so this container fails to bind it too and never
   starts. Keep `RENDEZVOUS_PORT` at a free, non-privileged port and let the Domain feature do the
   443 exposure instead.
+- **Federation (s2s, off by default).** `dokploy.compose.yml` ships a *commented-out* federation
+  block (both the `ports:` publish and the `MERIDIAN_RENDEZVOUS_FEDERATION__*` env vars) — federation
+  stays disabled (`federation.enabled` defaults `false`) until you uncomment it and supply cert/key
+  material, discovery config, and a policy. **If and when you do enable it, port 8444 must be
+  published as raw TCP passthrough only** — a bare Docker port mapping
+  (`"${MERIDIAN_FEDERATION_PORT:-8444}:8444"`), exactly like `RENDEZVOUS_PORT`/8443 above. **Do not**
+  add a second Dokploy Domain for it and route it through Traefik the way 8443 is routed above — that
+  would proxy-terminate the federation TLS, which [ADR 0017 C7](../adr/0017-federation-trust-boundary.md)
+  forbids. The two ports are *not* symmetric even though the compose file plumbs them the same
+  `${VAR:-default}` way: c2s's 8443 is safe to terminate at Traefik by design (ADR 0008) because c2s
+  peer identity comes from the post-TLS `Auth` signature, not the TLS layer itself; s2s federation has
+  no such second factor — the mTLS handshake itself *is* the identity check — so it must terminate
+  **in-process**, in the rendezvous binary, every time. Terminating it at a proxy instead would let
+  anything upstream of that proxy assert any peer identity it likes, undoing the trust boundary
+  [ADR 0017](../adr/0017-federation-trust-boundary.md)'s C1–C4 build. See
+  [deployment.md §9.2](./deployment.md#92-config-surface-deliberately-small) for the full federation
+  config surface and the private-CA/discovery-mode interaction, and the commented block in
+  `dokploy.compose.yml`/`dokploy.env.example` for the exact vars to uncomment.
 - **coturn's TURNS/443 rung.** `turnserver.conf` (T05) treats `turns://` on port 443 as the
   hostile-egress fallback rung, but on a Dokploy host port 443 is normally already owned by
   Dokploy's own Traefik for HTTP(S) routing — binding coturn there too would conflict. The compose
