@@ -80,7 +80,7 @@ the two `link.rs` edits and let 3.3 reuse 3.2's `with_deadline` helper)
 - [x] **3.22** s2s framing adversarial suite (**optional — first to cut**) — [file](./3.22-s2s-framing-adversarial.md)
 
 **Wave 7 — found during 3.22, not part of the original report**
-- [ ] **3.23** Bound `serve_link`'s idle read — no deadline lets a handshaked peer hold a
+- [x] **3.23** Bound `serve_link`'s idle read — no deadline lets a handshaked peer hold a
   `max_links` slot forever; in default WebPKI mode this is exploitable by any public-CA
   cert-holder, not gated by federation policy at all (severity refined by 3.22's security review)
   — [file](./3.23-serve-link-idle-read-deadline.md)

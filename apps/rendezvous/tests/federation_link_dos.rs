@@ -48,8 +48,10 @@
 //!   read_frame`, errors before a `FedFrame` is ever decoded) — the link closes instead, and the
 //!   server as a whole is proven not to be wedged by a subsequent legitimate dial.
 //! - slow-loris **after** the link is established (distinct from case (b) above, which is about
-//!   the handshake, bounded by `handshake_timeout_ms`): see that test's own doc comment for the
-//!   residual it surfaces — `serve_link`'s `recv_frame` has no idle/read deadline of its own.
+//!   the handshake, bounded by `handshake_timeout_ms`): task 3.22 found `serve_link`'s
+//!   `recv_frame` had no idle/read deadline of its own; task 3.23 closed that gap with the
+//!   separate `serve_idle_timeout_ms` knob — see that test's own doc comment for what it now
+//!   proves.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -73,8 +75,9 @@ use support::{spawn_federation, write, Identity, TestCa};
 
 // -- server harness ------------------------------------------------------------------------
 
-/// A tuned-down `Federation` config, full control over all three of task 3.2's numeric knobs.
-/// Private-CA mode under `ca`.
+/// A tuned-down `Federation` config, full control over all three of task 3.2's numeric knobs plus
+/// task 3.23's `serve_idle_timeout_ms`. Private-CA mode under `ca`.
+#[allow(clippy::too_many_arguments)]
 fn federation_config_full(
     dir: &Path,
     ca: &TestCa,
@@ -82,6 +85,7 @@ fn federation_config_full(
     handshake_timeout_ms: u64,
     max_concurrent_handshakes: u32,
     max_links: u32,
+    serve_idle_timeout_ms: u64,
 ) -> (Federation, Identity) {
     let id = ca.issue(dir, domain);
     let empty_map = write(dir, "empty-federation_map.toml", "");
@@ -97,16 +101,18 @@ fn federation_config_full(
         handshake_timeout_ms,
         max_concurrent_handshakes,
         max_links,
+        serve_idle_timeout_ms,
         ..Federation::default()
     };
     (federation, id)
 }
 
 /// (a)/(b)/(c)'s config: `handshake_timeout_ms` and `max_concurrent_handshakes` overridden small
-/// (so this whole suite stays fast and deterministic), `max_links` left at its generous default —
-/// these tests are about the handshake cap, not the link cap; (d) below builds its own config via
-/// [`federation_config_full`] to exercise `max_links` specifically, with the handshake cap generous
-/// instead.
+/// (so this whole suite stays fast and deterministic), `max_links` and `serve_idle_timeout_ms`
+/// left at their generous defaults — these tests are about the handshake cap, not the link cap or
+/// the idle-read deadline; (d) below builds its own config via [`federation_config_full`] to
+/// exercise `max_links` specifically (handshake cap generous instead), and the task 3.23 test
+/// below exercises `serve_idle_timeout_ms` specifically (both other knobs generous instead).
 fn federation_config(
     dir: &Path,
     ca: &TestCa,
@@ -121,6 +127,7 @@ fn federation_config(
         handshake_timeout_ms,
         max_concurrent_handshakes,
         Federation::default().max_links,
+        Federation::default().serve_idle_timeout_ms,
     )
 }
 
@@ -441,6 +448,7 @@ async fn exhausting_max_links_drops_the_next_link_promptly_after_a_successful_ha
         5_000, // generous handshake timeout — not what this test is about
         64,    // generous handshake cap — not what this test is about
         max_links,
+        Federation::default().serve_idle_timeout_ms, // generous — not what this test is about
     );
     let addr = spawn_hardened_listener(base_config("b.federation.test", b_federation)).await;
 
@@ -753,41 +761,54 @@ async fn truncated_and_oversized_length_prefixes_close_the_link_without_wedging_
     assert_eq!(link.peer_domains, vec!["b.federation.test".to_string()]);
 }
 
-// -- 3.22 (h) slow-loris AFTER the link is established ---------------------------------------
+// -- 3.23 (h) slow-loris AFTER the link is established: dropped by the idle-read deadline ----
 
 /// Distinct from case (b) above: (b) stalls DURING the mTLS+`FedHello` handshake, which
 /// `federation.handshake_timeout_ms` bounds (task 3.2). This test stalls a frame AFTER that
 /// handshake has already succeeded and `serve_link` has taken over — a phase `handshake_timeout_ms`
-/// never covers at all.
+/// never covers, bounded instead by the separate `federation.serve_idle_timeout_ms` knob (task
+/// 3.23; see [`Federation::serve_idle_timeout_ms`]'s own doc comment for why it is a third,
+/// independent timeout rather than a reuse of either sibling).
 ///
-/// **Residual found by this test, reported per this task's Scope rather than fixed (out of
-/// scope for a coverage-only task):** `inbound::serve_link`'s `link.recv_frame().await` in its
-/// main loop is not wrapped in any deadline (unlike `finish_handshake`, which
-/// `run_federation` wraps in `with_deadline(handshake_timeout, ...)`, and unlike the OUTBOUND
-/// dial/request path, which `federation::outbound` wraps in `with_deadline(timeouts.request,
-/// ...)` — see `link.rs`'s `FederationTimeouts` doc comment). A peer that completes a legitimate
-/// handshake and then trickles (or simply never sends) the rest of its next frame is never
-/// proactively disconnected by B: it holds one `max_links` permit for as long as it likes, with
-/// no idle/read deadline to reclaim it. This is bounded (at most `max_links` connections can do
-/// this at once, and each is capped at `MAX_FRAME_LEN` bytes of allocation), so it is not an
-/// unbounded resource leak — but it does mean a small number of slow/hostile-but-authenticated
-/// peers can occupy the entire `max_links` budget indefinitely, starving every other partner from
-/// establishing a link, for as long as they choose to stay silent. This test demonstrates the gap
-/// ((a)/(b) below) and that it is not otherwise fatal — the same stalled connection resumes and is
-/// served normally once it eventually finishes sending ((c) below), so this is "no idle timeout",
-/// not "the server wedges/panics/misbehaves on a stalled peer". Per this task's scope, this is
-/// reported here for a follow-up hardening task (an idle-read deadline around `serve_link`'s
-/// `recv_frame`, mirroring the handshake/outbound paths' existing `with_deadline` usage) rather
-/// than fixed inside this coverage-only task.
+/// Originally (task 3.22) this test only pinned the *absence* of any such deadline: it asserted
+/// the stalled connection sat idle within a bounded window, then resumed normally once the
+/// trickled frame was eventually completed. Task 3.23 closes that gap, and this test now proves
+/// the fix instead: (a) a peer that stalls mid-frame on an already-established link is dropped
+/// PROMPTLY once `serve_idle_timeout_ms` elapses — not merely "eventually" — mirroring this file's
+/// own (c)/(d) mutation-proof shape (a deadline that is unenforced, or wired to the wrong config
+/// field, would instead leave the connection open well past this test's bounded assertion
+/// window); and (b) the `max_links` permit that connection was holding is genuinely reclaimed
+/// afterward — a fresh dial, against what would otherwise be an exhausted `max_links = 1` budget,
+/// eventually succeeds, AND a real request/reply round-trip over that retried link succeeds too.
+/// The round-trip is the part that actually proves the permit was reclaimed: `dial()` returning
+/// `Ok` only proves the client-side mTLS + `FedHello` handshake completed, which (per case (d)
+/// above) is entirely independent of the server's `max_links` semaphore — a connection that loses
+/// the link-cap race still completes its handshake and is only dropped, silently, strictly
+/// afterward. So `dial()` succeeding alone cannot distinguish "the permit was genuinely reclaimed"
+/// from "the permit leaked forever but the handshake slot cap this test leaves generous happened
+/// to have room"; only a real, well-formed reply from `serve_link` (which only runs once the
+/// link-cap `try_acquire_owned()` genuinely succeeds) can. (Case (c)'s old "resume the stalled
+/// frame" check no longer applies: once the connection is proactively dropped on idle, there is
+/// nothing left to resume — proving the permit is freed for a NEW dial, and genuinely usable by
+/// it, is the more useful property once that behavior changed.)
 #[tokio::test]
-async fn slow_loris_after_link_established_reveals_no_idle_read_deadline() {
+async fn slow_loris_after_link_established_is_dropped_by_the_idle_read_deadline() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = TestCa::named("Meridian Test Federation CA (3.22 slow-loris)");
-    // A tight max_links cap (1) makes the residual directly observable: if the stalled connection
-    // is genuinely never reclaimed absent a completed frame, it alone exhausts the whole link
-    // budget.
-    let (b_federation, _b_id) =
-        federation_config_full(dir.path(), &ca, "b.federation.test", 5_000, 8, 1);
+    let ca = TestCa::named("Meridian Test Federation CA (3.23 slow-loris)");
+    // A tight max_links cap (1) makes the fix directly observable: only if the sole permit is
+    // genuinely released once `serve_link` returns can the follow-up dial in (b) below succeed at
+    // all. `serve_idle_timeout_ms` is kept short (same range as this file's own
+    // `handshake_timeout_ms` test values, e.g. case (b)/(c) above) so the whole suite stays fast.
+    let serve_idle_timeout_ms = 300;
+    let (b_federation, _b_id) = federation_config_full(
+        dir.path(),
+        &ca,
+        "b.federation.test",
+        5_000,
+        8,
+        1,
+        serve_idle_timeout_ms,
+    );
     let addr = spawn_hardened_listener(base_config("b.federation.test", b_federation)).await;
 
     let mut stream = establish_raw_link(
@@ -800,7 +821,7 @@ async fn slow_loris_after_link_established_reveals_no_idle_read_deadline() {
     .await;
 
     // A real, legitimate follow-up frame, computed up front so its exact encoded length is known
-    // — needed to trickle only PART of its 4-byte length prefix now and complete it later.
+    // — needed to trickle only PART of its 4-byte length prefix, then stop.
     let follow_up = FedFrame::new(
         FedOp::Reachability,
         55,
@@ -813,66 +834,180 @@ async fn slow_loris_after_link_established_reveals_no_idle_read_deadline() {
     let len_bytes = (follow_bytes.len() as u32).to_le_bytes();
 
     // Trickle only the first 2 of the 4 length-prefix bytes B's `serve_link` → `recv_frame` is
-    // waiting for, then stop.
+    // waiting for, then stop for good — unlike the pre-fix version of this test, nothing ever
+    // completes this frame.
     stream.write_all(&len_bytes[0..2]).await.unwrap();
     stream.flush().await.unwrap();
 
-    // (a) Observably: nothing comes back within a bounded window. `serve_link` is blocked inside
-    // `read_exact` awaiting the other two length-prefix bytes; there is no reply to read, and (per
-    // this test's finding above) nothing that would proactively close the connection either. This
-    // is a bounded-window observation, not a claim that the connection literally never closes.
-    let saw_anything = tokio::time::timeout(Duration::from_millis(500), async {
+    // (a) Prompt drop: once `serve_idle_timeout_ms` elapses, B must close the connection — no
+    // reply frame is possible (the idle-read deadline fires inside `recv_frame`'s own
+    // `read_exact`, before any `FedFrame` is ever decoded). Bounded at a few multiples of the
+    // configured deadline, mirroring case (b) above, so this is robust to scheduling jitter
+    // without degenerating into an unbounded "wait for it" sleep-then-assert.
+    let closed = tokio::time::timeout(Duration::from_millis(serve_idle_timeout_ms * 5), async {
         let mut buf = [0u8; 1];
         stream.read(&mut buf).await
     })
-    .await;
-    assert!(
-        saw_anything.is_err(),
-        "expected the stalled connection to sit idle — no reply, no close — within this bounded \
-         window: {saw_anything:?}"
-    );
-
-    // (b) That idleness is not free: with `max_links = 1`, the still-open, still-stalled
-    // connection above is the ONLY thing that can be holding the one link permit — a second,
-    // otherwise-legitimate dial completes its handshake (a separate, generous cap) but then gets
-    // dropped almost immediately (mirrors this file's existing max_links case (d)), proving the
-    // stalled link really is still occupying that slot.
-    let a2 = ca.issue(dir.path(), "a2.federation.test");
-    let mut over_link = dial(
-        addr,
-        "b.federation.test",
-        a2.client_tls(),
-        "a2.federation.test",
-        None,
-        FederationTimeouts::default(),
-    )
     .await
-    .expect("the handshake itself still completes — the handshake cap is untouched here");
-    let closed_promptly =
-        tokio::time::timeout(Duration::from_millis(500), over_link.recv_frame()).await;
-    assert!(
-        matches!(&closed_promptly, Ok(Err(_))),
-        "a dial over max_links=1 must be dropped promptly once its own handshake completes — \
-         proving the stalled connection above is genuinely still holding the one link permit: \
-         {closed_promptly:?}"
+    .expect(
+        "the idle-read deadline must close the stalled connection within a bounded time, not \
+         leave it open indefinitely",
     );
-    drop(over_link);
+    assert!(
+        matches!(closed, Ok(0) | Err(_)),
+        "expected EOF/IO-error once serve_idle_timeout_ms elapsed, got {closed:?}"
+    );
 
-    // (c) The stalled connection is not otherwise dead: once it eventually finishes sending a
-    // real frame, `serve_link` resumes and replies normally. This is what distinguishes "no idle
-    // timeout" (the residual reported above) from "the server wedges/panics on a stalled peer"
-    // (which this proves it does not do).
-    stream.write_all(&len_bytes[2..4]).await.unwrap();
-    stream.write_all(&follow_bytes).await.unwrap();
-    stream.flush().await.unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(5), raw_read_frame(&mut stream))
+    // (b) The max_links permit that connection held is genuinely reclaimed, not merely closed on
+    // B's side while the permit itself leaks: with max_links = 1, a fresh dial can only succeed if
+    // the idle-dropped connection's permit was actually released back to the semaphore. Retried
+    // with a short backoff (mirroring case (c)'s recovery check) so this also tolerates the small
+    // scheduling gap between the socket closing and `run_federation` observing `serve_link`'s
+    // return and dropping the permit guard, rather than requiring the permit to free up in the
+    // very same instant the client observes the close.
+    //
+    // NOTE: `dial()` returning `Ok` only proves the CLIENT-side mTLS + `FedHello` handshake
+    // completed — that happens entirely independent of the server's `max_links` semaphore (see
+    // `run_federation`'s doc comment / case (d) above: the link-cap `try_acquire_owned()` is
+    // checked strictly *after* the handshake finishes, and a permit-exhausted connection is
+    // dropped silently, with no reply frame, before `serve_link` ever runs). So a retry loop that
+    // stops as soon as `dial()` succeeds would pass even if the idle-dropped connection's permit
+    // were never actually reclaimed, as long as `dial()`'s own (separate, generous) handshake-slot
+    // cap had room — it says nothing about `max_links`. To actually prove the permit was reclaimed
+    // and consumed by this new link, drive a real request over it and require a real, well-formed
+    // reply: that only happens if `serve_link` genuinely took over the connection, which only
+    // happens if the link-cap `try_acquire_owned()` genuinely succeeded.
+    let a2 = ca.issue(dir.path(), "a2.federation.test");
+    let overall_budget = Duration::from_millis(serve_idle_timeout_ms * 10);
+    let mut link = tokio::time::timeout(overall_budget, async {
+        loop {
+            let attempt = dial(
+                addr,
+                "b.federation.test",
+                a2.client_tls(),
+                "a2.federation.test",
+                None,
+                FederationTimeouts::default(),
+            )
+            .await;
+            if let Ok(link) = attempt {
+                return link;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect(
+        "the max_links permit held by the idle-dropped connection must be reclaimed once \
+         serve_link returns — a fresh dial over the max_links=1 budget must eventually succeed",
+    );
+    assert_eq!(link.peer_domains, vec!["b.federation.test".to_string()]);
+
+    let probe = FedFrame::new(
+        FedOp::Reachability,
+        99,
+        &FedReachability {
+            target: [0x44u8; 32],
+        },
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), link.send_frame(&probe))
         .await
-        .expect("the resumed connection is served normally once its frame completes")
+        .expect("sending a real request on the retried link completes promptly")
+        .expect("send_frame itself succeeds");
+    let reply = tokio::time::timeout(Duration::from_secs(5), link.recv_frame())
+        .await
+        .expect(
+            "a real reply on the retried link arrives promptly — proving serve_link is genuinely \
+             running (and thus that the max_links permit was truly acquired), not merely that \
+             the client-side handshake completed",
+        )
         .expect("reading the reply frame succeeds");
     assert_eq!(
         reply.op,
         FedOp::Reachable,
-        "expected the completed request to be served"
+        "expected a well-formed Reachable reply from serve_link on the retried link"
     );
-    assert_eq!(reply.id, 55);
+    assert_eq!(reply.id, 99, "the reply must echo the probe's id");
+}
+
+// -- 3.23 (i) idle timeout resets per-iteration, it is not a total-lifetime cap -------------
+
+/// Non-blocking follow-up (reviewer note on the (h) test above): nothing else in this file proves
+/// `serve_idle_timeout_ms` is an IDLE deadline — reset every time a frame is read, per
+/// `serve_link`'s loop shape (`inbound.rs`: `with_deadline(idle_timeout, link.recv_frame())` is
+/// called fresh on every pass) — rather than some hypothetical TOTAL-lifetime cap on the link as a
+/// whole. A link that keeps sending real frames slower than `serve_idle_timeout_ms` apart, but
+/// well within it each individual gap, must stay alive indefinitely; a (wrong) lifetime-cap
+/// implementation would instead kill it once the cumulative connection age crossed the same
+/// threshold, even though no single gap between frames was ever too long.
+///
+/// Kept small and low-risk: reuses the same `dial` + `send_frame`/`recv_frame` round-trip shape as
+/// case (b) above, with generous spacing relative to scheduling jitter (`idle_timeout / 2`) and
+/// few enough iterations that the whole test finishes in well under a second.
+#[tokio::test]
+async fn periodic_frames_slower_than_the_idle_timeout_keep_the_link_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = TestCa::named("Meridian Test Federation CA (3.23 idle-reset)");
+    let serve_idle_timeout_ms = 200;
+    let (b_federation, _b_id) = federation_config_full(
+        dir.path(),
+        &ca,
+        "b.federation.test",
+        5_000, // generous handshake timeout — not what this test is about
+        8,     // generous handshake cap — not what this test is about
+        4,     // generous link cap — not what this test is about
+        serve_idle_timeout_ms,
+    );
+    let addr = spawn_hardened_listener(base_config("b.federation.test", b_federation)).await;
+
+    let a = ca.issue(dir.path(), "a.federation.test");
+    let mut link = dial(
+        addr,
+        "b.federation.test",
+        a.client_tls(),
+        "a.federation.test",
+        None,
+        FederationTimeouts::default(),
+    )
+    .await
+    .expect("legitimate dial completes");
+
+    // Each gap between frames is well under `serve_idle_timeout_ms` (half of it), but the
+    // cumulative wall-clock span across all iterations comfortably exceeds `serve_idle_timeout_ms`
+    // — the property a total-lifetime cap would violate but a genuinely per-read idle deadline
+    // would not.
+    let gap = Duration::from_millis(serve_idle_timeout_ms / 2);
+    let iterations: u64 = 6;
+    for i in 0..iterations {
+        tokio::time::sleep(gap).await;
+        let req = FedFrame::new(
+            FedOp::Reachability,
+            i,
+            &FedReachability {
+                target: [0x55u8; 32],
+            },
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), link.send_frame(&req))
+            .await
+            .unwrap_or_else(|_| panic!("send_frame {i} completes promptly"))
+            .unwrap_or_else(|e| panic!("send_frame {i} succeeds: {e:?}"));
+        let reply = tokio::time::timeout(Duration::from_secs(5), link.recv_frame())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "reply {i} arrives promptly — a link killed by a (wrong) total-lifetime cap \
+                     would instead have gone silent partway through this loop, well before any \
+                     single gap ever exceeded serve_idle_timeout_ms"
+                )
+            })
+            .unwrap_or_else(|e| panic!("reading reply {i} succeeds: {e:?}"));
+        assert_eq!(
+            reply.op,
+            FedOp::Reachable,
+            "expected reply {i} to be Reachable"
+        );
+        assert_eq!(reply.id, i, "reply {i} must echo its request id");
+    }
 }
