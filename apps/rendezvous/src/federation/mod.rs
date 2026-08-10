@@ -52,5 +52,8 @@ pub use discovery::{
     Discovery, DiscoveryError, Endpoint, HickoryResolver, RawSrv, SrvDiscovery, SrvResolver,
     StaticMap,
 };
-pub use link::{dial, FederationLink, FederationListener, FederationTlsPaths, LinkError};
+pub use link::{
+    dial, with_deadline, DeadlineExceeded, FederationLink, FederationListener, FederationTimeouts,
+    FederationTlsPaths, LinkError,
+};
 pub use policy::{Decision, FederationLimits, FederationPolicy, RateLimitScope, RejectReason};

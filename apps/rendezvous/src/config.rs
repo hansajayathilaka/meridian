@@ -191,18 +191,105 @@ pub struct Federation {
     /// match only, never substring/suffix — `evil-org-b.test` does not match an allowlisted
     /// `org-b.test`.
     pub allowlist: Vec<String>,
-    /// Per-origin-server budget for prekey-fetch requests (task 2.7), fixed one-minute window. See
-    /// [`Federation::default`] for the chosen starting value and its reasoning.
+    /// Per-origin-server budget for prekey-fetch requests (task 2.7), fixed one-minute window. One
+    /// `fed_fetch_bundle` request costs exactly one unit. See [`Federation::default`] for the
+    /// chosen starting value and its reasoning.
     pub fed_fetch_per_origin_per_min: u32,
-    /// Per-origin-server budget for route-reachability requests (task 2.8), fixed one-minute
-    /// window. See [`Federation::default`] for the chosen starting value and its reasoning.
+    /// Per-origin-server budget for real message-routing requests (task 2.8's `fed_route`), fixed
+    /// one-minute window. **True per-message cost (task 3.5 / review finding F4, fixed): one real
+    /// routed message costs exactly one unit of this budget.** Before this task it cost two —
+    /// `route_foreign`'s internal `fed_reachability` liveness pre-check and the `fed_route` it
+    /// precedes both spent this same budget, so ordinary cross-org chat throttled at roughly half
+    /// this value. As of 3.5, `fed_reachability` requests spend no budget at all (see
+    /// `federation::inbound::handle_fed_reachability`'s doc comment for the accounting fix and the
+    /// residual it accepts) — this field's name predates that split and covers `fed_route` alone,
+    /// despite the "per-origin" name not saying so explicitly. See [`Federation::default`] for the
+    /// chosen starting value and its reasoning.
     pub fed_route_per_origin_per_min: u32,
     /// Per-`(origin_domain, origin_account)` budget, shared across both fetch and route requests
     /// (task 2.6/2.7/2.8), fixed one-minute window. The `origin_account` half of this key is
     /// self-asserted by the partner server and not independently verifiable by us (ADR 0017) — see
     /// [`crate::federation::policy`]'s module doc for why that is accepted, not a gap this field
-    /// closes. See [`Federation::default`] for the chosen starting value and its reasoning.
+    /// closes. **True per-message cost on the route dimension (task 3.5, fixed):** one real routed
+    /// message costs exactly one unit, keyed on the SENDER's claimed account (`FedRoute::from`)
+    /// alone — never the recipient's, and never twice. Before this task it could cost the SAME
+    /// account a unit twice per round trip of a two-way conversation (once as `from` when they
+    /// sent, once as the reachability pre-check's `target` when the other side sent to them), and
+    /// always cost the recipient's account a unit it had no way to avoid, purely for being
+    /// addressed. On the fetch dimension this field is unchanged: one `fed_fetch_bundle` request
+    /// still costs one unit, keyed on `req.target` (see `federation::inbound::handle_fed_fetch`'s
+    /// doc comment on that reading). See [`Federation::default`] for the chosen starting value and
+    /// its reasoning.
     pub fed_per_origin_account_per_min: u32,
+    /// **`TODO: confirm`** (task 3.5 follow-up / review finding F4, blocking): per-origin-server
+    /// budget for `fed_reachability` requests (task 2.8), fixed one-minute window, keyed on
+    /// `origin_domain` ALONE — deliberately no per-account axis (`FedReachability` carries no
+    /// `from`/requester-account field to key one on; see
+    /// [`crate::federation::policy::FederationLimits::check_reachability`]'s doc comment). Added by
+    /// this follow-up, not the original task 3.5 fix: removing `fed_reachability`'s
+    /// `check_route` call stopped it double-spending the route budget, but also left it
+    /// completely unmetered — `FedOp::Reachability` is 2.8's own independent wire op, reachable by
+    /// any mTLS-admitted peer directly, not solely an internal implementation detail of
+    /// `route_foreign`'s liveness pre-check (a peer cannot be told apart from the wire frame
+    /// alone). This is genuine scope growth beyond the original task 3.5 file (which only named
+    /// "exempt reachability from rate limiting, or double the existing three defaults" as its two
+    /// sanctioned alternatives) — a fourth, independent limiter dimension was what review actually
+    /// required, so this field, like `handshake_timeout_ms`/`max_concurrent_handshakes`/`max_links`
+    /// above, is left `TODO: confirm` rather than presented as an already-settled number.
+    ///
+    /// **Coupling constraint (re-review, second follow-up to F4), stronger than "same order of
+    /// magnitude":** `route_foreign` unconditionally runs the reachability pre-check ONCE for every
+    /// real `fed_route` delivery it attempts (never cached, never skipped — see that function's own
+    /// doc comment), and both dimensions aggregate the same way (whole-origin, no cross-account
+    /// pooling). That 1:1 coupling makes the SMALLER of the two limits the binding constraint on
+    /// real, delivered messages, regardless of which one is nominally "the route budget" — a
+    /// `fed_reachability_per_origin_per_min` set below `fed_route_per_origin_per_min` silently caps
+    /// achievable route throughput at its own (lower) value, reintroducing exactly the
+    /// halved-throughput symptom this task exists to fix, just via a second limiter instead of a
+    /// double-spend. This field's value MUST therefore be `>=` [`Federation::fed_route_per_origin_per_min`],
+    /// not merely "roughly comparable" — see [`Federation::validate`], which enforces this at
+    /// config-load time. See [`Federation::default`] for the chosen starting value and its
+    /// reasoning.
+    pub fed_reachability_per_origin_per_min: u32,
+    /// **`TODO: confirm`** (task 3.2 / review finding F2+N5): how long `run_federation`'s accept
+    /// loop gives one inbound connection to complete mTLS + `FedHello` (via
+    /// [`crate::federation::link::with_deadline`]) before dropping it. Not grounded in any prior
+    /// design doc — proposed conservatively (generous relative to a real handshake over any
+    /// reasonable network, tight enough that a silent/hostile peer can't hold a handshake slot for
+    /// long) and left `TODO: confirm` rather than invented as settled. Must be `> 0` — see
+    /// [`Federation::validate`].
+    pub handshake_timeout_ms: u64,
+    /// **`TODO: confirm`** (task 3.2 / F2+N5): the pre-auth handshake-slot cap — how many inbound
+    /// connections may be mid mTLS+`FedHello` handshake at once before further connections are
+    /// dropped (see `federation::inbound::run_federation`'s doc comment for why this is a *separate*
+    /// semaphore from [`Federation::max_links`], not the same permit held across both phases). Same
+    /// "proposed, not grounded" status as `handshake_timeout_ms`. Must be `> 0`.
+    pub max_concurrent_handshakes: u32,
+    /// **`TODO: confirm`** (task 3.2 / F2+N5): the cap on total concurrently *established* (i.e.
+    /// past handshake, actively being [`crate::federation::inbound::serve_link`]'d) federation
+    /// links, across all partners. Same "proposed, not grounded" status as the two fields above.
+    /// Must be `> 0`.
+    pub max_links: u32,
+    /// **`TODO: confirm`** (task 3.3 / review finding F3): how long the OUTBOUND
+    /// [`crate::federation::link::dial`]'s raw `TcpStream::connect` step may take before giving
+    /// up — the dial-side analogue of `handshake_timeout_ms` above, which bounds the INBOUND
+    /// accept side instead. Not grounded in a prior design doc; proposed conservatively (generous
+    /// relative to any real TCP handshake over a reasonable network, tight enough that a
+    /// black-holed partner — one that never even completes the three-way handshake — can't hold a
+    /// pinned outbound task open for long). Must be `> 0` — see [`Federation::validate`].
+    pub connect_timeout_ms: u64,
+    /// **`TODO: confirm`** (task 3.3 / F3): how long EACH subsequent outbound step may take
+    /// before giving up — `dial`'s TLS handshake, `dial`'s `FedHello` exchange (two independent
+    /// deadlines inside `dial` itself), and, reused by [`crate::federation::outbound`], each
+    /// individual s2s request/reply exchange over an already-established link
+    /// (`fetch_foreign_bundle`'s and `reachable_foreign`'s reply receives). One shared knob across
+    /// all of these post-connect steps, mirroring `handshake_timeout_ms`'s single knob for the
+    /// whole inbound mTLS+`FedHello` handshake rather than a separate knob per step. Same
+    /// "proposed, not grounded" status as `connect_timeout_ms`. Must be `> 0`.
+    ///
+    /// Deliberately does NOT bound [`crate::federation::outbound::ROUTE_REPLY_GRACE`] — that
+    /// constant's value is task 3.20's, untouched here.
+    pub request_timeout_ms: u64,
 }
 
 /// Federation admission policy mode (task 2.6). See [`Federation::policy`]. Kept as its own
@@ -277,9 +364,105 @@ impl Default for Federation {
             //   more than a modest slice of its origin's own budget above.
             // Operators can raise all three; the failure mode of picking too low is a false-closed
             // rejection an operator notices and raises, not a silent abuse hole.
+            //
+            // **Task 3.5 correction (review finding F4):** the paragraph above was written when a
+            // real `fed_route`'s internal `fed_reachability` liveness pre-check ALSO spent
+            // `fed_route_per_origin_per_min` and `fed_per_origin_account_per_min` (a double-spend
+            // bug, not an intended part of this reasoning) — so, until 3.5 fixed it, the true
+            // achievable throughput for ordinary cross-org chat was roughly HALF of `600`/`30`
+            // (~30 msg/min per account, ≈1 message per 2s), not the number this comment describes.
+            // As of 3.5, `fed_reachability` no longer spends `route_per_origin`/
+            // `fed_per_origin_account_per_min` at all (see
+            // `federation::inbound::handle_fed_reachability`'s doc comment), so `600` and `30` now
+            // deliver the full throughput the paragraph above always intended — a real `fed_route`
+            // costs exactly one unit of each, once. The three numbers themselves are UNCHANGED by
+            // 3.5 (this task fixed the accounting, not the values — see the task file's Scope for
+            // the two sanctioned alternatives and why the accounting fix, not doubling these
+            // defaults, was chosen); they are simply, for the first time, honest about what they
+            // actually meter.
+            //
+            // **Task 3.5 follow-up correction (review finding F4, blocking):** the paragraph above
+            // was, in turn, only half the fix — it stopped `fed_reachability` from double-spending
+            // `route_per_origin`/`fed_per_origin_account_per_min`, but the review that landed it
+            // found that made `FedOp::Reachability` (2.8's own independent wire op, directly
+            // reachable by any mTLS-admitted peer, not merely `route_foreign`'s internal
+            // implementation detail) completely UNMETERED — bounded only by task 3.2's *global*
+            // link-count caps, not anything per-peer. `fed_reachability_per_origin_per_min` below
+            // is the fix: a fourth, independent limiter dimension, so `fed_reachability` is metered
+            // again without reintroducing any coupling to `fed_route_per_origin_per_min` (see that
+            // field's own doc comment, and `federation::policy::FederationLimits::check_reachability`'s,
+            // for the full accounting).
             fed_fetch_per_origin_per_min: 300,
             fed_route_per_origin_per_min: 600,
             fed_per_origin_account_per_min: 30,
+            // `TODO: confirm` (task 3.5 follow-up, review finding F4, blocking; value corrected by
+            // a second follow-up after re-review): a fourth, newly added limiter dimension — not
+            // one of the three original numbers above, and not grounded in a prior design doc any
+            // more than `handshake_timeout_ms`/`max_concurrent_handshakes`/`max_links` below are.
+            //
+            // **Coupling constraint, which dominates the reasoning below:** `route_foreign` spends
+            // exactly one unit of THIS budget for every real `fed_route` delivery it attempts (the
+            // mandatory, uncached, 1:1 liveness pre-check — see that function's doc comment), and
+            // both this limiter and `fed_route_per_origin_per_min` aggregate the same way
+            // (whole-origin, no per-account pooling on this one). Because the two are chained 1:1
+            // on every real message, the achievable real-delivery throughput for one origin is
+            // `min(fed_route_per_origin_per_min, fed_reachability_per_origin_per_min)` — so this
+            // value MUST be `>=` `fed_route_per_origin_per_min` (`600`) or it, not the route budget,
+            // becomes the real throughput ceiling, silently reintroducing this task's own
+            // halved-throughput symptom through a second limiter dimension instead of a
+            // double-spend. [`Federation::validate`] enforces this at config-load time so an
+            // operator who lowers one without the other gets a clear, fail-closed error instead of
+            // a silent cap.
+            //
+            // Picked equal to `fed_route_per_origin_per_min` (`600`), the smallest value the
+            // coupling constraint above allows, rather than some larger multiple: `fed_reachability`
+            // requests are cheap (one in-memory `Registry::is_connected` lookup, no store I/O at
+            // all — contrast `fed_fetch_bundle`'s store lookup) and read-only, and legitimate use is
+            // bursty-but-light — either a real route's own internal liveness pre-check (which, by
+            // construction, can never exceed the route budget's own call volume) or genuine
+            // presence-checking UX, neither of which needs headroom above the route budget itself.
+            // Operators can raise it further (e.g. to leave slack for standalone presence-checking
+            // UX beyond what real routes alone generate); they may not lower it below the route
+            // default without also lowering that default — validated, not merely documented.
+            fed_reachability_per_origin_per_min: 600,
+            // `TODO: confirm` (task 3.2, review findings F2/N5): none of these three are grounded
+            // in an existing design doc — picked here, conservatively, purely to stop one
+            // silent/slow inbound s2s connection from wedging the whole federation listener. See
+            // each field's own doc comment for what it bounds; do not treat these as settled
+            // without an explicit sign-off.
+            // - `handshake_timeout_ms = 10_000`: generous relative to any real mTLS+FedHello
+            //   round trip (well under a second on a healthy link) while still being short enough
+            //   that a hostile peer can't tie up a handshake slot for more than ~10s.
+            // - `max_concurrent_handshakes = 64`: bounds how many raw TCP connections may be
+            //   mid-handshake (mTLS not yet verified, `FedHello` not yet exchanged) at once —
+            //   well above the handshake concurrency a handful of legitimate partner orgs would
+            //   ever need at once (ADR 0002's 2-200 small-to-medium-org deployment shape), while
+            //   still capping the worst-case per-connection resource use (one task + one TLS
+            //   handshake buffer each) a single attacker opening many connections at once can
+            //   force.
+            // - `max_links = 256`: the ceiling on total simultaneously *established* links, set
+            //   above `max_concurrent_handshakes` (established links are cheap to hold open — one
+            //   idle task each — unlike an in-progress handshake) and, like the two above, an
+            //   operator-tunable ceiling rather than a throughput target.
+            handshake_timeout_ms: 10_000,
+            max_concurrent_handshakes: 64,
+            max_links: 256,
+            // `TODO: confirm` (task 3.3, review finding F3): the OUTBOUND (dial-side) mirror of
+            // the three inbound-hardening knobs just above — same "not grounded in a prior design
+            // doc, proposed conservatively" status. See each field's own doc comment for what it
+            // bounds.
+            // - `connect_timeout_ms = 5_000`: generous relative to any real TCP three-way
+            //   handshake over any reasonable network (typically well under a second), while
+            //   still bounding how long a black-holed partner (accepts TCP, then silence) can
+            //   hold a pinned outbound task open.
+            // - `request_timeout_ms = 10_000`: matches `handshake_timeout_ms`'s value (the
+            //   INBOUND side's equivalent budget for a full mTLS+FedHello handshake) since this
+            //   knob covers the analogous OUTBOUND steps (TLS handshake, FedHello exchange) plus
+            //   one additional real wire round trip for the actual fed request/reply, which
+            //   `ROUTE_REPLY_GRACE`'s much smaller 500ms is scoped to cover on its own for the
+            //   fire-and-forget `fed_route` case specifically (task 3.20, untouched here).
+            connect_timeout_ms: 5_000,
+            request_timeout_ms: 10_000,
         }
     }
 }
@@ -305,7 +488,18 @@ impl Federation {
             self.fed_fetch_per_origin_per_min,
             self.fed_route_per_origin_per_min,
             self.fed_per_origin_account_per_min,
+            self.fed_reachability_per_origin_per_min,
         )
+    }
+
+    /// Build the [`crate::federation::link::FederationTimeouts`] `dial` (and
+    /// `federation::outbound`'s per-exchange waits) read from (task 3.3). Same config-owns-parsing
+    /// / domain-module-owns-the-runtime-type split as [`Self::to_policy`]/[`Self::to_limits`].
+    pub fn to_timeouts(&self) -> crate::federation::link::FederationTimeouts {
+        crate::federation::link::FederationTimeouts {
+            connect: std::time::Duration::from_millis(self.connect_timeout_ms),
+            request: std::time::Duration::from_millis(self.request_timeout_ms),
+        }
     }
 }
 
@@ -418,6 +612,69 @@ impl Federation {
                  federation.discovery = \"static\" (federation_map.toml, which mandates a \
                  pinned_identity per partner) with a private CA, or clear ca_bundle_path to run \
                  SRV discovery in WebPKI mode."
+                    .to_string(),
+            );
+        }
+        // Task 3.2 (F2/N5): all three inbound-hardening knobs are `> 0`-or-bust — a `0` isn't
+        // "the strictest possible setting", it's a config that either wedges every inbound
+        // connection instantly (a 0ms handshake deadline) or admits none at all (a 0-permit
+        // semaphore), neither of which is a real operator intent. Reject both explicitly rather
+        // than let federation silently accept zero inbound connections forever, which an operator
+        // would have a hard time telling apart from "federation is broken."
+        if self.handshake_timeout_ms == 0 {
+            return Err(
+                "federation.handshake_timeout_ms must be greater than 0 (0 would time out every \
+                 inbound handshake instantly)"
+                    .to_string(),
+            );
+        }
+        if self.max_concurrent_handshakes == 0 {
+            return Err(
+                "federation.max_concurrent_handshakes must be greater than 0 (0 would admit no \
+                 inbound handshake at all)"
+                    .to_string(),
+            );
+        }
+        if self.max_links == 0 {
+            return Err(
+                "federation.max_links must be greater than 0 (0 would allow no established \
+                 federation link at all)"
+                    .to_string(),
+            );
+        }
+        // Task 3.5 second follow-up (re-review of F4): `route_foreign` spends exactly one unit of
+        // `fed_reachability_per_origin_per_min` for every real `fed_route` delivery it attempts (an
+        // uncached, mandatory 1:1 liveness pre-check — see that function's doc comment), and both
+        // limiters aggregate whole-origin with no per-account pooling on the reachability side. That
+        // 1:1 chaining means the SMALLER of the two values is the real, achievable per-origin route
+        // throughput, regardless of which field's name suggests it's "the route budget" — a
+        // reachability budget set below the route budget silently caps real message throughput at
+        // its own value, reintroducing this task's own halved-throughput symptom via a second
+        // limiter dimension instead of a double-spend. Reject that combination here, at config-load
+        // time, rather than let an operator discover it only as an unexplained throughput cap.
+        if self.fed_reachability_per_origin_per_min < self.fed_route_per_origin_per_min {
+            return Err(format!(
+                "federation.fed_reachability_per_origin_per_min ({}) must be >= \
+                 federation.fed_route_per_origin_per_min ({}): route_foreign's internal \
+                 reachability pre-check spends exactly one reachability unit for every real routed \
+                 message, so a lower reachability budget silently caps real route throughput at its \
+                 own value, below the documented route budget",
+                self.fed_reachability_per_origin_per_min, self.fed_route_per_origin_per_min
+            ));
+        }
+        // Task 3.3 (F3): the OUTBOUND mirror of the same "0 isn't the strictest possible
+        // setting, it's a config that either wedges/refuses every dial instantly" reasoning above.
+        if self.connect_timeout_ms == 0 {
+            return Err(
+                "federation.connect_timeout_ms must be greater than 0 (0 would time out every \
+                 outbound TCP connect instantly)"
+                    .to_string(),
+            );
+        }
+        if self.request_timeout_ms == 0 {
+            return Err(
+                "federation.request_timeout_ms must be greater than 0 (0 would time out every \
+                 outbound TLS handshake, FedHello exchange, and fed request/reply instantly)"
                     .to_string(),
             );
         }
@@ -634,6 +891,15 @@ mod tests {
                     "MERIDIAN_RENDEZVOUS_FEDERATION__FED_PER_ORIGIN_ACCOUNT_PER_MIN",
                     "5",
                 ),
+                (
+                    // Must stay >= the FED_ROUTE_PER_ORIGIN_PER_MIN value above (20) — task 3.5's
+                    // second follow-up (re-review of F4) added cross-field validation rejecting a
+                    // reachability budget below the route budget (see
+                    // `Federation::validate`), so this value can no longer be picked independently
+                    // of the route override just above it.
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__FED_REACHABILITY_PER_ORIGIN_PER_MIN",
+                    "25",
+                ),
             ],
         );
         let file = write_toml("");
@@ -648,6 +914,23 @@ mod tests {
         assert_eq!(config.federation.fed_fetch_per_origin_per_min, 10);
         assert_eq!(config.federation.fed_route_per_origin_per_min, 20);
         assert_eq!(config.federation.fed_per_origin_account_per_min, 5);
+        assert_eq!(config.federation.fed_reachability_per_origin_per_min, 25);
+    }
+
+    /// Task 3.5 follow-up (review finding F4, blocking): `fed_reachability_per_origin_per_min` is a
+    /// newly added limiter dimension — pin its default value directly (not just via env-override
+    /// round-tripping above) so a future accidental edit to `Federation::default` is caught here.
+    /// Task 3.5's second follow-up (re-review of F4) raised this default from `300` to `600` so it
+    /// is never, itself, below `fed_route_per_origin_per_min` — see [`Federation::validate`] for the
+    /// cross-field check that now enforces this at config-load time too.
+    #[test]
+    fn federation_reachability_limit_default_is_positive() {
+        let f = Federation::default();
+        assert_eq!(f.fed_reachability_per_origin_per_min, 600);
+        assert!(f.fed_reachability_per_origin_per_min >= f.fed_route_per_origin_per_min);
+
+        let config = Config::from_toml_str("").unwrap();
+        assert_eq!(config.federation.fed_reachability_per_origin_per_min, 600);
     }
 
     #[test]
@@ -775,6 +1058,202 @@ mod tests {
             .expect("static discovery with a private CA bundle must be accepted");
 
         assert_eq!(config.federation.ca_bundle_path, "/etc/meridian/fed-ca.pem");
+    }
+
+    // -- task 3.5 second follow-up (re-review of F4): reachability/route coupling validation ----
+
+    #[test]
+    fn fed_reachability_below_fed_route_is_rejected_fail_closed() {
+        // The precise bug the re-review found: `route_foreign` spends one reachability unit for
+        // every real routed message (a mandatory, uncached 1:1 pre-check), so a reachability budget
+        // set below the route budget silently caps real throughput at the smaller number — a second
+        // limiter reintroducing this task's own "halved throughput" symptom. Must be a hard `Err`,
+        // not a silent load.
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml(
+            "[federation]\nfed_route_per_origin_per_min = 600\n\
+             fed_reachability_per_origin_per_min = 300\n",
+        );
+
+        let err = Config::load(Some(file.path().to_str().unwrap())).expect_err(
+            "a reachability budget below the route budget must be rejected, not silently loaded",
+        );
+        assert!(err
+            .to_string()
+            .contains("fed_reachability_per_origin_per_min"));
+        assert!(err.to_string().contains("fed_route_per_origin_per_min"));
+    }
+
+    #[test]
+    fn fed_reachability_equal_to_fed_route_is_accepted() {
+        // The boundary case: equal is fine (this is the shipped default relationship) — only
+        // strictly less than is rejected.
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml(
+            "[federation]\nfed_route_per_origin_per_min = 600\n\
+             fed_reachability_per_origin_per_min = 600\n",
+        );
+
+        let config = Config::load(Some(file.path().to_str().unwrap()))
+            .expect("equal route and reachability budgets must be accepted");
+        assert_eq!(config.federation.fed_route_per_origin_per_min, 600);
+        assert_eq!(config.federation.fed_reachability_per_origin_per_min, 600);
+    }
+
+    #[test]
+    fn fed_reachability_above_fed_route_is_accepted() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml(
+            "[federation]\nfed_route_per_origin_per_min = 600\n\
+             fed_reachability_per_origin_per_min = 900\n",
+        );
+
+        let config = Config::load(Some(file.path().to_str().unwrap()))
+            .expect("a reachability budget above the route budget must be accepted");
+        assert_eq!(config.federation.fed_reachability_per_origin_per_min, 900);
+    }
+
+    // -- task 3.2: inbound-handshake-hardening config knobs -----------------------------------
+
+    #[test]
+    fn federation_handshake_defaults_are_positive_and_todo_confirm() {
+        // These three are explicitly `TODO: confirm` (task 3.2) — not grounded in a prior design
+        // doc — but they must still be well-formed (non-zero) out of the box.
+        let f = Federation::default();
+        assert_eq!(f.handshake_timeout_ms, 10_000);
+        assert_eq!(f.max_concurrent_handshakes, 64);
+        assert_eq!(f.max_links, 256);
+    }
+
+    #[test]
+    fn federation_handshake_env_overrides_apply() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__HANDSHAKE_TIMEOUT_MS",
+                    "2500",
+                ),
+                (
+                    "MERIDIAN_RENDEZVOUS_FEDERATION__MAX_CONCURRENT_HANDSHAKES",
+                    "8",
+                ),
+                ("MERIDIAN_RENDEZVOUS_FEDERATION__MAX_LINKS", "32"),
+            ],
+        );
+        let file = write_toml("");
+
+        let config = Config::load(Some(file.path().to_str().unwrap())).unwrap();
+
+        assert_eq!(config.federation.handshake_timeout_ms, 2500);
+        assert_eq!(config.federation.max_concurrent_handshakes, 8);
+        assert_eq!(config.federation.max_links, 32);
+    }
+
+    #[test]
+    fn federation_handshake_timeout_zero_is_rejected_fail_closed() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[federation]\nhandshake_timeout_ms = 0\n");
+
+        let err = Config::load(Some(file.path().to_str().unwrap()))
+            .expect_err("a 0ms handshake deadline must be rejected, not silently loaded");
+        assert!(err.to_string().contains("handshake_timeout_ms"));
+    }
+
+    #[test]
+    fn federation_max_concurrent_handshakes_zero_is_rejected_fail_closed() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[federation]\nmax_concurrent_handshakes = 0\n");
+
+        let err = Config::load(Some(file.path().to_str().unwrap()))
+            .expect_err("a 0-permit handshake semaphore must be rejected, not silently loaded");
+        assert!(err.to_string().contains("max_concurrent_handshakes"));
+    }
+
+    #[test]
+    fn federation_max_links_zero_is_rejected_fail_closed() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[federation]\nmax_links = 0\n");
+
+        let err = Config::load(Some(file.path().to_str().unwrap()))
+            .expect_err("a 0-permit link semaphore must be rejected, not silently loaded");
+        assert!(err.to_string().contains("max_links"));
+    }
+
+    #[test]
+    fn federation_handshake_env_overrides_reject_bad_int_fail_closed() {
+        // Mirrors `env_overrides_reject_bad_bool_fail_closed` above: a malformed env var must be a
+        // hard error, never a silent fallback to the default.
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[(
+                "MERIDIAN_RENDEZVOUS_FEDERATION__MAX_CONCURRENT_HANDSHAKES",
+                "not-a-number",
+            )],
+        );
+        let file = write_toml("");
+
+        assert!(Config::load(Some(file.path().to_str().unwrap())).is_err());
+    }
+
+    // -- task 3.3: outbound dial timeout config knobs ------------------------------------------
+
+    #[test]
+    fn federation_dial_timeout_defaults_are_positive_and_todo_confirm() {
+        // Explicitly `TODO: confirm` (task 3.3) — not grounded in a prior design doc — but must
+        // still be well-formed (non-zero) out of the box.
+        let f = Federation::default();
+        assert_eq!(f.connect_timeout_ms, 5_000);
+        assert_eq!(f.request_timeout_ms, 10_000);
+    }
+
+    #[test]
+    fn federation_dial_timeout_env_overrides_apply() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[
+                ("MERIDIAN_RENDEZVOUS_FEDERATION__CONNECT_TIMEOUT_MS", "1500"),
+                ("MERIDIAN_RENDEZVOUS_FEDERATION__REQUEST_TIMEOUT_MS", "3000"),
+            ],
+        );
+        let file = write_toml("");
+
+        let config = Config::load(Some(file.path().to_str().unwrap())).unwrap();
+
+        assert_eq!(config.federation.connect_timeout_ms, 1500);
+        assert_eq!(config.federation.request_timeout_ms, 3000);
+    }
+
+    #[test]
+    fn federation_connect_timeout_zero_is_rejected_fail_closed() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[federation]\nconnect_timeout_ms = 0\n");
+
+        let err = Config::load(Some(file.path().to_str().unwrap()))
+            .expect_err("a 0ms connect deadline must be rejected, not silently loaded");
+        assert!(err.to_string().contains("connect_timeout_ms"));
+    }
+
+    #[test]
+    fn federation_request_timeout_zero_is_rejected_fail_closed() {
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[federation]\nrequest_timeout_ms = 0\n");
+
+        let err = Config::load(Some(file.path().to_str().unwrap()))
+            .expect_err("a 0ms request deadline must be rejected, not silently loaded");
+        assert!(err.to_string().contains("request_timeout_ms"));
+    }
+
+    #[test]
+    fn federation_to_timeouts_matches_configured_millis() {
+        let f = Federation {
+            connect_timeout_ms: 111,
+            request_timeout_ms: 222,
+            ..Federation::default()
+        };
+        let timeouts = f.to_timeouts();
+        assert_eq!(timeouts.connect, std::time::Duration::from_millis(111));
+        assert_eq!(timeouts.request, std::time::Duration::from_millis(222));
     }
 
     #[test]

@@ -24,117 +24,17 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use meridian_rendezvous::config::{
-    Config, DiscoveryMode, Federation, FederationPolicyMode, Limits, Server, Turn,
-};
-use meridian_rendezvous::federation::inbound::{bind_federation, run_federation};
-use meridian_rendezvous::{serve, AppState, MemoryStore};
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
-use tokio::net::TcpListener;
+use meridian_rendezvous::config::{DiscoveryMode, Federation, FederationPolicyMode};
+use meridian_rendezvous::{AppState, MemoryStore};
 
-const BIN: &str = env!("CARGO_BIN_EXE_meridian");
+mod support;
+use support::{base_config, spawn_c2s, spawn_federation, write_federation_map, TestCa, BIN};
 
 /// Generous enough for two real in-process servers + one real s2s round trip on a loaded CI box,
 /// while still being a real, enforced bound: a genuine hang (the failure mode this task exists to
 /// close off) would sit at "forever", not "a few seconds late" — this catches that distinction
 /// without being so tight it flakes on a slow machine.
 const NO_HANG_TIMEOUT: Duration = Duration::from_secs(20);
-
-// -- PKI test harness (mirrors apps/rendezvous/tests/federation_fetch.rs) -----------------------
-
-struct TestCa {
-    cert: rcgen::Certificate,
-    key: KeyPair,
-}
-
-fn make_ca(common_name: &str) -> TestCa {
-    let mut params = CertificateParams::new(Vec::<String>::new()).expect("empty SAN list");
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    params
-        .distinguished_name
-        .push(DnType::CommonName, common_name);
-    let key = KeyPair::generate().expect("generate CA key");
-    let cert = params.self_signed(&key).expect("self-sign CA cert");
-    TestCa { cert, key }
-}
-
-fn make_leaf(domain: &str, ca: &TestCa) -> (rcgen::Certificate, KeyPair) {
-    let mut params =
-        CertificateParams::new(vec![domain.to_string()]).expect("SAN must be a valid DNS name");
-    params.distinguished_name.push(DnType::CommonName, domain);
-    let key = KeyPair::generate().expect("generate leaf key");
-    let cert = params
-        .signed_by(&key, &ca.cert, &ca.key)
-        .expect("sign leaf cert");
-    (cert, key)
-}
-
-fn write(dir: &Path, name: &str, contents: &str) -> std::path::PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, contents).unwrap();
-    path
-}
-
-struct Identity {
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
-    ca_bundle_path: std::path::PathBuf,
-}
-
-fn mint_identity(dir: &Path, tag: &str, domain: &str, ca: &TestCa) -> Identity {
-    let (leaf_cert, leaf_key) = make_leaf(domain, ca);
-    Identity {
-        cert_path: write(dir, &format!("{tag}.crt.pem"), &leaf_cert.pem()),
-        key_path: write(dir, &format!("{tag}.key.pem"), &leaf_key.serialize_pem()),
-        ca_bundle_path: write(dir, &format!("{tag}.ca.pem"), &ca.cert.pem()),
-    }
-}
-
-// -- Server harness (mirrors apps/rendezvous/tests/federation_fetch.rs) --------------------------
-
-fn base_config(domain: &str) -> Config {
-    Config {
-        server: Server {
-            domain: domain.to_string(),
-            bind: "127.0.0.1:0".to_string(),
-            ..Server::default()
-        },
-        limits: Limits::default(),
-        turn: Turn::default(),
-        federation: Federation::default(),
-    }
-}
-
-/// Spawn `domain`'s c2s WS listener and return its `ws://` URL.
-async fn spawn_c2s(state: Arc<AppState>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = serve(state, listener).await;
-    });
-    format!("ws://{addr}")
-}
-
-/// Bind `domain`'s s2s federation listener and start serving it. Returns the bound address.
-async fn spawn_federation(state: Arc<AppState>) -> SocketAddr {
-    let listener = bind_federation(&state).await.expect("bind s2s listener");
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        run_federation(listener, state).await;
-    });
-    addr
-}
-
-fn write_federation_map(dir: &Path, entries: &[(&str, SocketAddr, &str)]) -> std::path::PathBuf {
-    let mut toml = String::new();
-    for (domain, addr, pin) in entries {
-        toml.push_str(&format!(
-            "[[partner]]\ndomain = \"{domain}\"\nendpoint = \"{addr}\"\npinned_identity = \"{pin}\"\n\n"
-        ));
-    }
-    write(dir, "federation_map.toml", &toml)
-}
 
 /// A's federation config: dials out to B, pinning to B's own domain (a straightforward,
 /// non-adversarial private-CA setup — the pinned-identity mismatch attack is 2.7's job, not this
@@ -146,14 +46,14 @@ fn org_a_federation(
     b_domain: &str,
     b_fed_addr: SocketAddr,
 ) -> Federation {
-    let id = mint_identity(dir, "a", a_domain, ca);
+    let id = ca.issue(dir, "a", a_domain);
     let map_path = write_federation_map(dir, &[(b_domain, b_fed_addr, b_domain)]);
     Federation {
         enabled: true,
         bind: "127.0.0.1:0".to_string(),
-        cert_path: id.cert_path.to_str().unwrap().to_string(),
-        key_path: id.key_path.to_str().unwrap().to_string(),
-        ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
+        cert_path: id.cert_path_str().to_string(),
+        key_path: id.key_path_str().to_string(),
+        ca_bundle_path: id.ca_bundle_path_str().to_string(),
         discovery: DiscoveryMode::Static,
         map_path: map_path.to_str().unwrap().to_string(),
         // A's own OUTBOUND admission policy (task 3.1, review finding F1) — always `open` here:
@@ -174,14 +74,14 @@ fn org_b_federation(
     b_domain: &str,
     policy: FederationPolicyMode,
 ) -> Federation {
-    let id = mint_identity(dir, "b", b_domain, ca);
-    let empty_map = write(dir, "b-federation_map.toml", "");
+    let id = ca.issue(dir, "b", b_domain);
+    let empty_map = support::write(dir, "b-federation_map.toml", "");
     Federation {
         enabled: true,
         bind: "127.0.0.1:0".to_string(),
-        cert_path: id.cert_path.to_str().unwrap().to_string(),
-        key_path: id.key_path.to_str().unwrap().to_string(),
-        ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
+        cert_path: id.cert_path_str().to_string(),
+        key_path: id.key_path_str().to_string(),
+        ca_bundle_path: id.ca_bundle_path_str().to_string(),
         discovery: DiscoveryMode::Static,
         map_path: empty_map.to_str().unwrap().to_string(),
         policy,
@@ -206,6 +106,14 @@ async fn stand_up_two_orgs(dir: &Path, ca: &TestCa, b_policy: FederationPolicyMo
 }
 
 // -- CLI driver (mirrors apps/cli/tests/rendezvous_demo.rs) --------------------------------------
+//
+// NOTE: this file's `Client::run` is bounded by `NO_HANG_TIMEOUT` on EVERY call (not just the
+// explicit fetch-bundle one under test) — a real, deliberate difference from the shared
+// `support::Client` (whose `run` is unbounded, matching `federation_route_hint.rs`/
+// `session_connect_federation.rs`/`two_orgs_walkthrough.rs`'s original shape). Migrating this
+// file's CLI-driver bits onto the shared `Client` would silently weaken that bound, so this small
+// piece stays local (only the PKI/server-boot harness above moved to `support`) — see this task's
+// report for why.
 
 struct Client {
     home: tempfile::TempDir,
@@ -307,7 +215,7 @@ fn assert_no_security_copy(combined: &str) {
 #[test]
 fn closed_policy_org_produces_a_clean_non_zero_exit_never_a_hang() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
+    let ca = TestCa::new();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let a_c2s_url = rt.block_on(stand_up_two_orgs(
@@ -353,7 +261,7 @@ fn closed_policy_org_produces_a_clean_non_zero_exit_never_a_hang() {
 #[test]
 fn stale_hint_reports_unreachable_at_hint_never_a_security_warning() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
+    let ca = TestCa::new();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     // B is Open — the point here is that B genuinely has no record of the target, exactly the

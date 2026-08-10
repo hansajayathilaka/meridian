@@ -20,127 +20,16 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use meridian_identity::{generate_account, KeyHandle, MemorySecretStore};
 use meridian_proto::error_codes;
-use meridian_rendezvous::config::{
-    Config, DiscoveryMode, Federation, FederationPolicyMode, Limits, Server, Turn,
-};
-use meridian_rendezvous::federation::inbound::{bind_federation, run_federation};
-use meridian_rendezvous::{serve, AppState, MemoryStore};
-use meridian_signaling::{generate_bundle, SignalError, SignalingClient, DEFAULT_OTK_COUNT};
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+use meridian_rendezvous::config::{DiscoveryMode, Federation, FederationPolicyMode};
+use meridian_rendezvous::{AppState, MemoryStore};
+use meridian_signaling::{generate_bundle, SignalError, DEFAULT_OTK_COUNT};
 use tokio::net::TcpListener;
 
-// -- PKI test harness (mirrors apps/rendezvous/tests/federation_mtls.rs) --------------------
-
-struct TestCa {
-    cert: rcgen::Certificate,
-    key: KeyPair,
-}
-
-fn make_ca(common_name: &str) -> TestCa {
-    let mut params = CertificateParams::new(Vec::<String>::new()).expect("empty SAN list");
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    params
-        .distinguished_name
-        .push(DnType::CommonName, common_name);
-    let key = KeyPair::generate().expect("generate CA key");
-    let cert = params.self_signed(&key).expect("self-sign CA cert");
-    TestCa { cert, key }
-}
-
-fn make_leaf(domain: &str, ca: &TestCa) -> (rcgen::Certificate, KeyPair) {
-    let mut params =
-        CertificateParams::new(vec![domain.to_string()]).expect("SAN must be a valid DNS name");
-    params.distinguished_name.push(DnType::CommonName, domain);
-    let key = KeyPair::generate().expect("generate leaf key");
-    let cert = params
-        .signed_by(&key, &ca.cert, &ca.key)
-        .expect("sign leaf cert");
-    (cert, key)
-}
-
-fn write(dir: &Path, name: &str, contents: &str) -> std::path::PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, contents).unwrap();
-    path
-}
-
-struct Identity {
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
-    ca_bundle_path: std::path::PathBuf,
-}
-
-fn mint_identity(dir: &Path, tag: &str, domain: &str, ca: &TestCa) -> Identity {
-    let (leaf_cert, leaf_key) = make_leaf(domain, ca);
-    Identity {
-        cert_path: write(dir, &format!("{tag}.crt.pem"), &leaf_cert.pem()),
-        key_path: write(dir, &format!("{tag}.key.pem"), &leaf_key.serialize_pem()),
-        ca_bundle_path: write(dir, &format!("{tag}.ca.pem"), &ca.cert.pem()),
-    }
-}
-
-// -- Server harness ----------------------------------------------------------------------------
-
-fn base_config(domain: &str) -> Config {
-    Config {
-        server: Server {
-            domain: domain.to_string(),
-            bind: "127.0.0.1:0".to_string(),
-            ..Server::default()
-        },
-        limits: Limits::default(),
-        turn: Turn::default(),
-        federation: Federation::default(),
-    }
-}
-
-/// Spawn `domain`'s c2s WS listener and return its `ws://` URL.
-async fn spawn_c2s(state: Arc<AppState>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = serve(state, listener).await;
-    });
-    format!("ws://{addr}")
-}
-
-/// Bind `domain`'s s2s federation listener and start serving it. Returns the bound address (for
-/// the peer's `federation_map.toml`) — analogous to `federation_mtls.rs::bind_listener`, but
-/// through the real `AppState`-driven `inbound::bind_federation`/`run_federation` split `main.rs`
-/// itself uses, not a bare `FederationListener::bind` call.
-async fn spawn_federation(state: Arc<AppState>) -> SocketAddr {
-    let listener = bind_federation(&state).await.expect("bind s2s listener");
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        run_federation(listener, state).await;
-    });
-    addr
-}
-
-struct Acct {
-    store: MemorySecretStore,
-    pubkey: [u8; 32],
-    handle: KeyHandle,
-}
-
-fn new_acct(hint: &str) -> Acct {
-    let store = MemorySecretStore::new();
-    let account = generate_account(&store, hint).unwrap();
-    Acct {
-        pubkey: *account.public_key().as_bytes(),
-        handle: account.handle().clone(),
-        store,
-    }
-}
-
-impl Acct {
-    async fn connect(&self, url: &str) -> Result<SignalingClient, SignalError> {
-        SignalingClient::connect(url, &self.store, &self.handle, self.pubkey, None, 1).await
-    }
-}
+mod support;
+use support::{
+    base_config, new_acct, spawn_c2s, spawn_federation, write, write_federation_map, Acct, TestCa,
+};
 
 /// Publish `acct`'s bundle to `url` (a real client connect+publish+close round trip — the bundle
 /// is genuinely, validly signed, not hand-assembled), then drop the connection.
@@ -150,20 +39,6 @@ async fn publish(acct: &Acct, url: &str) {
         .await
         .unwrap();
     c.close().await.unwrap();
-}
-
-/// Build B's `federation_map.toml` (private-CA mode, task 2.5's schema) pointing `org-a.test` at
-/// `a_addr` — the direction A's *dial* needs is irrelevant here; what matters is that BOTH sides
-/// carry a map entry for the OTHER, since `link::dial`'s peer-identity pin (`pinned_identity`) is
-/// resolved client-side (by the dialer, from its own map) before it ever reaches the peer.
-fn write_federation_map(dir: &Path, entries: &[(&str, SocketAddr, &str)]) -> std::path::PathBuf {
-    let mut toml = String::new();
-    for (domain, addr, pin) in entries {
-        toml.push_str(&format!(
-            "[[partner]]\ndomain = \"{domain}\"\nendpoint = \"{addr}\"\npinned_identity = \"{pin}\"\n\n"
-        ));
-    }
-    write(dir, "federation_map.toml", &toml)
 }
 
 /// Everything needed to stand up A dialing out to B: A's own federation identity (signed by
@@ -178,14 +53,14 @@ fn org_a_federation(
     b_fed_addr: SocketAddr,
     b_pin: &str,
 ) -> Federation {
-    let id = mint_identity(dir, "a", a_domain, ca);
+    let id = ca.issue(dir, a_domain);
     let map_path = write_federation_map(dir, &[(b_domain, b_fed_addr, b_pin)]);
     Federation {
         enabled: true,
         bind: "127.0.0.1:0".to_string(),
-        cert_path: id.cert_path.to_str().unwrap().to_string(),
-        key_path: id.key_path.to_str().unwrap().to_string(),
-        ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
+        cert_path: id.cert_path_str().to_string(),
+        key_path: id.key_path_str().to_string(),
+        ca_bundle_path: id.ca_bundle_path_str().to_string(),
         discovery: DiscoveryMode::Static,
         map_path: map_path.to_str().unwrap().to_string(),
         // (task 3.1) `Federation::default`'s `policy` is `Closed` — the fail-closed default. This
@@ -208,14 +83,14 @@ fn org_b_federation(
     b_domain: &str,
     policy: FederationPolicyMode,
 ) -> Federation {
-    let id = mint_identity(dir, "b", b_domain, ca);
+    let id = ca.issue(dir, b_domain);
     let empty_map = write(dir, "b-federation_map.toml", "");
     Federation {
         enabled: true,
         bind: "127.0.0.1:0".to_string(),
-        cert_path: id.cert_path.to_str().unwrap().to_string(),
-        key_path: id.key_path.to_str().unwrap().to_string(),
-        ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
+        cert_path: id.cert_path_str().to_string(),
+        key_path: id.key_path_str().to_string(),
+        ca_bundle_path: id.ca_bundle_path_str().to_string(),
         discovery: DiscoveryMode::Static,
         map_path: empty_map.to_str().unwrap().to_string(),
         policy,
@@ -231,7 +106,7 @@ fn org_b_federation(
 #[tokio::test]
 async fn cross_org_fetch_is_byte_identical_and_never_dials_b_directly() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
+    let ca = TestCa::new();
 
     // Stand up B first (need its ephemeral federation port before writing A's map).
     let mut b_config = base_config("org-b.test");
@@ -302,7 +177,7 @@ async fn cross_org_fetch_is_byte_identical_and_never_dials_b_directly() {
 #[tokio::test]
 async fn client_opens_exactly_one_websocket_to_its_own_server() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
+    let ca = TestCa::new();
 
     let mut b_config = base_config("org-b.test");
     b_config.federation =
@@ -359,7 +234,7 @@ fn seed_bundle(acct: &Acct) -> meridian_proto::PrekeyBundle {
 #[tokio::test]
 async fn closed_policy_at_b_is_reported_as_fed_denied() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
+    let ca = TestCa::new();
 
     let mut b_config = base_config("org-b.test");
     b_config.federation =
@@ -399,7 +274,7 @@ async fn closed_policy_at_b_is_reported_as_fed_denied() {
 #[tokio::test]
 async fn unknown_key_at_b_is_reported_as_not_found_at_hint() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
+    let ca = TestCa::new();
 
     let mut b_config = base_config("org-b.test");
     b_config.federation =
@@ -439,7 +314,7 @@ async fn unknown_key_at_b_is_reported_as_not_found_at_hint() {
 #[tokio::test]
 async fn bs_federation_edge_rate_limit_trips_through_the_real_path() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
+    let ca = TestCa::new();
 
     let mut b_config = base_config("org-b.test");
     let mut b_fed = org_b_federation(dir.path(), &ca, "org-b.test", FederationPolicyMode::Open);
@@ -505,7 +380,7 @@ async fn bs_federation_edge_rate_limit_trips_through_the_real_path() {
 #[tokio::test]
 async fn dial_rejects_a_peer_cert_matching_the_hint_domain_but_not_the_pinned_identity() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
+    let ca = TestCa::new();
 
     let mut b_config = base_config("org-b.test");
     b_config.federation =

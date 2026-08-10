@@ -1,11 +1,12 @@
 //! Task 2.8 acceptance: federated envelope routing + per-request reachability (system-design.md
 //! §3.3 step 5, §3.4).
 //!
-//! Same two-real-server-over-real-mTLS harness as `federation_fetch.rs` (task 2.7) — cert-minting,
-//! `spawn_c2s`/`spawn_federation`, `org_a_federation`/`org_b_federation` config builders — copied
-//! and adapted per-file (the existing `federation_mtls.rs`/`federation_fetch.rs` duplication
-//! convention this crate already established; code-reviewer flagged this as acceptable on 2.7, not
-//! something to fix here).
+//! Same two-real-server-over-real-mTLS harness as `federation_fetch.rs` (task 2.7): cert-minting,
+//! `spawn_c2s`/`spawn_federation`, and `stand_up`/`boot_federated_pair` (this crate's shared
+//! `tests/support/mod.rs`, task 3.4/F18 — the per-file `make_ca`/`mint_identity`/server-boot
+//! duplication this comment used to describe was extracted there). This file keeps a local
+//! `org_a_federation` for the one config knob (A's `Federation`) `boot_federated_pair`'s options
+//! don't parameterize; B's side goes through `boot_federated_pair` directly.
 //!
 //! Each test maps to one of the task file's required cases:
 //! - byte-identical envelope A→B delivery, asserted on the exact bytes Bob's OWN live connection
@@ -23,139 +24,26 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use meridian_identity::{generate_account, KeyHandle, MemorySecretStore};
+use async_trait::async_trait;
 use meridian_proto::{error_codes, fed_error_codes, FedRoute, OpaqueBlob};
-use meridian_rendezvous::config::{
-    Config, DiscoveryMode, Federation, FederationPolicyMode, Limits, Server, Turn,
-};
-use meridian_rendezvous::federation::inbound::{bind_federation, handle_fed_route, run_federation};
+use meridian_rendezvous::config::{DiscoveryMode, Federation, FederationPolicyMode};
+use meridian_rendezvous::federation::inbound::handle_fed_route;
+use meridian_rendezvous::federation::{Discovery, DiscoveryError, Endpoint};
 use meridian_rendezvous::federation::{FederationLimits, FederationPolicy};
+use meridian_rendezvous::metrics::Metrics;
 use meridian_rendezvous::state::Registry;
-use meridian_rendezvous::{serve, AppState, MemoryStore};
-use meridian_signaling::{SignalError, SignalingClient};
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
-use tokio::net::TcpListener;
+use meridian_rendezvous::{AppState, MemoryStore};
+use meridian_signaling::SignalError;
+use tokio::net::{TcpListener, TcpStream};
 
-// -- PKI test harness (mirrors apps/rendezvous/tests/federation_mtls.rs / federation_fetch.rs) ---
-
-struct TestCa {
-    cert: rcgen::Certificate,
-    key: KeyPair,
-}
-
-fn make_ca(common_name: &str) -> TestCa {
-    let mut params = CertificateParams::new(Vec::<String>::new()).expect("empty SAN list");
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    params
-        .distinguished_name
-        .push(DnType::CommonName, common_name);
-    let key = KeyPair::generate().expect("generate CA key");
-    let cert = params.self_signed(&key).expect("self-sign CA cert");
-    TestCa { cert, key }
-}
-
-fn make_leaf(domain: &str, ca: &TestCa) -> (rcgen::Certificate, KeyPair) {
-    let mut params =
-        CertificateParams::new(vec![domain.to_string()]).expect("SAN must be a valid DNS name");
-    params.distinguished_name.push(DnType::CommonName, domain);
-    let key = KeyPair::generate().expect("generate leaf key");
-    let cert = params
-        .signed_by(&key, &ca.cert, &ca.key)
-        .expect("sign leaf cert");
-    (cert, key)
-}
-
-fn write(dir: &Path, name: &str, contents: &str) -> std::path::PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, contents).unwrap();
-    path
-}
-
-struct Identity {
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
-    ca_bundle_path: std::path::PathBuf,
-}
-
-fn mint_identity(dir: &Path, tag: &str, domain: &str, ca: &TestCa) -> Identity {
-    let (leaf_cert, leaf_key) = make_leaf(domain, ca);
-    Identity {
-        cert_path: write(dir, &format!("{tag}.crt.pem"), &leaf_cert.pem()),
-        key_path: write(dir, &format!("{tag}.key.pem"), &leaf_key.serialize_pem()),
-        ca_bundle_path: write(dir, &format!("{tag}.ca.pem"), &ca.cert.pem()),
-    }
-}
-
-// -- Server harness ----------------------------------------------------------------------------
-
-fn base_config(domain: &str) -> Config {
-    Config {
-        server: Server {
-            domain: domain.to_string(),
-            bind: "127.0.0.1:0".to_string(),
-            ..Server::default()
-        },
-        limits: Limits::default(),
-        turn: Turn::default(),
-        federation: Federation::default(),
-    }
-}
-
-/// Spawn `domain`'s c2s WS listener and return its `ws://` URL.
-async fn spawn_c2s(state: Arc<AppState>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = serve(state, listener).await;
-    });
-    format!("ws://{addr}")
-}
-
-/// Bind `domain`'s s2s federation listener and start serving it. Returns the bound address.
-async fn spawn_federation(state: Arc<AppState>) -> SocketAddr {
-    let listener = bind_federation(&state).await.expect("bind s2s listener");
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        run_federation(listener, state).await;
-    });
-    addr
-}
-
-struct Acct {
-    store: MemorySecretStore,
-    pubkey: [u8; 32],
-    handle: KeyHandle,
-}
-
-fn new_acct(hint: &str) -> Acct {
-    let store = MemorySecretStore::new();
-    let account = generate_account(&store, hint).unwrap();
-    Acct {
-        pubkey: *account.public_key().as_bytes(),
-        handle: account.handle().clone(),
-        store,
-    }
-}
-
-impl Acct {
-    async fn connect(&self, url: &str) -> Result<SignalingClient, SignalError> {
-        SignalingClient::connect(url, &self.store, &self.handle, self.pubkey, None, 1).await
-    }
-}
-
-/// Build a `federation_map.toml` (private-CA mode, task 2.5's schema) pointing `domain` at `addr`.
-fn write_federation_map(dir: &Path, entries: &[(&str, SocketAddr, &str)]) -> std::path::PathBuf {
-    let mut toml = String::new();
-    for (domain, addr, pin) in entries {
-        toml.push_str(&format!(
-            "[[partner]]\ndomain = \"{domain}\"\nendpoint = \"{addr}\"\npinned_identity = \"{pin}\"\n\n"
-        ));
-    }
-    write(dir, "federation_map.toml", &toml)
-}
+mod support;
+use support::{
+    base_config, boot_federated_pair, install_discovery, new_acct, spawn_c2s, spawn_federation,
+    write_federation_map, FederatedPairOpts, TestCa,
+};
 
 /// A dials out to B: A's own federation identity, a `federation_map.toml` pointing `b_domain` at
 /// `b_fed_addr` pinned to `b_pin`, `Federation::enabled = true`, `discovery = "static"`.
@@ -167,14 +55,14 @@ fn org_a_federation(
     b_fed_addr: SocketAddr,
     b_pin: &str,
 ) -> Federation {
-    let id = mint_identity(dir, "a", a_domain, ca);
+    let id = ca.issue(dir, a_domain);
     let map_path = write_federation_map(dir, &[(b_domain, b_fed_addr, b_pin)]);
     Federation {
         enabled: true,
         bind: "127.0.0.1:0".to_string(),
-        cert_path: id.cert_path.to_str().unwrap().to_string(),
-        key_path: id.key_path.to_str().unwrap().to_string(),
-        ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
+        cert_path: id.cert_path_str().to_string(),
+        key_path: id.key_path_str().to_string(),
+        ca_bundle_path: id.ca_bundle_path_str().to_string(),
         discovery: DiscoveryMode::Static,
         map_path: map_path.to_str().unwrap().to_string(),
         // (task 3.1) `Federation::default`'s `policy` is `Closed` — the fail-closed default. This
@@ -183,31 +71,6 @@ fn org_a_federation(
         // `tests/federation_outbound_policy.rs`), so A itself must be willing to dial `b_domain` at
         // all for any of them to reach B in the first place.
         policy: FederationPolicyMode::Open,
-        ..Federation::default()
-    }
-}
-
-/// B's own federation identity + admission policy — B never dials out in these tests.
-fn org_b_federation(
-    dir: &Path,
-    ca: &TestCa,
-    b_domain: &str,
-    policy: FederationPolicyMode,
-) -> Federation {
-    let id = mint_identity(dir, "b", b_domain, ca);
-    let empty_map = write(dir, "b-federation_map.toml", "");
-    Federation {
-        enabled: true,
-        bind: "127.0.0.1:0".to_string(),
-        cert_path: id.cert_path.to_str().unwrap().to_string(),
-        key_path: id.key_path.to_str().unwrap().to_string(),
-        ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
-        discovery: DiscoveryMode::Static,
-        map_path: empty_map.to_str().unwrap().to_string(),
-        policy,
-        fed_fetch_per_origin_per_min: 300,
-        fed_route_per_origin_per_min: 600,
-        fed_per_origin_account_per_min: 30,
         ..Federation::default()
     }
 }
@@ -222,34 +85,18 @@ struct Rig {
 }
 
 async fn stand_up(policy: FederationPolicyMode) -> Rig {
-    let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
-
-    let mut b_config = base_config("org-b.test");
-    b_config.federation = org_b_federation(dir.path(), &ca, "org-b.test", policy);
-    let b_store = Arc::new(MemoryStore::new());
-    let b_state = AppState::new(b_config, b_store);
-    let b_fed_addr = spawn_federation(b_state.clone()).await;
-    let b_c2s_url = spawn_c2s(b_state.clone()).await;
-
-    let mut a_config = base_config("org-a.test");
-    a_config.federation = org_a_federation(
-        dir.path(),
-        &ca,
-        "org-a.test",
-        "org-b.test",
-        b_fed_addr,
-        "org-b.test",
-    );
-    let a_store = Arc::new(MemoryStore::new());
-    let a_state = AppState::new(a_config, a_store);
-    let a_c2s_url = spawn_c2s(a_state).await;
-
+    let pair = boot_federated_pair(FederatedPairOpts {
+        b_policy: policy,
+        ..Default::default()
+    })
+    .await;
     Rig {
-        b_state,
-        a_c2s_url,
-        b_c2s_url,
-        _dir: dir,
+        b_state: pair.b_state,
+        a_c2s_url: pair.a_c2s_url,
+        b_c2s_url: pair
+            .b_c2s_url
+            .expect("boot_federated_pair spawns B's c2s by default"),
+        _dir: pair.dir,
     }
 }
 
@@ -304,7 +151,7 @@ async fn federated_route_delivers_byte_identical_envelope() {
 #[tokio::test]
 async fn oversized_envelope_is_rejected_before_any_dial() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
+    let ca = TestCa::new();
 
     // An address nothing is listening on: bind an ephemeral port, then drop the listener.
     let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -356,15 +203,24 @@ async fn oversized_envelope_is_rejected_before_any_dial() {
 async fn bs_defense_in_depth_oversized_check_rejects_directly() {
     let registry = Registry::default();
     let policy = FederationPolicy::Open;
-    let limits = FederationLimits::new(300, 600, 30);
+    let limits = FederationLimits::new(300, 600, 30, 300);
     let req = FedRoute {
         to: [0x11u8; 32],
         from: [0x22u8; 32],
         envelope: OpaqueBlob::new(vec![0x41u8; 2 * 1024 * 1024]),
     };
-    let err = handle_fed_route(&registry, &policy, &limits, "org-a.test", &req)
-        .await
-        .expect_err("an oversized FedRoute body must be rejected");
+    let metrics = Metrics::new();
+    let err = handle_fed_route(
+        &registry,
+        &policy,
+        &limits,
+        &metrics,
+        &["org-a.test".to_string()],
+        "org-a.test",
+        &req,
+    )
+    .await
+    .expect_err("an oversized FedRoute body must be rejected");
     assert_eq!(err.code, fed_error_codes::BAD_REQUEST);
     // The oversized recipient must never have reached the registry (defense-in-depth means the
     // check runs BEFORE delivery, not merely in addition to it).
@@ -519,5 +375,505 @@ fn reachability_path_introduces_no_logging_or_persistence() {
         !body.contains("Store"),
         "handle_fed_reachability must never take or touch a Store — reachability is an in-memory \
          Registry lookup only, never persisted"
+    );
+}
+
+// -- task 3.7: one link per routed message (F10) + SRV failover (N2) ----------------------------
+
+/// Wrap `target` behind a raw byte-forwarding TCP proxy: every accepted connection at the returned
+/// address is immediately paired with a fresh outbound connection to `target`, and the two streams
+/// are spliced together verbatim (`tokio::io::copy_bidirectional`). TLS still terminates at the
+/// REAL peer behind `target` — this proxy never touches a single mTLS byte, so it changes nothing
+/// about certificate validation or the s2s protocol above it. What it buys: an exact, external,
+/// syscall-level count of how many raw TCP connections crossed it — independent of anything
+/// `route_foreign`/`dial_foreign` themselves report, so a regression back to "one dial for the
+/// pre-check, a second for the real route" is provable from OUTSIDE the code under test, not merely
+/// inferred from its own internal call count.
+async fn spawn_counting_tcp_proxy(target: SocketAddr) -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let accepts_task = accepts.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut inbound, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => break,
+            };
+            accepts_task.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                if let Ok(mut outbound) = TcpStream::connect(target).await {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+    (addr, accepts)
+}
+
+/// Stand up B for real (accepting, real federation listener) and A dialing out THROUGH a counting
+/// proxy in front of B's real federation address, rather than at that address directly — so every
+/// raw TCP connection A opens toward B, whatever the s2s layer above it does, is independently
+/// countable at [`ProxiedRig::proxy_accepts`].
+struct ProxiedRig {
+    /// A's own state — needed for the dialing-side `federation_link_up` steady-state assertion
+    /// (see `n_routed_messages_show_n_single_link_opens_not_flapping`'s doc comment for why the
+    /// dialing side, not B's accept side, is what's asserted on).
+    a_state: Arc<AppState>,
+    a_c2s_url: String,
+    b_c2s_url: String,
+    proxy_accepts: Arc<AtomicUsize>,
+    _dir: tempfile::TempDir,
+}
+
+async fn stand_up_through_proxy() -> ProxiedRig {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = TestCa::new();
+
+    let b_id = ca.issue(dir.path(), "org-b.test");
+    let b_empty_map = write_federation_map(dir.path(), &[]);
+    let b_federation = Federation {
+        enabled: true,
+        bind: "127.0.0.1:0".to_string(),
+        cert_path: b_id.cert_path_str().to_string(),
+        key_path: b_id.key_path_str().to_string(),
+        ca_bundle_path: b_id.ca_bundle_path_str().to_string(),
+        discovery: DiscoveryMode::Static,
+        map_path: b_empty_map.to_str().unwrap().to_string(),
+        policy: FederationPolicyMode::Open,
+        ..Federation::default()
+    };
+    let mut b_config = base_config("org-b.test");
+    b_config.federation = b_federation;
+    let b_store = Arc::new(MemoryStore::new());
+    let b_state = AppState::new(b_config, b_store);
+    let b_fed_addr = spawn_federation(b_state.clone()).await;
+    let b_c2s_url = spawn_c2s(b_state.clone()).await;
+
+    let (proxy_addr, proxy_accepts) = spawn_counting_tcp_proxy(b_fed_addr).await;
+
+    // A's federation_map points "org-b.test" at the PROXY address, still pinned to B's real
+    // domain — the proxy is a pure byte-forwarder, so this changes nothing about which certificate
+    // A ends up validating (still B's own, presented across the proxied connection).
+    let a_federation = org_a_federation(
+        dir.path(),
+        &ca,
+        "org-a.test",
+        "org-b.test",
+        proxy_addr,
+        "org-b.test",
+    );
+    let mut a_config = base_config("org-a.test");
+    a_config.federation = a_federation;
+    let a_store = Arc::new(MemoryStore::new());
+    let a_state = AppState::new(a_config, a_store);
+    let a_c2s_url = spawn_c2s(a_state.clone()).await;
+
+    ProxiedRig {
+        a_state,
+        a_c2s_url,
+        b_c2s_url,
+        proxy_accepts,
+        _dir: dir,
+    }
+}
+
+/// Deliverable 1 (task 3.7): one routed message must open exactly ONE TCP connection to the
+/// foreign server. Before this task, `route_foreign` dialed twice — once for its internal
+/// `reachable_foreign` liveness pre-check, once more for the actual `FedRoute` — each a fully
+/// independent TCP+TLS connection to the same peer; this would show up here as 2, not 1.
+#[tokio::test]
+async fn one_routed_message_opens_exactly_one_tcp_connection() {
+    let rig = stand_up_through_proxy().await;
+
+    let alice = new_acct("org-a.test");
+    let mut ac = alice.connect(&rig.a_c2s_url).await.unwrap();
+    let bob = new_acct("org-b.test");
+    let mut bc = bob.connect(&rig.b_c2s_url).await.unwrap();
+
+    let delivered = ac
+        .route_with_hint(
+            bob.pubkey,
+            Some("org-b.test".to_string()),
+            b"one message, one link".to_vec(),
+        )
+        .await
+        .unwrap();
+    assert!(delivered, "bob is connected; the route must deliver");
+    bc.next_deliver().await.unwrap();
+
+    assert_eq!(
+        rig.proxy_accepts.load(Ordering::SeqCst),
+        1,
+        "one routed message must open exactly ONE TCP connection to B, counted at the proxy \
+         (not inferred from route_foreign's own internal call count) — 2 here would mean the old \
+         pre-check-dials-separately-from-the-real-dial behavior regressed"
+    );
+}
+
+/// Deliverable 3 (task 3.7): sending N routed messages in sequence must open exactly N TCP
+/// connections — not 2N — and A's OWN `federation_link_up` gauge (the dialing side — `route_foreign`
+/// runs on A, and its `fed_link` is dialed with `state.metrics`, i.e. A's `Arc<Metrics>`, per
+/// `dial_foreign`) must return to its steady-state 0 immediately after each message completes,
+/// never accumulating or "flapping" an extra link-open per message. `route_foreign`'s `fed_link` is
+/// a plain local variable, dropped synchronously (ordinary Rust drop-glue, no extra network round
+/// trip needed) before that call returns to its own caller — so a caller observing A's gauge right
+/// after one `route_with_hint` resolves should always see 0. (B's OWN accept-side gauge is
+/// deliberately NOT asserted here: B only notices the connection closed on ITS NEXT read, an
+/// inherently racy, separately-scheduled event relative to when A's client-visible call returns —
+/// asserting on it would make this test flaky for a reason that has nothing to do with the
+/// property under test.) A regression to "two independent dials per message" would still
+/// eventually return to 0 on A's side too (both links get dropped, just later and twice as often),
+/// so the *count*-based proof below is the load-bearing one; the gauge check is corroborating, not
+/// the sole proof.
+#[tokio::test]
+async fn n_routed_messages_show_n_single_link_opens_not_flapping() {
+    let rig = stand_up_through_proxy().await;
+
+    let alice = new_acct("org-a.test");
+    let mut ac = alice.connect(&rig.a_c2s_url).await.unwrap();
+    let bob = new_acct("org-b.test");
+    let mut bc = bob.connect(&rig.b_c2s_url).await.unwrap();
+
+    const N: usize = 4;
+    for i in 0..N {
+        let delivered = ac
+            .route_with_hint(
+                bob.pubkey,
+                Some("org-b.test".to_string()),
+                format!("message {i}").into_bytes(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("message {i} of {N} must deliver: {e:?}"));
+        assert!(delivered);
+        bc.next_deliver().await.unwrap();
+
+        assert_eq!(
+            rig.a_state.metrics.federation_links_up(),
+            0,
+            "message {i}: A's own federation_link_up gauge must be back at its steady-state 0 \
+             immediately after this one message's route_foreign call returns — the link it dialed \
+             is dropped inside route_foreign itself (ordinary Rust drop-glue, no extra network \
+             round trip) before returning, so nothing here should ever observe an elevated or \
+             still-climbing count between messages"
+        );
+    }
+
+    assert_eq!(
+        rig.proxy_accepts.load(Ordering::SeqCst),
+        N,
+        "{N} sequential routed messages must open exactly {N} TCP connections total — not {}, \
+         which is what the old two-dials-per-message behavior would have produced",
+        N * 2
+    );
+}
+
+/// A [`Discovery`] stand-in returning two fixed [`Endpoint`]s, in the SRV-shaped order
+/// [`SrvDiscovery`](meridian_rendezvous::federation::SrvDiscovery) would already have sorted them
+/// into (priority ascending) — this test drives `dial_foreign`'s SRV-failover loop directly,
+/// without needing a real DNS resolver or SRV records.
+struct TwoEndpointDiscovery {
+    first: Endpoint,
+    second: Endpoint,
+}
+
+#[async_trait]
+impl Discovery for TwoEndpointDiscovery {
+    async fn resolve(&self, _domain: &str) -> Result<Vec<Endpoint>, DiscoveryError> {
+        Ok(vec![self.first.clone(), self.second.clone()])
+    }
+}
+
+/// Deliverable 2 (task 3.7, N2): a first candidate endpoint that refuses the TCP connection
+/// outright must not fail the whole dial — `dial_foreign` falls through to the second candidate
+/// and, since it's a real reachable peer, the route still delivers. Both endpoints are SRV-shaped
+/// (`pinned_identity: None`): the domain pin for each is computed fresh from THAT candidate (falls
+/// back to the hint domain, "org-b.test") — never reused from the first, failed candidate — so this
+/// also proves the failover path still validates the SECOND candidate's certificate against the
+/// correct intended domain, not a relaxed or skipped check.
+#[tokio::test]
+async fn a_refusing_first_endpoint_falls_through_to_a_working_second() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = TestCa::new();
+
+    // B, for real: accepting real federation connections.
+    let b_id = ca.issue(dir.path(), "org-b.test");
+    let b_empty_map = write_federation_map(dir.path(), &[]);
+    let b_federation = Federation {
+        enabled: true,
+        bind: "127.0.0.1:0".to_string(),
+        cert_path: b_id.cert_path_str().to_string(),
+        key_path: b_id.key_path_str().to_string(),
+        ca_bundle_path: b_id.ca_bundle_path_str().to_string(),
+        discovery: DiscoveryMode::Static,
+        map_path: b_empty_map.to_str().unwrap().to_string(),
+        policy: FederationPolicyMode::Open,
+        ..Federation::default()
+    };
+    let mut b_config = base_config("org-b.test");
+    b_config.federation = b_federation;
+    let b_store = Arc::new(MemoryStore::new());
+    let b_state = AppState::new(b_config, b_store);
+    let b_fed_addr = spawn_federation(b_state.clone()).await;
+    let b_c2s_url = spawn_c2s(b_state).await;
+
+    // The "first" candidate: bound, then immediately dropped, so any connection attempt is
+    // refused (a fast RST) rather than hanging on a timeout.
+    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    drop(dead);
+
+    let a_id = ca.issue(dir.path(), "org-a.test");
+    // Unused once `install_discovery` below replaces A's discovery outright — only needs to parse
+    // cleanly at `AppState::new` time (same pattern as
+    // `federation_outbound_policy.rs::closed_policy_denial_makes_zero_dns_lookups_and_zero_tcp_connects`).
+    let a_unused_map = write_federation_map(dir.path(), &[]);
+    let a_federation = Federation {
+        enabled: true,
+        bind: "127.0.0.1:0".to_string(),
+        cert_path: a_id.cert_path_str().to_string(),
+        key_path: a_id.key_path_str().to_string(),
+        ca_bundle_path: a_id.ca_bundle_path_str().to_string(),
+        discovery: DiscoveryMode::Static,
+        map_path: a_unused_map.to_str().unwrap().to_string(),
+        policy: FederationPolicyMode::Open,
+        ..Federation::default()
+    };
+    let mut a_config = base_config("org-a.test");
+    a_config.federation = a_federation;
+    let a_store = Arc::new(MemoryStore::new());
+    let mut a_state = AppState::new(a_config, a_store);
+    install_discovery(
+        &mut a_state,
+        Arc::new(TwoEndpointDiscovery {
+            first: Endpoint {
+                host: dead_addr.ip().to_string(),
+                port: dead_addr.port(),
+                priority: 0,
+                weight: 0,
+                pinned_identity: None,
+                policy: None,
+            },
+            second: Endpoint {
+                host: b_fed_addr.ip().to_string(),
+                port: b_fed_addr.port(),
+                priority: 1,
+                weight: 0,
+                pinned_identity: None,
+                policy: None,
+            },
+        }),
+    );
+    let a_c2s_url = spawn_c2s(a_state).await;
+
+    let alice = new_acct("org-a.test");
+    let mut ac = alice.connect(&a_c2s_url).await.unwrap();
+    let bob = new_acct("org-b.test");
+    let mut bc = bob.connect(&b_c2s_url).await.unwrap();
+
+    let delivered = ac
+        .route_with_hint(
+            bob.pubkey,
+            Some("org-b.test".to_string()),
+            b"failover works".to_vec(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "a routed message must still succeed via the SECOND candidate endpoint once the \
+                 first refuses the connection outright: {e:?}"
+            )
+        });
+    assert!(delivered);
+    let msg = bc.next_deliver().await.unwrap();
+    assert_eq!(msg.blob.as_bytes(), b"failover works");
+}
+
+// -- task 3.8: federated deliveries count in envelopes_routed_total (F8 + N4) -------------------
+
+/// Minimal local mirror of `rendezvous.rs`'s own `http_get` — not shared through `tests/support`
+/// because it's the only file besides `rendezvous.rs` that needs a raw `/metrics` scrape (both
+/// `handle_fed_route`'s c2s router and the plain local one expose `/metrics` on the SAME axum
+/// router, task 2.8's federated-route tests just never previously had a reason to hit it).
+async fn http_get(host: &str, path: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = TcpStream::connect(host).await.unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Read the current value of one **unlabeled** Prometheus sample line (`<name> <value>`, e.g.
+/// `meridian_envelopes_routed_total 3`) out of a rendered `/metrics` body. Panics if the family
+/// isn't rendered at all, or if it turns up carrying a label block (`name{...}`) — this metric must
+/// never grow one (see this section's second test).
+fn metric_value(body: &str, name: &str) -> i64 {
+    let rendered_body = body.split_once("\r\n\r\n").map_or(body, |(_, b)| b);
+    for line in rendered_body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(name) {
+            let rest = rest.trim();
+            assert!(
+                !rest.starts_with('{'),
+                "{name} must never be exported with a label block (found: {line})"
+            );
+            return rest
+                .parse()
+                .unwrap_or_else(|_| panic!("failed to parse metric value from line: {line}"));
+        }
+    }
+    panic!("metric family {name} not found in body:\n{body}");
+}
+
+/// Task 3.8 (F8): a federated delivery — the inbound `fed_route` path, `handle_fed_route` — must
+/// increment `meridian_envelopes_routed_total` exactly once per successfully-delivered message,
+/// mirroring `ws::deliver_one`'s identical accounting for the local (same-server) path. Before this
+/// task's fix, `handle_fed_route` discarded `Registry::send_to`'s return value outright and never
+/// touched the metric at all, so every federated delivery — the entire point of Phase 2 — was
+/// invisible to ops dashboards reading this counter. Two sequential deliveries (not just one) prove
+/// this is a genuine per-delivery increment, not a one-shot fixup that only fires once.
+#[tokio::test]
+async fn federated_delivery_increments_envelopes_routed_total_exactly_once_per_message() {
+    let rig = stand_up(FederationPolicyMode::Open).await;
+    let host = rig
+        .b_c2s_url
+        .strip_prefix("ws://")
+        .expect("spawn_c2s always returns a ws:// URL")
+        .to_string();
+
+    let alice = new_acct("org-a.test");
+    let mut ac = alice.connect(&rig.a_c2s_url).await.unwrap();
+    let bob = new_acct("org-b.test");
+    let mut bc = bob.connect(&rig.b_c2s_url).await.unwrap();
+
+    let before = metric_value(
+        &http_get(&host, "/metrics").await,
+        "meridian_envelopes_routed_total",
+    );
+
+    let delivered = ac
+        .route_with_hint(bob.pubkey, Some("org-b.test".to_string()), b"one".to_vec())
+        .await
+        .unwrap();
+    assert!(delivered, "bob is connected; the route must deliver");
+    bc.next_deliver().await.unwrap();
+
+    let after_one = metric_value(
+        &http_get(&host, "/metrics").await,
+        "meridian_envelopes_routed_total",
+    );
+    assert_eq!(
+        after_one,
+        before + 1,
+        "one federated delivery must increment the counter by exactly one"
+    );
+
+    let delivered2 = ac
+        .route_with_hint(bob.pubkey, Some("org-b.test".to_string()), b"two".to_vec())
+        .await
+        .unwrap();
+    assert!(
+        delivered2,
+        "bob is still connected; the second route must deliver too"
+    );
+    bc.next_deliver().await.unwrap();
+
+    let after_two = metric_value(
+        &http_get(&host, "/metrics").await,
+        "meridian_envelopes_routed_total",
+    );
+    assert_eq!(
+        after_two,
+        before + 2,
+        "a second federated delivery must increment the counter by exactly one more — proving \
+         this is a real per-delivery increment, not a one-shot fixup"
+    );
+}
+
+/// Task 3.8 (Scope's hard "Out" constraint): a federated delivery must introduce no new metric
+/// name and no new label — in particular, no `peer_domain`/per-partner label, which would
+/// materialize the cross-org contact graph this server talks to (anonymity-and-retention.md
+/// must-never #2; 2.4 already settled the identical question the same way for
+/// `meridian_federation_link_up`). Mirrors `rendezvous.rs`'s own
+/// `metrics_endpoint_exposes_allowlisted_names` allowlist-diff pattern (exhaustiveness: every
+/// family actually rendered must be on `tools/metrics-allowlist.txt`), scraped from a real HTTP GET
+/// after a real federated delivery — not merely inferred from source code.
+#[tokio::test]
+async fn federated_delivery_introduces_no_new_metric_name_or_label() {
+    let rig = stand_up(FederationPolicyMode::Open).await;
+    let host = rig
+        .b_c2s_url
+        .strip_prefix("ws://")
+        .expect("spawn_c2s always returns a ws:// URL")
+        .to_string();
+
+    let alice = new_acct("org-a.test");
+    let mut ac = alice.connect(&rig.a_c2s_url).await.unwrap();
+    let bob = new_acct("org-b.test");
+    let mut bc = bob.connect(&rig.b_c2s_url).await.unwrap();
+
+    let delivered = ac
+        .route_with_hint(
+            bob.pubkey,
+            Some("org-b.test".to_string()),
+            b"metrics-allowlist check".to_vec(),
+        )
+        .await
+        .unwrap();
+    assert!(delivered);
+    bc.next_deliver().await.unwrap();
+
+    let body = http_get(&host, "/metrics").await;
+
+    let allowlist_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tools/metrics-allowlist.txt"
+    );
+    let allowlist_text =
+        std::fs::read_to_string(allowlist_path).expect("read tools/metrics-allowlist.txt");
+    let allowlist: std::collections::HashSet<String> = allowlist_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+
+    let rendered_body = body
+        .split_once("\r\n\r\n")
+        .map_or(body.as_str(), |(_, b)| b);
+    let mut rendered = std::collections::HashSet::new();
+    let mut saw_labeled_envelopes_routed = false;
+    for line in rendered_body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let name_and_labels = line.split_whitespace().next().unwrap_or("");
+        if name_and_labels.starts_with("meridian_envelopes_routed_total{") {
+            saw_labeled_envelopes_routed = true;
+        }
+        let name = name_and_labels.split('{').next().unwrap_or(name_and_labels);
+        rendered.insert(name.to_string());
+    }
+
+    assert!(
+        !saw_labeled_envelopes_routed,
+        "meridian_envelopes_routed_total must never carry a label (e.g. peer_domain) — that would \
+         materialize the cross-org contact graph"
+    );
+
+    let leaked: Vec<&String> = rendered.difference(&allowlist).collect();
+    assert!(
+        leaked.is_empty(),
+        "metric families rendered but not in tools/metrics-allowlist.txt: {leaked:?}\nfull body:\n{body}"
+    );
+    assert!(
+        rendered.contains("meridian_envelopes_routed_total"),
+        "the counter this task fixes must actually be rendered"
     );
 }

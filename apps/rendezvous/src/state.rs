@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::Message;
+use rustls::ClientConfig;
 use tokio::sync::mpsc;
 
 use crate::auth::AdmissionPolicy;
@@ -132,9 +133,39 @@ impl FederationTlsOwned {
 pub struct FederationRuntime {
     pub own_domain: String,
     pub tls: FederationTlsOwned,
+    /// Cached outbound mTLS `rustls::ClientConfig` (task 3.7, review finding F10). `link::dial`
+    /// used to call `link::build_client_tls_config(paths)` itself, inline, on *every single*
+    /// outbound dial — re-reading and re-parsing the CA bundle, cert chain, and private key from
+    /// disk fresh each time, even though none of that material changes between calls in a running
+    /// server. `rustls::ClientConfig` is designed to be built once and shared across many
+    /// connections (hence the `Arc`), so this is built exactly once, here, at startup, and the same
+    /// `Arc` is handed to every `dial` call for this server's lifetime.
+    ///
+    /// `None` under the identical condition as `discovery: None` (federation disabled) — built
+    /// together, in the same `if config.federation.enabled` branch, in
+    /// [`build_federation_runtime`]. Nothing dials out at all when federation is disabled, so there
+    /// is nothing to cache.
+    ///
+    /// **Deliberate timing tradeoff (task 3.7's Risk note):** moving this load from "the first byte
+    /// of every dial" to "server startup" changes *when* a rotated/absent/expired cert, key, or CA
+    /// bundle on disk becomes visible as a failure. Before this change, a broken cert/key/CA-bundle
+    /// only broke the very next dial attempt — each call independently re-read and re-failed, so
+    /// the breakage stayed silent until (and unless) something actually tried to federate. After
+    /// this change, it becomes a boot-time failure instead: `build_federation_runtime` panics
+    /// (`unwrap_or_else`, mirroring `discovery`'s own construction just below this field and
+    /// `main.rs`'s existing "an explicit misconfiguration is fatal at boot, never a silent
+    /// downgrade" posture), loud and fail-closed, the moment the server starts. This is a
+    /// deliberate side benefit, not an accidental regression: an operator who broke their
+    /// federation cert on disk now finds out at server start, not silently on the first real
+    /// cross-org message.
+    pub client_tls: Option<Arc<ClientConfig>>,
     pub discovery: Option<Arc<dyn federation::Discovery>>,
     pub policy: federation::FederationPolicy,
     pub limits: federation::FederationLimits,
+    /// Outbound dial/exchange timeout budget (task 3.3, review finding F3): read by
+    /// `federation::outbound::dial_foreign`'s `link::dial` call and by `fetch_foreign_bundle`'s /
+    /// `reachable_foreign`'s own per-exchange `send_frame`/`recv_frame` waits.
+    pub timeouts: federation::FederationTimeouts,
 }
 
 /// Build the [`FederationRuntime`] this config describes. Fails closed and loudly (`panic!`,
@@ -143,15 +174,21 @@ pub struct FederationRuntime {
 /// `discovery: None` when `enabled = true` but the discovery backend can't actually be built (a
 /// missing/malformed `federation_map.toml`, or no usable system DNS resolver for SRV mode) — an
 /// operator who turned federation on gets a clear boot-time error, not a server that silently
-/// never federates. When `enabled = false` this performs no I/O and no DNS lookup at all.
+/// never federates. Same posture for `client_tls` (task 3.7): a rotated/absent/expired cert, key,
+/// or CA bundle fails this call, not merely the first outbound dial — see
+/// [`FederationRuntime::client_tls`]'s doc comment. When `enabled = false` this performs no I/O
+/// and no DNS lookup at all.
 fn build_federation_runtime(config: &Config) -> FederationRuntime {
     let tls = FederationTlsOwned {
         cert_path: config.federation.cert_path.clone(),
         key_path: config.federation.key_path.clone(),
         ca_bundle_path: config.federation.ca_bundle_path.clone(),
     };
-    let discovery: Option<Arc<dyn federation::Discovery>> = if config.federation.enabled {
-        Some(match config.federation.discovery {
+    let (discovery, client_tls): (
+        Option<Arc<dyn federation::Discovery>>,
+        Option<Arc<ClientConfig>>,
+    ) = if config.federation.enabled {
+        let discovery = match config.federation.discovery {
             DiscoveryMode::Static => Arc::new(
                 federation::StaticMap::load(&config.federation.map_path).unwrap_or_else(|e| {
                     panic!(
@@ -167,16 +204,31 @@ fn build_federation_runtime(config: &Config) -> FederationRuntime {
                      federation enabled but no usable discovery source"
                 )
             })) as Arc<dyn federation::Discovery>,
-        })
+        };
+        // Task 3.7 (F10): built once here, alongside `discovery` — same fail-closed-at-boot
+        // posture, see `FederationRuntime::client_tls`'s doc comment for the timing tradeoff this
+        // is a deliberate acceptance of.
+        let client_tls =
+            federation::link::build_client_tls_config(&tls.as_paths()).unwrap_or_else(|e| {
+                panic!(
+                    "federation: building the outbound TLS client config from cert_path={:?} \
+                     key_path={:?} ca_bundle_path={:?}: {e} — refusing to boot with federation \
+                     enabled but unusable TLS material",
+                    tls.cert_path, tls.key_path, tls.ca_bundle_path
+                )
+            });
+        (Some(discovery), Some(client_tls))
     } else {
-        None
+        (None, None)
     };
     FederationRuntime {
         own_domain: config.server.domain.clone(),
         tls,
+        client_tls,
         discovery,
         policy: config.federation.to_policy(),
         limits: config.federation.to_limits(),
+        timeouts: config.federation.to_timeouts(),
     }
 }
 

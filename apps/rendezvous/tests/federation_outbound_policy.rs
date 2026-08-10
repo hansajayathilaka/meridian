@@ -17,13 +17,11 @@
 //!   through the exact same `Discovery` trait seam `federation::outbound` itself consults.
 //!
 //! ## Harness
-//! Reuses this crate's established two-real-server-over-real-mTLS pattern
-//! (`federation_fetch.rs`/`federation_route.rs`/`federation_abuse.rs`, code-reviewer-accepted
-//! per-file duplication rather than a shared `tests/support` module) for the wire-level
-//! (`fed_denied`) cases, plus a direct call into `federation::outbound` (both are `pub`) for the
-//! zero-I/O proof, which needs to install a call-counting [`Discovery`] into a running
-//! [`AppState`] — something only reachable by constructing the state directly, not through the
-//! config-driven [`AppState::new`] alone.
+//! Reuses this crate's shared `tests/support` PKI + server-boot harness (task 3.4) for the
+//! wire-level (`fed_denied`) cases, plus a direct call into `federation::outbound` (both are
+//! `pub`) for the zero-I/O proof, which needs to install a call-counting [`Discovery`] into a
+//! running [`AppState`] — something only reachable by constructing the state directly, not through
+//! the config-driven [`AppState::new`] alone.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -31,138 +29,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use meridian_identity::{generate_account, KeyHandle, MemorySecretStore};
-use meridian_rendezvous::config::{
-    Config, DiscoveryMode, Federation, FederationPolicyMode, Limits, Server, Turn,
-};
-use meridian_rendezvous::federation::inbound::{bind_federation, run_federation};
+use meridian_rendezvous::config::{DiscoveryMode, Federation, FederationPolicyMode};
 use meridian_rendezvous::federation::outbound::{
     fetch_foreign_bundle, route_foreign, FetchForeignError, RouteForeignError,
 };
 use meridian_rendezvous::federation::{Discovery, DiscoveryError, Endpoint};
-use meridian_rendezvous::{serve, AppState, MemoryStore};
-use meridian_signaling::{SignalError, SignalingClient};
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+use meridian_rendezvous::{AppState, MemoryStore};
+use meridian_signaling::SignalError;
 use tokio::net::TcpListener;
 
-// -- PKI test harness (mirrors federation_fetch.rs / federation_route.rs / federation_abuse.rs) --
-
-struct TestCa {
-    cert: rcgen::Certificate,
-    key: KeyPair,
-}
-
-fn make_ca(common_name: &str) -> TestCa {
-    let mut params = CertificateParams::new(Vec::<String>::new()).expect("empty SAN list");
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    params
-        .distinguished_name
-        .push(DnType::CommonName, common_name);
-    let key = KeyPair::generate().expect("generate CA key");
-    let cert = params.self_signed(&key).expect("self-sign CA cert");
-    TestCa { cert, key }
-}
-
-fn make_leaf(domain: &str, ca: &TestCa) -> (rcgen::Certificate, KeyPair) {
-    let mut params =
-        CertificateParams::new(vec![domain.to_string()]).expect("SAN must be a valid DNS name");
-    params.distinguished_name.push(DnType::CommonName, domain);
-    let key = KeyPair::generate().expect("generate leaf key");
-    let cert = params
-        .signed_by(&key, &ca.cert, &ca.key)
-        .expect("sign leaf cert");
-    (cert, key)
-}
-
-fn write(dir: &Path, name: &str, contents: &str) -> std::path::PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, contents).unwrap();
-    path
-}
-
-struct Identity {
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
-    ca_bundle_path: std::path::PathBuf,
-}
-
-fn mint_identity(dir: &Path, tag: &str, domain: &str, ca: &TestCa) -> Identity {
-    let (leaf_cert, leaf_key) = make_leaf(domain, ca);
-    Identity {
-        cert_path: write(dir, &format!("{tag}.crt.pem"), &leaf_cert.pem()),
-        key_path: write(dir, &format!("{tag}.key.pem"), &leaf_key.serialize_pem()),
-        ca_bundle_path: write(dir, &format!("{tag}.ca.pem"), &ca.cert.pem()),
-    }
-}
-
-// -- Server harness ----------------------------------------------------------------------------
-
-fn base_config(domain: &str) -> Config {
-    Config {
-        server: Server {
-            domain: domain.to_string(),
-            bind: "127.0.0.1:0".to_string(),
-            ..Server::default()
-        },
-        limits: Limits::default(),
-        turn: Turn::default(),
-        federation: Federation::default(),
-    }
-}
-
-/// Spawn `domain`'s c2s WS listener and return its `ws://` URL.
-async fn spawn_c2s(state: Arc<AppState>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = serve(state, listener).await;
-    });
-    format!("ws://{addr}")
-}
-
-/// Bind `domain`'s s2s federation listener and start serving it. Returns the bound address.
-async fn spawn_federation(state: Arc<AppState>) -> SocketAddr {
-    let listener = bind_federation(&state).await.expect("bind s2s listener");
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        run_federation(listener, state).await;
-    });
-    addr
-}
-
-struct Acct {
-    store: MemorySecretStore,
-    pubkey: [u8; 32],
-    handle: KeyHandle,
-}
-
-fn new_acct(hint: &str) -> Acct {
-    let store = MemorySecretStore::new();
-    let account = generate_account(&store, hint).unwrap();
-    Acct {
-        pubkey: *account.public_key().as_bytes(),
-        handle: account.handle().clone(),
-        store,
-    }
-}
-
-impl Acct {
-    async fn connect(&self, url: &str) -> Result<SignalingClient, SignalError> {
-        SignalingClient::connect(url, &self.store, &self.handle, self.pubkey, None, 1).await
-    }
-}
-
-/// Build a `federation_map.toml` (private-CA mode, task 2.5's schema) pointing `domain` at `addr`.
-fn write_federation_map(dir: &Path, entries: &[(&str, SocketAddr, &str)]) -> std::path::PathBuf {
-    let mut toml = String::new();
-    for (domain, addr, pin) in entries {
-        toml.push_str(&format!(
-            "[[partner]]\ndomain = \"{domain}\"\nendpoint = \"{addr}\"\npinned_identity = \"{pin}\"\n\n"
-        ));
-    }
-    write(dir, "federation_map.toml", &toml)
-}
+mod support;
+use support::{
+    base_config, boot_federated_pair, install_discovery, new_acct, spawn_c2s, write_federation_map,
+    FederatedPairOpts, TestCa,
+};
 
 /// Build A's [`Federation`] config: `enabled = true`, `discovery = "static"`, a map entry pointing
 /// `b_domain` at `b_fed_addr`, and A's own admission `policy` — the axis this task adds
@@ -177,14 +57,14 @@ fn org_a_federation(
     policy: FederationPolicyMode,
     allowlist: Vec<String>,
 ) -> Federation {
-    let id = mint_identity(dir, "a", a_domain, ca);
+    let id = ca.issue(dir, a_domain);
     let map_path = write_federation_map(dir, &[(b_domain, b_fed_addr, b_domain)]);
     Federation {
         enabled: true,
         bind: "127.0.0.1:0".to_string(),
-        cert_path: id.cert_path.to_str().unwrap().to_string(),
-        key_path: id.key_path.to_str().unwrap().to_string(),
-        ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
+        cert_path: id.cert_path_str().to_string(),
+        key_path: id.key_path_str().to_string(),
+        ca_bundle_path: id.ca_bundle_path_str().to_string(),
         discovery: DiscoveryMode::Static,
         map_path: map_path.to_str().unwrap().to_string(),
         policy,
@@ -193,61 +73,26 @@ fn org_a_federation(
     }
 }
 
-/// B's own federation identity — B's policy is always `open`; every test in this file exercises
-/// A's OWN outbound admission decision, never B's inbound one (that's `federation_fetch.rs`'s/
-/// `federation_route.rs`'s `closed_policy_at_b_is_reported_as_fed_denied`, already-correct and out
-/// of this task's scope). Several tests below expect the request to be refused by A before it ever
-/// reaches B at all — a B that would happily admit anything makes that refusal unambiguously A's.
-fn org_b_federation(dir: &Path, ca: &TestCa, b_domain: &str) -> Federation {
-    let id = mint_identity(dir, "b", b_domain, ca);
-    let empty_map = write(dir, "b-federation_map.toml", "");
-    Federation {
-        enabled: true,
-        bind: "127.0.0.1:0".to_string(),
-        cert_path: id.cert_path.to_str().unwrap().to_string(),
-        key_path: id.key_path.to_str().unwrap().to_string(),
-        ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
-        discovery: DiscoveryMode::Static,
-        map_path: empty_map.to_str().unwrap().to_string(),
-        policy: FederationPolicyMode::Open,
-        fed_fetch_per_origin_per_min: 300,
-        fed_route_per_origin_per_min: 600,
-        fed_per_origin_account_per_min: 30,
-        ..Federation::default()
-    }
-}
-
 /// Stand up B (accepting, `open`) + A (dialing out, with the given outbound `policy`), returning
-/// A's c2s URL — the common setup for the wire-level (`fed_denied`) cases below.
+/// A's c2s URL — the common setup for the wire-level (`fed_denied`) cases below. B's own inbound
+/// admission policy is always `open`; every test in this file exercises A's OWN outbound admission
+/// decision, never B's inbound one (that's `federation_fetch.rs`'s/`federation_route.rs`'s
+/// `closed_policy_at_b_is_reported_as_fed_denied`, already-correct and out of this task's scope).
+/// Several tests below expect the request to be refused by A before it ever reaches B at all — a B
+/// that would happily admit anything makes that refusal unambiguously A's. B's own c2s is never
+/// used by any test in this file, so it is not spawned.
 async fn stand_up(
     policy: FederationPolicyMode,
     allowlist: Vec<String>,
 ) -> (String, tempfile::TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
-
-    let b_config_federation = org_b_federation(dir.path(), &ca, "org-b.test");
-    let mut b_config = base_config("org-b.test");
-    b_config.federation = b_config_federation;
-    let b_store = Arc::new(MemoryStore::new());
-    let b_state = AppState::new(b_config, b_store);
-    let b_fed_addr = spawn_federation(b_state).await;
-
-    let mut a_config = base_config("org-a.test");
-    a_config.federation = org_a_federation(
-        dir.path(),
-        &ca,
-        "org-a.test",
-        "org-b.test",
-        b_fed_addr,
-        policy,
-        allowlist,
-    );
-    let a_store = Arc::new(MemoryStore::new());
-    let a_state = AppState::new(a_config, a_store);
-    let a_c2s_url = spawn_c2s(a_state).await;
-
-    (a_c2s_url, dir)
+    let pair = boot_federated_pair(FederatedPairOpts {
+        a_policy: policy,
+        a_allowlist: allowlist,
+        spawn_b_c2s: false,
+        ..Default::default()
+    })
+    .await;
+    (pair.a_c2s_url, pair.dir)
 }
 
 // -- 1: closed policy at A + outbound Fetch{hint} -> fed_denied ---------------------------------
@@ -323,7 +168,7 @@ async fn allowlist_policy_at_a_denies_a_non_member_domain() {
 #[tokio::test]
 async fn allowlist_policy_at_a_admits_the_listed_domain_and_proceeds_past_the_policy_check() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
+    let ca = TestCa::new();
 
     let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead_addr = dead.local_addr().unwrap();
@@ -378,21 +223,10 @@ impl Discovery for CountingDiscovery {
     }
 }
 
-/// Installs `discovery` into a freshly-built (not yet cloned/spawned) [`AppState`], via
-/// `Arc::get_mut` — the only way to reach `FederationRuntime::discovery` with a test-controlled
-/// [`Discovery`] impl, since [`AppState::new`] always builds a config-driven one internally. Must
-/// be called before the returned `Arc` is cloned anywhere (no live listener spawned on it yet).
-fn install_discovery(state: &mut Arc<AppState>, discovery: Arc<dyn Discovery>) {
-    Arc::get_mut(state)
-        .expect("AppState must still be uniquely owned (not yet cloned/spawned)")
-        .federation
-        .discovery = Some(discovery);
-}
-
 #[tokio::test]
 async fn closed_policy_denial_makes_zero_dns_lookups_and_zero_tcp_connects() {
     let dir = tempfile::tempdir().unwrap();
-    let ca = make_ca("Meridian Test Federation CA");
+    let ca = TestCa::new();
 
     // A real listener at the address `CountingDiscovery` would resolve "org-b.test" to, so a
     // dial-attempt regression is provable at the TCP layer, not just via the call counter.
@@ -422,14 +256,14 @@ async fn closed_policy_denial_makes_zero_dns_lookups_and_zero_tcp_connects() {
         },
     });
 
-    let id = mint_identity(dir.path(), "a", "org-a.test", &ca);
+    let id = ca.issue(dir.path(), "org-a.test");
     let mut a_config = base_config("org-a.test");
     a_config.federation = Federation {
         enabled: true,
         bind: "127.0.0.1:0".to_string(),
-        cert_path: id.cert_path.to_str().unwrap().to_string(),
-        key_path: id.key_path.to_str().unwrap().to_string(),
-        ca_bundle_path: id.ca_bundle_path.to_str().unwrap().to_string(),
+        cert_path: id.cert_path_str().to_string(),
+        key_path: id.key_path_str().to_string(),
+        ca_bundle_path: id.ca_bundle_path_str().to_string(),
         discovery: DiscoveryMode::Static,
         // `StaticMap::load` would fail-closed on this nonexistent path — irrelevant here, since
         // `install_discovery` below replaces the config-driven discovery entirely before it is

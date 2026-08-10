@@ -115,21 +115,17 @@ pub async fn fetch_foreign_bundle(
     };
     let out = FedFrame::new(FedOp::FetchBundle, 1, &req)
         .map_err(|e| FetchForeignError::Protocol(e.to_string()))?;
-    fed_link
-        .send_frame(&out)
+    // Task 3.3 (F3): bounded under `state.federation.timeouts.request` — a foreign server that
+    // completed `FedHello` but never reads/answers this request can no longer hang this call, or
+    // this connection's server-side task, forever.
+    let request_timeout = state.federation.timeouts.request;
+    with_request_deadline(request_timeout, &expected_domain, fed_link.send_frame(&out))
         .await
-        .map_err(|source| FetchForeignError::Dial {
-            domain: expected_domain.to_string(),
-            source,
-        })?;
+        .map_err(convert_dial_error)?;
 
-    let reply = fed_link
-        .recv_frame()
+    let reply = with_request_deadline(request_timeout, &expected_domain, fed_link.recv_frame())
         .await
-        .map_err(|source| FetchForeignError::Dial {
-            domain: expected_domain.to_string(),
-            source,
-        })?;
+        .map_err(convert_dial_error)?;
 
     match reply.op {
         FedOp::Bundle => reply
@@ -277,11 +273,31 @@ pub enum RouteForeignError {
 /// explicit follow-up, not resolved by this task.
 const ROUTE_REPLY_GRACE: Duration = Duration::from_millis(500);
 
-/// Resolve `hint_domain` and dial the resulting [`Endpoint`], exactly as
+/// Resolve `hint_domain` and dial the FIRST candidate [`Endpoint`] that succeeds, exactly as
 /// [`fetch_foreign_bundle`] does (same discovery lookup, same `pinned_identity`-over-`hint_domain`
 /// pin — see that function's doc comment for the non-negotiable reasoning), factored out here
 /// because [`route_foreign`] and [`reachable_foreign`] both need a fresh one-shot link and share
 /// [`RouteForeignError`] as their error type.
+///
+/// **Task 3.7 (N2, SRV failover):** `discovery.resolve` can return more than one candidate
+/// [`Endpoint`] — `SrvDiscovery` sorts them by RFC 2782 priority ascending, then weight descending
+/// (`SrvDiscovery::resolve`'s doc comment); `StaticMap` always returns exactly one, so this loop
+/// degrades to the old single-candidate behavior there with no change in observable behavior. This
+/// tries each candidate, in the order `resolve` already returned (never re-sorted here), falling
+/// through to the next on ANY failure — address resolution or the dial itself (TCP/TLS/`FedHello`)
+/// — rather than giving up after the first. Only once every candidate has been tried and failed is
+/// an `Err` returned, carrying whichever failure the LAST candidate produced (arbitrary among
+/// possibly-differing per-candidate failures, but no caller today branches on that — see
+/// `RouteForeignError`'s own doc comments on what `ws.rs` does with each variant).
+///
+/// **Domain pin, per candidate (task 3.7's Risk note — security-critical, do not relax):**
+/// `expected_domain` is computed FRESH for every candidate, from THAT candidate's own
+/// `pinned_identity` — never reused from an earlier failed candidate, never widened to "any
+/// domain" merely because earlier candidates failed. The mTLS handshake's certificate validation
+/// against `expected_domain` (`link::dial`) still runs in full for every candidate dialed, exactly
+/// as it did for the single-candidate path this replaces — a compromised or merely misconfigured
+/// second SRV target still has to present a certificate for the SAME intended domain (or pinned
+/// identity) as the first, or its dial fails exactly like any other domain mismatch.
 async fn dial_foreign(
     state: &AppState,
     hint_domain: &str,
@@ -329,43 +345,108 @@ async fn dial_foreign(
                 domain: hint_domain.to_string(),
                 source,
             })?;
-    let endpoint = endpoints
-        .into_iter()
-        .next()
-        .ok_or_else(|| RouteForeignError::Discovery {
-            domain: hint_domain.to_string(),
-            source: DiscoveryError::NotFound(hint_domain.to_string()),
-        })?;
 
-    let addr =
-        resolve_dial_addr(&endpoint)
-            .await
-            .map_err(|source| RouteForeignError::AddrResolution {
-                host: endpoint.host.clone(),
-                port: endpoint.port,
-                source,
-            })?;
+    // Task 3.7 (F10): the outbound `ClientConfig` is built once at startup
+    // (`state::FederationRuntime::client_tls`) and reused across every candidate dialed here —
+    // `link::dial` itself does no filesystem I/O or cert/key parsing anymore. `discovery.is_some()`
+    // (checked above) and `client_tls.is_some()` are always built together, in the same
+    // `if config.federation.enabled` branch of `build_federation_runtime`, so this can never
+    // observe federation enabled with no cached TLS config.
+    let client_tls = state.federation.client_tls.clone().expect(
+        "state.federation.discovery.is_some() (checked above) implies client_tls is also Some — \
+         both are built together in build_federation_runtime only when federation.enabled",
+    );
 
-    let expected_domain = endpoint
-        .pinned_identity
-        .as_deref()
-        .unwrap_or(hint_domain)
-        .to_string();
+    // `Discovery::resolve`'s own contract (see its doc comment) never returns `Ok(vec![])` — a
+    // domain with no usable endpoint is always an `Err` before this point — so `endpoints` is
+    // non-empty and this loop always runs at least once; `last_err` is populated by the first
+    // iteration and this `Option` wrapper exists only so the compiler can see a value on every
+    // path, not because a genuinely-empty `endpoints` is expected in practice.
+    let mut last_err: Option<RouteForeignError> = None;
+    for endpoint in endpoints {
+        let expected_domain = endpoint
+            .pinned_identity
+            .as_deref()
+            .unwrap_or(hint_domain)
+            .to_string();
 
-    let fed_link = link::dial(
-        addr,
-        &expected_domain,
-        &state.federation.tls.as_paths(),
-        &state.federation.own_domain,
-        Some(state.metrics.clone()),
-    )
-    .await
-    .map_err(|source| RouteForeignError::Dial {
-        domain: expected_domain.clone(),
-        source,
-    })?;
+        let addr = match resolve_dial_addr(&endpoint).await {
+            Ok(addr) => addr,
+            Err(source) => {
+                last_err = Some(RouteForeignError::AddrResolution {
+                    host: endpoint.host.clone(),
+                    port: endpoint.port,
+                    source,
+                });
+                continue;
+            }
+        };
 
-    Ok((fed_link, expected_domain))
+        // Task 3.3 (F3): `dial` itself bounds its own connect/TLS/hello steps against
+        // `state.federation.timeouts` — see `link::dial`'s doc comment. A black-holed candidate
+        // (accepts TCP, then silence; or completes TLS+FedHello, then never answers a later
+        // request) can no longer hang this call, and thus never leaks the task awaiting it,
+        // forever — it simply counts as this candidate's failure and the loop moves on.
+        match link::dial(
+            addr,
+            &expected_domain,
+            client_tls.clone(),
+            &state.federation.own_domain,
+            Some(state.metrics.clone()),
+            state.federation.timeouts,
+        )
+        .await
+        {
+            Ok(fed_link) => return Ok((fed_link, expected_domain)),
+            Err(source) => {
+                last_err = Some(RouteForeignError::Dial {
+                    domain: expected_domain,
+                    source,
+                });
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| RouteForeignError::Discovery {
+        domain: hint_domain.to_string(),
+        source: DiscoveryError::NotFound(hint_domain.to_string()),
+    }))
+}
+
+/// Await one outbound s2s exchange step (`send_frame`/`recv_frame`) over an already-established
+/// [`FederationLink`] under `timeout`, folding a deadline expiry into the SAME
+/// `RouteForeignError::Dial { source: LinkError::Timeout, .. }` shape a timed-out [`dial`] itself
+/// would have produced (task 3.3, review finding F3) — so a caller downstream (`ws.rs`) cannot
+/// distinguish "the connect/TLS/hello step timed out inside `dial`" from "the actual
+/// fed_fetch_bundle/fed_reachability round trip itself timed out": both collapse to the identical
+/// `Dial{..}` variant, which already maps to the client-visible `fed_unreachable` code — no new
+/// error shape, and no new observable signal, for either failure mode.
+///
+/// Returns [`RouteForeignError`] (not [`FetchForeignError`]) even though [`fetch_foreign_bundle`]
+/// is one of the two callers: `convert_dial_error`'s existing `Dial` mapping already handles this
+/// exact shape, so `fetch_foreign_bundle` reuses it via `.map_err(convert_dial_error)` rather than
+/// this function needing a second, near-identical copy.
+async fn with_request_deadline<F, T>(
+    timeout: std::time::Duration,
+    expected_domain: &str,
+    fut: F,
+) -> Result<T, RouteForeignError>
+where
+    F: std::future::Future<Output = Result<T, LinkError>>,
+{
+    match link::with_deadline(timeout, fut).await {
+        Ok(inner) => inner.map_err(|source| RouteForeignError::Dial {
+            domain: expected_domain.to_string(),
+            source,
+        }),
+        Err(link::DeadlineExceeded(duration)) => Err(RouteForeignError::Dial {
+            domain: expected_domain.to_string(),
+            source: LinkError::Timeout {
+                phase: "request",
+                duration,
+            },
+        }),
+    }
 }
 
 /// Server A's outbound path for a client's `RouteBody{to, to_hint}` naming a foreign account:
@@ -382,6 +463,23 @@ async fn dial_foreign(
 /// **Oversized rejection is pre-dial** (architect decision #1): the real `FedFrame` this call
 /// would send is built and measured against [`link::MAX_FRAME_LEN`] before any network I/O at
 /// all, including before the reachability pre-check's own dial.
+///
+/// **Task 3.7 (review finding F10, single-link exchange):** this used to call
+/// [`reachable_foreign`] for the reachability pre-check — which dialed its own, fresh
+/// [`FederationLink`] internally — and THEN, if the pre-check confirmed `connected: true`, called
+/// [`dial_foreign`] again for the actual `FedRoute`: two entirely separate TCP+TLS connections
+/// (two mTLS handshakes) to the same peer for one logical routed message. This now dials
+/// [`dial_foreign`] exactly ONCE and speaks both the `FedReachability` pre-check
+/// ([`reachable_on_link`]) and (if confirmed reachable) the `FedRoute` itself, sequentially, over
+/// that SAME link.
+///
+/// **TOCTOU note (task 3.7's Risk note, inherited from task 2.8):** narrowing to one dial per
+/// message legitimately narrows — but does **not** close — the window task 2.8 already documented
+/// between "confirmed reachable" and "actually routed": `to` can still disconnect from B in the
+/// interval between the `FedReachable{connected: true}` reply and the `FedRoute` send below, even
+/// though that interval is now bounded by one link's round-trip latency rather than two separate
+/// dials' worth of connection setup. This function does not, and per task 3.7's scope cannot,
+/// close that window outright.
 pub async fn route_foreign(
     state: &AppState,
     hint_domain: &str,
@@ -407,6 +505,22 @@ pub async fn route_foreign(
         return Err(RouteForeignError::EnvelopeTooLarge { len: encoded.len() });
     }
 
+    // Task 3.7: the single dial this whole exchange now uses. A failure here — before we've even
+    // learned whether `to` is reachable — gets exactly the same collapsing treatment the PRE-CHECK's
+    // own (formerly separate) dial always got, per architect decision #3 below: `Denied` (this
+    // server's own policy refusing to dial `hint_domain` at all) surfaces as itself, since it's the
+    // identical axis as B declining outright (`Fed`, below); every other cause (discovery miss,
+    // address resolution failure, TLS/connect failure across every SRV-failover candidate) collapses
+    // into `TargetUnreachable` — this server genuinely could not determine `to`'s liveness, which is
+    // indistinguishable, by design, from `to` simply being offline (the anti-existence-oracle
+    // requirement this task inherits unchanged).
+    let (mut fed_link, expected_domain) = match dial_foreign(state, hint_domain).await {
+        Ok(pair) => pair,
+        Err(RouteForeignError::Denied) => return Err(RouteForeignError::Denied),
+        Err(_) => return Err(RouteForeignError::TargetUnreachable),
+    };
+    let request_timeout = state.federation.timeouts.request;
+
     // Architect decision #3: the pre-check's TARGET-LIVENESS outcome (offline, unknown, or a
     // connectivity/protocol failure that leaves liveness undetermined) collapses to
     // `TargetUnreachable` — never a distinct signal. This is deliberately NOT the same as B
@@ -416,30 +530,27 @@ pub async fn route_foreign(
     // itself — collapsing a closed-policy answer into "recipient offline" would both hide a real
     // policy signal from the caller and contradict this task's own required behaviour ("closed
     // origin at B → fed_denied", not `not_connected`).
-    //
-    // (task 3.1) `RouteForeignError::Denied` — THIS server's own policy refusing to dial
-    // `hint_domain` at all, surfaced by the pre-check's own internal `dial_foreign` call — is the
-    // identical axis as `Fed` above, not the target-liveness axis: A never even attempted to learn
-    // whether `to` is reachable, so folding this into `TargetUnreachable` would misreport a local
-    // policy refusal as "recipient offline" and (worse, since this task's whole point is closing an
-    // SSRF oracle) would make the pre-check's own denial indistinguishable from the real dial
-    // attempt just below ever having happened at all.
-    match reachable_foreign(state, hint_domain, to).await {
+    match reachable_on_link(&mut fed_link, &expected_domain, to, request_timeout).await {
         Ok(true) => {}
         Ok(false) => return Err(RouteForeignError::TargetUnreachable),
         Err(RouteForeignError::Fed(fed_err)) => return Err(RouteForeignError::Fed(fed_err)),
-        Err(RouteForeignError::Denied) => return Err(RouteForeignError::Denied),
         Err(_) => return Err(RouteForeignError::TargetUnreachable),
     }
 
-    let (mut fed_link, expected_domain) = dial_foreign(state, hint_domain).await?;
-    fed_link
-        .send_frame(&out)
-        .await
-        .map_err(|source| RouteForeignError::Dial {
-            domain: expected_domain.clone(),
-            source,
-        })?;
+    // From here on B is known-reachable (the exchange just above confirmed it over this same
+    // link) — a failure sending/receiving the actual `FedRoute` now is a genuine "could not
+    // complete the route right now" outcome, not a target-liveness signal, and surfaces as itself
+    // (`fed_unreachable`), exactly as it did before this task when this was still a second,
+    // independent dial.
+    //
+    // Task 3.3 (F3), review fix: bounded under `state.federation.timeouts.request` — same
+    // treatment as `fetch_foreign_bundle`'s and `reachable_foreign`'s send/recv exchanges (see
+    // `with_request_deadline`'s doc comment). Without this, a partner that completes real
+    // mTLS+`FedHello` (i.e. is admitted by policy) and then never drains its TCP receive window
+    // hangs this `write_all`/`flush` forever, leaking a pinned task plus TLS link on the path
+    // that carries an actual authenticated user's routed envelope — exactly the failure mode this
+    // task exists to close, just missed on this one call site in the original diff.
+    with_request_deadline(request_timeout, &expected_domain, fed_link.send_frame(&out)).await?;
 
     // See `ROUTE_REPLY_GRACE`'s doc comment: `FedOp::Route` is fire-and-forget on success, so
     // "nothing arrived within a generous bound" IS the success outcome, not an error.
@@ -463,35 +574,27 @@ pub async fn route_foreign(
     }
 }
 
-/// Server A's outbound path for `fed_reachability`: resolve `hint_domain`, dial, and ask "is a
-/// device for `target` connected right now?" — per-request only, never a subscription (system
-/// design §3.4). The only caller in this task is [`route_foreign`]'s own internal pre-check
-/// (architect decision #3); nothing here makes this a new client-visible c2s trigger.
-pub async fn reachable_foreign(
-    state: &AppState,
-    hint_domain: &str,
+/// The `fed_reachability` request/reply exchange itself — send `FedReachability`, await
+/// `FedReachable`/`FedErr` — over an ALREADY-established [`FederationLink`]. Factored out of
+/// [`reachable_foreign`] (task 3.7, review finding F10) so [`route_foreign`] can run this same
+/// exchange on the ONE link it already dialed, instead of [`reachable_foreign`] dialing a second,
+/// independent link purely for the pre-check. [`reachable_foreign`] itself is now a thin wrapper:
+/// dial, then delegate here.
+async fn reachable_on_link(
+    fed_link: &mut FederationLink,
+    expected_domain: &str,
     target: [u8; 32],
+    request_timeout: Duration,
 ) -> Result<bool, RouteForeignError> {
-    let (mut fed_link, expected_domain) = dial_foreign(state, hint_domain).await?;
-
     let req = FedReachability { target };
     let out = FedFrame::new(FedOp::Reachability, 1, &req)
         .map_err(|e| RouteForeignError::Protocol(e.to_string()))?;
-    fed_link
-        .send_frame(&out)
-        .await
-        .map_err(|source| RouteForeignError::Dial {
-            domain: expected_domain.clone(),
-            source,
-        })?;
+    // Task 3.3 (F3): same bounded-wait treatment as `fetch_foreign_bundle`'s identical shape —
+    // see `with_request_deadline`'s doc comment.
+    with_request_deadline(request_timeout, expected_domain, fed_link.send_frame(&out)).await?;
 
-    let reply = fed_link
-        .recv_frame()
-        .await
-        .map_err(|source| RouteForeignError::Dial {
-            domain: expected_domain,
-            source,
-        })?;
+    let reply =
+        with_request_deadline(request_timeout, expected_domain, fed_link.recv_frame()).await?;
 
     match reply.op {
         FedOp::Reachable => {
@@ -512,6 +615,31 @@ pub async fn reachable_foreign(
     }
 }
 
+/// Server A's outbound path for `fed_reachability`: resolve `hint_domain`, dial, and ask "is a
+/// device for `target` connected right now?" — per-request only, never a subscription (system
+/// design §3.4). Kept as its own `pub` entry point (task 3.7) for a caller that wants a standalone
+/// reachability check with no follow-up route — [`route_foreign`]'s own internal pre-check (architect
+/// decision #3) no longer calls this directly; it calls [`dial_foreign`] + [`reachable_on_link`]
+/// itself instead, so its pre-check and its follow-up `FedRoute` share the one link
+/// [`dial_foreign`] opens rather than each dialing independently. Nothing here makes this a new
+/// client-visible c2s trigger.
+///
+/// **Task 3.5 + its review follow-up (review finding F4):** the request this sends is answered, on
+/// B's side, by `federation::inbound::handle_fed_reachability`, which spends its own dedicated
+/// `reachability_per_origin` budget — never `route_per_origin`/`per_origin_account` (the original
+/// double-spend this task closed), and never fully unmetered either (the review-finding gap the
+/// follow-up closed) — see that function's doc comment for the full accounting fix. Nothing on A's
+/// side changes: this call still costs exactly one wire round trip, same as before.
+pub async fn reachable_foreign(
+    state: &AppState,
+    hint_domain: &str,
+    target: [u8; 32],
+) -> Result<bool, RouteForeignError> {
+    let (mut fed_link, expected_domain) = dial_foreign(state, hint_domain).await?;
+    let request_timeout = state.federation.timeouts.request;
+    reachable_on_link(&mut fed_link, &expected_domain, target, request_timeout).await
+}
+
 /// Resolve an [`Endpoint`]'s `host:port` to a concrete [`SocketAddr`] to dial. This is ordinary
 /// hostname resolution for the s2s *dial target* (e.g. an internal-DNS service name in
 /// `federation_map.toml`, per that file's own doc comment) — a different, unrelated DNS query from
@@ -529,4 +657,48 @@ async fn resolve_dial_addr(endpoint: &Endpoint) -> std::io::Result<SocketAddr> {
                 format!("no address found for {}:{}", endpoint.host, endpoint.port),
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Task 3.3 review follow-up (finding F3, blocking): a deterministic, no-real-socket proof
+    //! that [`with_request_deadline`] genuinely bounds an indefinitely-pending send/recv future —
+    //! complementing `tests/federation_timeouts.rs`'s
+    //! `route_foreigns_outbound_send_is_wrapped_under_the_request_deadline`, which pins that
+    //! [`route_foreign`]'s own outbound `send_frame` call is actually wrapped by this helper. That
+    //! test proves the wrap is PRESENT; this one proves the wrap WORKS — together they cover what
+    //! a live-socket integration test would have claimed to prove, without that test's vacuous-pass
+    //! risk (see this crate's `tests/federation_timeouts.rs` module doc comment, case (d), for why
+    //! a live-socket version of this specific assertion cannot reliably distinguish "wrapped" from
+    //! "not wrapped" at all: a single envelope-sized `write_all` essentially never blocks at the
+    //! syscall level on ordinary Linux TCP defaults, regardless of peer behavior).
+    use super::*;
+
+    #[tokio::test]
+    async fn with_request_deadline_bounds_a_future_that_never_resolves() {
+        let timeout = Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        // `std::future::pending` never completes, on its own, under any circumstances — the same
+        // shape as a `send_frame`/`recv_frame` call against a peer that never reads or replies.
+        let never_resolves = std::future::pending::<Result<(), LinkError>>();
+        let result = with_request_deadline(timeout, "org-b.test", never_resolves).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "with_request_deadline must not itself hang waiting on a future that never resolves"
+        );
+        match result {
+            Err(RouteForeignError::Dial {
+                domain,
+                source: LinkError::Timeout { phase, duration },
+            }) => {
+                assert_eq!(domain, "org-b.test");
+                assert_eq!(phase, "request");
+                assert_eq!(duration, timeout);
+            }
+            other => panic!(
+                "expected RouteForeignError::Dial{{source: LinkError::Timeout{{..}}, ..}} once \
+                 the deadline elapsed, got {other:?}"
+            ),
+        }
+    }
 }

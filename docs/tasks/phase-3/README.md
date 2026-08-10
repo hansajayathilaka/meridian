@@ -46,18 +46,18 @@ alternate with build phases, so Phase 3 is unblocked by definition.
 **Wave 1 — the blocking gate** (must land before the next build phase; 3.2 before 3.3 to serialise
 the two `link.rs` edits and let 3.3 reuse 3.2's `with_deadline` helper)
 - [x] **3.1** Enforce federation policy on the outbound dial path (F1, blocking) — [file](./3.1-outbound-federation-policy.md)
-- [ ] **3.2** Un-wedge the inbound s2s listener: concurrent, time-bounded accept (F2+N5, blocking) — [file](./3.2-inbound-accept-loop-hardening.md)
-- [ ] **3.3** Bound every outbound s2s I/O exchange (F3, blocking) — [file](./3.3-outbound-s2s-timeouts.md)
+- [x] **3.2** Un-wedge the inbound s2s listener: concurrent, time-bounded accept (F2+N5, blocking) — [file](./3.2-inbound-accept-loop-hardening.md)
+- [x] **3.3** Bound every outbound s2s I/O exchange (F3, blocking) — [file](./3.3-outbound-s2s-timeouts.md)
 
 **Wave 2 — test harness** (deliberately after the gate so the blockers aren't held hostage to an
 11-file refactor; deliberately before everything else so no 12th `make_ca` copy appears)
-- [ ] **3.4** Extract the shared s2s test harness (PKI + server boot) (F18) — [file](./3.4-federation-test-support-harness.md)
+- [x] **3.4** Extract the shared s2s test harness (PKI + server boot) (F18) — [file](./3.4-federation-test-support-harness.md)
 
 **Wave 3 — federation server** (dependency-ordered: they edit the same two functions)
-- [ ] **3.5** Stop the reachability pre-check double-spending route budgets (F4) — [file](./3.5-fed-ratelimit-double-spend.md)
-- [ ] **3.6** Accept-side peer identity must consider all authenticated SANs (F9) — [file](./3.6-multi-san-peer-identity.md)
-- [ ] **3.7** Reuse TLS config + one link per federated message, SRV failover (F10+N2) — [file](./3.7-federation-link-reuse.md)
-- [ ] **3.8** Count federated deliveries in `envelopes_routed_total` (F8+N4) — [file](./3.8-fed-delivery-metrics.md)
+- [x] **3.5** Stop the reachability pre-check double-spending route budgets (F4) — [file](./3.5-fed-ratelimit-double-spend.md)
+- [x] **3.6** Accept-side peer identity must consider all authenticated SANs (F9) — [file](./3.6-multi-san-peer-identity.md)
+- [x] **3.7** Reuse TLS config + one link per federated message, SRV failover (F10+N2) — [file](./3.7-federation-link-reuse.md)
+- [x] **3.8** Count federated deliveries in `envelopes_routed_total` (F8+N4) — [file](./3.8-fed-delivery-metrics.md)
 - [ ] **3.9** Resolve the dead per-partner `policy` field in `federation_map.toml` (F7) — [file](./3.9-federation-map-policy-field.md)
 
 **Wave 4 — parallel track** (core client + CI; no federation-server contention, can run alongside wave 3)

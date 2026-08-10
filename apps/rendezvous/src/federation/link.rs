@@ -13,6 +13,13 @@
 //!   never additionally the system store — the whole air-gap trust model depends on this being an
 //!   *exclusive* root, not an additive one (ADR 0017 C4).
 //!
+//! **Task 3.7:** [`dial`] itself no longer builds the client config from `FederationTlsPaths` on
+//! every call — it takes a pre-built `Arc<ClientConfig>` from its caller, who builds it once via
+//! [`build_client_tls_config`] and reuses the same `Arc` across every dial (see
+//! `state::FederationRuntime::client_tls`'s doc comment). [`build_server_tls_config`] is still
+//! built from `FederationTlsPaths` too, but that already only ever happened once, at
+//! [`FederationListener::bind`] time — the listener side was never rebuilding it per-connection.
+//!
 //! [`dial`] additionally takes `expected_domain`: the domain THIS side intended to reach, per ADR
 //! 0017 (a) — never the literal address/hostname it happened to dial (that's a job for discovery,
 //! [2.5](../../../../docs/tasks/phase-2/2.5-federation-discovery.md), out of scope here). rustls's
@@ -27,13 +34,16 @@
 //! whose client cert chains to the configured trust root is accepted at the TLS layer; *which*
 //! peers are actually allowed to federate at all is a policy decision
 //! ([2.6](../../../../docs/tasks/phase-2/2.6-federation-policy-limits.md), out of scope here). What
-//! this task's listener does is learn and report the peer's authenticated origin domain (SAN/CN of
-//! the validated client cert) so that later policy can act on it.
+//! this task's listener does is learn and report the peer's authenticated origin domain(s) (every
+//! SAN/CN entry on the validated client cert — task 3.6, review finding F9: not just the first)
+//! so that later policy can act on the whole set.
 
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use meridian_proto::{FedFrame, FedHello, FedOp, FED_VERSION};
 use rustls::pki_types::pem::PemObject;
@@ -51,6 +61,35 @@ use crate::metrics::Metrics;
 /// force an unbounded allocation merely by sending a large length prefix ahead of a short or absent
 /// body. Generous relative to any `FedHello`/`FedRoute`-sized body.
 pub const MAX_FRAME_LEN: usize = 1 << 20; // 1 MiB
+
+/// A deadline (`tokio::time::timeout`) elapsed before `fut` completed. Kept as its own tiny error
+/// type — not folded into [`LinkError`] — because [`with_deadline`] is generic over ANY future, not
+/// just link-establishment ones: task 3.3 (outbound s2s dial timeouts) wraps
+/// [`dial`]/connect-and-write futures in the exact same helper, and a caller composing `with_deadline`
+/// around some other future entirely (not a `Result<_, LinkError>`) still gets a meaningful error.
+#[derive(Debug, thiserror::Error)]
+#[error("operation did not complete within {0:?}")]
+pub struct DeadlineExceeded(pub Duration);
+
+/// Run `fut` to completion, or fail with [`DeadlineExceeded`] once `duration` elapses — a thin,
+/// consistently-typed wrapper around `tokio::time::timeout`.
+///
+/// Shared by both directions of s2s federation:
+/// - inbound (this task, 3.2): [`FederationListener`]'s accept loop wraps
+///   [`FederationListener::finish_handshake`] in `with_deadline(handshake_timeout, ...)` so one
+///   silent/slow peer's mTLS+`FedHello` handshake cannot wedge the whole listener (the raw
+///   `tcp.accept()` itself — [`FederationListener::accept_raw`] — stays outside any deadline: it is
+///   already bounded by the OS accept queue and must never be blocked on a peer's behavior at all).
+/// - outbound (task 3.3, not this task): the dial-out path reuses this same helper rather than
+///   hand-rolling its own `tokio::time::timeout` call with a different error shape.
+pub async fn with_deadline<F, T>(duration: Duration, fut: F) -> Result<T, DeadlineExceeded>
+where
+    F: Future<Output = T>,
+{
+    tokio::time::timeout(duration, fut)
+        .await
+        .map_err(|_elapsed| DeadlineExceeded(duration))
+}
 
 /// Errors establishing or operating an s2s federation link.
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +115,74 @@ pub enum LinkError {
     Handshake(String),
     #[error("frame of {0} bytes exceeds the {MAX_FRAME_LEN}-byte limit")]
     FrameTooLarge(usize),
+    /// (task 3.3, review finding F3) One step of the OUTBOUND dial/exchange path — `phase` is a
+    /// static, non-identifying label (`"connect"` | `"tls"` | `"hello"` | `"request"`), never
+    /// anything derived from the peer's address/domain, mirroring `inbound.rs`'s `DropRateLimiter`
+    /// convention of static reason strings only — did not complete within `duration`. Kept as a
+    /// single variant covering every phase (rather than one variant per phase) because every
+    /// caller (`ws.rs`'s `federated_fetch_error_reply`/`federated_route_error_reply`) already
+    /// treats every other `Dial{source: LinkError, ..}` outcome identically (`FED_UNREACHABLE`) —
+    /// a genuinely different variant per phase would add no client-visible distinction, only more
+    /// match arms to keep in sync.
+    #[error("dial timed out during {phase} after {duration:?}")]
+    Timeout {
+        phase: &'static str,
+        duration: Duration,
+    },
+}
+
+/// Outbound dial timeout budget (task 3.3, review finding F3): bounds how long [`dial`] — and,
+/// reused by [`crate::federation::outbound`], each individual s2s request/reply exchange over an
+/// already-established link (`fetch_foreign_bundle`, `reachable_foreign`) — will wait at each
+/// step before giving up, so a black-holed partner (one that accepts a TCP connection but never
+/// completes TLS, or completes the handshake but never answers) cannot hang the originating
+/// client's WebSocket session or leak a pinned task plus TLS link forever.
+///
+/// The concrete default values (`config::Federation::connect_timeout_ms`/`request_timeout_ms`)
+/// are `TODO: confirm` there, not here — this type only carries whatever the caller resolved.
+#[derive(Clone, Copy, Debug)]
+pub struct FederationTimeouts {
+    /// Bounds the raw `TcpStream::connect` step only — before any TLS byte is exchanged.
+    pub connect: Duration,
+    /// Bounds EACH of `dial`'s TLS-handshake and `FedHello`-exchange steps (two separate
+    /// deadlines, not one shared budget spanning both), and each individual outbound s2s
+    /// request/reply exchange over an already-established link. One shared knob across all of
+    /// these post-connect steps, mirroring `Federation::handshake_timeout_ms`'s single knob for
+    /// the whole INBOUND mTLS+`FedHello` handshake, rather than a separate knob per step.
+    pub request: Duration,
+}
+
+impl Default for FederationTimeouts {
+    /// Mirrors `config::Federation::default`'s `connect_timeout_ms = 5_000` /
+    /// `request_timeout_ms = 10_000` — kept in sync manually since this type has no dependency on
+    /// `crate::config` (same split as `FederationTlsPaths`/`config::Federation`'s TLS-path
+    /// fields). Used by tests that don't care about this task's specific timeout values; `dial`'s
+    /// real callers always pass an explicit value resolved from config.
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_millis(5_000),
+            request: Duration::from_millis(10_000),
+        }
+    }
+}
+
+/// Await one phase of [`dial`]'s connect/TLS/hello sequence under `duration`, collapsing BOTH "the
+/// phase's own operation failed" and "the phase's deadline elapsed" into a single [`LinkError`] —
+/// callers need only one `?`, and a deadline expiry becomes [`LinkError::Timeout`] tagged with
+/// `phase` rather than a bare [`DeadlineExceeded`] that would need re-wrapping at every call site.
+async fn dial_phase<F, T, E>(
+    duration: Duration,
+    phase: &'static str,
+    fut: F,
+) -> Result<T, LinkError>
+where
+    F: Future<Output = Result<T, E>>,
+    LinkError: From<E>,
+{
+    match with_deadline(duration, fut).await {
+        Ok(inner) => inner.map_err(LinkError::from),
+        Err(DeadlineExceeded(duration)) => Err(LinkError::Timeout { phase, duration }),
+    }
 }
 
 /// PEM file paths for this rendezvous's own federation identity and trust root. Mirrors
@@ -301,13 +408,25 @@ async fn exchange_hello<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
 
 /// An established, mutually authenticated s2s link.
 ///
-/// `peer_domain` is the peer's **cryptographically authenticated** origin domain: for a dialed
-/// link this is the caller's own `expected_domain` (proven by the TLS handshake succeeding at
-/// all, per this module's doc comment); for an accepted link it is extracted from the validated
-/// client certificate's SAN/CN. It is NEVER the self-asserted `FedHello.domain` — see the
-/// `exchange_hello` helper's docs.
+/// `peer_domains` are the peer's **cryptographically authenticated** origin domain(s): for a
+/// dialed link this is a single-element vec holding the caller's own `expected_domain` (proven
+/// by the TLS handshake succeeding at all, per this module's doc comment); for an accepted link
+/// it is EVERY SAN `dNSName` (or CN-fallback) entry extracted from the validated client
+/// certificate — a real partner cert can authenticate more than one domain at once (e.g. a
+/// domain-migration/aliasing pattern), and the accept side has no prior "expected domain" to
+/// narrow that down to one (see [`FederationListener::finish_handshake`]'s doc comment). This is
+/// NEVER the self-asserted `FedHello.domain` — see the `exchange_hello` helper's docs.
+///
+/// **Task 3.6 (review finding F9):** this used to be a single `peer_domain: String`, populated
+/// on the accept side by `identities[0]` alone — the first SAN a peer's certificate happened to
+/// list. That both (a) false-rejected a partner whose allowlisted domain wasn't first in SAN
+/// order, and (b) could silently fragment rate-limit history across a cert renewal that
+/// reordered (without changing the values of) the same SAN set. Carrying the whole set here, plus
+/// [`Self::metering_key`]'s deterministic tie-break, fixes both without ever admitting a domain
+/// the certificate does not actually authenticate (authorization below still matches against the
+/// full validated set, never a self-asserted one).
 pub struct FederationLink {
-    pub peer_domain: String,
+    pub peer_domains: Vec<String>,
     stream: TlsStream<TcpStream>,
     metrics: Option<Arc<Metrics>>,
 }
@@ -321,6 +440,24 @@ impl FederationLink {
     /// Receive one [`FedFrame`] from this link.
     pub async fn recv_frame(&mut self) -> Result<FedFrame, LinkError> {
         read_frame(&mut self.stream).await
+    }
+
+    /// A single, deterministic domain string to key per-origin metering (rate-limit buckets) on —
+    /// never for authorization (see [`crate::federation::policy::FederationPolicy::admit_any`],
+    /// which matches against the whole [`Self::peer_domains`] set instead). The
+    /// lexicographically smallest entry: stable across a cert renewal that reorders `peer_domains`
+    /// without changing which domain VALUES are present, so the same underlying partner's
+    /// rate-limit history never fragments merely because a CA (or `rcgen`-style tool) happened to
+    /// re-order SANs on reissue. `peer_domains` is always non-empty by construction (both `dial`
+    /// and `finish_handshake` populate it before returning `Ok`; `peer_identities` itself errors
+    /// out — `LinkError::NoPeerIdentity` — on an empty SAN/CN set), so this never falls back to
+    /// its `unwrap_or_default` empty-string case in practice.
+    pub fn metering_key(&self) -> &str {
+        self.peer_domains
+            .iter()
+            .min()
+            .map(String::as_str)
+            .unwrap_or_default()
     }
 }
 
@@ -343,23 +480,44 @@ impl Drop for FederationLink {
 /// explicit parameter since discovery doesn't exist yet. `own_domain` is this server's own
 /// self-asserted `FedHello.domain` (diagnostic only). `metrics`, if given, is updated for the
 /// link's lifetime (see [`FederationLink`]'s `Drop` impl).
+///
+/// **Task 3.7 (review finding F10):** `client_tls` is a pre-built `Arc<ClientConfig>` — this
+/// function does **no** filesystem I/O and no cert/key/CA-bundle parsing of its own. It used to
+/// call [`build_client_tls_config`] internally on every single invocation, re-reading and
+/// re-parsing the same on-disk cert/key/CA-bundle material fresh for every outbound dial even
+/// though none of it changes between calls in a running server. `rustls::ClientConfig` is designed
+/// to be built once and reused across many connections (hence the `Arc`) — callers now build it
+/// once, at startup, and pass the same `Arc` to every `dial` call (see
+/// `state::FederationRuntime::client_tls`'s doc comment for the fail-closed timing tradeoff this
+/// creates).
+///
+/// **Task 3.3 (review finding F3, blocking):** every step that can block on a black-holed or
+/// merely slow partner — the raw `TcpStream::connect`, the TLS handshake, and the `FedHello`
+/// exchange — runs under [`dial_phase`]/[`with_deadline`], bounded by `timeouts.connect` (the
+/// first step) or `timeouts.request` (the latter two, each its own independent deadline). Without
+/// this, a partner that merely accepts a TCP connection and goes silent — never completing TLS —
+/// would hang this call, and the pinned task plus TLS-layer resources awaiting it, forever; a
+/// deadline that elapses at any of the three steps surfaces as [`LinkError::Timeout`], which
+/// `federation::outbound`'s callers already fold into the same client-visible `fed_unreachable`
+/// outcome as every other dial failure (see `outbound.rs`'s `Dial` error variant).
 pub async fn dial(
     addr: SocketAddr,
     expected_domain: &str,
-    paths: &FederationTlsPaths<'_>,
+    client_tls: Arc<ClientConfig>,
     own_domain: &str,
     metrics: Option<Arc<Metrics>>,
+    timeouts: FederationTimeouts,
 ) -> Result<FederationLink, LinkError> {
-    let tls_config = build_client_tls_config(paths)?;
-    let connector = TlsConnector::from(tls_config);
-    let tcp = TcpStream::connect(addr).await?;
+    let connector = TlsConnector::from(client_tls);
+    let tcp = dial_phase(timeouts.connect, "connect", TcpStream::connect(addr)).await?;
     let server_name = ServerName::try_from(expected_domain.to_string())
         .map_err(|e| LinkError::Cert(format!("invalid domain {expected_domain:?}: {e}")))?;
 
     // The handshake itself is the primary enforcement of the domain pin: rustls's hostname
     // verification rejects a cert that chains to the trust root but whose SAN doesn't cover
     // `server_name` before `connect` ever returns Ok.
-    let tls_stream = connector.connect(server_name, tcp).await?;
+    let tls_stream =
+        dial_phase(timeouts.request, "tls", connector.connect(server_name, tcp)).await?;
 
     // Belt-and-suspenders re-check (see module docs): re-extract the peer's SAN/CN and re-assert
     // it covers `expected_domain` explicitly, rather than relying solely on the above having
@@ -383,13 +541,18 @@ pub async fn dial(
     }
 
     let mut stream: TlsStream<TcpStream> = tls_stream.into();
-    let _peer_asserted_domain = exchange_hello(&mut stream, own_domain).await?;
+    let _peer_asserted_domain = dial_phase(
+        timeouts.request,
+        "hello",
+        exchange_hello(&mut stream, own_domain),
+    )
+    .await?;
 
     if let Some(m) = &metrics {
         m.federation_link_up();
     }
     Ok(FederationLink {
-        peer_domain: expected_domain.to_string(),
+        peer_domains: vec![expected_domain.to_string()],
         stream,
         metrics,
     })
@@ -429,13 +592,33 @@ impl FederationListener {
         self.tcp.local_addr()
     }
 
-    /// Accept and fully establish one inbound federation link: TCP accept, mTLS handshake (client
-    /// certificate mandatory), origin-domain extraction from the validated client certificate's
-    /// SAN/CN, and the `FedHello` exchange.
-    pub async fn accept(&self) -> Result<(FederationLink, SocketAddr), LinkError> {
-        let (tcp, peer_addr) = self.tcp.accept().await?;
-        // A missing (or otherwise invalid) client certificate is rejected here: `accept` errors
-        // before returning a stream, because `build_server_tls_config` always installs a
+    /// Accept one raw TCP connection — nothing more. Deliberately the *only* work `run_federation`'s
+    /// accept loop (task 3.2) does inline: cheap, and bounded by the OS accept queue rather than by
+    /// anything a peer does after connecting. Everything that CAN block on a hostile/slow peer (the
+    /// mTLS handshake, the `FedHello` exchange) lives in [`Self::finish_handshake`] instead, which
+    /// callers spawn as their own task, typically under [`with_deadline`].
+    pub async fn accept_raw(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        self.tcp.accept().await
+    }
+
+    /// Finish establishing one inbound federation link from an already-`accept_raw`'d TCP stream:
+    /// mTLS handshake (client certificate mandatory), origin-domain extraction from the validated
+    /// client certificate's SAN/CN, and the `FedHello` exchange.
+    ///
+    /// Split out of [`Self::accept`] (task 3.2, F2/N5): this is the part of accepting a connection
+    /// that a hostile or merely slow peer can stall indefinitely (an mTLS handshake that never
+    /// sends a `ClientHello`, a `FedHello` whose length prefix never arrives), so callers that care
+    /// about one such peer never blocking every other inbound connection — i.e. `run_federation` —
+    /// spawn this per-connection and wrap it in [`with_deadline`], rather than `await`ing it inline
+    /// in the accept loop the way [`Self::accept`] still does for callers (tests, mostly) that don't
+    /// need that.
+    pub async fn finish_handshake(
+        &self,
+        tcp: TcpStream,
+        peer_addr: SocketAddr,
+    ) -> Result<(FederationLink, SocketAddr), LinkError> {
+        // A missing (or otherwise invalid) client certificate is rejected here: this errors before
+        // returning a stream, because `build_server_tls_config` always installs a
         // `WebPkiClientVerifier` (never `with_no_client_auth`) — mTLS is mandatory, ADR 0017 C7.
         let tls_stream = self.acceptor.accept(tcp).await?;
 
@@ -446,10 +629,12 @@ impl FederationListener {
                 .cloned()
                 .ok_or(LinkError::NoPeerIdentity)?
         };
-        let identities = peer_identities(&peer_cert)?;
-        // No prior "expected domain" to pin against on the accept side (see module docs) — the
-        // first SAN/CN entry is what this side learns as the peer's authenticated origin domain.
-        let peer_domain = identities[0].clone();
+        // No prior "expected domain" to pin against on the accept side (see module docs) — every
+        // SAN/CN entry the validated cert asserts becomes this side's learned peer identity set
+        // (task 3.6, review finding F9: previously only `identities[0]`, which false-rejected a
+        // multi-SAN partner whose allowlisted domain wasn't first — see `FederationLink`'s doc
+        // comment).
+        let peer_domains = peer_identities(&peer_cert)?;
 
         let mut stream: TlsStream<TcpStream> = tls_stream.into();
         let _peer_asserted_domain = exchange_hello(&mut stream, &self.own_domain).await?;
@@ -459,11 +644,21 @@ impl FederationListener {
         }
         Ok((
             FederationLink {
-                peer_domain,
+                peer_domains,
                 stream,
                 metrics: self.metrics.clone(),
             },
             peer_addr,
         ))
+    }
+
+    /// Accept and fully establish one inbound federation link in one call: [`Self::accept_raw`]
+    /// followed immediately by [`Self::finish_handshake`], with no deadline and no concurrency cap.
+    /// Kept for callers (chiefly tests, e.g. `tests/federation_mtls.rs`) that just want one link
+    /// end to end; `run_federation`'s hardened accept loop (task 3.2) calls the two halves
+    /// separately instead, so it is never blocked awaiting one peer's handshake.
+    pub async fn accept(&self) -> Result<(FederationLink, SocketAddr), LinkError> {
+        let (tcp, peer_addr) = self.accept_raw().await?;
+        self.finish_handshake(tcp, peer_addr).await
     }
 }

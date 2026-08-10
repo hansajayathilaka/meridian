@@ -16,14 +16,19 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 3, Wave 1 (blocking gate) in progress.** **3.1** (outbound federation SSRF, F1)
-  is **done** ([file](./phase-3/3.1-outbound-federation-policy.md)) — security-reviewer, architect,
-  and code-reviewer all signed off; code-reviewer's should-fix (a `NotConfigured`-vs-`Denied`
-  ordering inconsistency between the fetch and route outbound paths when federation is simply
-  disabled) was fixed in the same task. Phases 0–2 are **done**.
-- **NEXT:** `/next-task` — **3.2** (one silent TCP connection wedges the inbound listener), then
-  **3.3** (no timeouts on outbound s2s I/O) — land 3.2 before 3.3, they share `link.rs` and 3.3
-  reuses 3.2's `with_deadline`.
+- **NOW:** **Phase 3 Wave 3 is done** (3.5–3.8; Waves 1–2 were already done). **3.1**–**3.8** all
+  landed ([3.1](./phase-3/3.1-outbound-federation-policy.md), [3.2](./phase-3/3.2-inbound-accept-loop-hardening.md),
+  [3.3](./phase-3/3.3-outbound-s2s-timeouts.md), [3.4](./phase-3/3.4-federation-test-support-harness.md),
+  [3.5](./phase-3/3.5-fed-ratelimit-double-spend.md), [3.6](./phase-3/3.6-multi-san-peer-identity.md),
+  [3.7](./phase-3/3.7-federation-link-reuse.md), [3.8](./phase-3/3.8-fed-delivery-metrics.md)). 3.5
+  (fed ratelimit double-spend, F4) took three review rounds — see its Outcome. 3.6/3.7/3.8 each
+  closed with only trivial/zero findings. Phases 0–2 are **done**.
+- **NEXT:** `/next-task` — **3.9** (dead per-partner `policy` field in `federation_map.toml`, F7)
+  is the next item in Wave 3, but per its own file needs an **architect decision** before
+  implementation (three materially different fixes on the table, no default named — see
+  [phase-3/README.md](./phase-3/README.md#adr-obligations)); this is a genuine pre-implementation
+  escalation, not a normal review gate. Wave 4 (3.10–3.14) is unblocked and can run in parallel /
+  before 3.9 is resolved if preferred.
 
 ### Live carry-forwards (not owned by any open task)
 Everything else is owned by a Phase-3 task; these are the exceptions that would otherwise evaporate:
@@ -155,17 +160,17 @@ phase.
 
 **Wave 1 — blocking gate** (3.2 before 3.3: same `link.rs`, and 3.3 reuses 3.2's `with_deadline`)
 - [x] **3.1** Enforce federation policy on the outbound dial path (F1) — [file](./phase-3/3.1-outbound-federation-policy.md)
-- [ ] **3.2** Un-wedge the inbound s2s listener: concurrent, time-bounded accept (F2+N5) — [file](./phase-3/3.2-inbound-accept-loop-hardening.md)
-- [ ] **3.3** Bound every outbound s2s I/O exchange (F3) — [file](./phase-3/3.3-outbound-s2s-timeouts.md)
+- [x] **3.2** Un-wedge the inbound s2s listener: concurrent, time-bounded accept (F2+N5) — [file](./phase-3/3.2-inbound-accept-loop-hardening.md)
+- [x] **3.3** Bound every outbound s2s I/O exchange (F3) — [file](./phase-3/3.3-outbound-s2s-timeouts.md)
 
 **Wave 2 — test harness** (after the gate, before every other test-adding task)
-- [ ] **3.4** Extract the shared s2s test harness (PKI + server boot) (F18) — [file](./phase-3/3.4-federation-test-support-harness.md)
+- [x] **3.4** Extract the shared s2s test harness (PKI + server boot) (F18) — [file](./phase-3/3.4-federation-test-support-harness.md)
 
 **Wave 3 — federation server**
-- [ ] **3.5** Stop the reachability pre-check double-spending route budgets (F4) — [file](./phase-3/3.5-fed-ratelimit-double-spend.md)
-- [ ] **3.6** Accept-side peer identity must consider all authenticated SANs (F9) — [file](./phase-3/3.6-multi-san-peer-identity.md)
-- [ ] **3.7** Reuse TLS config + one link per federated message, SRV failover (F10+N2) — [file](./phase-3/3.7-federation-link-reuse.md)
-- [ ] **3.8** Count federated deliveries in `envelopes_routed_total` (F8+N4) — [file](./phase-3/3.8-fed-delivery-metrics.md)
+- [x] **3.5** Stop the reachability pre-check double-spending route budgets (F4) — [file](./phase-3/3.5-fed-ratelimit-double-spend.md)
+- [x] **3.6** Accept-side peer identity must consider all authenticated SANs (F9) — [file](./phase-3/3.6-multi-san-peer-identity.md)
+- [x] **3.7** Reuse TLS config + one link per federated message, SRV failover (F10+N2) — [file](./phase-3/3.7-federation-link-reuse.md)
+- [x] **3.8** Count federated deliveries in `envelopes_routed_total` (F8+N4) — [file](./phase-3/3.8-fed-delivery-metrics.md)
 - [ ] **3.9** Resolve the dead per-partner `policy` field in `federation_map.toml` (F7) — [file](./phase-3/3.9-federation-map-policy-field.md)
 
 **Wave 4 — parallel track** (core client + CI; no federation-server contention)
