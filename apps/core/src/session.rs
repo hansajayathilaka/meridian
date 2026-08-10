@@ -433,6 +433,11 @@ pub struct P2pSession<T: Transport> {
     /// itself once the gate has actually fired (inserted a [`crate::chat::MessageRequest`]) — see
     /// `pump`'s `CHAT_LABEL` arm. Left `true` on any *other* error (e.g. a forged first frame) so a
     /// subsequent, genuine first frame is still gated rather than slipping through ungated.
+    ///
+    /// (task 3.11) Also read (never mutated) by [`Self::decide_open`] as half of the live
+    /// `PolicyCtx::first_contact` signal fed to every registered stream type's `on_open` hook — see
+    /// that function's doc for why this flag alone is insufficient once the first chat frame has
+    /// been processed, and `ChatState::pending_request` covers the rest.
     chat_first_contact_gate: bool,
 }
 
@@ -745,7 +750,7 @@ impl<T: Transport> P2pSession<T> {
             CtrlFrame::Open {
                 sid, ty, params, ..
             } => {
-                let decision = self.decide_open(sid, &ty, &params);
+                let decision = self.decide_open(sid, &ty, &params, chat);
                 match decision {
                     crate::streams::OpenDecision::Accept => {
                         self.send_ctrl(store, handle, chat, &CtrlFrame::Accept { sid })
@@ -787,17 +792,44 @@ impl<T: Transport> P2pSession<T> {
         }
     }
 
-    fn decide_open(&self, sid: u64, ty: &str, params: &[u8]) -> crate::streams::OpenDecision {
+    /// (task 3.11 / review finding F11) `first_contact` is derived from **live** peer state, not a
+    /// per-session snapshot, and — critically — is registry-agnostic: it answers "is this peer
+    /// currently an undecided first contact" the same way regardless of which stream type `ty`
+    /// names, so a hook a future stream type (file/media/…) writes for its own `on_open` sees the
+    /// real signal without this substrate ever special-casing that type. Two conditions, either of
+    /// which means "yes":
+    ///   * `self.chat_first_contact_gate` — still `true` before this session's first-ever
+    ///     `mrd.chat/1` content frame has even arrived (see that field's doc): a peer who opens some
+    ///     *other* stream type before ever sending a chat message is exactly as much a first contact
+    ///     as one who sends chat first.
+    ///   * `chat.pending_request(&self.peer_ik).is_some()` — a `MessageRequest` already exists for
+    ///     this peer and the local user has not yet accepted/rejected it. This is what
+    ///     `chat_first_contact_gate` alone *cannot* see: that flag is cleared the moment the first
+    ///     chat content frame is *processed* (`pump`'s `CHAT_LABEL` arm), independent of whether the
+    ///     resulting `MessageRequest` has actually been decided — so a peer who has sent one chat
+    ///     message, still awaiting accept/reject, and then opens a second (non-chat) stream must
+    ///     still read as a first contact. Reuses `ChatState::pending_request` (already public, task
+    ///     2.10/3.10) rather than duplicating `pending_requests` bookkeeping here.
+    fn decide_open(
+        &self,
+        sid: u64,
+        ty: &str,
+        params: &[u8],
+        chat: &ChatState,
+    ) -> crate::streams::OpenDecision {
         match self.registry.get(ty) {
-            Some(st) => st.on_open(
-                sid,
-                params,
-                &crate::streams::PolicyCtx {
-                    peer_ik: self.peer_ik,
-                    // T04 has no persisted contact list yet; T08 wires real first-contact state.
-                    first_contact: false,
-                },
-            ),
+            Some(st) => {
+                let first_contact =
+                    self.chat_first_contact_gate || chat.pending_request(&self.peer_ik).is_some();
+                st.on_open(
+                    sid,
+                    params,
+                    &crate::streams::PolicyCtx {
+                        peer_ik: self.peer_ik,
+                        first_contact,
+                    },
+                )
+            }
             None => crate::streams::OpenDecision::Reject {
                 code: "unsupported".to_string(),
                 reason: format!("unknown stream type {ty}"),
