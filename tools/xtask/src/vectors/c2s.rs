@@ -1,14 +1,14 @@
 //! Generate c2s conformance fixtures for the federation-hint extension (`test-vectors/c2s-v1.json`,
 //! review finding F20).
 //!
-//! `Fetch{hint}` / `RouteBody{to_hint}` (task 2.3/2.7/2.8) and the federation error codes added to
-//! [`meridian_proto::error_codes`] (task 2.9) were previously proven only by hand-written round-trip
-//! assertions in `apps/proto/tests/roundtrip.rs` — real, but Rust-only, so a WASM/mobile
-//! implementation had no committed byte-fixed target to reproduce. This module closes that gap the
-//! same way `federation.rs` already does for the s2s side: every vector's `frame_hex` is produced by
-//! the real `Frame::new`/`to_bytes` encode path (deterministic CBOR, fixed byte patterns, no
-//! RNG/wall-clock), and `apps/proto/tests/conformance.rs` independently reconstructs each vector
-//! from its committed hex fields and re-derives `frame_hex` to close the loop.
+//! `Fetch{hint}` / `RouteBody{to_hint}` (task 2.3/2.7/2.8) had hand-written round-trip assertions in
+//! `apps/proto/tests/roundtrip.rs` — real, but Rust-only, so a WASM/mobile implementation had no
+//! committed byte-fixed target to reproduce. The federation error codes added to
+//! [`meridian_proto::error_codes`] (task 2.9) had no wire-encoding test at all, Rust or otherwise.
+//! This module closes both gaps the same way `federation.rs` already does for the s2s side: every
+//! vector's `frame_hex` is produced by the real `Frame::new`/`to_bytes` encode path (deterministic
+//! CBOR, fixed byte patterns, no RNG/wall-clock), and `apps/proto/tests/conformance.rs` independently
+//! reconstructs each vector from its committed hex fields and re-derives `frame_hex` to close the loop.
 //!
 //! Scope (task 3.14): the hint fields and the *new* federation error codes only — not the whole
 //! historic c2s frame set, which `roundtrip.rs` already covers and which is a pre-existing gap this
