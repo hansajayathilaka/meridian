@@ -16,23 +16,26 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 3 Wave 3 is (all but 3.9) done and Wave 4 is fully done.** **3.1**–**3.8** and
-  **3.10**–**3.14** all landed ([3.1](./phase-3/3.1-outbound-federation-policy.md),
-  [3.2](./phase-3/3.2-inbound-accept-loop-hardening.md), [3.3](./phase-3/3.3-outbound-s2s-timeouts.md),
-  [3.4](./phase-3/3.4-federation-test-support-harness.md), [3.5](./phase-3/3.5-fed-ratelimit-double-spend.md),
-  [3.6](./phase-3/3.6-multi-san-peer-identity.md), [3.7](./phase-3/3.7-federation-link-reuse.md),
-  [3.8](./phase-3/3.8-fed-delivery-metrics.md), [3.10](./phase-3/3.10-message-request-flood-bound.md),
-  [3.11](./phase-3/3.11-first-contact-ctrl-gate.md), [3.12](./phase-3/3.12-ci-docker-build-gate.md),
-  [3.13](./phase-3/3.13-wss-crypto-provider-test.md), [3.14](./phase-3/3.14-c2s-hint-conformance-vectors.md)).
-  3.5 (fed ratelimit double-spend, F4) took three review rounds — see its Outcome. 3.6/3.7/3.8/3.11
-  each closed with only trivial/zero findings; 3.13 and 3.14's combined reviews each independently
-  reproduced their own mutation-checks (disabling the fix / corrupting a fixture byte) rather than
-  taking the implementer's account on trust, both zero blocking findings. Phases 0–2 are **done**.
-- **NEXT:** `/next-task` — **3.9** (dead per-partner `policy` field in `federation_map.toml`, F7) is
-  the last item in Wave 3 and the only thing before Wave 5, but per its own file needs an **architect
-  decision** before implementation (three materially different fixes on the table, no default named —
-  see [phase-3/README.md](./phase-3/README.md#adr-obligations)); this is a genuine pre-implementation
-  escalation, not a normal review gate.
+- **NOW:** **Waves 1–6 of Phase 3 are done; only 3.9 (Wave 3) and the newly-filed 3.23 (Wave 7)
+  remain open.** This run landed **3.15**–**3.22** back-to-back
+  ([3.15](./phase-3/3.15-federation-protocol-doc-sync.md),
+  [3.16](./phase-3/3.16-private-ca-srv-hazard.md), [3.17](./phase-3/3.17-dokploy-federation-surface.md),
+  [3.18](./phase-3/3.18-coturn-realm-placeholder.md),
+  [3.19](./phase-3/3.19-adr-image-distribution-signing.md) (new [ADR 0019](../adr/0019-container-image-distribution.md)),
+  [3.20](./phase-3/3.20-route-reply-grace-residual.md) (measured + tightened `ROUTE_REPLY_GRACE`
+  500ms→300ms, no ADR needed), [3.21](./phase-3/3.21-phase-3-nit-sweep.md),
+  [3.22](./phase-3/3.22-s2s-framing-adversarial.md)) — all with clean review sign-offs (mostly
+  zero-to-trivial findings, a couple of cheap non-blocking fixes applied inline). **3.22's coverage
+  work found a real, unfixed defect** (`serve_link`'s main loop has no idle-read deadline — a
+  handshaked peer can stall forever and hold a `max_links` slot; in default WebPKI mode this is
+  exploitable by any public-CA cert-holder, not gated by federation policy at all), correctly
+  reported rather than fixed in-task per its Scope, and carried forward as **3.23**. Phases 0–2 are
+  **done**.
+- **NEXT:** `/next-task` — two independent items remain, neither blocking the other: **3.9** (dead
+  per-partner `policy` field in `federation_map.toml`, F7) still needs an **architect decision**
+  first (three materially different fixes on the table, no default named — see
+  [phase-3/README.md](./phase-3/README.md#adr-obligations)), and **3.23** (bound `serve_link`'s
+  idle read, found during 3.22) is a normal, unblocked fix-task ready to implement.
 
 ### Live carry-forwards (not owned by any open task)
 Everything else is owned by a Phase-3 task; these are the exceptions that would otherwise evaporate:
@@ -199,7 +202,11 @@ phase.
 **Wave 6 — last**
 - [x] **3.20** Resolve the `ROUTE_REPLY_GRACE` false-positive-success residual (may yield ADR 0020) — [file](./phase-3/3.20-route-reply-grace-residual.md)
 - [x] **3.21** Nit sweep (N1, N3) — [file](./phase-3/3.21-phase-3-nit-sweep.md)
-- [ ] **3.22** s2s framing adversarial suite (**optional — first to cut**) — [file](./phase-3/3.22-s2s-framing-adversarial.md)
+- [x] **3.22** s2s framing adversarial suite (**optional — first to cut**) — [file](./phase-3/3.22-s2s-framing-adversarial.md)
+
+**Wave 7 — found during 3.22, not part of the original report**
+- [ ] **3.23** Bound `serve_link`'s idle read (no idle-read deadline; in WebPKI mode exploitable by
+  any public-CA cert-holder, not gated by federation policy) — [file](./phase-3/3.23-serve-link-idle-read-deadline.md)
 
 ---
 

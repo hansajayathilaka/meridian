@@ -31,16 +31,42 @@
 //!   `serve_link` ever runs. Same mutation-proof shape as (c): prove the drop by its promptness
 //!   (an immediate EOF/IO error from the client's own `recv_frame`), not merely "some later
 //!   connection eventually got through".
+//!
+//! ## Task 3.22 (optional, coverage-only): `serve_link`'s adversarial framing arms
+//! Four more cells, below the (a)–(d) set above, exercise `inbound::serve_link`'s `bad_request`
+//! reply arms (never reached by any test before this task) plus the length-prefix framing this
+//! task's own `link::read_frame` enforces. These drive genuinely malformed bytes at an already
+//! ESTABLISHED link — after `finish_handshake` succeeds and `serve_link` is sitting in its main
+//! `recv_frame` loop — which `FederationLink::send_frame` cannot itself produce (it only ever
+//! emits well-formed frames), so each cell hand-rolls the wire format on a raw `TlsStream` instead
+//! (see the `raw_write_frame`/`raw_read_frame`/`establish_raw_link` helpers below):
+//! - malformed CBOR body (a syntactically valid `FedFrame{op: FetchBundle, ...}` whose nested body
+//!   is not valid CBOR for `FedFetchBundle`) → `FedErr{bad_request}`, link survives.
+//! - unknown `FedOp` mid-stream (a syntactically valid `FedOp::Hello` frame sent after the
+//!   handshake's own `Hello` exchange already completed) → `FedErr{bad_request}`, link survives.
+//! - truncated / oversized length prefix → no reply frame (the framing layer itself, `link::
+//!   read_frame`, errors before a `FedFrame` is ever decoded) — the link closes instead, and the
+//!   server as a whole is proven not to be wedged by a subsequent legitimate dial.
+//! - slow-loris **after** the link is established (distinct from case (b) above, which is about
+//!   the handshake, bounded by `handshake_timeout_ms`): see that test's own doc comment for the
+//!   residual it surfaces — `serve_link`'s `recv_frame` has no idle/read deadline of its own.
 
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use meridian_proto::{
+    fed_error_codes, FedErr, FedFrame, FedHello, FedOp, FedReachability, FED_VERSION,
+};
 use meridian_rendezvous::config::{Config, DiscoveryMode, Federation, FederationPolicyMode};
+use meridian_rendezvous::federation::link::{build_client_tls_config, MAX_FRAME_LEN};
 use meridian_rendezvous::federation::{dial, FederationTimeouts};
 use meridian_rendezvous::{AppState, MemoryStore};
+use rustls::pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 
 mod support;
 use support::{spawn_federation, write, Identity, TestCa};
@@ -108,6 +134,79 @@ async fn spawn_hardened_listener(config: Config) -> SocketAddr {
     let store = Arc::new(MemoryStore::new());
     let state = AppState::new(config, store);
     spawn_federation(state).await
+}
+
+// -- 3.22: raw framing adversarial helpers ---------------------------------------------------
+//
+// `FederationLink::send_frame`/`recv_frame` can only ever produce/consume a WELL-FORMED frame —
+// several of the shapes below need bytes that API cannot itself express (a bad length prefix, a
+// syntactically-valid-outer-frame-but-garbage-body). These three helpers hand-roll exactly the
+// wire format `link.rs`'s (private) `write_frame`/`read_frame`/`exchange_hello` implement, on a
+// raw stream the test controls directly, so each cell can inject exactly the malformed bytes it
+// needs to.
+
+/// Write one length-delimited `FedFrame`: `uint32-le(len(cbor(FedFrame))) || cbor(FedFrame)`
+/// (docs/api/federation-protocol-v1.md §1) — mirrors `link::write_frame`.
+async fn raw_write_frame<S: AsyncWrite + Unpin>(stream: &mut S, frame: &FedFrame) {
+    let bytes = frame.to_bytes().expect("frame encodes");
+    stream
+        .write_all(&(bytes.len() as u32).to_le_bytes())
+        .await
+        .expect("write length prefix");
+    stream.write_all(&bytes).await.expect("write frame body");
+    stream.flush().await.expect("flush");
+}
+
+/// Read one length-delimited `FedFrame` — mirrors `link::read_frame` (private to `link.rs`, so
+/// tests that need raw-stream access can't call it directly).
+async fn raw_read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<FedFrame> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).await?;
+    FedFrame::from_bytes(&buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+}
+
+/// Complete a real mTLS handshake AND the `FedHello` exchange by hand — `federation::dial` also
+/// does this, but hands back an opaque `FederationLink` with no raw-stream access, which is
+/// exactly what the shapes below need. Returns the raw, fully-established `TlsStream`: at this
+/// point B's `serve_link` (inbound.rs) is sitting in its main `recv_frame` loop, waiting for the
+/// very next frame — precisely where each shape below wants to inject its malformed bytes.
+async fn establish_raw_link(
+    dir: &Path,
+    ca: &TestCa,
+    addr: SocketAddr,
+    a_domain: &str,
+    b_domain: &str,
+) -> tokio_rustls::client::TlsStream<TcpStream> {
+    let a = ca.issue(dir, a_domain);
+    let client_tls = build_client_tls_config(&a.paths()).expect("build client tls config");
+    let connector = TlsConnector::from(client_tls);
+    let tcp = TcpStream::connect(addr).await.expect("tcp connect");
+    let server_name = ServerName::try_from(b_domain.to_string()).expect("valid domain");
+    let mut stream = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("mTLS handshake completes (both sides present valid certs)");
+
+    let hello = FedHello {
+        v: FED_VERSION,
+        domain: a_domain.to_string(),
+    };
+    let out = FedFrame::new(FedOp::Hello, 0, &hello).expect("encode FedHello");
+    raw_write_frame(&mut stream, &out).await;
+    let in_frame = raw_read_frame(&mut stream)
+        .await
+        .expect("read B's FedHello");
+    assert_eq!(
+        in_frame.op,
+        FedOp::Hello,
+        "expected B's own FedHello reply to complete the handshake"
+    );
+
+    stream
 }
 
 // -- (a) a silent connection must not wedge the accept loop ---------------------------------
@@ -411,4 +510,369 @@ async fn exhausting_max_links_drops_the_next_link_promptly_after_a_successful_ha
     // The in-cap links stay open (and thus keep occupying their permits) for the whole test — drop
     // them explicitly at the end so the intent is clear.
     drop(links);
+}
+
+// -- 3.22 (e) malformed CBOR body: bad_request, link survives -------------------------------
+
+/// Mutation-check (test-engineer, task 3.22): temporarily replacing `inbound.rs`'s
+/// `FedOp::FetchBundle` decode-error arm's body with a bare `continue;` (dropping the malformed
+/// frame silently instead of replying `bad_request`) makes this test fail — the `raw_read_frame`
+/// below then times out waiting for a reply that never arrives. Restored after confirming that.
+#[tokio::test]
+async fn malformed_fetch_bundle_body_gets_bad_request_and_the_link_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = TestCa::named("Meridian Test Federation CA (3.22 malformed-body)");
+    let (b_federation, _b_id) = federation_config(dir.path(), &ca, "b.federation.test", 5_000, 8);
+    let addr = spawn_hardened_listener(base_config("b.federation.test", b_federation)).await;
+
+    let mut stream = establish_raw_link(
+        dir.path(),
+        &ca,
+        addr,
+        "a.federation.test",
+        "b.federation.test",
+    )
+    .await;
+
+    // A syntactically valid outer `FedFrame{op: FetchBundle, id: 7, ...}` whose nested `body` is
+    // NOT valid CBOR for `FedFetchBundle` at all — `FedFrame::new` (used by every legitimate
+    // caller, including `FederationLink::send_frame`) can only ever encode a real body, so this
+    // has to be built by hand.
+    let bad = FedFrame {
+        op: FedOp::FetchBundle,
+        id: 7,
+        body: vec![0xff, 0xff, 0xff, 0xff],
+    };
+    raw_write_frame(&mut stream, &bad).await;
+
+    let reply = tokio::time::timeout(Duration::from_secs(5), raw_read_frame(&mut stream))
+        .await
+        .expect("a bad_request reply arrives promptly, not a hang")
+        .expect("reading the reply frame succeeds");
+    assert_eq!(reply.op, FedOp::Err, "expected a FedErr reply");
+    assert_eq!(
+        reply.id, 7,
+        "the reply must echo the malformed request's id"
+    );
+    let err: FedErr = reply.decode().expect("FedErr body decodes");
+    assert_eq!(err.code, fed_error_codes::BAD_REQUEST);
+    assert!(
+        err.msg.contains("fed_fetch_bundle"),
+        "expected the fetch_bundle-specific malformed-body message, got {:?}",
+        err.msg
+    );
+
+    // The link survives: a subsequent LEGITIMATE request on the SAME connection still gets
+    // served normally — the malformed frame above did not kill or otherwise wedge `serve_link`'s
+    // loop, only the one bad request within it.
+    let ok = FedFrame::new(
+        FedOp::Reachability,
+        8,
+        &FedReachability {
+            target: [0x11u8; 32],
+        },
+    )
+    .unwrap();
+    raw_write_frame(&mut stream, &ok).await;
+    let reply2 = tokio::time::timeout(Duration::from_secs(5), raw_read_frame(&mut stream))
+        .await
+        .expect("a second, legitimate reply arrives promptly")
+        .expect("reading the second reply frame succeeds");
+    assert_eq!(
+        reply2.op,
+        FedOp::Reachable,
+        "expected the link to keep serving"
+    );
+    assert_eq!(reply2.id, 8);
+}
+
+// -- 3.22 (f) unknown FedOp mid-stream: bad_request, link survives ---------------------------
+
+/// Mutation-check (test-engineer, task 3.22): temporarily replacing `inbound.rs`'s final
+/// `_ => { ... }` catch-all arm's body with `_ => {}` (silently drop the unknown-op frame instead
+/// of replying `bad_request`) makes this test fail the same way as the malformed-body test above.
+/// Restored after confirming that.
+#[tokio::test]
+async fn unknown_op_mid_stream_gets_bad_request_and_the_link_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = TestCa::named("Meridian Test Federation CA (3.22 unknown-op)");
+    let (b_federation, _b_id) = federation_config(dir.path(), &ca, "b.federation.test", 5_000, 8);
+    let addr = spawn_hardened_listener(base_config("b.federation.test", b_federation)).await;
+
+    let mut stream = establish_raw_link(
+        dir.path(),
+        &ca,
+        addr,
+        "a.federation.test",
+        "b.federation.test",
+    )
+    .await;
+
+    // A syntactically valid frame naming an op `serve_link`'s `match` doesn't dispatch on: a
+    // second, mid-stream `FedOp::Hello` — `Hello` is only ever handled once, inline, during
+    // `finish_handshake`'s own `exchange_hello`; `serve_link`'s loop has never seen it before and
+    // has no arm for it (falls into the final `_ =>` catch-all, per that arm's own doc comment).
+    let stray_hello = FedFrame::new(
+        FedOp::Hello,
+        3,
+        &FedHello {
+            v: FED_VERSION,
+            domain: "a.federation.test".to_string(),
+        },
+    )
+    .unwrap();
+    raw_write_frame(&mut stream, &stray_hello).await;
+
+    let reply = tokio::time::timeout(Duration::from_secs(5), raw_read_frame(&mut stream))
+        .await
+        .expect("a bad_request reply arrives promptly, not a hang")
+        .expect("reading the reply frame succeeds");
+    assert_eq!(reply.op, FedOp::Err, "expected a FedErr reply");
+    assert_eq!(
+        reply.id, 3,
+        "the reply must echo the unknown-op request's id"
+    );
+    let err: FedErr = reply.decode().expect("FedErr body decodes");
+    assert_eq!(err.code, fed_error_codes::BAD_REQUEST);
+    assert!(
+        err.msg.contains("not supported"),
+        "expected the unknown-op message, got {:?}",
+        err.msg
+    );
+
+    // The link survives: a subsequent LEGITIMATE request on the SAME connection still gets served.
+    let ok = FedFrame::new(
+        FedOp::Reachability,
+        4,
+        &FedReachability {
+            target: [0x22u8; 32],
+        },
+    )
+    .unwrap();
+    raw_write_frame(&mut stream, &ok).await;
+    let reply2 = tokio::time::timeout(Duration::from_secs(5), raw_read_frame(&mut stream))
+        .await
+        .expect("a second, legitimate reply arrives promptly")
+        .expect("reading the second reply frame succeeds");
+    assert_eq!(
+        reply2.op,
+        FedOp::Reachable,
+        "expected the link to keep serving"
+    );
+    assert_eq!(reply2.id, 4);
+}
+
+// -- 3.22 (g) truncated / oversized length prefix: no reply, link closes, server unwedged ----
+
+/// Mutation-check (test-engineer, task 3.22): temporarily removing `link.rs::read_frame`'s
+/// `if len > MAX_FRAME_LEN { return Err(...) }` guard (so an oversized declared length is no
+/// longer rejected before the receive buffer is allocated) makes the oversized half of this test
+/// fail — with nothing enforcing the cap, B just blocks in `read_exact` waiting for the
+/// (never-sent) rest of the declared body, so the connection is never closed within this test's
+/// bounded window. Restored after confirming that.
+///
+/// The truncated (EOF) half below has no equivalent single guard to neuter — it exercises
+/// `read_exact`'s own built-in short-read-then-EOF propagation, not an explicit `if`, so it is not
+/// separately mutation-checked (noted here rather than silently skipped).
+#[tokio::test]
+async fn truncated_and_oversized_length_prefixes_close_the_link_without_wedging_the_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = TestCa::named("Meridian Test Federation CA (3.22 length-prefix)");
+    let (b_federation, _b_id) = federation_config(dir.path(), &ca, "b.federation.test", 5_000, 8);
+    let addr = spawn_hardened_listener(base_config("b.federation.test", b_federation)).await;
+
+    // -- oversized: the declared length alone exceeds MAX_FRAME_LEN; no body ever follows -------
+    {
+        let mut stream = establish_raw_link(
+            dir.path(),
+            &ca,
+            addr,
+            "a1.federation.test",
+            "b.federation.test",
+        )
+        .await;
+        let oversized_len: u32 = (MAX_FRAME_LEN as u32) + 1;
+        stream
+            .write_all(&oversized_len.to_le_bytes())
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+
+        // `link::read_frame` rejects the length prefix BEFORE allocating/reading any body — no
+        // `FedErr` reply is possible at this layer (there is no decoded `FedFrame` to reply to
+        // yet); the connection must simply close, promptly, well before any real 1 MiB+ body
+        // could ever plausibly arrive.
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut buf = [0u8; 1];
+            stream.read(&mut buf).await
+        })
+        .await
+        .expect("the server closes an oversized-length-prefix connection promptly");
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "expected EOF/IO-error from a connection whose declared length exceeded \
+             MAX_FRAME_LEN, got {closed:?}"
+        );
+    }
+
+    // -- truncated: a small, in-bounds length prefix, then fewer body bytes than declared, then
+    //    the peer hangs up outright — the frame is never completed ----------------------------
+    {
+        let mut stream = establish_raw_link(
+            dir.path(),
+            &ca,
+            addr,
+            "a2.federation.test",
+            "b.federation.test",
+        )
+        .await;
+        stream.write_all(&100u32.to_le_bytes()).await.unwrap(); // declares 100 body bytes
+        stream.write_all(&[0u8; 10]).await.unwrap(); // sends only 10
+        stream.flush().await.unwrap();
+        drop(stream); // hang up mid-frame — the other 90 bytes never arrive
+    }
+
+    // Neither bad connection above must have wedged the server (leaked its `max_links` permit
+    // forever, panicked the accept loop, etc.): a fresh, entirely legitimate dial right
+    // afterward still completes normally.
+    let a3 = ca.issue(dir.path(), "a3.federation.test");
+    let link = tokio::time::timeout(
+        Duration::from_secs(5),
+        dial(
+            addr,
+            "b.federation.test",
+            a3.client_tls(),
+            "a3.federation.test",
+            None,
+            FederationTimeouts::default(),
+        ),
+    )
+    .await
+    .expect("a legitimate dial after the bad connections completes promptly, not hang")
+    .expect("the legitimate dial itself succeeds");
+    assert_eq!(link.peer_domains, vec!["b.federation.test".to_string()]);
+}
+
+// -- 3.22 (h) slow-loris AFTER the link is established ---------------------------------------
+
+/// Distinct from case (b) above: (b) stalls DURING the mTLS+`FedHello` handshake, which
+/// `federation.handshake_timeout_ms` bounds (task 3.2). This test stalls a frame AFTER that
+/// handshake has already succeeded and `serve_link` has taken over — a phase `handshake_timeout_ms`
+/// never covers at all.
+///
+/// **Residual found by this test, reported per this task's Scope rather than fixed (out of
+/// scope for a coverage-only task):** `inbound::serve_link`'s `link.recv_frame().await` in its
+/// main loop is not wrapped in any deadline (unlike `finish_handshake`, which
+/// `run_federation` wraps in `with_deadline(handshake_timeout, ...)`, and unlike the OUTBOUND
+/// dial/request path, which `federation::outbound` wraps in `with_deadline(timeouts.request,
+/// ...)` — see `link.rs`'s `FederationTimeouts` doc comment). A peer that completes a legitimate
+/// handshake and then trickles (or simply never sends) the rest of its next frame is never
+/// proactively disconnected by B: it holds one `max_links` permit for as long as it likes, with
+/// no idle/read deadline to reclaim it. This is bounded (at most `max_links` connections can do
+/// this at once, and each is capped at `MAX_FRAME_LEN` bytes of allocation), so it is not an
+/// unbounded resource leak — but it does mean a small number of slow/hostile-but-authenticated
+/// peers can occupy the entire `max_links` budget indefinitely, starving every other partner from
+/// establishing a link, for as long as they choose to stay silent. This test demonstrates the gap
+/// ((a)/(b) below) and that it is not otherwise fatal — the same stalled connection resumes and is
+/// served normally once it eventually finishes sending ((c) below), so this is "no idle timeout",
+/// not "the server wedges/panics/misbehaves on a stalled peer". Per this task's scope, this is
+/// reported here for a follow-up hardening task (an idle-read deadline around `serve_link`'s
+/// `recv_frame`, mirroring the handshake/outbound paths' existing `with_deadline` usage) rather
+/// than fixed inside this coverage-only task.
+#[tokio::test]
+async fn slow_loris_after_link_established_reveals_no_idle_read_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = TestCa::named("Meridian Test Federation CA (3.22 slow-loris)");
+    // A tight max_links cap (1) makes the residual directly observable: if the stalled connection
+    // is genuinely never reclaimed absent a completed frame, it alone exhausts the whole link
+    // budget.
+    let (b_federation, _b_id) =
+        federation_config_full(dir.path(), &ca, "b.federation.test", 5_000, 8, 1);
+    let addr = spawn_hardened_listener(base_config("b.federation.test", b_federation)).await;
+
+    let mut stream = establish_raw_link(
+        dir.path(),
+        &ca,
+        addr,
+        "a.federation.test",
+        "b.federation.test",
+    )
+    .await;
+
+    // A real, legitimate follow-up frame, computed up front so its exact encoded length is known
+    // — needed to trickle only PART of its 4-byte length prefix now and complete it later.
+    let follow_up = FedFrame::new(
+        FedOp::Reachability,
+        55,
+        &FedReachability {
+            target: [0x33u8; 32],
+        },
+    )
+    .unwrap();
+    let follow_bytes = follow_up.to_bytes().unwrap();
+    let len_bytes = (follow_bytes.len() as u32).to_le_bytes();
+
+    // Trickle only the first 2 of the 4 length-prefix bytes B's `serve_link` → `recv_frame` is
+    // waiting for, then stop.
+    stream.write_all(&len_bytes[0..2]).await.unwrap();
+    stream.flush().await.unwrap();
+
+    // (a) Observably: nothing comes back within a bounded window. `serve_link` is blocked inside
+    // `read_exact` awaiting the other two length-prefix bytes; there is no reply to read, and (per
+    // this test's finding above) nothing that would proactively close the connection either. This
+    // is a bounded-window observation, not a claim that the connection literally never closes.
+    let saw_anything = tokio::time::timeout(Duration::from_millis(500), async {
+        let mut buf = [0u8; 1];
+        stream.read(&mut buf).await
+    })
+    .await;
+    assert!(
+        saw_anything.is_err(),
+        "expected the stalled connection to sit idle — no reply, no close — within this bounded \
+         window: {saw_anything:?}"
+    );
+
+    // (b) That idleness is not free: with `max_links = 1`, the still-open, still-stalled
+    // connection above is the ONLY thing that can be holding the one link permit — a second,
+    // otherwise-legitimate dial completes its handshake (a separate, generous cap) but then gets
+    // dropped almost immediately (mirrors this file's existing max_links case (d)), proving the
+    // stalled link really is still occupying that slot.
+    let a2 = ca.issue(dir.path(), "a2.federation.test");
+    let mut over_link = dial(
+        addr,
+        "b.federation.test",
+        a2.client_tls(),
+        "a2.federation.test",
+        None,
+        FederationTimeouts::default(),
+    )
+    .await
+    .expect("the handshake itself still completes — the handshake cap is untouched here");
+    let closed_promptly =
+        tokio::time::timeout(Duration::from_millis(500), over_link.recv_frame()).await;
+    assert!(
+        matches!(&closed_promptly, Ok(Err(_))),
+        "a dial over max_links=1 must be dropped promptly once its own handshake completes — \
+         proving the stalled connection above is genuinely still holding the one link permit: \
+         {closed_promptly:?}"
+    );
+    drop(over_link);
+
+    // (c) The stalled connection is not otherwise dead: once it eventually finishes sending a
+    // real frame, `serve_link` resumes and replies normally. This is what distinguishes "no idle
+    // timeout" (the residual reported above) from "the server wedges/panics on a stalled peer"
+    // (which this proves it does not do).
+    stream.write_all(&len_bytes[2..4]).await.unwrap();
+    stream.write_all(&follow_bytes).await.unwrap();
+    stream.flush().await.unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), raw_read_frame(&mut stream))
+        .await
+        .expect("the resumed connection is served normally once its frame completes")
+        .expect("reading the reply frame succeeds");
+    assert_eq!(
+        reply.op,
+        FedOp::Reachable,
+        "expected the completed request to be served"
+    );
+    assert_eq!(reply.id, 55);
 }

@@ -77,7 +77,13 @@ the two `link.rs` edits and let 3.3 reuse 3.2's `with_deadline` helper)
 **Wave 6 — last** (depend on everything settling)
 - [x] **3.20** Resolve the `ROUTE_REPLY_GRACE` false-positive-success residual (may yield ADR 0020) — [file](./3.20-route-reply-grace-residual.md)
 - [x] **3.21** Nit sweep (N1, N3) — [file](./3.21-phase-3-nit-sweep.md)
-- [ ] **3.22** s2s framing adversarial suite (**optional — first to cut**) — [file](./3.22-s2s-framing-adversarial.md)
+- [x] **3.22** s2s framing adversarial suite (**optional — first to cut**) — [file](./3.22-s2s-framing-adversarial.md)
+
+**Wave 7 — found during 3.22, not part of the original report**
+- [ ] **3.23** Bound `serve_link`'s idle read — no deadline lets a handshaked peer hold a
+  `max_links` slot forever; in default WebPKI mode this is exploitable by any public-CA
+  cert-holder, not gated by federation policy at all (severity refined by 3.22's security review)
+  — [file](./3.23-serve-link-idle-read-deadline.md)
 
 ### Findings with no task, and why
 - **"Fine as-is" ratification list** (zero s2s replay dedup, per-request reachability, the two-orgs
