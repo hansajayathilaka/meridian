@@ -4,6 +4,7 @@
 //! wall-clock/RNG input) so re-running the generator is a no-op against a clean checkout — that
 //! self-consistency is itself asserted by CI (`git diff --exit-code test-vectors/`).
 
+mod c2s;
 mod envelope;
 mod federation;
 mod identity;
@@ -39,5 +40,6 @@ pub fn generate() -> Result<(), String> {
     envelope::generate_envelope()?;
     safety_numbers::generate_safety_numbers()?;
     federation::generate_federation()?;
+    c2s::generate_c2s()?;
     Ok(())
 }
