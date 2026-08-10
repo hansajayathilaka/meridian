@@ -25,9 +25,14 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # chown a mounted /data volume, then execs the server as `meridian` itself (never runs application
 # code as root).
 EXPOSE 8443
-# Matches the [server].bind default (0.0.0.0:8443); if you override
-# MERIDIAN_RENDEZVOUS_SERVER__BIND to a different port, override this HEALTHCHECK too (e.g. via
-# compose's own `healthcheck:` block, which replaces this one).
+# Matches this image's actual bind address, 0.0.0.0:8443 — NOT config.rs's own compiled-in
+# `[server].bind` default, which is `127.0.0.1:8443` (loopback-only, deliberately fail-closed for a
+# bare `cargo run`/library embedding with no config supplied). The 0.0.0.0 this image binds to
+# instead comes from `rendezvous.example.toml` (baked in at /etc/meridian/rendezvous.toml, COPY'd
+# above), which this ENTRYPOINT loads by default; a container that skips that file (or supplies its
+# own with a different bind) will listen elsewhere, and this HEALTHCHECK needs updating to match. If
+# you override MERIDIAN_RENDEZVOUS_SERVER__BIND to a different port, override this HEALTHCHECK too
+# (e.g. via compose's own `healthcheck:` block, which replaces this one).
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
     CMD curl -fs http://127.0.0.1:8443/healthz || exit 1
 # Config path is overridable; mount your own /etc/meridian/rendezvous.toml in production.

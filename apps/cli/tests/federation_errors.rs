@@ -24,7 +24,9 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use meridian_proto::{fed_error_codes, FedErr, FedFrame, FedOp};
 use meridian_rendezvous::config::{DiscoveryMode, Federation, FederationPolicyMode};
+use meridian_rendezvous::federation::{FederationListener, FederationTlsPaths};
 use meridian_rendezvous::{AppState, MemoryStore};
 
 mod support;
@@ -301,6 +303,115 @@ fn stale_hint_reports_unreachable_at_hint_never_a_security_warning() {
     assert!(
         combined.contains("org-b.test"),
         "expected the hint domain to be named, got: {combined}"
+    );
+    assert_no_security_copy(&combined);
+}
+
+// -- Scenario 3: a hostile foreign server's free-form FedErr.msg must never reach the client -----
+// (task 3.21, finding N1). Scenarios 1/2 above drive a real, honest `meridian-rendezvous` as org B,
+// which only ever emits FIXED, code-mapped copy — so they cannot, by construction, prove this
+// property: an honest B never sends attacker-chosen text in the first place. This scenario stands
+// up a ROGUE B that speaks the real s2s wire protocol directly (real mTLS handshake, real `FedHello`,
+// real `FedFrame`/`FedErr` bytes — never a Rust value handed straight to a function under test) and
+// have it answer with a `FedErr.msg` a hostile/compromised partner might actually send, then assert
+// that text never survives into what `meridian fetch-bundle` prints.
+
+/// A suspicious `FedErr.msg` string: a plausible fake system message (the kind of text that would
+/// be actively harmful if forwarded verbatim into a victim's terminal) plus a control character (a
+/// bell, `\x07`) that has no legitimate business in this CLI's output at all — either fragment
+/// leaking is sufficient to prove the free-form-message passthrough this task closes off.
+const HOSTILE_FED_ERR_MSG: &str =
+    "SYSTEM ALERT: your account is compromised, call +1-555-0199 immediately\u{7}";
+
+/// Bind a rogue s2s mTLS listener presenting a cert for `domain`, signed by `ca` — the SAME
+/// private CA `org_a_federation` pins org A's dial to, so the handshake succeeds exactly as it
+/// would against a real, honest B — that answers the very first frame of the very first inbound
+/// link with `FedFrame{op: Err, body: FedErr{policy_denied, HOSTILE_FED_ERR_MSG}}`, regardless of
+/// what op that frame actually was. One reply is all either code path under test
+/// (`federated_fetch_error_reply`'s or `federated_route_error_reply`'s `Fed(fed_err)` arm) needs to
+/// see.
+async fn rogue_hostile_federation_server(dir: &Path, ca: &TestCa, domain: &str) -> SocketAddr {
+    let identity = ca.issue(dir, "rogue", domain);
+    let paths = FederationTlsPaths {
+        cert_path: identity.cert_path_str(),
+        key_path: identity.key_path_str(),
+        ca_bundle_path: identity.ca_bundle_path_str(),
+    };
+    let listener = FederationListener::bind("127.0.0.1:0", &paths, domain, None)
+        .await
+        .expect("bind rogue federation listener");
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut link, _peer_addr)) = listener.accept().await {
+            if let Ok(req) = link.recv_frame().await {
+                let err = FedErr {
+                    code: fed_error_codes::POLICY_DENIED.to_string(),
+                    msg: HOSTILE_FED_ERR_MSG.to_string(),
+                };
+                if let Ok(reply) = FedFrame::new(FedOp::Err, req.id, &err) {
+                    let _ = link.send_frame(&reply).await;
+                }
+            }
+        }
+    });
+    addr
+}
+
+#[test]
+fn hostile_foreign_fed_err_msg_never_reaches_the_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = TestCa::new();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let a_c2s_url = rt.block_on(async {
+        let b_fed_addr = rogue_hostile_federation_server(dir.path(), &ca, "org-b.test").await;
+
+        let mut a_config = base_config("org-a.test");
+        a_config.federation =
+            org_a_federation(dir.path(), &ca, "org-a.test", "org-b.test", b_fed_addr);
+        let a_store = Arc::new(MemoryStore::new());
+        let a_state = AppState::new(a_config, a_store);
+        spawn_c2s(a_state).await
+    });
+
+    let alice = Client::new();
+    alice.new_account("alice.key", "org-a.test");
+
+    // A syntactically valid id hinting at org-b.test — the rogue server never inspects the
+    // request, so what account it names is irrelevant to this scenario.
+    let ghost = Client::new();
+    ghost.new_account("ghost.key", "org-b.test");
+    let ghost_id = ghost.id();
+
+    let out = alice.run(&["fetch-bundle", &ghost_id, "--server", &a_c2s_url]);
+
+    assert!(
+        !out.status.success(),
+        "a policy-denied fetch must fail, non-zero exit; stdout={}",
+        stdout(&out)
+    );
+    assert!(
+        out.status.code().is_some(),
+        "the process must exit cleanly (a defined exit code), not be killed/signalled"
+    );
+
+    let combined = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(
+        !combined.contains(HOSTILE_FED_ERR_MSG),
+        "the hostile FedErr.msg leaked verbatim into client-visible output: {combined}"
+    );
+    assert!(
+        !combined.to_ascii_lowercase().contains("system alert") && !combined.contains("555-0199"),
+        "a fragment of the hostile FedErr.msg leaked into client-visible output: {combined}"
+    );
+    assert!(
+        !combined.chars().any(|c| c == '\u{7}'),
+        "a raw control character from the hostile FedErr.msg leaked into client-visible output"
+    );
+    // Only the mapped local code's fixed copy — never the foreign server's own text.
+    assert!(
+        combined.contains("federation denied") && combined.contains("org-b.test"),
+        "expected the fixed fed_denied copy naming org-b.test, got: {combined}"
     );
     assert_no_security_copy(&combined);
 }

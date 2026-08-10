@@ -365,7 +365,22 @@ fn federated_fetch_error_reply(hint: &str, e: &FetchForeignError) -> (&'static s
                 // outcome rather than inventing a new client-visible code (2.9's job).
                 error_codes::FED_UNREACHABLE
             };
-            (code, format!("federated fetch declined: {}", fed_err.msg))
+            // `fed_err.msg` is NEVER forwarded here (task 3.21, finding N1): it is free-form text
+            // chosen entirely by the foreign server, i.e. attacker-controlled the moment that
+            // partner is hostile or compromised — 2.9's taxonomy sanitized `fed_err.code` into
+            // `code` above, but did nothing about this field. Only the mapped `code` picks the
+            // client-facing text below, same fixed-copy-per-branch pattern every other arm in this
+            // match already uses; never a "the remote server said: ..." passthrough, which would
+            // still leak attacker-chosen text into the victim's UI.
+            let msg = match code {
+                error_codes::FED_DENIED => "federation partner declined the request",
+                error_codes::RATE_LIMITED => "federation partner is rate-limiting this server",
+                error_codes::NOT_FOUND_AT_HINT => {
+                    "no such account at the hinted federation partner"
+                }
+                _ => "federated fetch declined",
+            };
+            (code, msg.to_string())
         }
     }
 }
@@ -552,7 +567,17 @@ fn federated_route_error_reply(hint: &str, e: &RouteForeignError) -> (&'static s
                 // outcome rather than inventing a new client-visible code (2.9's job).
                 error_codes::FED_UNREACHABLE
             };
-            (code, format!("federated route declined: {}", fed_err.msg))
+            // `fed_err.msg` is NEVER forwarded here (task 3.21, finding N1) — same reasoning as
+            // `federated_fetch_error_reply`'s identical arm: it's free-form text the foreign
+            // server chose, attacker-controlled once that partner is hostile/compromised. Only
+            // the mapped `code` picks the fixed client-facing text; never a "the remote server
+            // said: ..." passthrough.
+            let msg = match code {
+                error_codes::FED_DENIED => "federation partner declined the request",
+                error_codes::RATE_LIMITED => "federation partner is rate-limiting this server",
+                _ => "federated route declined",
+            };
+            (code, msg.to_string())
         }
     }
 }
