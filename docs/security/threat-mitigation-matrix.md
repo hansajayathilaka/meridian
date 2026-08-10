@@ -35,6 +35,13 @@ Companion to design §1. Every adversary maps to concrete mitigations *and* to t
   interactive accept/reject prompt (its `ChatState` is fresh per invocation, so every dial's
   responder side is first contact) — that polished UX is Feature 08's job, tracked separately from
   this gate. Proven by `apps/core/tests/p2p_session.rs::p2p_first_contact_is_gated_second_envelope_refused_accept_delivers`.
+  As of 3.11, the gate also covers arbitrary registered ctrl-frame stream opens beyond chat itself:
+  `decide_open`'s `PolicyCtx.first_contact` is derived from `chat_first_contact_gate` OR a live
+  `ChatState::pending_request` lookup, so a peer who has sent one chat message but is still
+  undecided is still correctly gated when opening a second, unrelated (non-chat) stream — closing
+  the loophole where `decide_open` previously hardcoded `first_contact: false`. Registry-agnostic:
+  computed once per `decide_open` call, handed uniformly to every `StreamType::on_open`. Proven by
+  `apps/core/tests/p2p_session.rs::ctrl_open_gates_on_undecided_message_request_for_a_non_chat_stream_type`.
   Optional contact tokens + PoW stamp (T14).
 - OTK depletion bounded per-source; signed-prekey fallback weakens only first-message deniability, never confidentiality (T02). (Moot for envelope v1, which is not deniable at all — every ciphertext is identity-signed; see [ADR 0016](../adr/0016-envelope-deniability.md).)
 
