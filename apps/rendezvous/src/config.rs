@@ -321,11 +321,12 @@ impl Default for Federation {
     fn default() -> Self {
         Self {
             enabled: false,
-            // Federation (s2s mTLS) default port: adjacent to, but distinct from, the c2s WSS
-            // default (8443) — TODO: confirm was resolved by picking 8444 (next integer) so both
-            // listeners can run on the same host with no config edit and no ambiguity about which
-            // port is which. Not an IANA-registered service port as of this writing; operators are
-            // free to override via `federation.bind` / `MERIDIAN_RENDEZVOUS_FEDERATION__BIND`.
+            // Federation (s2s mTLS) default port: settled as 8444 — adjacent to, but distinct
+            // from, the c2s WSS default (8443) — so both listeners can run on the same host with
+            // no config edit and no ambiguity about which port is which. Not an IANA-registered
+            // service port; operators are free to override via `federation.bind` /
+            // `MERIDIAN_RENDEZVOUS_FEDERATION__BIND`. Documented (task 3.15, review finding F14):
+            // docs/api/federation-protocol-v1.md §1 and docs/operations/deployment.md §9.2.
             bind: "127.0.0.1:8444".into(),
             cert_path: String::new(),
             key_path: String::new(),

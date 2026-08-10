@@ -17,6 +17,18 @@ Two containers plus a database: `meridian-rendezvous` (single Rust binary; Postg
 
 Domain + certs; federation policy (`open | allowlist | closed`) and the static federation map (air-gapped) or SRV (connected); registration admission (open, invite-token, or OIDC-gated per §3.2); mailbox TTL/quota; TURN secret + bandwidth caps; connection policy defaults (`direct|prefer-relay|relay-only`); rate-limit knobs. Everything else is client-side. Every key is TOML in `rendezvous.toml` (generated from [`rendezvous.example.toml`](../../apps/rendezvous/rendezvous.example.toml)) and can be overridden per-deployment with `MERIDIAN_RENDEZVOUS_<SECTION>__<FIELD>` env vars (e.g. `MERIDIAN_RENDEZVOUS_TURN__SECRET`), merged via `figment` ([ADR 0018](../adr/0018-rendezvous-config-loading.md)) — see [rendezvous-protocol-v1 §5](../api/rendezvous-protocol-v1.md#5-config-surface-the-92-subset) — so secrets never need to be baked into the generated file or image. The CLI's local connection-policy store (`policy.json`) picks up the same convention for its org-pushed default: `MERIDIAN_POLICY__ORG_DEFAULT` works even with no `policy.json` present.
 
+**Federation port.** `federation.bind` defaults to `127.0.0.1:8444` — deliberately adjacent to the
+c2s WSS default (`8443`) so both listeners can run on the same host with no config edit and no
+ambiguity about which port is which. **8444 is not an IANA-registered service port**; it is purely
+this project's convention, and operators are free to override it (`federation.bind` /
+`MERIDIAN_RENDEZVOUS_FEDERATION__BIND`). Per [ADR 0017 C7](../adr/0017-federation-trust-boundary.md),
+whatever port is chosen must terminate mTLS **in-process** — never at a proxy/VIP the way c2s's
+8443 is terminated today ([rendezvous-protocol-v1 §8](../api/rendezvous-protocol-v1.md#8-known-mvp-simplifications-t02));
+if 8444 (or its override) is published through a reverse proxy or
+load balancer, publish it as **raw TCP passthrough only**. See
+[federation-protocol-v1.md §1](../api/federation-protocol-v1.md#1-transport--framing) for the wire
+rationale.
+
 ### 9.3 Air-gapped operation
 
 Fully supported by construction: internal DNS + private CA for client-server and federation mTLS; static federation map instead of SRV; internal STUN/TURN only (clients accept an org-pushed ICE-server list, and in air-gapped mode the public-STUN default is disabled); no APNs/FCM → Android foreground-service wake, iOS foreground-only (named limitation); client updates via the org's artifact mirror with our release signatures verified offline. Nothing in the protocol phones home; there is no license server, telemetry endpoint, or key registry outside the org.

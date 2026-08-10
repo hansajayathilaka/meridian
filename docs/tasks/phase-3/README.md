@@ -68,7 +68,7 @@ the two `link.rs` edits and let 3.3 reuse 3.2's `with_deadline` helper)
 - [x] **3.14** Conformance vectors for the c2s hint extension (F20) — [file](./3.14-c2s-hint-conformance-vectors.md)
 
 **Wave 5 — docs, ops, ratification**
-- [ ] **3.15** Doc-sync the federation wire/deploy facts (F14+F15) — [file](./3.15-federation-protocol-doc-sync.md)
+- [x] **3.15** Doc-sync the federation wire/deploy facts (F14+F15) — [file](./3.15-federation-protocol-doc-sync.md)
 - [ ] **3.16** Warn on private-CA trust anchors under SRV discovery (F6) — [file](./3.16-private-ca-srv-hazard.md)
 - [ ] **3.17** Give the production stack a federation surface with a C7 guard-rail (F17) — [file](./3.17-dokploy-federation-surface.md)
 - [ ] **3.18** Fix the live coturn `realm` placeholder (F19) — [file](./3.18-coturn-realm-placeholder.md)
