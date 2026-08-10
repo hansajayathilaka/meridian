@@ -151,6 +151,51 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --workspace --release
 
+  docker-build:
+    name: Docker build gate (apps/rendezvous/Dockerfile)
+    # F12 (Phase-3 review) / task 3.12: docker-publish.yml only builds + pushes AFTER a merge to
+    # main, so a broken Dockerfile/entrypoint (bad COPY path, a cargo build regression under the
+    # `sqlite` feature, a privilege-drop or chown mistake) was only ever discovered post-merge.
+    # This job builds the exact same file on every PR — before merge — but never pushes and never
+    # sees a registry credential: no `docker/login-action`, no `packages: write` permission below,
+    # and (unlike docker-publish.yml) no GITHUB_TOKEN login step at all. Keep it that way — this
+    # gate must not become a second path that can leak the publish credential.
+    needs: lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # Build-only, no push, no registry login. --load pulls the image into the local docker
+      # engine so the smoke-test steps below can run it.
+      - name: docker build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/rendezvous/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: meridian-rendezvous:ci-gate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Smoke test: the image must actually bind and must actually drop root before running
+      # application code (docker-entrypoint.sh's whole job — see docs/operations/docker-image.md
+      # §1). No plaintext ever crosses this box, so nothing here inspects request/response bodies;
+      # it only checks that the container comes up and that PID 1 is the unprivileged `meridian`
+      # user, not root.
+      - name: docker run smoke test (bind + privilege drop)
+        run: bash tools/docker-smoke-test.sh meridian-rendezvous:ci-gate rendezvous-smoke 18443
+
+      - name: cleanup
+        if: always()
+        run: |
+          docker rm -f rendezvous-smoke >/dev/null 2>&1 || true
+          docker volume rm rendezvous-smoke-data >/dev/null 2>&1 || true
+
   coverage:
     name: Coverage (measurement only, non-blocking)
     needs: test

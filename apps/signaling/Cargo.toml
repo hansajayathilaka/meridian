@@ -9,6 +9,14 @@ publish = false
 # fetch peer bundles WITH mandatory signature verification against the requested key. Part of
 # meridian-core (re-exported); depends on identity/store for keys and proto for wire types.
 # Public API contract: docs/api/core-api-contracts.md ("Sessions & messaging" builds on this).
+[features]
+default = []
+# T3.13/F13: exposes `SignalingClient::connect_with_test_ca_pem`, which trusts an explicit
+# self-signed CA instead of the OS/native trust store — only ever used by
+# `apps/cli/tests/wss_tls.rs` (a dev-dependency edge, mirroring 3.4's `test-tamper-hook` on
+# meridian-rendezvous). Never enabled in a release binary.
+test-support = []
+
 [dependencies]
 meridian-proto = { path = "../proto" }
 meridian-identity = { path = "../identity" }
@@ -21,6 +29,17 @@ x25519-dalek = { workspace = true }
 getrandom = { workspace = true }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
+# rustls 0.23 requires an explicit process-wide crypto backend selection before any `wss://` TLS
+# handshake (`install_crypto_provider`, called at the top of `SignalingClient::connect`) — no
+# longer left to `apps/cli/src/main.rs` to remember (T3.13/F13). `default-features = false` +
+# explicit feature list (mirrors `apps/rendezvous/Cargo.toml`'s own rustls entry): pins the single
+# crypto backend already resolved elsewhere in this workspace's lock via `tokio-tungstenite`'s own
+# `rustls-tls-native-roots` feature, instead of also pulling in aws-lc-rs, rustls's own default
+# provider. `std` is needed by `ClientConfig::builder()`, used only by the `test-support`-gated
+# `connect_with_test_ca_pem`, but declared unconditionally rather than relying on some other crate
+# in the build graph to supply it — this crate already requires `tokio` (std-only), so there is no
+# no_std purity to preserve here.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "ring"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }

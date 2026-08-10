@@ -80,6 +80,45 @@ pub enum ChatError {
 /// [`PrekeyVault::expire_previous_generation`]).
 pub const PREV_GENERATION_GRACE_SECS: u64 = 60;
 
+/// Hard cap on the number of undecided [`MessageRequest`]s [`ChatState`] will hold at once (task
+/// 3.10 / review finding F5).
+///
+/// OTK-free X3DH is legal (`used_opk: None`), so a first-contact envelope costs its sender
+/// nothing but a fresh identity key — nothing upstream of this bounds how many distinct strangers
+/// can each land a `Session` + `MessageRequest` in the sealed-at-rest `ChatState`, which is
+/// rewritten on every save. Once the cap is reached, the *oldest still-undecided* request is
+/// evicted (its `Session` dropped with it, see [`evict_oldest_pending`]) to admit the new one.
+///
+/// `TODO: confirm`: no design doc (system-design.md §3.5, `docs/architecture/features/06-cross-org-federation.md`)
+/// gives a numeric depth for the request queue. 256 was chosen to stay generous for a legitimate
+/// user fielding many simultaneous strangers (e.g. an ID posted publicly) — two orders of
+/// magnitude above the ~5 concurrent unread requests a real inbox is ever likely to hold — while
+/// still bounding `ChatState`'s pending-request footprint to a small, fixed multiple of one
+/// session's size regardless of flood volume. See this task's Outcome section
+/// (`docs/tasks/phase-3/3.10-message-request-flood-bound.md`) for the full reasoning.
+pub const MAX_PENDING_REQUESTS: usize = 256;
+
+/// Hard cap, in bytes, on the `body` string retained as a pending request's
+/// [`MessageRequest::intro`] (task 3.10 / review finding F5).
+///
+/// This bounds [`ChatContent::Text`]'s `body` field itself (see `cap_intro`/`truncate_utf8`), not
+/// the final encoded `mrd.chat/1` payload — the encoded size of a capped intro is `MAX_INTRO_LEN`
+/// bytes plus the small fixed CBOR/id framing overhead around `body` (tens of bytes), not exactly
+/// `MAX_INTRO_LEN` encoded bytes. Bounds a single request's contribution to `ChatState`'s at-rest
+/// size independently of [`MAX_PENDING_REQUESTS`], so a handful of maximally-padded intros can't
+/// dominate the queue's footprint even below the count cap. An oversized intro is *truncated*, not
+/// dropped: dropping it would leave [`ChatError::MessageRequest`] returned with no corresponding
+/// entry in `pending_requests`, breaking the invariant every caller (`apps/cli`) relies on that the
+/// error always means "look this sender up, they're queued".
+///
+/// `TODO: confirm`: no design doc bounds §3.5's "a short encrypted intro" numerically. 4 KiB is
+/// generous for a genuine one-line/one-paragraph greeting (an order of magnitude past a typical
+/// chat message) while keeping a single request's worst-case storage contribution well under
+/// `apps/rendezvous/src/federation/link.rs`'s `MAX_FRAME_LEN` (1 MiB, the wire ceiling a single
+/// envelope is bound by upstream of this). See this task's Outcome section for the full
+/// reasoning.
+pub const MAX_INTRO_LEN: usize = 4096;
+
 /// One published one-time prekey's key pair (public + X25519 secret).
 ///
 /// The secret is zeroized on drop (matching `meridian-crypto`'s `DoubleRatchet` style), so removing
@@ -304,6 +343,25 @@ pub struct ChatState {
     /// task still opens (mirrors `PrekeyVault::previous`'s precedent, task 1.31).
     #[serde(default)]
     pending_requests: BTreeMap<[u8; 32], MessageRequest>,
+    /// Arrival order (oldest first) of the sender keys currently present in `pending_requests`
+    /// (task 3.10 / review finding F5). This crate is deliberately clock-free (it compiles to
+    /// wasm32, where `std::time::SystemTime::now()` is unavailable — see
+    /// [`PrekeyVault::set_bundle`]'s doc comment for the same constraint), so eviction order is
+    /// tracked as a plain insertion sequence rather than by timestamp.
+    ///
+    /// Maintained in lockstep with `pending_requests` by every path that adds or removes an
+    /// entry — [`insert_pending_request`](Self::insert_pending_request),
+    /// [`accept_request`](Self::accept_request), [`reject_request`](Self::reject_request), and
+    /// [`evict_oldest_pending`](Self::evict_oldest_pending) — which is what makes the "only a
+    /// genuinely undecided request is evictable" invariant hold: a request that has been accepted
+    /// or rejected is removed from both collections in the same call, so it can never be the
+    /// target `evict_oldest_pending` picks. `#[serde(default)]` for the same at-rest-compat
+    /// reason as `pending_requests` itself; [`open_at_rest`](Self::open_at_rest) reconciles it
+    /// against `pending_requests` right after deserializing (see
+    /// [`reconcile_request_order`](Self::reconcile_request_order)) so a state sealed before this
+    /// task — or any other future desync — can't leave the two out of step.
+    #[serde(default)]
+    request_order: Vec<[u8; 32]>,
 }
 
 impl ChatState {
@@ -366,7 +424,14 @@ impl ChatState {
     /// (signature verified, X3DH complete); accepting is pure local bookkeeping and re-verifies
     /// nothing.
     pub fn accept_request(&mut self, sender_ik: &[u8; 32]) -> Option<MessageRequest> {
-        self.pending_requests.remove(sender_ik)
+        let out = self.pending_requests.remove(sender_ik);
+        if out.is_some() {
+            // (task 3.10) Removed from `request_order` in the same call that decides the
+            // request, so an accepted request is never again reachable from
+            // `evict_oldest_pending` — it simply isn't in either collection anymore.
+            self.request_order.retain(|k| k != sender_ik);
+        }
+        out
     }
 
     /// Reject a pending message request: discards it *and* the (already-established) session
@@ -391,8 +456,89 @@ impl ChatState {
     /// block, which is exactly what keeps rejection from being an oracle.
     pub fn reject_request(&mut self, sender_ik: &[u8; 32]) -> bool {
         let had = self.pending_requests.remove(sender_ik).is_some();
+        if had {
+            // (task 3.10) Same reasoning as `accept_request`: pruned here so a rejected request
+            // can't linger in `request_order` as a stale, already-decided entry.
+            self.request_order.retain(|k| k != sender_ik);
+        }
         self.sessions.remove(sender_ik);
         had
+    }
+
+    // -- task 3.10: bounding the queue against a stranger flood (review finding F5) -------------
+
+    /// Insert a freshly-gated first-contact request, evicting the oldest still-undecided one first
+    /// if `pending_requests` is already at [`MAX_PENDING_REQUESTS`].
+    ///
+    /// Callers must only reach this once [`open_inbound_gated`](Self::open_inbound_gated) has
+    /// already confirmed `sender_ik` has no existing pending request (the `RequestPending` check
+    /// at the top of that method) — so every call here is a genuinely new entry, never a
+    /// replacement of one already in the queue.
+    fn insert_pending_request(&mut self, sender_ik: [u8; 32], req: MessageRequest) {
+        if self.pending_requests.len() >= MAX_PENDING_REQUESTS {
+            self.evict_oldest_pending();
+        }
+        self.pending_requests.insert(sender_ik, req);
+        self.request_order.push(sender_ik);
+    }
+
+    /// Drop the least-recently-arrived entry in `request_order` (and its `Session`) to make room
+    /// under [`MAX_PENDING_REQUESTS`].
+    ///
+    /// **Why this can never evict a decided request.** `request_order` only ever contains keys
+    /// for requests that are *currently* in `pending_requests`: every insertion path adds to both
+    /// collections together, and both `accept_request` and `reject_request` remove from both
+    /// together in the same call. A request that has already been accepted or rejected is
+    /// therefore never a member of `request_order` by the time this runs — there is no way for
+    /// eviction to reach back and discard a decision the user already made. The `while` loop below
+    /// is defense-in-depth against a hypothetical desync (e.g. a future bug, or state reconciled
+    /// from an old at-rest blob by [`reconcile_request_order`](Self::reconcile_request_order))
+    /// rather than a path this code expects to exercise in the maintained invariant.
+    fn evict_oldest_pending(&mut self) {
+        while !self.request_order.is_empty() {
+            let oldest = self.request_order.remove(0);
+            if self.pending_requests.remove(&oldest).is_some() {
+                self.sessions.remove(&oldest);
+                return;
+            }
+            // Stale order entry with no matching pending request — shouldn't happen given the
+            // lockstep invariant above, but keep looking rather than silently evict nothing.
+        }
+    }
+
+    /// Repair `request_order` against `pending_requests` after deserializing an at-rest blob:
+    /// drop any order entries with no matching pending request, and append any pending request
+    /// missing from the order.
+    ///
+    /// Needed for two cases: a `ChatState` sealed before this task (no `request_order` field in
+    /// its CBOR — `#[serde(default)]` leaves it empty even though `pending_requests` may not be),
+    /// and defense-in-depth against any other way the two could have drifted apart. Requests
+    /// recovered this way are appended in `pending_requests`'s own (`BTreeMap`/key) order — not
+    /// true arrival order, since this crate is deliberately clock-free and the original order was
+    /// never recorded for them.
+    ///
+    /// **This fallback order is not neutral — it is attacker-influenceable.**
+    /// `pending_requests` is keyed by the sender's account identity key, which OTK-free X3DH
+    /// (the exact fact `MAX_PENDING_REQUESTS` exists to mitigate) lets an attacker mint for free
+    /// and choose freely: a numerically-large-prefix key sorts last, i.e. "most recently arrived",
+    /// under this fallback. So an attacker who can predict or force a legacy-blob reconciliation
+    /// (e.g. around an upgrade boundary) can grind an identity key to make their own planted
+    /// pre-upgrade request look newest, at a genuinely older legitimate request's expense should
+    /// eviction pressure hit. This is deliberately accepted as a narrow, one-time residual — see
+    /// this task's Outcome section (`docs/tasks/phase-3/3.10-message-request-flood-bound.md`) for
+    /// why it doesn't extend past a single `open_at_rest` call and can't touch anything already
+    /// decided — rather than a claim that this ordering is neutral or "can't be gamed".
+    fn reconcile_request_order(&mut self) {
+        let known: std::collections::BTreeSet<[u8; 32]> =
+            self.pending_requests.keys().copied().collect();
+        self.request_order.retain(|k| known.contains(k));
+        let already_ordered: std::collections::BTreeSet<[u8; 32]> =
+            self.request_order.iter().copied().collect();
+        for k in known {
+            if !already_ordered.contains(&k) {
+                self.request_order.push(k);
+            }
+        }
     }
 
     /// Build a signed, ratchet-encrypted envelope for `content` to `peer_ik`. See [`seal_bytes`] for
@@ -546,12 +692,16 @@ impl ChatState {
             // happen (the session was just installed by `open_bytes`, above, under this same `&mut
             // self` borrow) — never a silent downgrade of a real safety-number mismatch.
             let safety_number = self.safety_number(our_ik, from).unwrap_or_default();
-            self.pending_requests.insert(
+            // (task 3.10 / F5) Bound the intro's storage contribution before it ever lands in the
+            // queue; `plaintext.len()` is the already-measured encoded size of `content`, so this
+            // avoids a redundant re-encode purely to check it.
+            let intro = cap_intro(content, plaintext.len());
+            self.insert_pending_request(
                 *from,
                 MessageRequest {
                     sender_ik: *from,
                     safety_number,
-                    intro: content,
+                    intro,
                 },
             );
             return Err(ChatError::MessageRequest);
@@ -653,8 +803,12 @@ impl ChatState {
     ) -> Result<Self, ChatError> {
         let key = store_key(store, handle)?;
         let plaintext = at_rest::open(&key, sealed)?;
-        let state = ciborium::from_reader(&plaintext[..])
+        let mut state: Self = ciborium::from_reader(&plaintext[..])
             .map_err(|e| meridian_proto::CodecError::Decode(e.to_string()))?;
+        // (task 3.10) A blob sealed before this task has no `request_order` field at all
+        // (`#[serde(default)]` leaves it empty regardless of `pending_requests`); repair it here
+        // rather than let `evict_oldest_pending` ever see a mismatch between the two.
+        state.reconcile_request_order();
         Ok(state)
     }
 
@@ -679,6 +833,43 @@ fn to_wire_prekey(m: &PrekeyMaterial) -> Prekey {
         used_spk: m.used_spk,
         used_opk: m.used_opk,
     }
+}
+
+/// Bound `content`'s contribution to a pending request's at-rest size to [`MAX_INTRO_LEN`] (task
+/// 3.10 / review finding F5). `raw_len` is `content`'s already-measured encoded byte length (the
+/// ratchet plaintext [`ChatState::open_bytes`] just returned) — reusing it avoids a redundant
+/// re-encode purely to check the size.
+///
+/// Only [`ChatContent::Text`]'s `body` is unbounded today, so it is the only variant truncated;
+/// [`ChatContent::Receipt`] carries a fixed-size 16-byte id and can never approach the cap on its
+/// own. **Residual, stated rather than hidden:** a future `ChatContent` variant
+/// (`mrd.chat/1`'s doc comment notes typing/reactions are planned additions) with its own
+/// unbounded field would need its own arm here — nothing in the type system enforces that, so
+/// it's a manual invariant for whoever adds the next variant to keep alongside it.
+fn cap_intro(content: ChatContent, raw_len: usize) -> ChatContent {
+    if raw_len <= MAX_INTRO_LEN {
+        return content;
+    }
+    match content {
+        ChatContent::Text { id, body } => ChatContent::Text {
+            id,
+            body: truncate_utf8(&body, MAX_INTRO_LEN),
+        },
+        other => other,
+    }
+}
+
+/// Truncate `s` to at most `max_bytes` UTF-8 bytes, backing off to the nearest char boundary so a
+/// multi-byte codepoint is never split into invalid UTF-8.
+fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 // Local byte-string serde helpers (kept private to the crate; proto's equivalents are pub(crate)).
@@ -742,5 +933,101 @@ mod opt_b32 {
         fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
             Ok(Wrap(super::b32::deserialize(d)?))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Crate-private unit tests that need direct access to `pending_requests`/`request_order`
+    //! (task 3.10 review fixup): the integration tests in `apps/core/tests/` can only drive
+    //! `ChatState` through its public API, which never leaves `request_order` empty while
+    //! `pending_requests` is populated — so they can exercise `reconcile_request_order`'s
+    //! "nothing to repair" path (via the at-rest round trip of a pre-task `ChatState::default()`,
+    //! see `message_request_gate.rs`'s `a_chat_state_sealed_before_this_task_still_opens`) but
+    //! never its actual repair loop. This module fills that gap.
+    use super::*;
+    use meridian_identity::{generate_account, MemorySecretStore};
+
+    fn intro(tag: u8) -> MessageRequest {
+        MessageRequest {
+            sender_ik: [tag; 32],
+            safety_number: format!("test-safety-number-{tag}"),
+            intro: ChatContent::Text {
+                id: [tag; 16],
+                body: format!("hi, this is sender {tag}"),
+            },
+        }
+    }
+
+    /// Simulates the exact desynced state `reconcile_request_order` exists to repair — a
+    /// `pending_requests` populated directly (bypassing `insert_pending_request`, as a legacy
+    /// pre-task-3.10 blob's `#[serde(default)]`-emptied `request_order` would be) — and asserts
+    /// the repair loop actually runs: every pending key ends up in `request_order`, in the
+    /// documented deterministic ascending-key fallback order, and a subsequent
+    /// `evict_oldest_pending` picks the lowest key and drops its session with it.
+    #[test]
+    fn reconcile_request_order_repairs_desynced_legacy_state() {
+        let store = MemorySecretStore::new();
+        let account = generate_account(&store, "chat.reconcile.self").unwrap();
+        let our_ik = *account.public_key().as_bytes();
+
+        let mut state = ChatState::default();
+
+        // Three distinct sender identity keys, populated straight into `pending_requests` — never
+        // through `insert_pending_request`, so `request_order` stays empty exactly as it would
+        // for a blob sealed before this task.
+        let mut keys: Vec<[u8; 32]> = Vec::new();
+        for i in 0..3u8 {
+            let sender = generate_account(&store, &format!("chat.reconcile.sender.{i}")).unwrap();
+            let sender_ik = *sender.public_key().as_bytes();
+            state.pending_requests.insert(sender_ik, intro(i));
+            // A live session per pending request, matching the real invariant (a `MessageRequest`
+            // never exists without one) — so eviction dropping it is actually observable below.
+            state
+                .start_initiator_session(
+                    &store,
+                    account.handle(),
+                    &our_ik,
+                    &sender_ik,
+                    &[7u8; 32],
+                    None,
+                )
+                .unwrap();
+            keys.push(sender_ik);
+        }
+        assert!(
+            state.request_order.is_empty(),
+            "sanity: this must reproduce the desynced/legacy shape reconcile_request_order repairs"
+        );
+
+        state.reconcile_request_order();
+
+        let mut expected_order = keys.clone();
+        expected_order.sort();
+        assert_eq!(
+            state.request_order, expected_order,
+            "repaired order must be pending_requests's own ascending-key order, per the \
+             documented deterministic fallback"
+        );
+
+        // Eviction must now pick the lowest-key entry and drop its session with it.
+        let lowest = expected_order[0];
+        state.evict_oldest_pending();
+        assert!(
+            state.pending_request(&lowest).is_none(),
+            "evict_oldest_pending must remove the lowest-key (repaired-order-first) entry"
+        );
+        assert!(
+            !state.has_session(&lowest),
+            "the evicted entry's session must be dropped with it"
+        );
+        for k in &expected_order[1..] {
+            assert!(
+                state.pending_request(k).is_some(),
+                "eviction must not touch entries other than the oldest"
+            );
+            assert!(state.has_session(k));
+        }
+        assert_eq!(&state.request_order, &expected_order[1..]);
     }
 }

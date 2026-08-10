@@ -61,11 +61,11 @@ the two `link.rs` edits and let 3.3 reuse 3.2's `with_deadline` helper)
 - [ ] **3.9** Resolve the dead per-partner `policy` field in `federation_map.toml` (F7) — [file](./3.9-federation-map-policy-field.md)
 
 **Wave 4 — parallel track** (core client + CI; no federation-server contention, can run alongside wave 3)
-- [ ] **3.10** Bound `pending_requests` against a stranger flood (F5) — [file](./3.10-message-request-flood-bound.md)
-- [ ] **3.11** Thread first-contact state into `decide_open` (ctrl-frame gate) (F11) — [file](./3.11-first-contact-ctrl-gate.md)
-- [ ] **3.12** Build the rendezvous image pre-merge + schedule the `--ignored` runner (F12) — [file](./3.12-ci-docker-build-gate.md)
-- [ ] **3.13** Test the `wss://` crypto-provider install (F13) — [file](./3.13-wss-crypto-provider-test.md)
-- [ ] **3.14** Conformance vectors for the c2s hint extension (F20) — [file](./3.14-c2s-hint-conformance-vectors.md)
+- [x] **3.10** Bound `pending_requests` against a stranger flood (F5) — [file](./3.10-message-request-flood-bound.md)
+- [x] **3.11** Thread first-contact state into `decide_open` (ctrl-frame gate) (F11) — [file](./3.11-first-contact-ctrl-gate.md)
+- [x] **3.12** Build the rendezvous image pre-merge + schedule the `--ignored` runner (F12) — [file](./3.12-ci-docker-build-gate.md)
+- [x] **3.13** Test the `wss://` crypto-provider install (F13) — [file](./3.13-wss-crypto-provider-test.md)
+- [x] **3.14** Conformance vectors for the c2s hint extension (F20) — [file](./3.14-c2s-hint-conformance-vectors.md)
 
 **Wave 5 — docs, ops, ratification**
 - [ ] **3.15** Doc-sync the federation wire/deploy facts (F14+F15) — [file](./3.15-federation-protocol-doc-sync.md)

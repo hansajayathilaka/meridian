@@ -817,6 +817,146 @@ async fn open_unregistered_stream_type_is_rejected() {
 }
 
 #[tokio::test]
+async fn ctrl_open_gates_on_undecided_message_request_for_a_non_chat_stream_type() {
+    // F11 / task 3.11: `decide_open`'s `PolicyCtx.first_contact` must reflect the peer's *live*
+    // undecided-`MessageRequest` state instead of the old hardcoded `false` — and must do so
+    // uniformly for any registered stream type, never as a chat-specific special case (the
+    // stream-registry contract: additive stream types touch the registry only). `Probe` is a
+    // throwaway non-chat type whose `on_open` records exactly what `PolicyCtx.first_contact` it was
+    // handed, so this test proves the signal reaches an arbitrary registered type's own policy hook.
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Probe(Arc<AtomicBool>);
+    impl StreamType for Probe {
+        fn name(&self) -> &'static str {
+            "mrd.probe/1"
+        }
+        fn version(&self) -> u16 {
+            1
+        }
+        fn channel_cfg(&self) -> ChannelCfg {
+            ChannelCfg::reliable_ordered("mrd.probe/1")
+        }
+        fn direction(&self) -> meridian_core::envelope::Direction {
+            meridian_core::envelope::Direction::Bidir
+        }
+        fn on_open(
+            &self,
+            _sid: meridian_core::streams::StreamId,
+            _params: &[u8],
+            policy: &meridian_core::streams::PolicyCtx,
+        ) -> meridian_core::streams::OpenDecision {
+            self.0.store(policy.first_contact, Ordering::SeqCst);
+            meridian_core::streams::OpenDecision::Accept
+        }
+    }
+
+    let mut alice = Peer::new("gate.a");
+    let mut bob = Peer::new("gate.b");
+    establish_ratchet(&mut alice, &mut bob);
+    let alice_ik = alice.ik();
+
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(LoopbackTransport::new(fabric.clone()));
+    let tb = Arc::new(LoopbackTransport::new(fabric.clone()));
+
+    // Both sides register the non-chat probe type (the opener needs it locally too, to build the
+    // OPEN frame's channel config) — only Bob's copy's `on_open` is ever exercised here, since he is
+    // the one deciding Alice's OPENs.
+    let mut alice_reg = StreamRegistry::with_builtins();
+    register_stream_type(
+        &mut alice_reg,
+        Arc::new(Probe(Arc::new(AtomicBool::new(false)))),
+    );
+    let seen = Arc::new(AtomicBool::new(false));
+    let mut bob_reg = StreamRegistry::with_builtins();
+    register_stream_type(&mut bob_reg, Arc::new(Probe(seen.clone())));
+
+    let (ra, rb) = connect(
+        ta,
+        tb,
+        &mut alice,
+        &mut bob,
+        Arc::new(alice_reg),
+        Arc::new(bob_reg),
+    )
+    .await;
+    let mut asess = ra.expect("established");
+    let mut bsess = rb.expect("established");
+    let ahandle = alice.handle();
+    let bhandle = bob.handle();
+
+    // Alice's first-ever chat content frame to Bob: gated as a `MessageRequest`, held undecided.
+    asess
+        .send_chat(&alice.store, &ahandle, &mut alice.chat, "hi bob")
+        .await
+        .unwrap();
+    match bsess.pump(&bob.store, &bhandle, &mut bob.chat).await {
+        Err(SessionError::Chat(ChatError::MessageRequest)) => {}
+        other => panic!("expected the first content frame to be gated, got {other:?}"),
+    }
+    assert!(
+        bob.chat.pending_request(&alice_ik).is_some(),
+        "an undecided MessageRequest must be held for Alice"
+    );
+
+    // Alice now opens a completely unrelated, non-chat stream type. Bob's `decide_open` must feed
+    // `first_contact: true` into `Probe::on_open` — proving the fix reads *live* `pending_request`
+    // state, not just the session-establishment-time `chat_first_contact_gate` flag (which was
+    // already cleared by the chat frame above, and would wrongly read `false` here on its own — the
+    // exact gap this task closes).
+    asess
+        .open_stream(
+            &alice.store,
+            &ahandle,
+            &mut alice.chat,
+            "mrd.probe/1",
+            vec![],
+        )
+        .await
+        .unwrap();
+    match bsess
+        .pump(&bob.store, &bhandle, &mut bob.chat)
+        .await
+        .unwrap()
+    {
+        Some(SessionEvent::StreamOpened(_, ty)) => assert_eq!(ty, "mrd.probe/1"),
+        other => panic!("expected Bob to accept the probe stream open, got {other:?}"),
+    }
+    assert!(
+        seen.load(Ordering::SeqCst),
+        "an undecided MessageRequest must feed first_contact: true into a non-chat stream's \
+         on_open policy hook — this must never be a chat-specific special case"
+    );
+
+    // Once the request is decided (accepted), the same peer opening yet another stream must no
+    // longer read as a first contact.
+    bob.chat.accept_request(&alice_ik).expect("accept");
+    asess
+        .open_stream(
+            &alice.store,
+            &ahandle,
+            &mut alice.chat,
+            "mrd.probe/1",
+            vec![],
+        )
+        .await
+        .unwrap();
+    match bsess
+        .pump(&bob.store, &bhandle, &mut bob.chat)
+        .await
+        .unwrap()
+    {
+        Some(SessionEvent::StreamOpened(_, ty)) => assert_eq!(ty, "mrd.probe/1"),
+        other => panic!("expected Bob to accept the second probe stream open, got {other:?}"),
+    }
+    assert!(
+        !seen.load(Ordering::SeqCst),
+        "an already-decided contact must read first_contact: false"
+    );
+}
+
+#[tokio::test]
 async fn relay_only_session_reports_observed_not_assumed_candidates() {
     // F20: `session info`'s `candidates offered` claim must come from what was actually gathered,
     // not merely from the policy label — this drives a real relay-only dial/answer end-to-end

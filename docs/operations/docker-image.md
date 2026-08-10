@@ -22,6 +22,33 @@ required [`ci.yml`](../../.github/workflows/ci.yml) to pass before a PR can merg
 `TODO: confirm` branch protection is actually configured that way on this repo — if it isn't, this
 pipeline will happily publish an image from an untested commit.
 
+> **This TODO cannot be resolved from an agent session.** Whether a GitHub branch-protection rule
+> or ruleset actually requires `ci.yml` to pass before merging to `main` is a repo **Settings**
+> fact (Settings → Branches, or Settings → Rules → Rulesets), not something visible in the
+> checked-out tree, and no tool available in this environment (no MCP server, no `gh` CLI access)
+> can read it. **A human with access to `github.com/<owner>/meridian/settings/branches` (or
+> `/rules`) needs to check this directly** and either confirm the requirement is set (ideally as a
+> required status check named for the `ci.yml` workflow, covering every job task 3.12 added — see
+> §1a below) or add it if it's missing. Task
+> [3.12](../tasks/phase-3/3.12-ci-docker-build-gate.md) added a build-only Docker gate to `ci.yml`
+> itself (§1a), which strengthens the pre-merge check *if and only if* branch protection actually
+> gates the merge on it — that dependency is exactly what this TODO is about.
+
+### 1a. The pre-merge Docker build gate
+
+As of task [3.12](../tasks/phase-3/3.12-ci-docker-build-gate.md) (fixing review finding F12),
+[`ci.yml`](../../.github/workflows/ci.yml)'s `docker-build` job builds this same
+`apps/rendezvous/Dockerfile` — plus a `docker run` smoke test asserting the container binds,
+answers `/healthz`, and actually drops root (PID 1 runs as the unprivileged `meridian` user, not
+just a fresh `docker exec` session, which defaults to root regardless of the entrypoint) — on
+**every pull request**, before merge. It never pushes and never receives a registry credential (no
+`docker/login-action`, no `packages: write`), so it cannot become a second path that leaks the
+`docker-publish.yml` publish credential. This closes the F12 gap in principle — a broken
+Dockerfile or entrypoint now fails a PR check instead of only surfacing after
+`docker-publish.yml` runs on `main` — but only actually blocks a merge if branch protection
+requires this job (or all of `ci.yml`) to pass first, which is exactly the unresolved fact in the
+callout above.
+
 The image is built with the `sqlite` cargo feature, so accounts and prekey bundles persist across
 container restarts (SQLite file, `create_if_missing` + self-migrating — no separate migration step).
 Postgres isn't wired up: `apps/rendezvous/Cargo.toml` only implements a `sqlite` backend today, so

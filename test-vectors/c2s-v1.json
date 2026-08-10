@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "note": "c2s wire-encoding conformance vectors for the federation-hint extension (F20): Fetch.hint, RouteBody.to_hint, and the new federation error codes — deterministic CBOR (fixed byte patterns, no RNG/wall-clock). Regenerate with `cargo run -p xtask -- vectors`. Spec: docs/api/wire-protocol.md, docs/api/federation-protocol-v1.md, apps/proto/src/msg.rs. The full historic c2s frame set (Challenge/Auth/Publish/Bundle/Deliver/TurnReq/TurnGrant) is proven only by apps/proto/tests/roundtrip.rs's hand-written round trips, a pre-existing gap this task does not widen into (see docs/tasks/phase-3/3.14-c2s-hint-conformance-vectors.md Scope).",
+  "vectors": [
+    {
+      "name": "fetch-no-hint",
+      "op": "Fetch",
+      "id": 1,
+      "fields": {
+        "hint": null,
+        "tamper": false,
+        "target_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "frame_hex": "a3626f706546657463686269640164626f6479582aa16674617267657458201111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "name": "fetch-with-hint",
+      "op": "Fetch",
+      "id": 2,
+      "fields": {
+        "hint": "org-b.example",
+        "tamper": false,
+        "target_hex": "2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      "frame_hex": "a3626f706546657463686269640264626f6479583da266746172676574582022222222222222222222222222222222222222222222222222222222222222226468696e746d6f72672d622e6578616d706c65"
+    },
+    {
+      "name": "route-no-hint",
+      "op": "Route",
+      "id": 3,
+      "fields": {
+        "blob_hex": "deadbeef",
+        "to_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+        "to_hint": null
+      },
+      "frame_hex": "a3626f7065526f7574656269640364626f64795830a262746f5820333333333333333333333333333333333333333333333333333333333333333364626c6f6244deadbeef"
+    },
+    {
+      "name": "route-with-hint",
+      "op": "Route",
+      "id": 4,
+      "fields": {
+        "blob_hex": "cafebabe",
+        "to_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+        "to_hint": "org-b.example"
+      },
+      "frame_hex": "a3626f7065526f7574656269640464626f64795846a362746f5820444444444444444444444444444444444444444444444444444444444444444467746f5f68696e746d6f72672d622e6578616d706c6564626c6f6244cafebabe"
+    },
+    {
+      "name": "err-fed-denied",
+      "op": "Err",
+      "id": 5,
+      "fields": {
+        "code": "fed_denied",
+        "msg": "org-b.example is not accepting this request"
+      },
+      "frame_hex": "a3626f70634572726269640564626f64795842a264636f64656a6665645f64656e696564636d7367782b6f72672d622e6578616d706c65206973206e6f7420616363657074696e6720746869732072657175657374"
+    },
+    {
+      "name": "err-fed-unreachable",
+      "op": "Err",
+      "id": 5,
+      "fields": {
+        "code": "fed_unreachable",
+        "msg": "org-b.example unreachable"
+      },
+      "frame_hex": "a3626f70634572726269640564626f64795835a264636f64656f6665645f756e726561636861626c65636d736778196f72672d622e6578616d706c6520756e726561636861626c65"
+    },
+    {
+      "name": "err-not-found-at-hint",
+      "op": "Err",
+      "id": 5,
+      "fields": {
+        "code": "not_found_at_hint",
+        "msg": "no such account at org-b.example"
+      },
+      "frame_hex": "a3626f70634572726269640564626f6479583ea264636f6465716e6f745f666f756e645f61745f68696e74636d736778206e6f2073756368206163636f756e74206174206f72672d622e6578616d706c65"
+    }
+  ]
+}
