@@ -129,7 +129,7 @@ T08 has no "Decisions to ratify" section and no ADR obligations of its own.
 
 ## Tasks (todo)
 <!-- Filled by /plan-phase. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
-- [ ] **4.1** <title> — [file](./4.1-<slug>.md)
+Not yet broken down — that's `/plan-phase`'s job.
 
 ## Exit criteria
 - All Phase 4 tasks `[x]`, tree green (`just build`, `cargo clippy --workspace --all-targets -D
