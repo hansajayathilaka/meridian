@@ -244,7 +244,7 @@ inside 4.9. 28 tasks, [full DAG here](./phase-4/README.md#dependency-order).
 
 **T17 infra — no T08 dependency**
 - [x] **4.11** `apps/tui` crate skeleton + terminal guard — [file](./phase-4/4.11-tui-crate-skeleton-terminal-guard.md)
-- [ ] **4.12** `meridian tui` subcommand + environment gate — [file](./phase-4/4.12-tui-subcommand-env-gate.md)
+- [~] **4.12** `meridian tui` subcommand + environment gate — [file](./phase-4/4.12-tui-subcommand-env-gate.md)
 - [x] **4.13** Extract shared account/home-layout helpers into `meridian-core` — [file](./phase-4/4.13-extract-account-home-layout-core.md)
 - [ ] **4.14** `meridian-tui::config` — [file](./phase-4/4.14-tui-config.md)
 - [ ] **4.15** `meridian-tui::store` — [file](./phase-4/4.15-tui-store.md)
