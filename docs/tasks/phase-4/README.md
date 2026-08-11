@@ -127,9 +127,108 @@ T08 has no "Decisions to ratify" section and no ADR obligations of its own.
   [task-tracking](../../../.claude/skills/task-tracking/SKILL.md) · Definition of Done gate 9 (every
   future user-visible feature ships its TUI surface via T17's extension registry, starting now).
 
+## Envelope-v2 re-deferred — the concrete trigger
+`/plan-phase` (with an **architect** call) resolved the obligation from this README's Dependency-check
+section: full envelope-v2 (ADR 0016 C1–C7, new AAD, `v: 2` field, hard flag day, new conformance
+vectors) is **not** scheduled in Phase 4. Nothing in ADR 0016 requires it — the ADR gates only Feature
+07 (mailbox), and T07 is already excluded from this phase for that exact reason. Bundling all of C1–C7
+alongside T08+T17 would repeat, at much larger scale, the "one coherent, reviewable unit" problem Phase
+2's README used to keep T09 out of Phase 2 alongside T06.
+
+**What does land in Phase 4:** a narrow, v1-scoped, non-wire-breaking fix inside task
+[4.9](./4.9-desync-guarded-rehandshake.md) — `open_bytes`'s stale-session short-circuit, which
+architect confirmed would otherwise make T08's own desync-recovery deliverable not actually work (a
+legitimate re-initiation from a peer with a *stale* session, not merely *no* session, is currently
+swallowed forever). This fix does **not** discharge ADR 0016 C7 — envelope v2 will still rewrite the
+same function under the new AAD/commit-on-decrypt rules and must re-verify this behavior then.
+
+**The trigger, made mechanical instead of prose (so it can't evaporate a third time):**
+1. [`docs/architecture/roadmap.md`](../../architecture/roadmap.md)'s dependency table now lists T07's
+   deps as `03, 06, envelope-v2` — the same table `task-picker` mechanically reads every
+   `/pick-next-phase` run, so a future run cannot read T07 as pickable without also seeing the new
+   dependency.
+2. Envelope-v2 is committed here as the **named next build-phase target**: after Phase 5 (this phase's
+   review sweep), the build phase immediately following is envelope-v2's own phase — scope pre-written
+   as ADR 0016's C1–C7 + `ratchet-v2.json`/`envelope-v2.json` vectors + the flag-day cutover, sized
+   comparably to Phase 2 (T06), so a future `/plan-phase` cannot under-scope it either.
+3. `docs/tasks/README.md`'s Live carry-forwards restates this as a rule: T07 (and T14, transitively) are
+   not pickable until an envelope-v2 task/phase exists in the tracker with status done.
+
 ## Tasks (todo)
-<!-- Filled by /plan-phase. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
-Not yet broken down — that's `/plan-phase`'s job.
+<!-- Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
+
+**ADR track — block all T17 code, not T08** (4.1, 4.2 can run together)
+- [ ] **4.1** ADR 0020 — TUI packaging — [file](./4.1-adr-tui-packaging.md)
+- [ ] **4.2** ADR 0021 — client-local store & config formats — [file](./4.2-adr-client-store-config-formats.md)
+
+**T08 track — starts immediately, independent of the ADRs** (the phase's longest critical-path chain)
+- [ ] **4.3** Trust module + contact store core — [file](./4.3-trust-module-contact-store.md)
+- [ ] **4.4** Key-change handling: block/warn semantics — [file](./4.4-key-change-block-warn-gate.md)
+- [ ] **4.5** Safety-number compare UX primitives + `meridian verify` — [file](./4.5-safety-number-verify-cli.md)
+- [ ] **4.6** Petname assignment + contact management CLI — [file](./4.6-petname-contact-management-cli.md)
+- [ ] **4.7** Message-request UX finalization (from T06) — [file](./4.7-message-request-finalization.md)
+- [ ] **4.8** Org directory-attestation ingest — [file](./4.8-directory-attestation-ingest.md)
+- [ ] **4.9** Desync detection → guarded fresh-X3DH re-handshake (1.18 follow-through; includes the
+  `open_bytes` short-circuit fix) — [file](./4.9-desync-guarded-rehandshake.md)
+- [ ] **4.10** `meridian-mitm-sim` trust-state matrix — [file](./4.10-mitm-sim-trust-matrix.md)
+
+**T17 infra — no dependency on T08; starts alongside it once 4.1 lands** (4.13 has zero dependencies —
+start it day 1)
+- [ ] **4.11** `apps/tui` crate skeleton + terminal guard — [file](./4.11-tui-crate-skeleton-terminal-guard.md)
+- [ ] **4.12** `meridian tui` subcommand + environment gate — [file](./4.12-tui-subcommand-env-gate.md)
+- [ ] **4.13** Extract shared account/home-layout helpers into `meridian-core` — [file](./4.13-extract-account-home-layout-core.md)
+- [ ] **4.14** `meridian-tui::config` — [file](./4.14-tui-config.md)
+- [ ] **4.15** `meridian-tui::store` — [file](./4.15-tui-store.md)
+- [ ] **4.16** Onboarding screen — [file](./4.16-onboarding-screen.md)
+- [ ] **4.17** Unlock screen — [file](./4.17-unlock-screen.md)
+- [ ] **4.18** Extension registry (`meridian-tui::surface`) — [file](./4.18-extension-registry.md)
+
+**T17 screens — the rendezvous point; 4.19 is the first task needing both tracks**
+- [ ] **4.19** Contact list + add-contact + contact detail — [file](./4.19-contact-list-detail-screens.md)
+- [ ] **4.20** Chat / conversation screen — [file](./4.20-chat-screen.md)
+- [ ] **4.21** Message-request queue screen — [file](./4.21-message-request-queue-screen.md)
+- [ ] **4.22** Verification screen — [file](./4.22-verification-screen.md)
+- [ ] **4.23** Key-change adversarial test — [file](./4.23-key-change-adversarial-test.md)
+- [ ] **4.24** Settings screen — [file](./4.24-settings-screen.md)
+- [ ] **4.25** Help overlay + command palette + diagnostics — [file](./4.25-help-palette-diagnostics.md)
+- [ ] **4.26** Terminal-constraint degradation — [file](./4.26-terminal-constraint-degradation.md)
+- [ ] **4.27** At-rest audit harness — [file](./4.27-at-rest-audit-harness.md)
+
+**Phase exit gate**
+- [ ] **4.28** Docs sync + phase acceptance-demo wiring — [file](./4.28-docs-sync-acceptance-demo.md)
+
+### Dependency order
+```
+4.1 ─┬─► 4.11 ─┬─► 4.12
+     │         └─► 4.18
+4.2 ─┘
+4.13 (no deps — start day 1) ──► 4.14, 4.15, 4.17, 4.19
+
+4.3 ─┬─► 4.4 ──► 4.9 ──► 4.10
+     ├─► 4.5 ───────────►┤
+     ├─► 4.6 ──► 4.7 ────┤
+     └─► 4.8 (needs 4.3, 4.6)
+
+4.14 ──► 4.16 ──┐
+4.15 ──┬─► 4.17 ┤
+       └────────┴─► 4.19 ──► 4.20 ──► 4.21
+(4.3,4.6) ──────────┘          │        ▲
+(4.4) ──────────────────────────┘        │
+(4.7) ─────────────────────────────────┘
+(4.4,4.5) ──────────────────────────────────────► 4.22 ──► 4.23
+4.14 ──► 4.24
+4.18,4.19,4.20 ──► 4.25
+4.20 ──► 4.26
+4.15,4.16,4.19,4.20,4.22 ──► 4.27
+everything ──► 4.28
+```
+**Parallel tracks.** Track ADR (4.1, 4.2) — no code. Track T08 (4.3→4.10) — the phase's longest
+sequential chain, zero dependency on the ADRs or on any T17 task. Track T17-infra (4.13 independent;
+4.11/4.12/4.18 need only 4.1) — runs alongside Track T08. Once 4.1+4.2 land, 4.14/4.15/4.16/4.17 proceed
+in parallel with T08's later tasks (they touch disjoint files: `apps/tui` vs. `apps/core/src/trust.rs` +
+`harnesses/`). **4.19 is the hard merge point** — the first T17 task needing T08's `trust.rs` (4.3) and
+petname API (4.6); everything downstream in T17 (4.20–4.27) serializes behind both tracks converging
+there. 4.24 and 4.13 are the most freely schedulable — use them to fill slack.
 
 ## Exit criteria
 - All Phase 4 tasks `[x]`, tree green (`just build`, `cargo clippy --workspace --all-targets -D
