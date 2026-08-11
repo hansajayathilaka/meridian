@@ -159,7 +159,7 @@ same function under the new AAD/commit-on-decrypt rules and must re-verify this 
 
 **ADR track — block all T17 code, not T08** (4.1, 4.2 can run together)
 - [x] **4.1** ADR 0020 — TUI packaging — [file](./4.1-adr-tui-packaging.md)
-- [ ] **4.2** ADR 0021 — client-local store & config formats — [file](./4.2-adr-client-store-config-formats.md)
+- [x] **4.2** ADR 0021 — client-local store & config formats — [file](./4.2-adr-client-store-config-formats.md)
 
 **T08 track — starts immediately, independent of the ADRs** (the phase's longest critical-path chain)
 - [ ] **4.3** Trust module + contact store core — [file](./4.3-trust-module-contact-store.md)

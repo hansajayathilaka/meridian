@@ -230,7 +230,7 @@ inside 4.9. 28 tasks, [full DAG here](./phase-4/README.md#dependency-order).
 
 **ADR track — blocks all T17 code, not T08**
 - [x] **4.1** ADR 0020 — TUI packaging — [file](./phase-4/4.1-adr-tui-packaging.md)
-- [~] **4.2** ADR 0021 — client-local store & config formats — [file](./phase-4/4.2-adr-client-store-config-formats.md)
+- [x] **4.2** ADR 0021 — client-local store & config formats — [file](./phase-4/4.2-adr-client-store-config-formats.md)
 
 **T08 track — starts immediately**
 - [~] **4.3** Trust module + contact store core — [file](./phase-4/4.3-trust-module-contact-store.md)
