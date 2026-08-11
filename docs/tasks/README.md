@@ -16,29 +16,25 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 3 is fully done — all 23 tasks `[x]`, no open ADR obligations.** This run
-  closed the last two items: **3.23** — bound `serve_link`'s idle read
-  ([file](./phase-3/3.23-serve-link-idle-read-deadline.md)): a new, independent
-  `federation.serve_idle_timeout_ms` config knob (default 10_000ms, derived from
-  `request_timeout_ms`'s precedent), `serve_link`'s main loop now wraps `recv_frame` in
-  `with_deadline` so a handshaked-but-stalling peer can no longer hold a `max_links` slot forever
-  (review + a parallel test-engineer mutation-check caught and fixed a test-soundness gap in the
-  permit-reclamation assertion before landing). And **3.9** — the dead per-partner `policy` field
-  in `federation_map.toml` ([file](./phase-3/3.9-federation-map-policy-field.md), F7): architect
-  chose reject-on-presence (a `[[partner]]` entry setting `policy` is now a fail-closed
-  config-load error, `DiscoveryError::UnsupportedPolicyField`) over plain removal (would just
-  relocate the same silent-failure bug to serde) or enforcement (out of scope — would require
-  redesigning `FederationPolicy` into a per-partner dimension, and would silently no-op under SRV
-  discovery). Both landed with clean combined-reviewer sign-offs, tree green, lints clean. Phases
-  0–2 are **done**.
-- **NEXT:** `/pick-next-phase` — Phase 3 (review of Phase 2) is closed; no fix-tasks remain and no
-  ADR obligations are outstanding. Time to pick the next **build** phase's feature(s) per the
-  [roadmap](../architecture/roadmap.md) dependency DAG. **New candidate:**
-  [T17 — Terminal TUI Client](../architecture/features/17-terminal-tui-client.md) was spec'd
-  out-of-band (design: [tui-client.md](../architecture/tui-client.md)); its deps (01–05) are all
-  done, so it is pickable immediately. If picked, its phase must open with the two ADR obligations
-  the spec names (**0020** TUI packaging, **0021** client-local store/config formats) before any
-  code — same shape as Phase 2's 2.1.
+- **NOW:** **`/pick-next-phase` chose Phase 4 = T08 (Verification & Contact Trust) + T17 (Terminal
+  TUI Client), bundled together.** [Phase 4 README](./phase-4/README.md) has the full rationale;
+  short version: T17's spec treats safety-number verification, mark-verified, and un-softenable
+  key-change blocking as mandatory in-scope UI, but that state machine is T08's core deliverable
+  ("lands in core, consumed by every client") — picking T17 alone would force either stubbing a
+  scope item it calls mandatory or building a shadow trust implementation in the TUI, which would
+  violate T17's own "no protocol logic in the TUI" rule. So both land in one phase, with T08's core
+  trust module + `meridian-mitm-sim` sequenced ahead of T17's verification screens. **T07 (Offline
+  Mailbox) was considered and excluded**: despite its roadmap deps (03, 06) reading as satisfied,
+  [ADR 0016](../adr/0016-envelope-deniability.md) gates it on envelope v2 landing first ("shipping
+  the mailbox first is what makes the exposure durable"), and envelope v2 is still unbuilt. That
+  ADR's "when Feature 08/09 is planned" trigger has now fired — Phase 4's README flags that
+  `/plan-phase` must either schedule envelope v2 inside Phase 4 or explicitly re-defer it with a new
+  concrete trigger, not drop it silently again. Phase 4 opens with **ADR 0020** (TUI packaging) and
+  **ADR 0021** (client-local store/config formats) before any code, same shape as Phase 2's 2.1.
+  Phases 0–3 are **done**.
+- **NEXT:** `/plan-phase` — break T08 + T17 into tasks per [Phase 4's README](./phase-4/README.md)
+  (goal, scope, the T17/T08 sequencing resolution, dependency check, ADR obligations, and reading
+  list are all there).
 
 ### Live carry-forwards (not owned by any open task)
 Everything else is owned by a Phase-3 task; these are the exceptions that would otherwise evaporate:
@@ -215,6 +211,18 @@ phase.
 **Wave 7 — found during 3.22, not part of the original report**
 - [x] **3.23** Bound `serve_link`'s idle read (no idle-read deadline; in WebPKI mode exploitable by
   any public-CA cert-holder, not gated by federation policy) — [file](./phase-3/3.23-serve-link-idle-read-deadline.md)
+
+### Phase 4 — Verification & Trust + Terminal TUI Client · **planning** · [details](./phase-4/README.md)
+Build phase. **[T08 — Verification & Contact Trust](../architecture/features/08-verification-trust.md)**
++ **[T17 — Terminal TUI Client](../architecture/features/17-terminal-tui-client.md)**, bundled: T08's
+core trust module (safety-number compare, TOFU→pinned→verified states, un-softenable key-change
+blocking, `meridian-mitm-sim`) is a hard prerequisite for T17's mandatory verification screens — see
+the [phase README](./phase-4/README.md#resolving-the-t17t08-overlap) for why they aren't split. T07
+(Offline Mailbox) considered and excluded — [ADR 0016](../adr/0016-envelope-deniability.md) gates it on
+envelope v2, still unbuilt; that ADR's "when Feature 08/09 is planned" trigger has now fired and
+`/plan-phase` must resolve it (schedule envelope v2 here, or re-defer with a concrete new trigger).
+Deps: T08→T03 done; T17→T01–T05 done (T06 done too). Opens with ADR 0020 (TUI packaging) + ADR 0021
+(client-local store/config formats) before any code. Tasks not yet broken down — next: `/plan-phase`.
 
 ---
 
