@@ -12,6 +12,7 @@ members = [
   "apps/transport",
   "apps/signaling",
   "apps/cli",
+  "apps/tui",
   "apps/rendezvous",
   "tools/xtask",
 ]
@@ -47,6 +48,12 @@ serde_json = "1.0"
 # CLI.
 clap = { version = "4.6.1", features = ["derive"] }
 rpassword = "7.4"
+# Terminal TUI client (T17; meridian-tui only, ADR 0020 — no other crate may depend on these).
+# ratatui's default "crossterm" feature pulls in crossterm 0.29 internally (via the ratatui-crossterm
+# backend crate), so pinning crossterm itself to the same 0.29 line keeps the KeyEvent/Event types
+# meridian-tui constructs directly and the ones ratatui's CrosstermBackend expects identical.
+ratatui = "0.30.2"
+crossterm = "0.29.0"
 # Wire types & CBOR (shared client/server — deterministic encoding, DOC-01).
 ciborium = "0.2.2"
 # X25519 prekeys (T02 bundles; audited RustCrypto — never hand-rolled per ADR 0011 spirit).

@@ -17,8 +17,10 @@ flowchart TB
     FFI["meridian-ffi (UniFFI)"]
     WASM["meridian-wasm (wasm-bindgen)"]
     CLIBIN["meridian-cli"]
+    TUI["meridian-tui<br/>(ratatui + crossterm, ADR 0020)"]
   end
-  CORE --> FFI & WASM & CLIBIN
+  CORE --> FFI & WASM & CLIBIN & TUI
+  CLIBIN -- "meridian tui subcommand" --> TUI
 
   subgraph Targets["Shipped clients"]
     T_CLI["Terminal<br/>ratatui / --json"]
@@ -27,7 +29,7 @@ flowchart TB
     T_AND["Android<br/>Compose + .so"]
     T_IOS["iOS<br/>SwiftUI + xcframework"]
   end
-  CLIBIN --> T_CLI
+  TUI --> T_CLI
   WASM --> T_WEB
   CORE -- "in-process" --> T_DESK
   FFI -- "bindings/kotlin" --> T_AND
@@ -58,5 +60,5 @@ flowchart TB
   classDef shim fill:#fdf3d8,stroke:#b8860b
   classDef target fill:#eef7e8,stroke:#5a8a4a
   class PROTO,CORE,ID,STORE2,CRYPTO,TRUST2,SESS2,TRANS2,STREAMS2,SIG2 spine
-  class FFI,WASM,CLIBIN shim
+  class FFI,WASM,CLIBIN,TUI shim
   class T_CLI,T_WEB,T_DESK,T_AND,T_IOS target

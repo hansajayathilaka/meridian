@@ -1,0 +1,32 @@
+[package]
+name = "meridian-tui"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The interactive ratatui client (T17). Owns all terminal-rendering code in the workspace — see
+# ADR 0020 (docs/adr/0020-tui-packaging.md): this crate depends on meridian-core ONLY, never on
+# meridian-cli (meridian-cli depends on meridian-tui, launching it via a `meridian tui` subcommand,
+# task 4.12). No protocol logic lands here; it orchestrates meridian-core exactly like the CLI does.
+[lib]
+name = "meridian_tui"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Exposes terminal::test_support::RecordingOps (a fake TerminalOps that records raw-mode/alt-screen
+# transitions instead of touching a real TTY) so the integration test in tests/ can reach it. Never
+# enabled by a normal consumer (meridian-cli) — mirrors apps/signaling's "test-support" pattern.
+test-support = []
+
+[dependencies]
+meridian-core = { path = "../core" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+
+[dev-dependencies]
+# Self-dependency with test-support enabled, so tests/terminal_guard.rs (a separate crate linking
+# the normal, non-`cfg(test)` build of this lib) can reach terminal::test_support::RecordingOps.
+meridian-tui = { path = ".", features = ["test-support"] }

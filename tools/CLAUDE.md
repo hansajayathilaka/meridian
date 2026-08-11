@@ -8,6 +8,8 @@ Scoped memory. Inherits [root](../CLAUDE.md). Developer tooling that CI mirrors 
   generation (`cargo run -p xtask -- vectors`).
 - **Invariant lints** (also run by `just lint-invariants` / CI):
   - `lint-server-no-core.sh` — `meridian-rendezvous` must not depend on `meridian-core` (ADR 0008).
+  - `lint-tui-no-cli.sh` — `meridian-tui` must depend on `meridian-core` only, never `meridian-cli`
+    (ADR 0020 condition 3).
   - `lint-no-serde-on-blob.sh` — no structured (de)serialization of opaque payloads server-side.
   - `lint-metrics-allowlist.sh` (+ `metrics-allowlist.txt`) — server exports only allowlisted metrics.
 - `check-docs.sh` — relative-link / doc checker (run during verification).

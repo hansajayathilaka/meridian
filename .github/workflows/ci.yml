@@ -27,6 +27,9 @@ jobs:
           # Guards the guard: fails CI if the cargo-tree check stops catching a TRANSITIVE core
           # dependency — the route the old grep-based lint could never see (F21).
           bash tools/lint-server-no-core.sh --selftest
+          # ADR 0020 condition 3: meridian-tui depends on meridian-core only, never meridian-cli.
+          bash tools/lint-tui-no-cli.sh
+          bash tools/lint-tui-no-cli.sh --selftest
           bash tools/lint-no-serde-on-blob.sh
           # Guards the guard: fails CI if a future edit to the lint silently regresses its
           # module-qualified-path / multi-line bypass coverage (F15).
