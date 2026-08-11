@@ -27,6 +27,7 @@ mod session;
 mod session_connect;
 #[cfg(feature = "tui")]
 mod tui;
+mod verify;
 use account::{AccountDescriptor, StoreKind};
 
 const OS_KEYSTORE_SERVICE: &str = "meridian";
@@ -89,6 +90,20 @@ enum TopCommand {
     Contact {
         #[command(subcommand)]
         cmd: ContactCommand,
+    },
+    /// Safety-number compare/verify (T08): displays the 60-digit number + QR for out-of-band
+    /// compare with the peer, or — with `--scan-file` — headlessly compares a scanned QR image
+    /// against the number computed locally. Marks the contact verified on a confirmed match
+    /// (see `apps/cli/src/verify.rs` and `docs/security/verification-ux.md`). Requires the peer
+    /// to already be a known contact (`meridian contact add` first).
+    Verify {
+        /// The peer's full `mrd1:…@domain` ID.
+        id: String,
+        /// Headless compare: path to a QR image (e.g. scanned from the peer's device) to decode
+        /// and compare against the safety number computed locally, instead of the interactive
+        /// display + confirm prompt.
+        #[arg(long)]
+        scan_file: Option<PathBuf>,
     },
     /// Open an end-to-end-encrypted chat with a peer, relayed through the rendezvous (T03).
     Chat {
@@ -324,6 +339,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         TopCommand::Id { cmd } => run_id(cmd),
         TopCommand::Contact { cmd } => run_contact(cmd),
+        TopCommand::Verify { id, scan_file } => run_verify(&id, scan_file.as_deref()),
         TopCommand::Register { server, invite } => cmd_register(&server, invite),
         TopCommand::FetchBundle { id, server, tamper } => cmd_fetch_bundle(&id, &server, tamper),
         TopCommand::Chat { id, server, json } => cmd_chat(&id, &server, json),
@@ -371,6 +387,17 @@ fn run_contact(cmd: ContactCommand) -> Result<ExitCode, String> {
         }
         ContactCommand::Block { id } => contact::cmd_block(&id, store.as_ref(), &handle)?,
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `meridian verify …` — loads the current account (same shape as `run_contact`) and delegates to
+/// `verify.rs`.
+fn run_verify(id: &str, scan_file: Option<&Path>) -> Result<ExitCode, String> {
+    let descriptor = AccountDescriptor::load()?;
+    let own_pubkey = account_pub_bytes(&descriptor)?;
+    let store = load_store(&descriptor)?;
+    let handle = KeyHandle::from_label(&descriptor.label);
+    verify::cmd_verify(id, &own_pubkey, scan_file, store.as_ref(), &handle)?;
     Ok(ExitCode::SUCCESS)
 }
 

@@ -35,6 +35,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 age = { workspace = true }
 hex = { workspace = true }
+# `meridian verify --scan-file`: loads a QR image from disk to hand to
+# `meridian_core::identity::decode_luma` (task 4.5). The workspace default has no format codecs
+# enabled (just the core `ImageBuffer` types `qr.rs` needs); this crate is the one that actually
+# reads/writes image files, so it opts into PNG here.
+image = { workspace = true, features = ["png"] }
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
 getrandom = { workspace = true }
 figment = { version = "0.10.19", features = ["json", "env"] }
