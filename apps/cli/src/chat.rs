@@ -15,7 +15,10 @@
 //! A first envelope from a peer this `ChatState` has never seen before is gated into a
 //! segregated message-request state rather than delivered (task 2.10, system-design.md §3.5): see
 //! `handle_inbound`'s `ChatError::MessageRequest` arm for the prompt and `answer_request` for the
-//! accept/reject handling.
+//! accept/reject handling. (task 4.7) Accepting is also where this gate meets `meridian-core`'s
+//! trust module: `answer_request` TOFU-pins the sender as a real `Contact` and offers an inline
+//! petname, while rejecting touches `trust` not at all — see `run`'s deferred-pin comment for why
+//! the ordinary early-`observe` call below does not itself pin an as-yet-undecided first contact.
 //!
 //! (task 4.4) Every outbound `mrd.chat/1` text send also consults `meridian_core::trust`'s
 //! un-softenable [`SendGate`]: a verified contact's key change hard-blocks sends (no bypass, only
@@ -63,13 +66,38 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
 
     let mut state = load_state(store, handle)?;
     let mut trust = load_trust(store, handle)?;
-    // TOFU-record (or just refresh) this contact so `can_send` below has something to consult.
-    // Never itself a key-change signal — see `TrustStore::observe`'s doc for why a same-invocation
-    // `peer_ik` can't organically surface one; that correlation has to come from a caller that
-    // actually knows two keys are the same contact (`TrustStore::observe_key_change`), which this
-    // single fixed-peer relay chat has no basis to invent on its own.
-    trust.observe(peer_ik, &peer_hint, crate::now_unix());
-    save_trust(&trust, store, handle)?;
+    // Roles are decided by key order so two peers both running `chat` establish exactly one X3DH,
+    // independent of who types first (moved up from below so the TOFU-pin decision just below can
+    // read it too).
+    let initiator = account_pub.as_slice() <= peer_ik.as_slice();
+    // (task 4.7) TOFU-record (or just refresh) this contact so `can_send` below has something to
+    // consult — but only when this side already has a basis to want this contact pinned: it's the
+    // initiator (deliberately reaching out to `peer_ik`, same posture as `contact add`) or a
+    // session with `peer_ik` already exists **and there is no still-undecided `MessageRequest`
+    // for it**. `state.has_session(&peer_ik)` alone is NOT sufficient to rule out an undecided
+    // first-contact request: `ChatState::open_inbound_gated` installs the responder's ratchet
+    // session as a side effect of processing the first prekey envelope *before* deciding whether
+    // to gate it into `pending_requests` (`apps/core/src/chat.rs`'s `open_bytes`/
+    // `open_inbound_gated`), so a session can already exist for a peer whose request the user has
+    // not yet answered. Without the `pending_request(&peer_ik).is_none()` check, restarting this
+    // process while a request sits undecided would silently TOFU-pin the sender on the next
+    // invocation's startup — the exact premature-pin bug this task exists to close, just moved
+    // from "first invocation" to "process restart before a decision" (found by this task's
+    // required review, reproduced, and fixed here rather than deferred).
+    // A responder with no session yet is the more common case that can land a still-gated
+    // first-contact `MessageRequest` (task 2.10, `handle_inbound`'s `ChatError::MessageRequest`
+    // arm): pinning here, before the user has even seen the intro and safety number, would
+    // TOFU-pin a `Contact` regardless of what the user later decides, defeating
+    // `reject_request`'s "no trace" guarantee (task 4.7's actual gap — see `answer_request`, which
+    // owns the deferred pin for both cases). Never itself a key-change signal — see
+    // `TrustStore::observe`'s doc for why a same-invocation `peer_ik` can't organically surface one;
+    // that correlation has to come from a caller that actually knows two keys are the same contact
+    // (`TrustStore::observe_key_change`), which this single fixed-peer relay chat has no basis to
+    // invent on its own.
+    if initiator || (state.has_session(&peer_ik) && state.pending_request(&peer_ik).is_none()) {
+        trust.observe(peer_ik, &peer_hint, crate::now_unix());
+        save_trust(&trust, store, handle)?;
+    }
 
     let mut client = SignalingClient::connect(&server, store, handle, account_pub, None, 1)
         .await
@@ -94,10 +122,9 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
         crate::now_unix(),
     );
 
-    // Roles are decided by key order so two peers both running `chat` establish exactly one X3DH.
-    // Only the initiator needs the peer's bundle; the responder derives everything from the
-    // opening prekey message, so it just waits (avoiding a mutual fetch deadlock at startup).
-    let initiator = account_pub.as_slice() <= peer_ik.as_slice();
+    // Only the initiator (role decided above) needs the peer's bundle; the responder derives
+    // everything from the opening prekey message, so it just waits (avoiding a mutual fetch
+    // deadlock at startup).
     if initiator && !state.has_session(&peer_ik) {
         let peer_bundle = fetch_with_retry(&mut client, peer_ik, &peer_hint, &peer_label).await?;
         state
@@ -149,7 +176,7 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
                 match maybe_line {
                     Some(text) if text.trim().is_empty() => {}
                     Some(text) if awaiting_request => {
-                        answer_request(&mut client, &mut state, &trust, store, handle, &account_pub, &peer_ik, &peer_hint, &peer_label, &text, json, &mut pending, &mut pending_key_change_ack, &mut awaiting_key_change_ack).await?;
+                        answer_request(&mut client, &mut state, &mut trust, store, handle, &account_pub, &peer_ik, &peer_hint, &peer_label, &text, json, &mut pending, &mut pending_key_change_ack, &mut awaiting_key_change_ack).await?;
                         awaiting_request = false;
                     }
                     Some(text) if awaiting_key_change_ack => {
@@ -705,14 +732,27 @@ async fn deliver_content(
 }
 
 /// Handle the user's typed answer to a pending message-request prompt (task 2.10): `y`/`yes`
-/// (case-insensitive) accepts, anything else rejects. Accepting delivers the held intro exactly
-/// like an ordinary message; rejecting is silent (see [`ChatState::reject_request`]'s doc comment
-/// on why nothing is sent back to the sender).
+/// (case-insensitive) accepts, anything else rejects.
+///
+/// **Accept (task 4.7):** delivers the held intro exactly like an ordinary message, and — the glue
+/// this task adds — TOFU-pins `peer_ik` as a real [`meridian_core::trust::Contact`] via
+/// [`TrustStore::observe`] (the request gate's own security properties — sender key, safety number,
+/// intro shown before this point — are already correct from 2.10 and are not re-derived here; see
+/// `run`'s doc comment on why this is the *first* `observe` call for a responder that had no prior
+/// session, now that the unconditional early pin in `run` is deferred for exactly this case), then
+/// offers an inline, optional petname assignment the same way `contact.rs`'s `cmd_add` does: only
+/// when stdin is actually a TTY (never blocks a scripted/`--json` flow), value typed by the operator
+/// only — never derived from `peer_hint`/`peer_label`/anything wire-observed (the petname-never-
+/// from-wire invariant `contact.rs` documents at module level).
+///
+/// **Reject:** silent (see [`ChatState::reject_request`]'s doc comment on why nothing is sent back
+/// to the sender) — and, matching that silence, `trust` is never touched: no `Contact` record is
+/// created, no petname prompt, no trace at all of the rejected sender in the trust store.
 #[allow(clippy::too_many_arguments)]
 async fn answer_request(
     client: &mut SignalingClient,
     state: &mut ChatState,
-    trust: &TrustStore,
+    trust: &mut TrustStore,
     store: &dyn SecretStore,
     handle: &KeyHandle,
     account_pub: &[u8; 32],
@@ -736,6 +776,26 @@ async fn answer_request(
             } else {
                 println!("(accepted — now chatting with {peer_label})");
             }
+
+            // (task 4.7) TOFU-pin the now-accepted sender. Idempotent/refreshing if `run` already
+            // pinned this `peer_ik` (the initiator, or an already-established-session responder);
+            // for the deferred first-contact-responder case this is the very first `observe` call
+            // for this contact, made only now that the user has actually accepted.
+            trust.observe(*peer_ik, peer_hint, crate::now_unix());
+
+            // Offer a petname inline, exactly like `contact add`'s interactive prompt — TTY-gated
+            // so a scripted/`--json` flow (stdin piped, never a TTY) never blocks on it.
+            if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                if let Some(name) = crate::contact::prompt_petname()? {
+                    trust
+                        .set_petname(peer_ik, Some(name.clone()))
+                        .map_err(|e| format!("setting petname for {peer_label}: {e}"))?;
+                    if !json {
+                        println!("  petname set: \"{name}\"");
+                    }
+                }
+            }
+
             deliver_content(
                 client,
                 state,
@@ -755,6 +815,10 @@ async fn answer_request(
             .await?;
         }
     } else {
+        // No `trust` interaction here at all (task 4.7): `reject_request` already discards the
+        // held `MessageRequest`/session state on the `chat.rs` (core) side, and this branch must
+        // not create a `Contact` record either, so a rejected sender leaves genuinely no trace in
+        // either store.
         state.reject_request(peer_ik);
         if json {
             println!(

@@ -170,7 +170,10 @@ fn state_str(state: TrustState) -> &'static str {
 
 /// Interactive petname prompt — only ever reached when stdin is a TTY (see [`cmd_add`]). An empty
 /// line (just pressing Enter) skips assigning a petname.
-fn prompt_petname() -> Result<Option<String>, String> {
+///
+/// `pub(crate)` (task 4.7) so `chat.rs`'s `answer_request` can offer the identical inline prompt on
+/// message-request accept, without duplicating this 5-line function.
+pub(crate) fn prompt_petname() -> Result<Option<String>, String> {
     print!("Petname for this contact (optional, Enter to skip): ");
     std::io::stdout().flush().map_err(|e| e.to_string())?;
     let mut line = String::new();
