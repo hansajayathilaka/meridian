@@ -32,6 +32,11 @@ pub use meridian_crypto as crypto;
 /// lets one core run on five targets (T04, ADR 0014).
 pub use meridian_transport as transport;
 
+/// The account descriptor (`account.json`) and `$MERIDIAN_HOME` layout helpers (T01, relocated in
+/// task 4.13 so every shim — CLI, and per ADR 0020 the core-only `meridian-tui` — reaches the same
+/// on-disk account/session-store layout through one code path.
+pub mod account;
+
 /// Chat session manager — signs/verifies + seals/opens `mrd.chat/1` envelopes and owns the
 /// persistable session store. Transport-agnostic (relay today, P2P/mailbox later).
 pub mod chat;

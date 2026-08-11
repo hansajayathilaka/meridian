@@ -2346,7 +2346,9 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "ciborium",
+ "figment",
  "getrandom 0.3.4",
+ "hex",
  "meridian-crypto",
  "meridian-envelope",
  "meridian-identity",
@@ -2355,6 +2357,8 @@ dependencies = [
  "meridian-store",
  "meridian-transport",
  "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "zeroize",
