@@ -26,6 +26,12 @@ demo you can execute at sign-off. Trust-critical substrate comes first; convenie
 | [14](./features/14-selfhosting-ops-kit.md) | Self-Hosting Ops Kit | One-command stack; dashboard; air-gapped install | 06, 07 |
 | [15](./features/15-location-stickers.md) | Location & Stickers | Live location on map; signed sticker pack P2P | 09, 11 |
 | [16](./features/16-tier2-tunnels.md) | Tier-2 Tunnels (SSH / fs) | `ssh` into a NAT'd headless box via `meridian tunnel` | 09 |
+| [17](./features/17-terminal-tui-client.md) | Terminal TUI Client | `meridian tui`: keypair → contacts → verified chat, no subcommands | 01–05 |
+
+Feature 17 was added after the original 16 (see [docs/INDEX.md](../INDEX.md)); its number is an
+identifier, not a queue position. Its dependencies (01–05) are all done, so it is pickable now, and it
+is the surface every later user-visible feature plugs into
+([Definition of Done gate 9](../../CONTRIBUTING.md#definition-of-done-every-change-must-satisfy)).
 
 ## Phasing (from the design)
 
@@ -47,5 +53,7 @@ Sequencing rationale: everything trust-critical (identity, federation, verificat
 
 ## Parallel tracks for a small team
 Track A (protocol): 01→03→08→13 · Track B (transport): 04→05→09→10→16 ·
-Track C (infra): 02→06→07→14 · Track D (clients): 11→12→15.
-Features 01–04 are the critical path everyone converges on first.
+Track C (infra): 02→06→07→14 · Track D (clients): 17→11→12→15.
+Features 01–04 are the critical path everyone converges on first. Track D now starts at 17 — the
+terminal client needs only 01–05, so it can run in parallel with any other track and gives every
+later feature a place to land in front of a user.

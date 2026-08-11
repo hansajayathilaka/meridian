@@ -62,6 +62,13 @@ A change is **not done** until all of the following hold:
    [/doc-sync](./.claude/commands/doc-sync.md). All relative links resolve.
 8. **No invented design.** If a detail is absent from the docs, insert `TODO: confirm` and flag it —
    never guess architecture.
+9. **Client surface.** A user-visible feature ships its **TUI surface** — a stream-type renderer,
+   palette command, and/or pane, registered per the
+   [extension contract](./docs/architecture/tui-client.md#8-extension-contract--every-feature-ships-a-tui-surface)
+   with no edits to the TUI core. A feature with genuinely no user surface (server-only, infra, CI,
+   docs) says so explicitly in its task file. The point is that the decision is *recorded*, not that
+   every task grows a UI. Applies from [T17](./docs/architecture/features/17-terminal-tui-client.md)
+   onward; features that predate it acquire their surface when their own follow-up work lands.
 
 ## Guardrails baked into the repo
 - `.claude/settings.json` denies `git push` and `rm -rf`; auto-formats Rust on edit.

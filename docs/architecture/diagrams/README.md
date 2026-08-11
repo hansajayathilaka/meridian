@@ -14,6 +14,8 @@ syntax-validated in CI.
 ## State machines
 - [Session state machine](./session-state-machine.mermaid)
 - [Contact trust state machine](./trust-state-machine.mermaid)
+- [TUI screen flow](./tui-screen-flow.mermaid) — terminal client screens, from onboarding to chat,
+  including the un-softenable key-change stops ([design](../tui-client.md))
 
 ## Sequences
 - [Cross-org session setup](./seq-cross-org-setup.mermaid)

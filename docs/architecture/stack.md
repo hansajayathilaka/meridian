@@ -20,7 +20,7 @@ Rust specifically because: memory safety in an adversarial-input parser (every b
 | **Crypto** | Rust | X3DH + header-encrypted Double Ratchet, composed in `meridian-crypto` from audited RustCrypto primitives (see ADR-R3 / [ADR 0015](../adr/0015-ratchet-composition.md)); OpenMLS for groups (Phase 3); ML-KEM via `ml-kem`/`pqcrypto` for the PQXDH slot | never bespoke; audited primitives only |
 | **P2P data channels + ICE/SCTP/DTLS/SRTP** | Rust | **webrtc-rs** | pure-Rust, identical wire behavior headless↔browser. *Currency:* data channels / ICE / SCTP / DTLS / SRTP are production-usable; full media 3A (echo cancel, noise suppression, NetEQ) is **not** ported — so media takes a different path (next row) |
 | **Real-time media** (audio/video/screenshare capture+processing) | Rust FFI over C++ | **libwebrtc** (mobile & desktop) / **libdatachannel** as a lighter alt for data-only paths | webrtc-rs lacks audio 3A; libwebrtc gives hardware codecs, AEC/AGC/NS, and platform capture. Confined behind the `Transport` trait so the core never depends on it directly |
-| **Terminal client** | Rust | **ratatui** (TUI) + `--json` headless mode; webrtc-rs transport; `cpal` for optional voice | WebRTC is a protocol, not a browser feature — CLI speaks it natively (design §6) |
+| **Terminal client** | Rust | **ratatui** + `crossterm` in `meridian-tui` (launched by `meridian tui`, [T17](./features/17-terminal-tui-client.md) / [design](./tui-client.md)); `meridian-cli` keeps the `--json` headless mode; webrtc-rs transport; `cpal` for optional voice | WebRTC is a protocol, not a browser feature — CLI speaks it natively (design §6). Interactive UI is split into its own crate so the demo/CI binary needn't link it |
 | **Browser client** | Rust→WASM core + TypeScript UI | core via **wasm-bindgen**; UI in **SvelteKit** (or React — ADR-R4); browser-native `RTCPeerConnection` as the Transport impl | browser forbids custom transports, hence the trait; Svelte for small bundles |
 | **Desktop client** (Win/mac/Linux) | Rust + TypeScript | **Tauri v2** (WebView2/WKWebView/WebKitGTK shell, Rust core in-process) | ~3–5 MB bundles vs Electron's ~100 MB; core runs in-process, no IPC to a separate backend. *Currency:* Tauri v2 stable (2.9.x line, late 2025), desktop is production-grade |
 | **Android client** | Kotlin | **Jetpack Compose** UI over **UniFFI**-generated Kotlin bindings; libwebrtc; ConnectionService; StrongBox Keystore; FCM wake | native shell needed for CallKit-equivalent, background, hardware keystore — *not* Tauri (next note) |
@@ -118,7 +118,7 @@ proto ── identity ── store
 
 | Target | Toolchain path | Core delivered as | UI layer | Transport impl |
 |---|---|---|---|---|
-| **Terminal** | `cargo build -p meridian-cli` | linked in-process | ratatui / stdout-json | webrtc-rs |
+| **Terminal** | `cargo build -p meridian-cli` (+ `-p meridian-tui`) | linked in-process | ratatui (`meridian tui`) / stdout-json | webrtc-rs |
 | **Browser** | `wasm-pack`/`trunk` on `meridian-wasm` → `bindings/typescript` | `.wasm` + JS glue | SvelteKit | browser `RTCPeerConnection` |
 | **Desktop** | `cargo tauri build` (embeds core in the Tauri Rust process) | linked in-process | Tauri + shared-ui (Svelte) | webrtc-rs (data) / libwebrtc (media) |
 | **Android** | `cargo ndk` → `.so` per ABI; UniFFI → `bindings/kotlin`; Gradle assembles | `.so` + Kotlin bindings | Jetpack Compose | libwebrtc (Android) |

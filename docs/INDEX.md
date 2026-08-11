@@ -105,6 +105,17 @@ These were created to make the scaffold Claude-Code-ready; see
 | [glossary.md](./glossary.md) | Shared vocabulary |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | Workflow + global Definition of Done |
 
+## Additions after handoff
+
+| New document | Purpose |
+|--------------|---------|
+| [architecture/features/17-terminal-tui-client.md](./architecture/features/17-terminal-tui-client.md) | Feature spec T17 — the terminal TUI client (keypair creation → contacts → verified chat) |
+| [architecture/tui-client.md](./architecture/tui-client.md) | Design of record for the TUI: screens, keymap, runtime, local store/config schemas, security rules, extension contract |
+| [architecture/diagrams/tui-screen-flow.mermaid](./architecture/diagrams/tui-screen-flow.mermaid) | TUI screen/state flow, including the un-softenable key-change stops |
+
+T17 is the 17th feature spec (the original set was 16) and is where **Definition of Done gate 9**
+— every user-visible feature ships a TUI surface — comes from.
+
 [ADR 0011](./adr/0011-ratchet-library.md) was moved from *open* to **Accepted** (X3DH layer, hand-wired
 over RustCrypto primitives; the vodozemac choice for the Double Ratchet mechanism was later superseded
 by [ADR 0015](./adr/0015-ratchet-composition.md) once the `ratchet-header-enc` spike found vodozemac's

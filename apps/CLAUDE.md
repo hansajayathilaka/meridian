@@ -15,7 +15,12 @@ Rust workspace crates (each has its own scoped `CLAUDE.md` where the rules are s
   fingerprints, at-rest. Never bespoke.
 - `transport/` — `meridian-transport`: `Transport` trait, WebRTC data channels, ICE/relay.
 - `signaling/` — `meridian-signaling`: session signaling frames.
-- `cli/` — `meridian-cli`: terminal client; the reference client and demo driver.
+- `cli/` — `meridian-cli`: headless terminal client; the reference client and demo driver. Every
+  feature's acceptance demo runs here (`--json` modes stay scriptable).
+- `tui/` — `meridian-tui` (**planned, T17**): the interactive ratatui client, launched by
+  `meridian tui`. Design: [docs/architecture/tui-client.md](../docs/architecture/tui-client.md).
+  Rule: **no protocol logic** — it orchestrates `meridian-core` exactly like the CLI does, and it is
+  never *more capable* than the headless CLI, only nicer.
 - `rendezvous/` — `meridian-rendezvous` (axum + sqlx): the signaling server. **Only** depends on `meridian-proto`.
 - `web/` — browser client (SvelteKit + WASM core).
 
@@ -29,6 +34,9 @@ and the [core-modules diagram](../docs/architecture/diagrams/core-modules.mermai
 - **All wire types come from `meridian-proto`.** Don't redefine envelope/bundle/ctrl shapes; follow the
   [api-contracts skill](../.claude/skills/api-contracts/SKILL.md).
 - **Additive stream types** register via the stream registry only — no core edits.
+- **A user-visible feature also lands its TUI surface** (Definition of Done gate 9), registered per
+  the [TUI extension contract](../docs/architecture/tui-client.md#8-extension-contract--every-feature-ships-a-tui-surface)
+  — a renderer / palette command / pane, with no edits to the TUI core.
 - **Adversarial-input mindset:** every byte off the wire is hostile; verify signatures before
   deserializing payloads.
 - Match each feature's acceptance demo in

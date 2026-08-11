@@ -51,6 +51,9 @@ just two-orgs     # local two-org federation demo stack
 - **ADRs are binding** ([docs/adr/](./docs/adr/README.md)). Don't diverge silently — supersede with a
   new ADR and involve the `architect` subagent.
 - **Additive stream types touch the registry only**, never core crates.
+- **User-visible features ship a TUI surface** (Definition of Done gate 9) — registered per the
+  [TUI extension contract](./docs/architecture/tui-client.md#8-extension-contract--every-feature-ships-a-tui-surface),
+  never by editing the TUI core. No user surface? Say so explicitly in the task file.
 - **Server never depends on `meridian-core`** (only `meridian-proto`); dependency graph stays acyclic.
 - If a needed detail is absent from the design, insert `TODO: confirm` — do not invent.
 - Rust: `cargo fmt` (enforced by a PostToolUse hook) + `cargo clippy` clean before done.
