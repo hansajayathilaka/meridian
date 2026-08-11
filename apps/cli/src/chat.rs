@@ -16,11 +16,19 @@
 //! segregated message-request state rather than delivered (task 2.10, system-design.md §3.5): see
 //! `handle_inbound`'s `ChatError::MessageRequest` arm for the prompt and `answer_request` for the
 //! accept/reject handling.
+//!
+//! (task 4.4) Every outbound `mrd.chat/1` text send also consults `meridian_core::trust`'s
+//! un-softenable [`SendGate`]: a verified contact's key change hard-blocks sends (no bypass, only
+//! re-verification clears it) and a pinned (TOFU) contact's blocks until the user explicitly
+//! acknowledges the canonical warning — see `send_gated`. This CLI is the scriptable reference/demo
+//! surface (`apps/cli/CLAUDE.md`), so it enforces the same invariant the TUI's modal (task 4.22)
+//! will later present more richly, rather than only ever displaying it once that lands.
 
 use meridian_core::chat::{ChatError, ChatState};
 use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{KeyHandle, SecretStore};
 use meridian_core::signaling::{SignalingClient, DEFAULT_OTK_COUNT};
+use meridian_core::trust::{SendGate, TrustStore};
 use tokio::sync::mpsc;
 
 use crate::account;
@@ -54,6 +62,14 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
     } = args;
 
     let mut state = load_state(store, handle)?;
+    let mut trust = load_trust(store, handle)?;
+    // TOFU-record (or just refresh) this contact so `can_send` below has something to consult.
+    // Never itself a key-change signal — see `TrustStore::observe`'s doc for why a same-invocation
+    // `peer_ik` can't organically surface one; that correlation has to come from a caller that
+    // actually knows two keys are the same contact (`TrustStore::observe_key_change`), which this
+    // single fixed-peer relay chat has no basis to invent on its own.
+    trust.observe(peer_ik, &peer_hint, crate::now_unix());
+    save_trust(&trust, store, handle)?;
 
     let mut client = SignalingClient::connect(&server, store, handle, account_pub, None, 1)
         .await
@@ -120,6 +136,12 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
     // Set while a message request from `peer_ik` is awaiting the user's accept/reject decision
     // (task 2.10, §3.5): the next typed line is read as the answer instead of chat text to send.
     let mut awaiting_request = false;
+    // (task 4.4) Text held behind a live `SendGate::Warn` — the peer's key changed while pinned
+    // (not yet verified) — plus whether the next typed line should be read as that warning's
+    // acknowledge/decline answer instead of ordinary chat text. Mirrors `pending`/`awaiting_request`
+    // above exactly, one gate lower in the same escalation.
+    let mut pending_key_change_ack: Vec<String> = Vec::new();
+    let mut awaiting_key_change_ack = false;
 
     loop {
         tokio::select! {
@@ -127,12 +149,15 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
                 match maybe_line {
                     Some(text) if text.trim().is_empty() => {}
                     Some(text) if awaiting_request => {
-                        answer_request(&mut client, &mut state, store, handle, &account_pub, &peer_ik, &peer_hint, &peer_label, &text, json, &mut pending).await?;
+                        answer_request(&mut client, &mut state, &trust, store, handle, &account_pub, &peer_ik, &peer_hint, &peer_label, &text, json, &mut pending, &mut pending_key_change_ack, &mut awaiting_key_change_ack).await?;
                         awaiting_request = false;
+                    }
+                    Some(text) if awaiting_key_change_ack => {
+                        answer_key_change_warning(&mut client, &mut state, &mut trust, store, handle, &account_pub, &peer_ik, &peer_hint, &peer_label, &text, json, &mut pending_key_change_ack, &mut awaiting_key_change_ack).await?;
                     }
                     Some(text) => {
                         if state.has_session(&peer_ik) {
-                            send_text(&mut client, &mut state, store, handle, &account_pub, &peer_ik, &peer_hint, &peer_label, &text, json).await?;
+                            send_gated(&mut client, &mut state, &trust, store, handle, &account_pub, &peer_ik, &peer_hint, &peer_label, vec![text], json, &mut pending_key_change_ack, &mut awaiting_key_change_ack).await?;
                         } else {
                             pending.push(text);
                             if !json {
@@ -145,13 +170,15 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
             }
             delivered = client.next_deliver() => {
                 let deliver = delivered.map_err(|e| format!("receiving: {e}"))?;
-                handle_inbound(&mut client, &mut state, store, handle, &account_pub, &deliver, &peer_hint, &peer_label, json, &mut pending, &mut awaiting_request).await?;
+                handle_inbound(&mut client, &mut state, &trust, store, handle, &account_pub, &deliver, &peer_hint, &peer_label, json, &mut pending, &mut awaiting_request, &mut pending_key_change_ack, &mut awaiting_key_change_ack).await?;
             }
         }
         save_state(&state, store, handle)?;
+        save_trust(&trust, store, handle)?;
     }
 
     save_state(&state, store, handle)?;
+    save_trust(&trust, store, handle)?;
     let _ = client.close().await;
     Ok(())
 }
@@ -310,10 +337,209 @@ async fn send_text(
     Ok(())
 }
 
+/// (task 4.4) Every outbound `mrd.chat/1` **text** send funnels through here — never straight to
+/// [`send_text`] — so `meridian_core::trust`'s un-softenable [`SendGate`] is consulted before
+/// anything is sealed/routed, no matter which call site (typed input, the post-accept/post-deliver
+/// flush queue) is sending. Delivery receipts are not routed through this gate: they only ever
+/// acknowledge content the user already decrypted and saw, so withholding them protects nothing an
+/// attacker doesn't already have and would just break the protocol's own liveness.
+///
+/// - [`SendGate::Ok`]: sends every one of `texts`, in order, exactly as [`send_text`] always did.
+/// - [`SendGate::Blocked`]: refuses **all** of `texts` — prints the canonical wording (never a
+///   silent drop) and sends nothing. No path here — or anywhere in this file — can send past a
+///   `Blocked` gate; the only way out is a genuine re-verification
+///   (`meridian_core::trust::TrustStore::mark_verified`), which this CLI does not yet expose a
+///   command for (out of scope here — the safety-number/QR verify flow is a separate task), so a
+///   `Blocked` contact simply cannot be messaged by this binary until that lands.
+/// - [`SendGate::Warn`]: prints the canonical wording and holds `texts` in `held` pending the next
+///   typed line's accept/decline (see `answer_key_change_warning`) — "blocking-until-acknowledged"
+///   per verification-ux.md, not a full interactive Verify flow (4.22's TUI modal owns that), but
+///   never a silent pass-through either.
+#[allow(clippy::too_many_arguments)]
+async fn send_gated(
+    client: &mut SignalingClient,
+    state: &mut ChatState,
+    trust: &TrustStore,
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+    account_pub: &[u8; 32],
+    peer_ik: &[u8; 32],
+    peer_hint: &str,
+    peer_label: &str,
+    texts: Vec<String>,
+    json: bool,
+    held: &mut Vec<String>,
+    awaiting_ack: &mut bool,
+) -> Result<(), String> {
+    if texts.is_empty() {
+        return Ok(());
+    }
+    match trust.can_send(peer_ik) {
+        SendGate::Ok => {
+            for text in texts {
+                send_text(
+                    client,
+                    state,
+                    store,
+                    handle,
+                    account_pub,
+                    peer_ik,
+                    peer_hint,
+                    peer_label,
+                    &text,
+                    json,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        SendGate::Blocked(reason) => {
+            print_gate_line("blocked", &reason, texts.len(), peer_label, json);
+            // `texts` is intentionally dropped here, not queued: verification-ux.md is explicit
+            // this is a hard stop, and re-queuing would just be a slower-motion bypass (send it
+            // later, once nobody's looking) of the same invariant.
+            Ok(())
+        }
+        SendGate::Warn(reason) => {
+            // Print once per new hold, not once per already-held message piling up behind it.
+            if !*awaiting_ack {
+                print_gate_line("warning", &reason, texts.len(), peer_label, json);
+            }
+            held.extend(texts);
+            *awaiting_ack = true;
+            Ok(())
+        }
+    }
+}
+
+/// Shared `Blocked`/`Warn` line(s), in both `--json` and plain modes — factored out (and kept pure,
+/// unlike most of this file) so the CLI can never present one without the other (both call sites in
+/// [`send_gated`] must go through this) and so the "the canonical `reason` text always ends up
+/// somewhere the user sees it, never swallowed" property is unit-testable without a live network
+/// (see the `tests` module below).
+fn gate_lines(
+    kind: &str,
+    reason: &str,
+    held_count: usize,
+    peer_label: &str,
+    json: bool,
+) -> Vec<String> {
+    if json {
+        vec![format!(
+            "{{\"event\":\"key_change_{kind}\",\"from\":{},\"reason\":{},\"held\":{held_count}}}",
+            json_string(peer_label),
+            json_string(reason)
+        )]
+    } else {
+        let mut lines = vec![format!("! {reason}")];
+        if kind == "warning" {
+            lines.push(format!(
+                "  type 'y' to acknowledge and send ({held_count} message(s) held), anything else cancels them:"
+            ));
+        }
+        lines
+    }
+}
+
+fn print_gate_line(kind: &str, reason: &str, held_count: usize, peer_label: &str, json: bool) {
+    for line in gate_lines(kind, reason, held_count, peer_label, json) {
+        println!("{line}");
+    }
+}
+
+/// (task 4.4) Handle the user's typed answer to a live `SendGate::Warn` prompt (mirrors
+/// `answer_request`'s accept/reject pattern exactly, one gate lower): `y`/`yes` (case-insensitive)
+/// acknowledges via [`TrustStore::acknowledge_key_change`] — which re-pins the contact's new key
+/// **without** a safety-number compare, exactly as verification-ux.md specifies for the pinned
+/// case — and then flushes every held message through [`send_gated`] again (now reading `Ok`).
+/// Anything else declines: the held messages are discarded, and the contact stays gated (the next
+/// send attempt re-prompts).
+///
+/// `held`/`awaiting_ack` are the **same** state the caller's main loop reads (never fresh, throwaway
+/// locals for the post-ack flush): [`send_gated`]'s re-check after acknowledging is expected to
+/// read `Ok` (nothing else mutates `trust` between the `acknowledge_key_change` call just above it
+/// and that re-check, both on this single-threaded event loop), but if it somehow didn't — a future
+/// change, a race this code doesn't anticipate — a message must re-arm the *real* prompt state
+/// rather than being silently captured in a local that is dropped when this function returns. This
+/// function therefore fully owns `*awaiting_ack` (the caller no longer resets it unconditionally).
+#[allow(clippy::too_many_arguments)]
+async fn answer_key_change_warning(
+    client: &mut SignalingClient,
+    state: &mut ChatState,
+    trust: &mut TrustStore,
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+    account_pub: &[u8; 32],
+    peer_ik: &[u8; 32],
+    peer_hint: &str,
+    peer_label: &str,
+    answer: &str,
+    json: bool,
+    held: &mut Vec<String>,
+    awaiting_ack: &mut bool,
+) -> Result<(), String> {
+    let ack = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    let queued = std::mem::take(held);
+    *awaiting_ack = false;
+    if ack {
+        // `TrustError::NotAcknowledgeable` here would mean the gate is no longer `PinnedKeyChanged`
+        // (e.g. it escalated to `Blocked` under our feet, or was already acknowledged) — surface it
+        // rather than silently dropping the held messages either way.
+        trust
+            .acknowledge_key_change(peer_ik)
+            .map_err(|e| format!("acknowledging key change for {peer_label}: {e}"))?;
+        if json {
+            println!(
+                "{{\"event\":\"key_change_acknowledged\",\"from\":{}}}",
+                json_string(peer_label)
+            );
+        } else {
+            println!(
+                "(acknowledged — {peer_label}'s new key is re-pinned; re-verify when you can)"
+            );
+        }
+        // Re-check through the real `held`/`awaiting_ack` state, not a throwaway local: `can_send`
+        // is expected to read `Ok` now, but if it somehow doesn't, the held text must land back in
+        // the state the main loop actually reads next, not be silently dropped.
+        send_gated(
+            client,
+            state,
+            trust,
+            store,
+            handle,
+            account_pub,
+            peer_ik,
+            peer_hint,
+            peer_label,
+            queued,
+            json,
+            held,
+            awaiting_ack,
+        )
+        .await?;
+    } else {
+        if json {
+            println!(
+                "{{\"event\":\"key_change_declined\",\"from\":{},\"discarded\":{}}}",
+                json_string(peer_label),
+                queued.len()
+            );
+        } else {
+            println!(
+                "(not sent — key-change warning for {peer_label} was not acknowledged; {} \
+                 message(s) discarded)",
+                queued.len()
+            );
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_inbound(
     client: &mut SignalingClient,
     state: &mut ChatState,
+    trust: &TrustStore,
     store: &dyn SecretStore,
     handle: &KeyHandle,
     account_pub: &[u8; 32],
@@ -323,6 +549,8 @@ async fn handle_inbound(
     json: bool,
     pending: &mut Vec<String>,
     awaiting_request: &mut bool,
+    pending_key_change_ack: &mut Vec<String>,
+    awaiting_key_change_ack: &mut bool,
 ) -> Result<(), String> {
     // Retire a superseded prekey generation whose grace window has passed *before* consulting the
     // vault, so 1.31's reconnect-race allowance stays time-bounded in a long-running process rather
@@ -341,6 +569,7 @@ async fn handle_inbound(
             deliver_content(
                 client,
                 state,
+                trust,
                 store,
                 handle,
                 account_pub,
@@ -349,6 +578,8 @@ async fn handle_inbound(
                 peer_label,
                 json,
                 pending,
+                pending_key_change_ack,
+                awaiting_key_change_ack,
                 content,
             )
             .await
@@ -404,6 +635,7 @@ async fn handle_inbound(
 async fn deliver_content(
     client: &mut SignalingClient,
     state: &mut ChatState,
+    trust: &TrustStore,
     store: &dyn SecretStore,
     handle: &KeyHandle,
     account_pub: &[u8; 32],
@@ -412,6 +644,8 @@ async fn deliver_content(
     peer_label: &str,
     json: bool,
     pending: &mut Vec<String>,
+    pending_key_change_ack: &mut Vec<String>,
+    awaiting_key_change_ack: &mut bool,
     content: ChatContent,
 ) -> Result<(), String> {
     match content {
@@ -425,7 +659,9 @@ async fn deliver_content(
             } else {
                 println!("[{peer_label}] {body}");
             }
-            // Auto-acknowledge with a delivery receipt.
+            // Auto-acknowledge with a delivery receipt. Never gated by `SendGate` (task 4.4's
+            // `send_gated` doc comment): a receipt only acknowledges content the user already
+            // decrypted and saw, so withholding it protects nothing.
             let receipt = state
                 .seal_outbound(
                     store,
@@ -437,23 +673,25 @@ async fn deliver_content(
                 .map_err(|e| format!("sealing receipt: {e}"))?;
             let _ = route_tolerant(client, *from, peer_hint, receipt, peer_label).await?;
 
-            // Session is now live (or newly accepted) — flush anything typed early.
+            // Session is now live (or newly accepted) — flush anything typed early, gated exactly
+            // like ordinary typed input (task 4.4): `send_gated` decides Ok/Warn/Blocked itself.
             let queued = std::mem::take(pending);
-            for text in queued {
-                send_text(
-                    client,
-                    state,
-                    store,
-                    handle,
-                    account_pub,
-                    from,
-                    peer_hint,
-                    peer_label,
-                    &text,
-                    json,
-                )
-                .await?;
-            }
+            send_gated(
+                client,
+                state,
+                trust,
+                store,
+                handle,
+                account_pub,
+                from,
+                peer_hint,
+                peer_label,
+                queued,
+                json,
+                pending_key_change_ack,
+                awaiting_key_change_ack,
+            )
+            .await?;
         }
         ChatContent::Receipt { ack } => {
             if json {
@@ -474,6 +712,7 @@ async fn deliver_content(
 async fn answer_request(
     client: &mut SignalingClient,
     state: &mut ChatState,
+    trust: &TrustStore,
     store: &dyn SecretStore,
     handle: &KeyHandle,
     account_pub: &[u8; 32],
@@ -483,6 +722,8 @@ async fn answer_request(
     answer: &str,
     json: bool,
     pending: &mut Vec<String>,
+    pending_key_change_ack: &mut Vec<String>,
+    awaiting_key_change_ack: &mut bool,
 ) -> Result<(), String> {
     let accept = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
     if accept {
@@ -498,6 +739,7 @@ async fn answer_request(
             deliver_content(
                 client,
                 state,
+                trust,
                 store,
                 handle,
                 account_pub,
@@ -506,6 +748,8 @@ async fn answer_request(
                 peer_label,
                 json,
                 pending,
+                pending_key_change_ack,
+                awaiting_key_change_ack,
                 req.intro,
             )
             .await?;
@@ -575,6 +819,37 @@ fn save_state(
     std::fs::write(&path, sealed).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
+/// (task 4.4) Load the sealed [`TrustStore`] alongside `load_state`'s `ChatState` — same
+/// missing-file-means-fresh-store / any-other-error-is-fatal shape, same fail-closed-on-tamper
+/// behavior (`TrustStore::open_at_rest`'s doc: ADR 0021 condition 5b — a corrupt/wrong-key blob
+/// must never be silently reinitialized, since that would erase key-change/pinned-key history).
+fn load_trust(store: &dyn SecretStore, handle: &KeyHandle) -> Result<TrustStore, String> {
+    let path = account::trust_path()?;
+    match std::fs::read(&path) {
+        Ok(sealed) => TrustStore::open_at_rest(store, handle, &sealed)
+            .map_err(|e| format!("opening trust store {}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TrustStore::default()),
+        Err(e) => Err(format!("reading {}: {e}", path.display())),
+    }
+}
+
+/// Mirrors `save_state` exactly.
+fn save_trust(
+    trust: &TrustStore,
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+) -> Result<(), String> {
+    let path = account::trust_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+    }
+    let sealed = trust
+        .seal_at_rest(store, handle)
+        .map_err(|e| format!("sealing trust store: {e}"))?;
+    std::fs::write(&path, sealed).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
 /// Minimal JSON string escaping for `--json` output (bodies can contain quotes/backslashes).
 fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -592,4 +867,76 @@ fn json_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    //! (task 4.4) Unit coverage for `gate_lines` — the pure core of the CLI's key-change gate
+    //! surfacing. `send_gated`/`answer_key_change_warning` themselves need a live
+    //! `SignalingClient`/network to exercise end to end (covered instead by `meridian-core`'s
+    //! `key_change_gate` integration tests, which drive the same `SendGate`/`TrustStore` this file
+    //! merely consults); what belongs here is the CLI-specific property that the canonical `reason`
+    //! text always ends up in what gets printed, in both output modes, and is never dropped.
+    use super::*;
+
+    const REASON: &str = "The safety number for bob@org-b.test has changed. \
+        This can happen if they reinstalled or switched devices — but it can also mean someone is \
+        intercepting your messages. Sends to bob@org-b.test are blocked until you verify the new \
+        safety number with them through a channel you trust.";
+
+    #[test]
+    fn blocked_plain_mode_surfaces_the_full_canonical_reason_and_no_ack_prompt() {
+        let lines = gate_lines("blocked", REASON, 2, "bob@org-b.test", false);
+        assert_eq!(lines.len(), 1, "Blocked never offers an acknowledge prompt");
+        assert!(
+            lines[0].contains(REASON),
+            "the canonical reason must be surfaced verbatim, never summarized/softened: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn blocked_json_mode_carries_the_full_reason_and_event_name() {
+        let lines = gate_lines("blocked", REASON, 3, "bob@org-b.test", true);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("\"event\":\"key_change_blocked\""));
+        assert!(lines[0].contains("\"held\":3"));
+        assert!(lines[0].contains(&json_string(REASON)));
+    }
+
+    #[test]
+    fn warn_plain_mode_surfaces_the_reason_and_an_explicit_acknowledge_prompt() {
+        let lines = gate_lines("warning", REASON, 1, "bob@org-b.test", false);
+        assert_eq!(
+            lines.len(),
+            2,
+            "Warn must show the reason AND an explicit prompt — never a silent hold"
+        );
+        assert!(lines[0].contains(REASON));
+        assert!(
+            lines[1].to_lowercase().contains("acknowledge"),
+            "must make the pending decision explicit: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn warn_json_mode_carries_the_full_reason_and_event_name() {
+        let lines = gate_lines("warning", REASON, 1, "bob@org-b.test", true);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("\"event\":\"key_change_warning\""));
+        assert!(lines[0].contains(&json_string(REASON)));
+    }
+
+    #[test]
+    fn neither_mode_ever_drops_the_reason_text() {
+        for json in [false, true] {
+            for kind in ["blocked", "warning"] {
+                let lines = gate_lines(kind, REASON, 0, "bob@org-b.test", json);
+                let joined = lines.join("\n");
+                assert!(
+                    joined.contains(REASON) || joined.contains(&json_string(REASON)),
+                    "kind={kind} json={json} dropped the canonical reason: {lines:?}"
+                );
+            }
+        }
+    }
 }

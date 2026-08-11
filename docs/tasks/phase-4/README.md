@@ -163,7 +163,7 @@ same function under the new AAD/commit-on-decrypt rules and must re-verify this 
 
 **T08 track — starts immediately, independent of the ADRs** (the phase's longest critical-path chain)
 - [x] **4.3** Trust module + contact store core — [file](./4.3-trust-module-contact-store.md)
-- [ ] **4.4** Key-change handling: block/warn semantics — [file](./4.4-key-change-block-warn-gate.md)
+- [x] **4.4** Key-change handling: block/warn semantics — [file](./4.4-key-change-block-warn-gate.md)
 - [ ] **4.5** Safety-number compare UX primitives + `meridian verify` — [file](./4.5-safety-number-verify-cli.md)
 - [ ] **4.6** Petname assignment + contact management CLI — [file](./4.6-petname-contact-management-cli.md)
 - [ ] **4.7** Message-request UX finalization (from T06) — [file](./4.7-message-request-finalization.md)

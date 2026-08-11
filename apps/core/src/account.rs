@@ -157,6 +157,14 @@ pub fn sessions_path() -> Result<PathBuf, String> {
     Ok(config_dir()?.join("sessions.bin"))
 }
 
+/// The sealed trust-store path (`trust.rs`'s `TrustStore`: contacts + pinned-key history +
+/// key-change state), next to the account descriptor — same layout convention as
+/// [`sessions_path`], and (task 4.4) sealed under the identical `at_rest::STORE_KEY_INFO`
+/// derivation (ADR 0021: one key derivation, shared by every client-local sealed store).
+pub fn trust_path() -> Result<PathBuf, String> {
+    Ok(config_dir()?.join("trust.bin"))
+}
+
 fn absolutize(p: &Path) -> PathBuf {
     if p.is_absolute() {
         p.to_path_buf()
@@ -221,6 +229,16 @@ mod tests {
         assert_eq!(
             sessions_path().expect("sessions_path"),
             tmp.path().join("sessions.bin")
+        );
+    }
+
+    #[test]
+    fn trust_path_is_config_dir_trust_bin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set(tmp.path());
+        assert_eq!(
+            trust_path().expect("trust_path"),
+            tmp.path().join("trust.bin")
         );
     }
 

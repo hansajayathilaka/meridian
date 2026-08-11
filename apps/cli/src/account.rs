@@ -16,7 +16,9 @@ use std::path::Path;
 use age::secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
-pub use meridian_core::account::{config_dir, sessions_path, AccountDescriptor, StoreKind};
+pub use meridian_core::account::{
+    config_dir, sessions_path, trust_path, AccountDescriptor, StoreKind,
+};
 
 const PORTABLE_VERSION: u8 = 1;
 
