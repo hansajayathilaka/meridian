@@ -229,11 +229,11 @@ Envelope v2 (T07's blocker) is deliberately **not** in this phase — see
 inside 4.9. 28 tasks, [full DAG here](./phase-4/README.md#dependency-order).
 
 **ADR track — blocks all T17 code, not T08**
-- [ ] **4.1** ADR 0020 — TUI packaging — [file](./phase-4/4.1-adr-tui-packaging.md)
-- [ ] **4.2** ADR 0021 — client-local store & config formats — [file](./phase-4/4.2-adr-client-store-config-formats.md)
+- [x] **4.1** ADR 0020 — TUI packaging — [file](./phase-4/4.1-adr-tui-packaging.md)
+- [~] **4.2** ADR 0021 — client-local store & config formats — [file](./phase-4/4.2-adr-client-store-config-formats.md)
 
 **T08 track — starts immediately**
-- [ ] **4.3** Trust module + contact store core — [file](./phase-4/4.3-trust-module-contact-store.md)
+- [~] **4.3** Trust module + contact store core — [file](./phase-4/4.3-trust-module-contact-store.md)
 - [ ] **4.4** Key-change handling: block/warn semantics — [file](./phase-4/4.4-key-change-block-warn-gate.md)
 - [ ] **4.5** Safety-number compare UX primitives + `meridian verify` — [file](./phase-4/4.5-safety-number-verify-cli.md)
 - [ ] **4.6** Petname assignment + contact management CLI — [file](./phase-4/4.6-petname-contact-management-cli.md)
@@ -245,7 +245,7 @@ inside 4.9. 28 tasks, [full DAG here](./phase-4/README.md#dependency-order).
 **T17 infra — no T08 dependency**
 - [ ] **4.11** `apps/tui` crate skeleton + terminal guard — [file](./phase-4/4.11-tui-crate-skeleton-terminal-guard.md)
 - [ ] **4.12** `meridian tui` subcommand + environment gate — [file](./phase-4/4.12-tui-subcommand-env-gate.md)
-- [ ] **4.13** Extract shared account/home-layout helpers into `meridian-core` — [file](./phase-4/4.13-extract-account-home-layout-core.md)
+- [~] **4.13** Extract shared account/home-layout helpers into `meridian-core` — [file](./phase-4/4.13-extract-account-home-layout-core.md)
 - [ ] **4.14** `meridian-tui::config` — [file](./phase-4/4.14-tui-config.md)
 - [ ] **4.15** `meridian-tui::store` — [file](./phase-4/4.15-tui-store.md)
 - [ ] **4.16** Onboarding screen — [file](./phase-4/4.16-onboarding-screen.md)
