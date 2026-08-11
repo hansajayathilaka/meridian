@@ -10,7 +10,7 @@ reads **only** the master tracker plus the one phase/task file it needs — neve
 
 **Read first (once, only the parts you need):**
 - Master tracker: [docs/tasks/README.md](../../../docs/tasks/README.md) — always start here.
-- Definition of Done (8 gates): [CONTRIBUTING.md](../../../CONTRIBUTING.md).
+- Definition of Done (9 gates — gate 9 is the TUI client surface): [CONTRIBUTING.md](../../../CONTRIBUTING.md).
 - Feature specs (the "what"): [docs/architecture/features/](../../../docs/architecture/features/) +
   [roadmap.md](../../../docs/architecture/roadmap.md) dependency DAG.
 

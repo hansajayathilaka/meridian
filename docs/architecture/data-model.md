@@ -63,7 +63,7 @@ outbox/          queued envelopes awaiting connectivity (idempotent by eid)
 streams/         resumable transfer state: manifest, merkle root, range bitmap
 config/          org-pushed defaults (ICE servers, connection policy) + user overrides
 ```
-Whole store sealed with XChaCha20-Poly1305 under a key from `SecretStore`; browser variant = same layout in IndexedDB encrypted blobs. Restore-from-backup with stale ratchet state fails closed → automatic fresh X3DH with a user-visible notice (§10).
+Whole store sealed with XChaCha20-Poly1305 under a key from `SecretStore`; browser variant = same layout in IndexedDB encrypted blobs. The terminal client's concrete realization of `contacts/`, `history/`, `outbox/`, and `config/` — file layout, JSON schemas, versioning/migration, and the TOML config — is specified in [tui-client.md §5](./tui-client.md#5-local-store--configuration) (ratified by ADR 0021). That encoding is client-local: each client realizes this layout in its own format, and a portable/shared on-disk format would need its own contract. Restore-from-backup with stale ratchet state fails closed → automatic fresh X3DH with a user-visible notice (§10).
 
 ## 3. Retention defaults
 

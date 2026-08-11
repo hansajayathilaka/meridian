@@ -1,0 +1,69 @@
+stateDiagram-v2
+  [*] --> Launch
+
+  Launch --> Preflight: meridian tui
+  Preflight --> Bail: not a TTY / TERM=dumb / terminal too small
+  Bail --> [*]: print the equivalent headless CLI command, exit 1
+
+  Preflight --> Onboarding: no account.json in MERIDIAN_HOME
+  Preflight --> Unlock: account exists, file-backed store
+  Preflight --> Main: account exists, OS keystore
+
+  state Onboarding {
+    [*] --> ChooseStore
+    ChooseStore --> OrgHint: OS keystore or passphrase keyfile
+    OrgHint --> Generate: enter the @domain hint
+    Generate --> ShowIdentity: Ed25519 keypair minted via meridian-identity
+    ShowIdentity --> Register: mrd1 ID plus QR shown, copy or save
+    Register --> PublishBundle: connect to rendezvous, optional invite token
+    PublishBundle --> [*]: prekey bundle published
+    note right of ShowIdentity
+      The private key never leaves the
+      SecretStore and is never rendered.
+    end note
+  }
+  Onboarding --> Main: registered
+
+  Unlock --> Main: passphrase accepted
+  Unlock --> Unlock: wrong passphrase, retry with attempt count
+  Unlock --> [*]: user quits
+
+  state Main {
+    [*] --> Conversation
+    Conversation --> Contacts: Tab
+    Contacts --> Conversation: Enter on a contact
+    Contacts --> AddContact: n
+    AddContact --> Contacts: paste mrd1 ID or import QR, assign a local petname
+    Contacts --> Requests: r
+    Requests --> Contacts: accept promotes to pinned, reject drops the request
+    Contacts --> Verify: v
+    Verify --> Contacts: safety numbers match, mark verified or block
+    Conversation --> Diagnostics: palette
+    Diagnostics --> Conversation: Esc
+    Conversation --> Settings: palette
+    Settings --> Conversation: Esc
+  }
+
+  Main --> Help: F1
+  Help --> Main: Esc
+  Main --> Palette: Ctrl-K
+  Palette --> Main: Esc or run a command
+
+  Main --> KeyChangeWarning: pinned contact key changed
+  KeyChangeWarning --> Main: acknowledged, contact re-pinned
+  KeyChangeWarning --> Main: Verify is the primary action, opens the Verify screen
+
+  Main --> KeyChangeBlocked: VERIFIED contact key or device record changed
+  KeyChangeBlocked --> Main: re-verified out of band, sends resume
+  KeyChangeBlocked --> Blocked: user blocks the contact
+  Blocked --> Main: contact stays blocked, sends refused
+  note right of KeyChangeBlocked
+    Composer is DISABLED. No dismiss,
+    no trust-anyway, no timed accept.
+    Wording is canonical per
+    security/verification-ux.md.
+  end note
+
+  Main --> Quit: Ctrl-Q
+  Quit --> Main: cancelled, unsent input preserved
+  Quit --> [*]: terminal restored by the RAII guard

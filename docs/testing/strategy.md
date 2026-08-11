@@ -28,6 +28,9 @@ Wire-level pcap assertions (1.27, `tools/netns-nat-matrix.sh`'s `assert_*` helpe
 ## 5. Extension-contract validation
 T09/T15/T16 acceptance includes: (a) implemented with zero core-crate changes (CODEOWNERS gate), (b) a "third-party implementability" test — an engineer off the task builds a toy stream type from `stream-types-v1.md` alone in <1 day. If the doc isn't sufficient, the contract fails, not the engineer.
 
+## 5b. Client-surface verification (TUI)
+T17's terminal client is verified headlessly so it runs in CI like anything else: (a) **screen snapshots** through `ratatui`'s `TestBackend` at 80×24 and at a narrow width, for every screen and modal — these also pin the canonical verification wording, so softening it fails a test; (b) an **at-rest audit**, the on-disk counterpart to the opacity audit: script a conversation, then assert no file the client wrote contains a message body, a petname, or key material; (c) a **key-change adversarial test** asserting the composer is hard-blocked for a verified contact whose key changed, with no send path available; (d) a **terminal-restoration test** (forced panic mid-render leaves cooked mode and the main screen); (e) store round-trip + schema-migration tests, including refusal to open a newer schema version. The pure `update` function makes most interaction logic testable with no terminal at all. Details: [tui-client.md §9](../architecture/tui-client.md#9-testing).
+
 ## 6. Ops verification (continuous, not archaeological)
 T14's demo scripts run in CI: compose stack weekly, air-gapped install per release (asserting zero uplink egress via capture), prekey-depletion drill fires the alert, upgrade+rollback both leave a green smoke suite.
 

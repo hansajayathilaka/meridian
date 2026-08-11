@@ -33,7 +33,12 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   0–2 are **done**.
 - **NEXT:** `/pick-next-phase` — Phase 3 (review of Phase 2) is closed; no fix-tasks remain and no
   ADR obligations are outstanding. Time to pick the next **build** phase's feature(s) per the
-  [roadmap](../architecture/roadmap.md) dependency DAG.
+  [roadmap](../architecture/roadmap.md) dependency DAG. **New candidate:**
+  [T17 — Terminal TUI Client](../architecture/features/17-terminal-tui-client.md) was spec'd
+  out-of-band (design: [tui-client.md](../architecture/tui-client.md)); its deps (01–05) are all
+  done, so it is pickable immediately. If picked, its phase must open with the two ADR obligations
+  the spec names (**0020** TUI packaging, **0021** client-local store/config formats) before any
+  code — same shape as Phase 2's 2.1.
 
 ### Live carry-forwards (not owned by any open task)
 Everything else is owned by a Phase-3 task; these are the exceptions that would otherwise evaporate:
@@ -45,6 +50,11 @@ Everything else is owned by a Phase-3 task; these are the exceptions that would 
   the fetch path, same-OTK-to-many-fetchers, reflection, per-device delivery, skipped-key exhaustion.
   Listed in [phase-3/README.md](./phase-3/README.md#findings-with-no-task-and-why); not a Phase-2
   regression, deliberately not scoped into Phase 3.
+- **Definition of Done gate 9 (TUI client surface) is now live** — every user-visible feature ships a
+  TUI surface via the [extension contract](../architecture/tui-client.md#8-extension-contract--every-feature-ships-a-tui-surface),
+  or its task file states why it has none. It binds from T17 onward; features already built (T01–T06)
+  acquire their surfaces as T17 and their own follow-ups land. `/plan-phase` must carry this into
+  every future build phase's task set.
 - **If `relay_rewrite.rs` ever flakes in CI**, widen its `SIDE_TIMEOUT`, **never** `ANSWER_TIMEOUT` —
   the test burns ~31 s real time with only ~4–5 s slack over the 30 s timeout it is exercising.
 - **A human must confirm branch protection on `main` actually requires `ci.yml` to pass before
