@@ -16,7 +16,7 @@ demo you can execute at sign-off. Trust-critical substrate comes first; convenie
 | [04](./features/04-p2p-session-substrate.md) | P2P Session Substrate | Chat goes P2P; survives server shutdown | 03 |
 | [05](./features/05-nat-traversal-relay-policy.md) | NAT Traversal & Relay Policy | Session across symmetric NATs; `relay-only` hides IPs | 04 |
 | [06](./features/06-cross-org-federation.md) | Cross-Org Federation | Full cross-org walkthrough on two stacks | 04 |
-| [07](./features/07-offline-mailbox.md) | Offline Ciphertext Mailbox | Offline peer gets message on reconnect; DB ciphertext-only | 03, 06 |
+| [07](./features/07-offline-mailbox.md) | Offline Ciphertext Mailbox | Offline peer gets message on reconnect; DB ciphertext-only | 03, 06, **envelope-v2** |
 | [08](./features/08-verification-trust.md) | Verification & Contact Trust | Simulated MITM fails closed; safety-number QR | 03 |
 | [09](./features/09-file-transfer.md) | File Transfer Stream | 1 GiB transfer, killed mid-way, resumes + verifies | 04 |
 | [10](./features/10-av-calls-screenshare.md) | Voice / Video / Screenshare | Cross-org video call, live relay fallback | 05, 06 |
@@ -32,6 +32,18 @@ Feature 17 was added after the original 16 (see [docs/INDEX.md](../INDEX.md)); i
 identifier, not a queue position. Its dependencies (01–05) are all done, so it is pickable now, and it
 is the surface every later user-visible feature plugs into
 ([Definition of Done gate 9](../../CONTRIBUTING.md#definition-of-done-every-change-must-satisfy)).
+
+**`envelope-v2` is not a numbered feature — it's a standing dependency gate.**
+[ADR 0016](../adr/0016-envelope-deniability.md) (accepted; envelope v2 drops the per-message
+identity-key signature) requires the mailbox (07) to ship only after envelope v2 lands, since v1's
+signed ciphertexts sitting in a multi-day server-side mailbox is exactly the exposure v2 removes. That
+obligation slipped through two build phases as ADR prose alone; it is now encoded here, mechanically,
+so `task-picker` cannot read 07 (or 14, transitively) as pickable without seeing it. **07 and 14 are not
+pickable by `/pick-next-phase` until a tracker task/phase named "envelope v2" exists with status
+done** — full scope: ADR 0016's C1–C7, the new canonical AAD, a leading `v: 2` field, and
+`ratchet-v2.json`/`envelope-v2.json` conformance vectors, all as one coherent build phase (see
+[Phase 4's README](../tasks/phase-4/README.md#envelope-v2-re-deferred) for the decision to defer it out
+of Phase 4 and commit it as the build phase immediately following Phase 5).
 
 ## Phasing (from the design)
 

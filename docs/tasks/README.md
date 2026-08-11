@@ -16,32 +16,38 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **`/pick-next-phase` chose Phase 4 = T08 (Verification & Contact Trust) + T17 (Terminal
-  TUI Client), bundled together.** [Phase 4 README](./phase-4/README.md) has the full rationale;
-  short version: T17's spec treats safety-number verification, mark-verified, and un-softenable
-  key-change blocking as mandatory in-scope UI, but that state machine is T08's core deliverable
-  ("lands in core, consumed by every client") — picking T17 alone would force either stubbing a
-  scope item it calls mandatory or building a shadow trust implementation in the TUI, which would
-  violate T17's own "no protocol logic in the TUI" rule. So both land in one phase, with T08's core
-  trust module + `meridian-mitm-sim` sequenced ahead of T17's verification screens. **T07 (Offline
-  Mailbox) was considered and excluded**: despite its roadmap deps (03, 06) reading as satisfied,
-  [ADR 0016](../adr/0016-envelope-deniability.md) gates it on envelope v2 landing first ("shipping
-  the mailbox first is what makes the exposure durable"), and envelope v2 is still unbuilt. That
-  ADR's "when Feature 08/09 is planned" trigger has now fired — Phase 4's README flags that
-  `/plan-phase` must either schedule envelope v2 inside Phase 4 or explicitly re-defer it with a new
-  concrete trigger, not drop it silently again. Phase 4 opens with **ADR 0020** (TUI packaging) and
-  **ADR 0021** (client-local store/config formats) before any code, same shape as Phase 2's 2.1.
-  Phases 0–3 are **done**.
-- **NEXT:** `/plan-phase` — break T08 + T17 into tasks per [Phase 4's README](./phase-4/README.md)
-  (goal, scope, the T17/T08 sequencing resolution, dependency check, ADR obligations, and reading
-  list are all there).
+- **NOW:** **`/plan-phase` broke Phase 4 (T08 + T17) into 28 tasks (4.1–4.28), fully
+  dependency-ordered.** [Phase 4 README](./phase-4/README.md) has the complete task list, DAG, and
+  parallel tracks. Two tracks run independently until they converge: **Track T08** (4.3→4.10 —
+  trust module, key-change gate, safety-number UX, petnames, message-request finalization, directory
+  attestation, guarded desync re-handshake, `meridian-mitm-sim`) and **Track T17-infra** (4.11–4.18 —
+  crate skeleton + terminal guard, subcommand wiring, the `$MERIDIAN_HOME` extraction into
+  `meridian-core`, config, store, onboarding, unlock, extension registry), both gated behind
+  **4.1/4.2** (ADRs 0020 TUI packaging, 0021 store/config formats) for T17's code only — T08 has no
+  ADR dependency and starts immediately. The two tracks converge at **4.19** (contact list, the first
+  T17 screen needing T08's trust module), after which T17's remaining screens (4.20–4.27) and the
+  phase exit gate (4.28) serialize. **The envelope-v2 obligation was resolved, not dropped**: an
+  architect call (recorded in [Phase 4's README](./phase-4/README.md#envelope-v2-re-deferred))
+  determined full envelope-v2 doesn't block T08/T17 and stays out of this phase for the same
+  "one coherent reviewable unit" reason Phase 2 kept T09 out of Phase 2 — but a narrow, v1-scoped fix
+  to `open_bytes`'s stale-session short-circuit (which T08's own desync-recovery deliverable
+  otherwise silently fails to accomplish) lands inside **4.9**. The re-defer trigger is now
+  mechanical, not prose: [roadmap.md](../architecture/roadmap.md)'s dependency table lists T07's deps
+  as `03, 06, envelope-v2` — the same table `task-picker` reads every `/pick-next-phase` run — so T07
+  (and T14, transitively) cannot be read as pickable again until an envelope-v2 task/phase exists with
+  status done. Phases 0–3 are **done**.
+- **NEXT:** `/next-task` — start with **4.1/4.2** (ADRs) and **4.3** (T08 trust module) and **4.13**
+  (account/home-layout extraction) in parallel; see [Phase 4's dependency order](./phase-4/README.md#dependency-order)
+  for the full sequencing.
 
 ### Live carry-forwards (not owned by any open task)
-Everything else is owned by a Phase-3 task; these are the exceptions that would otherwise evaporate:
-- **Envelope v2 must carry the replay-dedup obligation.** Phase 2 ships **zero s2s replay/dedup**,
-  deferred entirely to envelope v2's `eid` per [ADR 0016](../adr/0016-envelope-deniability.md) C7
-  (2.13 bounds a replay's harm to one failed decrypt). When Feature 08/09 is planned, this must
-  appear in the envelope-v2 task's obligations.
+Everything else is owned by a Phase-4 task; these are the exceptions that would otherwise evaporate:
+- **Envelope v2 is now a standing, mechanically-checked dependency gate**, not prose. See
+  [roadmap.md](../architecture/roadmap.md) (T07's deps row + the note beneath the table) and
+  [Phase 4's README](./phase-4/README.md#envelope-v2-re-deferred). It must still carry the
+  replay-dedup obligation from Phase 2 (2.13 bounds a replay's harm to one failed decrypt; full dedup
+  via envelope v2's `eid` per [ADR 0016](../adr/0016-envelope-deniability.md) C7) into whatever build
+  phase implements it.
 - **The adversarial frontier carried from Phase 1** — SPK grace-window aging, stale-bundle replay on
   the fetch path, same-OTK-to-many-fetchers, reflection, per-device delivery, skipped-key exhaustion.
   Listed in [phase-3/README.md](./phase-3/README.md#findings-with-no-task-and-why); not a Phase-2
@@ -212,17 +218,53 @@ phase.
 - [x] **3.23** Bound `serve_link`'s idle read (no idle-read deadline; in WebPKI mode exploitable by
   any public-CA cert-holder, not gated by federation policy) — [file](./phase-3/3.23-serve-link-idle-read-deadline.md)
 
-### Phase 4 — Verification & Trust + Terminal TUI Client · **planning** · [details](./phase-4/README.md)
+### Phase 4 — Verification & Trust + Terminal TUI Client · **in progress** · [details](./phase-4/README.md)
 Build phase. **[T08 — Verification & Contact Trust](../architecture/features/08-verification-trust.md)**
 + **[T17 — Terminal TUI Client](../architecture/features/17-terminal-tui-client.md)**, bundled: T08's
 core trust module (safety-number compare, TOFU→pinned→verified states, un-softenable key-change
 blocking, `meridian-mitm-sim`) is a hard prerequisite for T17's mandatory verification screens — see
-the [phase README](./phase-4/README.md#resolving-the-t17t08-overlap) for why they aren't split. T07
-(Offline Mailbox) considered and excluded — [ADR 0016](../adr/0016-envelope-deniability.md) gates it on
-envelope v2, still unbuilt; that ADR's "when Feature 08/09 is planned" trigger has now fired and
-`/plan-phase` must resolve it (schedule envelope v2 here, or re-defer with a concrete new trigger).
-Deps: T08→T03 done; T17→T01–T05 done (T06 done too). Opens with ADR 0020 (TUI packaging) + ADR 0021
-(client-local store/config formats) before any code. Tasks not yet broken down — next: `/plan-phase`.
+the [phase README](./phase-4/README.md#resolving-the-t17t08-overlap) for why they aren't split.
+Envelope v2 (T07's blocker) is deliberately **not** in this phase — see
+[the re-deferral](./phase-4/README.md#envelope-v2-re-deferred) — except for a narrow v1-scoped fix
+inside 4.9. 28 tasks, [full DAG here](./phase-4/README.md#dependency-order).
+
+**ADR track — blocks all T17 code, not T08**
+- [ ] **4.1** ADR 0020 — TUI packaging — [file](./phase-4/4.1-adr-tui-packaging.md)
+- [ ] **4.2** ADR 0021 — client-local store & config formats — [file](./phase-4/4.2-adr-client-store-config-formats.md)
+
+**T08 track — starts immediately**
+- [ ] **4.3** Trust module + contact store core — [file](./phase-4/4.3-trust-module-contact-store.md)
+- [ ] **4.4** Key-change handling: block/warn semantics — [file](./phase-4/4.4-key-change-block-warn-gate.md)
+- [ ] **4.5** Safety-number compare UX primitives + `meridian verify` — [file](./phase-4/4.5-safety-number-verify-cli.md)
+- [ ] **4.6** Petname assignment + contact management CLI — [file](./phase-4/4.6-petname-contact-management-cli.md)
+- [ ] **4.7** Message-request UX finalization (from T06) — [file](./phase-4/4.7-message-request-finalization.md)
+- [ ] **4.8** Org directory-attestation ingest — [file](./phase-4/4.8-directory-attestation-ingest.md)
+- [ ] **4.9** Desync detection → guarded fresh-X3DH re-handshake (incl. `open_bytes` short-circuit fix) — [file](./phase-4/4.9-desync-guarded-rehandshake.md)
+- [ ] **4.10** `meridian-mitm-sim` trust-state matrix — [file](./phase-4/4.10-mitm-sim-trust-matrix.md)
+
+**T17 infra — no T08 dependency**
+- [ ] **4.11** `apps/tui` crate skeleton + terminal guard — [file](./phase-4/4.11-tui-crate-skeleton-terminal-guard.md)
+- [ ] **4.12** `meridian tui` subcommand + environment gate — [file](./phase-4/4.12-tui-subcommand-env-gate.md)
+- [ ] **4.13** Extract shared account/home-layout helpers into `meridian-core` — [file](./phase-4/4.13-extract-account-home-layout-core.md)
+- [ ] **4.14** `meridian-tui::config` — [file](./phase-4/4.14-tui-config.md)
+- [ ] **4.15** `meridian-tui::store` — [file](./phase-4/4.15-tui-store.md)
+- [ ] **4.16** Onboarding screen — [file](./phase-4/4.16-onboarding-screen.md)
+- [ ] **4.17** Unlock screen — [file](./phase-4/4.17-unlock-screen.md)
+- [ ] **4.18** Extension registry (`meridian-tui::surface`) — [file](./phase-4/4.18-extension-registry.md)
+
+**T17 screens — converge at 4.19**
+- [ ] **4.19** Contact list + add-contact + contact detail — [file](./phase-4/4.19-contact-list-detail-screens.md)
+- [ ] **4.20** Chat / conversation screen — [file](./phase-4/4.20-chat-screen.md)
+- [ ] **4.21** Message-request queue screen — [file](./phase-4/4.21-message-request-queue-screen.md)
+- [ ] **4.22** Verification screen — [file](./phase-4/4.22-verification-screen.md)
+- [ ] **4.23** Key-change adversarial test — [file](./phase-4/4.23-key-change-adversarial-test.md)
+- [ ] **4.24** Settings screen — [file](./phase-4/4.24-settings-screen.md)
+- [ ] **4.25** Help overlay + command palette + diagnostics — [file](./phase-4/4.25-help-palette-diagnostics.md)
+- [ ] **4.26** Terminal-constraint degradation — [file](./phase-4/4.26-terminal-constraint-degradation.md)
+- [ ] **4.27** At-rest audit harness — [file](./phase-4/4.27-at-rest-audit-harness.md)
+
+**Phase exit gate**
+- [ ] **4.28** Docs sync + phase acceptance-demo wiring — [file](./phase-4/4.28-docs-sync-acceptance-demo.md)
 
 ---
 
