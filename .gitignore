@@ -7,3 +7,6 @@
 # dev CA artifacts
 infra/deploy/.ca/
 demo/two-orgs/.ca/
+
+# ephemeral agent worktrees
+.claude/worktrees/
