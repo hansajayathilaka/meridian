@@ -24,6 +24,8 @@ mod opacity;
 mod policy;
 mod session;
 mod session_connect;
+#[cfg(feature = "tui")]
+mod tui;
 use account::{AccountDescriptor, StoreKind};
 
 const OS_KEYSTORE_SERVICE: &str = "meridian";
@@ -112,6 +114,11 @@ enum TopCommand {
         #[command(subcommand)]
         cmd: DemoCommand,
     },
+    /// Launch the interactive terminal client (T17). Refuses gracefully — pointing at the
+    /// scriptable `--json` equivalent — on `TERM=dumb`, a non-TTY stdout, or a terminal smaller
+    /// than 80x24. Compiled out entirely under `--no-default-features` (ADR 0020).
+    #[cfg(feature = "tui")]
+    Tui,
 }
 
 #[derive(Subcommand)]
@@ -281,6 +288,8 @@ fn main() -> ExitCode {
         TopCommand::Doctor { json } => run_doctor(json),
         TopCommand::Config { cmd } => run_config(cmd),
         TopCommand::Demo { cmd } => run_demo(cmd),
+        #[cfg(feature = "tui")]
+        TopCommand::Tui => tui::run(),
     };
     match result {
         Ok(code) => code,

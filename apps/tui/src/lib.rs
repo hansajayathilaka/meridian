@@ -39,6 +39,15 @@ use ratatui::Terminal;
 
 use tokio::sync::mpsc;
 
+/// The terminal's current size (columns, rows), as reported by crossterm on stdout.
+///
+/// Exposed so `meridian-cli`'s `meridian tui` subcommand (task 4.12) can gate entry — refusing on an
+/// undersized terminal — before calling [`run`], without needing a crossterm dependency of its own:
+/// ADR 0020 condition 1 keeps all crossterm usage inside this crate.
+pub fn terminal_size() -> io::Result<(u16, u16)> {
+    crossterm::terminal::size()
+}
+
 /// Runs the TUI to completion: installs the terminal guard, wires the event loop
 /// (crossterm input + worker responses + 250ms tick) into `App::update`/`App::render`, and restores
 /// the terminal on the way out (normal exit, error, or panic). Called from `meridian-cli`'s `tui`

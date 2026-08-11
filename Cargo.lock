@@ -2659,6 +2659,7 @@ dependencies = [
  "meridian-proto",
  "meridian-rendezvous",
  "meridian-signaling",
+ "meridian-tui",
  "rcgen",
  "rpassword",
  "rustls",

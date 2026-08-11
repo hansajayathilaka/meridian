@@ -175,7 +175,7 @@ same function under the new AAD/commit-on-decrypt rules and must re-verify this 
 **T17 infra — no dependency on T08; starts alongside it once 4.1 lands** (4.13 has zero dependencies —
 start it day 1)
 - [x] **4.11** `apps/tui` crate skeleton + terminal guard — [file](./4.11-tui-crate-skeleton-terminal-guard.md)
-- [ ] **4.12** `meridian tui` subcommand + environment gate — [file](./4.12-tui-subcommand-env-gate.md)
+- [x] **4.12** `meridian tui` subcommand + environment gate — [file](./4.12-tui-subcommand-env-gate.md)
 - [x] **4.13** Extract shared account/home-layout helpers into `meridian-core` — [file](./4.13-extract-account-home-layout-core.md)
 - [ ] **4.14** `meridian-tui::config` — [file](./4.14-tui-config.md)
 - [ ] **4.15** `meridian-tui::store` — [file](./4.15-tui-store.md)
