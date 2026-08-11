@@ -32,12 +32,18 @@
 //! - **`federation_map.toml` schema:** an array of `[[partner]]` tables (not a `domain`-keyed
 //!   TOML table — a domain like `org-b.test` as a raw TOML key needs quoting/escaping for no
 //!   benefit here). Fields: `domain` (the discovery/hint domain — ADR 0017 (a)/C3's certificate
-//!   validation target), `endpoint` (`host:port` to dial), `pinned_identity` (the SAN/CN ADR 0017
-//!   C4 requires for private-CA/air-gap mode, **mandatory**, fail-closed at parse time — see
-//!   [`StaticMap::load`]), and `policy` (optional, carried through unparsed/uninterpreted for
-//!   [2.6](../../../../docs/tasks/phase-2/2.6-federation-policy-limits.md) to define; this task
-//!   neither validates nor acts on its contents). Named `pinned_identity`, not `ca_pin` (the task
-//!   file's suggested name, inherited from data-model.md's abandoned table): ADR 0017 C4's pin is
+//!   validation target), `endpoint` (`host:port` to dial), and `pinned_identity` (the SAN/CN ADR
+//!   0017 C4 requires for private-CA/air-gap mode, **mandatory**, fail-closed at parse time — see
+//!   [`StaticMap::load`]). There is deliberately **no** per-partner `policy` field: a `[[partner]]`
+//!   entry that sets one is a fail-closed config-load error
+//!   ([`DiscoveryError::UnsupportedPolicyField`]), not a silently-ignored or silently-dropped key —
+//!   see [task 3.9](../../../../docs/tasks/phase-3/3.9-federation-map-policy-field.md) (review
+//!   finding F7), which closed the earlier, dead version of this field that was parsed and carried
+//!   through but never consulted by anything. Federation admission is server-wide only, via
+//!   `federation.policy` (`open`/`allowlist`/`closed` —
+//!   [2.6](../../../../docs/tasks/phase-2/2.6-federation-policy-limits.md), [`super::policy`]),
+//!   never a per-partner dimension. Named `pinned_identity`, not `ca_pin` (the task file's
+//!   suggested name, inherited from data-model.md's abandoned table): ADR 0017 C4's pin is
 //!   an identity name (SAN/CN) compared against the peer certificate's subject fields, never a
 //!   certificate/key fingerprint — "ca_pin" reads as the *rejected* SPKI-fingerprint option ((a)
 //!   option C in ADR 0017), which this schema deliberately does not implement. `pinned_identity`
@@ -99,11 +105,6 @@ pub struct Endpoint {
     /// a trust source (ADR 0017 (a)) — a caller resolving via SRV pins to the hint `domain` itself
     /// (WebPKI mode), not to any value this struct carries.
     pub pinned_identity: Option<String>,
-    /// Federation policy label carried through unparsed from the `federation_map.toml` entry, for
-    /// [2.6](../../../../docs/tasks/phase-2/2.6-federation-policy-limits.md) to define and enforce.
-    /// This task neither validates nor interprets its contents — `None` if the entry omitted it,
-    /// and always `None` for SRV-sourced endpoints (SRV carries no policy information at all).
-    pub policy: Option<String>,
 }
 
 /// Errors resolving a federation partner domain to dial targets.
@@ -136,6 +137,20 @@ pub enum DiscoveryError {
          (ADR 0017 C4 requires an explicit SAN/CN pin per partner)"
     )]
     MissingPin { domain: String },
+    /// `StaticMap::load` (task 3.9 / review finding F7): an entry sets a per-partner `policy`
+    /// field. There is no such thing — federation admission is server-wide only, via
+    /// [`super::policy::FederationPolicy`] (`federation.policy` — `open`/`allowlist`/`closed`),
+    /// never a per-partner dimension. Before this task the field was parsed and carried through on
+    /// [`Endpoint`] but never consulted by anything, so an operator writing `policy = "closed"` for
+    /// a partner silently got nothing; rejecting presence at load time closes that silent-failure
+    /// gap without inventing a second, potentially-disagreeing policy gate alongside the real one
+    /// (see [`super::outbound`]'s task-3.1 choke point).
+    #[error(
+        "federation_map.toml entry for domain {domain:?} sets a per-partner \"policy\" field, \
+         which is not supported — federation admission is server-wide only, via federation.policy \
+         (open|allowlist|closed), never per partner"
+    )]
+    UnsupportedPolicyField { domain: String },
     /// `StaticMap::load`: an entry's `endpoint` isn't `host:port`, or the port doesn't parse.
     #[error("federation_map.toml entry for domain {domain:?} has an invalid endpoint {endpoint:?}: {reason}")]
     InvalidEndpoint {
@@ -243,6 +258,11 @@ impl StaticMap {
 
         let mut entries = HashMap::with_capacity(file.partner.len());
         for p in file.partner {
+            // Task 3.9 / F7: reject a per-partner `policy` field outright, the same fail-closed
+            // posture as `MissingPin` below — never silently ignored, never silently dropped.
+            if p.policy.is_some() {
+                return Err(DiscoveryError::UnsupportedPolicyField { domain: p.domain });
+            }
             if p.pinned_identity.trim().is_empty() {
                 return Err(DiscoveryError::MissingPin { domain: p.domain });
             }
@@ -258,7 +278,6 @@ impl StaticMap {
                 priority: 0,
                 weight: 0,
                 pinned_identity: Some(p.pinned_identity),
-                policy: p.policy,
             };
             // DNS domains are case-insensitive (RFC 4343). Normalize to ASCII-lowercase before
             // both insertion and (in `resolve`, below) lookup, so a differently-cased entry for
@@ -411,8 +430,6 @@ impl<R: SrvResolver> Discovery for SrvDiscovery<R> {
                 // pinned identity to carry. Certificate validation for an SRV-resolved endpoint
                 // targets the hint `domain` itself (WebPKI mode).
                 pinned_identity: None,
-                // SRV carries no federation-policy information.
-                policy: None,
             })
             .collect())
     }

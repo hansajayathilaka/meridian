@@ -28,18 +28,21 @@
 #                    `SAN=DNS:org-a.test` as of this task's fix — rustls-webpki never falls back to
 #                    the bare CN, so the SAN is what the TLS handshake itself actually checks), NOT
 #                    `endpoint`'s host.
-#   policy           optional; carried through unparsed/uninterpreted by task 2.5.
-#                    Semantics (`open | allowlist | closed`) are task 2.6's ("federation policy
-#                    limits") to define and enforce — this file only reserves the field.
+#
+# There is deliberately no per-partner `policy` field (task 3.9 / review finding F7): an earlier
+# version of this schema reserved one, but it was parsed and carried through without ever being
+# consulted by anything, so an operator setting it here would have silently gotten nothing.
+# Federation admission is server-wide only, via `federation.policy` (`open | allowlist | closed`,
+# task 2.6) in each rendezvous's own config — see docker-compose.static.yml — never a per-partner
+# dimension in this file. A `[[partner]]` entry that sets `policy` is now a fail-closed
+# config-load error (`StaticMap::from_toml_str` rejects it).
 
 [[partner]]
 domain = "org-a.test"
 endpoint = "fed.org-a.test:8444"
 pinned_identity = "org-a.test"
-policy = "allowlist"
 
 [[partner]]
 domain = "org-b.test"
 endpoint = "fed.org-b.test:8444"
 pinned_identity = "org-b.test"
-policy = "allowlist"

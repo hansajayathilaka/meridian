@@ -2,7 +2,7 @@
 
 # Phase 3 — Review of Phase 2
 
-**Kind:** review · **Status:** in progress · **Reviews phase(s):** Phase 2 (Cross-Org Federation, tasks 2.1–2.17) plus the Phase-1 follow-ups that landed in the same window (1.32, 1.33) and the untracked out-of-band work merged alongside (PRs #36–#42: figment config loading / ADR 0018, Docker Hub publish pipeline, Dokploy deploy stack + fixes, coturn config fixes, CLI `wss://` support).
+**Kind:** review · **Status:** done · **Reviews phase(s):** Phase 2 (Cross-Org Federation, tasks 2.1–2.17) plus the Phase-1 follow-ups that landed in the same window (1.32, 1.33) and the untracked out-of-band work merged alongside (PRs #36–#42: figment config loading / ADR 0018, Docker Hub publish pipeline, Dokploy deploy stack + fixes, coturn config fixes, CLI `wss://` support).
 
 ## Goal
 Sweep everything built since the Phase-1 review report for bugs, gaps, loopholes, dead ends,
@@ -58,7 +58,7 @@ the two `link.rs` edits and let 3.3 reuse 3.2's `with_deadline` helper)
 - [x] **3.6** Accept-side peer identity must consider all authenticated SANs (F9) — [file](./3.6-multi-san-peer-identity.md)
 - [x] **3.7** Reuse TLS config + one link per federated message, SRV failover (F10+N2) — [file](./3.7-federation-link-reuse.md)
 - [x] **3.8** Count federated deliveries in `envelopes_routed_total` (F8+N4) — [file](./3.8-fed-delivery-metrics.md)
-- [ ] **3.9** Resolve the dead per-partner `policy` field in `federation_map.toml` (F7) — [file](./3.9-federation-map-policy-field.md)
+- [x] **3.9** Resolve the dead per-partner `policy` field in `federation_map.toml` (F7) — [file](./3.9-federation-map-policy-field.md)
 
 **Wave 4 — parallel track** (core client + CI; no federation-server contention, can run alongside wave 3)
 - [x] **3.10** Bound `pending_requests` against a stranger flood (F5) — [file](./3.10-message-request-flood-bound.md)

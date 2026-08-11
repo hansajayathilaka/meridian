@@ -657,7 +657,6 @@ async fn a_refusing_first_endpoint_falls_through_to_a_working_second() {
                 priority: 0,
                 weight: 0,
                 pinned_identity: None,
-                policy: None,
             },
             second: Endpoint {
                 host: b_fed_addr.ip().to_string(),
@@ -665,7 +664,6 @@ async fn a_refusing_first_endpoint_falls_through_to_a_working_second() {
                 priority: 1,
                 weight: 0,
                 pinned_identity: None,
-                policy: None,
             },
         }),
     );
