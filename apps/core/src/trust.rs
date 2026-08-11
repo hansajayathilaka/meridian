@@ -72,6 +72,14 @@ use serde::{Deserialize, Serialize};
 /// hint is preferable to silently dropping the observation.
 pub const MAX_HINT_LEN: usize = 253; // max DNS name length; generous for any real `@domain` hint.
 
+/// Bound a [`Contact::petname`]'s contribution to [`TrustStore`]'s at-rest size. Unlike
+/// [`MAX_HINT_LEN`], this is not a hostile-input defense — see [`TrustStore::set_petname`]'s doc:
+/// a petname is never wire-derived, so nothing attacker-controlled ever reaches this bound. It
+/// exists purely to stop an accidental paste (e.g. a whole clipboard's worth of text) from
+/// bloating the sealed store; truncated, not rejected, for the same "still usable" reasoning as
+/// [`bounded_hint`].
+pub const MAX_PETNAME_LEN: usize = 128;
+
 /// Errors from the trust store.
 #[derive(Debug, thiserror::Error)]
 pub enum TrustError {
@@ -151,10 +159,11 @@ pub struct PinnedKey {
     pub last_seen_unix: u64,
 }
 
-/// A contact record: the peer's current identity key, an advisory id/hint, its trust state, and
-/// the full history of keys ever pinned for it (naming mirrors ADR 0021's `pinned_key_history` —
+/// A contact record: the peer's current identity key, an advisory id/hint, its trust state, the
+/// full history of keys ever pinned for it (naming mirrors ADR 0021's `pinned_key_history` —
 /// this module is the source of truth any client-local mirror, e.g. the TUI's `contacts.json`
-/// (task 4.15), is built from).
+/// (task 4.15), is built from), a purely local petname (task 4.6), and a purely local
+/// user-initiated block flag (task 4.6).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Contact {
     /// The peer's current Ed25519 identity key — also the [`TrustStore`] map key.
@@ -167,6 +176,32 @@ pub struct Contact {
     /// Every key ever pinned for this contact, oldest first. Never truncated or reordered by this
     /// module.
     pub pinned_key_history: Vec<PinnedKey>,
+    /// (task 4.6) A local display name, set **only** by [`TrustStore::set_petname`] — which is
+    /// itself called only from explicit local user input (`meridian contact add --petname` / the
+    /// interactive prompt / `meridian contact rename`; see `apps/cli/src/contact.rs`). **Never**
+    /// populated from `hint`, the `mrd1:` id string, a QR payload, or any other wire-observed
+    /// field — that is a threat-model invariant (system-design.md §3.1: "display names are never
+    /// taken from the wire"), not a style choice. A spoofed "petname" arriving via any wire path
+    /// is exactly the kind of thing a malicious peer or server would try, so no code path in this
+    /// module or [`TrustStore::observe`]/[`TrustStore::observe_key_change`] (both of which *do*
+    /// take wire-observed `hint` values) ever writes to this field.
+    ///
+    /// `#[serde(default)]` so a store sealed before this task still opens (mirrors
+    /// `escalate_pinned_key_change`'s precedent) — a pre-4.6 store correctly defaults every
+    /// contact to "no petname yet".
+    #[serde(default)]
+    pub petname: Option<String>,
+    /// (task 4.6) Blocked by explicit local user action (`meridian contact block`) —
+    /// deliberately **not** [`TrustState::Blocked`]. See [`TrustStore::set_user_blocked`]'s doc
+    /// for the full reasoning; in short, these are two different concepts that must stay
+    /// independently clearable: `TrustState::Blocked` means "a verified contact's key changed"
+    /// and is intentionally un-clearable except by a genuine re-verification
+    /// ([`TrustStore::mark_verified`]) — task 4.4's core security invariant. Conflating the two
+    /// would either make a user's own block un-clearable by a normal "unblock" action, or (worse)
+    /// let unblocking a user-initiated block silently also dismiss a real key-change incident.
+    /// `#[serde(default)]` for the same pre-4.6-store-compatibility reason as `petname`.
+    #[serde(default)]
+    pub user_blocked: bool,
 }
 
 impl Contact {
@@ -297,6 +332,10 @@ impl TrustStore {
                     first_seen_unix: now_unix,
                     last_seen_unix: now_unix,
                 }],
+                // Never set here — see `Contact::petname`'s doc: TOFU-pinning a wire-observed key
+                // must never populate a display name from anything wire-derived.
+                petname: None,
+                user_blocked: false,
             },
         );
         TrustState::Pinned
@@ -460,6 +499,14 @@ impl TrustStore {
             return SendGate::Ok;
         };
         let label = contact_label(contact);
+        // (task 4.6) A user-initiated block is checked first and independently of `state` — see
+        // `Contact::user_blocked`'s doc. It can co-occur with a key-change `Blocked`/`Warn`, in
+        // which case the user-block reason is shown (the user already knows they blocked this
+        // contact; the key-change detail underneath doesn't need surfacing on top of that), but
+        // either condition alone is sufficient to gate sends.
+        if contact.user_blocked {
+            return SendGate::Blocked(user_blocked_reason(&label));
+        }
         match contact.state {
             TrustState::Blocked => SendGate::Blocked(blocked_reason(&label)),
             TrustState::PinnedKeyChanged => SendGate::Warn(warn_reason(&label)),
@@ -481,6 +528,57 @@ impl TrustStore {
     /// The current escalation setting — see [`set_escalate_pinned_key_change`](Self::set_escalate_pinned_key_change).
     pub fn escalate_pinned_key_change(&self) -> bool {
         self.escalate_pinned_key_change
+    }
+
+    /// (task 4.6) Set (`Some`) or clear (`None`) `pubkey`'s local petname — see [`Contact::petname`]'s
+    /// doc for the invariant this method is the single write path for: **the only legitimate
+    /// callers are `apps/cli/src/contact.rs`'s `add`/`rename` handlers, passing a value that came
+    /// from an explicit `--petname` flag or an interactive terminal prompt — never a value derived
+    /// from `hint`, an `mrd1:` id string, or any other wire-observed field.** This method itself
+    /// does not and cannot enforce that (it has no way to know where its `petname` argument came
+    /// from); the invariant is enforced by there being no other call site, which is exactly what
+    /// this task's required security-reviewer pass checks.
+    ///
+    /// An empty string is treated the same as `None` (cleared), so `meridian contact rename <id>
+    /// ""` clears rather than setting a visible-but-empty name. Non-empty values longer than
+    /// [`MAX_PETNAME_LEN`] are truncated (at a UTF-8 boundary), matching [`bounded_hint`]'s
+    /// truncate-not-reject behavior.
+    ///
+    /// Errs [`TrustError::UnknownContact`] if `pubkey` has no contact record — there is nothing to
+    /// name; callers must [`observe`](Self::observe) (or `observe_key_change`) the contact first,
+    /// which `contact add` always does before considering `--petname`.
+    pub fn set_petname(
+        &mut self,
+        pubkey: &[u8; 32],
+        petname: Option<String>,
+    ) -> Result<(), TrustError> {
+        let contact = self
+            .contacts
+            .get_mut(pubkey)
+            .ok_or(TrustError::UnknownContact)?;
+        contact.petname = petname
+            .filter(|p| !p.is_empty())
+            .map(|p| bounded_petname(&p));
+        Ok(())
+    }
+
+    /// (task 4.6) Set or clear `pubkey`'s **user-initiated** block ([`Contact::user_blocked`]),
+    /// from an explicit local action (`meridian contact block`). Deliberately independent of
+    /// [`TrustState`]/[`TrustState::Blocked`] — see [`Contact::user_blocked`]'s doc for why this
+    /// is a separate field rather than a reuse of the key-change `Blocked` state: doing so keeps
+    /// task 4.4's "only `mark_verified` clears a verified contact's key-change block" invariant
+    /// completely untouched by this task's user-blocking feature in either direction (a user
+    /// block/unblock can never affect a key-change block, and a key-change block can never affect
+    /// a user block).
+    ///
+    /// Errs [`TrustError::UnknownContact`] if `pubkey` has no contact record.
+    pub fn set_user_blocked(&mut self, pubkey: &[u8; 32], blocked: bool) -> Result<(), TrustError> {
+        let contact = self
+            .contacts
+            .get_mut(pubkey)
+            .ok_or(TrustError::UnknownContact)?;
+        contact.user_blocked = blocked;
+        Ok(())
     }
 
     /// Serialize and seal the whole store under a key derived from the account key in `store` —
@@ -529,6 +627,19 @@ fn bounded_hint(hint: &str) -> String {
     hint[..end].to_string()
 }
 
+/// Truncate `petname` to [`MAX_PETNAME_LEN`] bytes at a UTF-8 char boundary — mirrors
+/// [`bounded_hint`] exactly, just for the local-only petname bound.
+fn bounded_petname(petname: &str) -> String {
+    if petname.len() <= MAX_PETNAME_LEN {
+        return petname.to_string();
+    }
+    let mut end = MAX_PETNAME_LEN;
+    while !petname.is_char_boundary(end) {
+        end -= 1;
+    }
+    petname[..end].to_string()
+}
+
 /// (task 4.4) The next [`TrustState`] a contact currently at `prior_state` reaches after
 /// [`TrustStore::observe_key_change`] records a genuine key change, given whether org policy
 /// escalates the pinned case (`escalate`). See [`TrustStore::observe_key_change`]'s doc for the
@@ -554,14 +665,14 @@ fn escalated_state(prior_state: TrustState, escalate: bool) -> TrustState {
     }
 }
 
-/// The best available human-facing label for `contact` in a [`SendGate`] message. Petname
-/// assignment (feature spec 08 §3.1: "display names are never taken from the wire") has not landed
-/// yet as of this task — `TODO: confirm` once it does, this should prefer the local petname over
-/// the advisory hint. Until then, falls back to the hint, and — if even that is empty — a short,
-/// unambiguous key-derived label so a warning/block message is never left without an identifiable
-/// subject.
+/// The best available human-facing label for `contact` in a [`SendGate`] message: the local
+/// petname (task 4.6) if one is set, else the advisory hint, else — if even that is empty — a
+/// short, unambiguous key-derived label so a warning/block message is never left without an
+/// identifiable subject.
 fn contact_label(contact: &Contact) -> String {
-    if !contact.hint.is_empty() {
+    if let Some(petname) = contact.petname.as_deref().filter(|p| !p.is_empty()) {
+        petname.to_string()
+    } else if !contact.hint.is_empty() {
         contact.hint.clone()
     } else {
         format!("contact {}", &hex::encode(contact.pubkey)[..12])
@@ -603,6 +714,21 @@ fn warn_reason(label: &str) -> String {
          {label} are paused until you either verify the new safety number with them through a \
          channel you trust, or explicitly acknowledge this warning (which re-pins the new key \
          without verifying it — verify first if anything you're about to send is sensitive)."
+    )
+}
+
+/// Canonical wording for [`SendGate::Blocked`] from a **user-initiated** block
+/// ([`Contact::user_blocked`], task 4.6) — deliberately distinct from [`blocked_reason`]'s
+/// key-change wording: there is no safety number, no interception concern, and no "verify to
+/// resume" step, because this block was the user's own explicit choice rather than a detected
+/// anomaly. This task's CLI surface (`apps/cli/src/contact.rs`) exposes `block` but not an
+/// `unblock` counterpart (scoped to `add/list/rename/block` only) — [`TrustStore::set_user_blocked`]
+/// already supports clearing it (`blocked: false`) for whenever that CLI/TUI surface lands, so the
+/// wording below stays deliberately generic rather than naming a command that doesn't exist yet.
+/// `TODO: confirm` final user-facing copy with design/UX (same note as [`blocked_reason`]).
+fn user_blocked_reason(label: &str) -> String {
+    format!(
+        "You have blocked {label} locally. Sends stay blocked while that local block is in place."
     )
 }
 
@@ -650,5 +776,54 @@ mod b32 {
             }
         }
         d.deserialize_byte_buf(V)
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    //! `bounded_hint`/`bounded_petname` are private, so their UTF-8-boundary truncation behavior
+    //! (task 4.6's security review, required addition) is tested here rather than from an
+    //! integration test in `tests/`, which can't reach non-`pub` items.
+    use super::{bounded_hint, bounded_petname, MAX_HINT_LEN, MAX_PETNAME_LEN};
+
+    /// A multi-byte character straddling the truncation boundary must never split it: the result
+    /// must be valid UTF-8 (guaranteed by `String`'s own invariant, so this would panic rather
+    /// than silently corrupt if `bounded_petname` ever regressed to a naive byte-index slice) and
+    /// must be no longer than the bound.
+    #[test]
+    fn bounded_petname_truncates_at_a_utf8_boundary_not_mid_character() {
+        // '💥' is 4 bytes in UTF-8. Repeat it enough to straddle MAX_PETNAME_LEN (128) at a
+        // non-character-aligned byte offset if truncation were done naively.
+        let petname: String = "a".repeat(MAX_PETNAME_LEN - 2) + "💥💥💥";
+        assert!(petname.len() > MAX_PETNAME_LEN);
+
+        let truncated = bounded_petname(&petname);
+        assert!(truncated.len() <= MAX_PETNAME_LEN);
+        // If this panicked, bounded_petname sliced through a multi-byte character's interior --
+        // String::len() confirms it stayed valid UTF-8 already, but chars().count() is a second,
+        // more direct proof the content is actually intact characters, not raw bytes.
+        assert!(truncated.chars().count() > 0);
+        assert!(petname.starts_with(&truncated));
+    }
+
+    #[test]
+    fn bounded_hint_truncates_at_a_utf8_boundary_not_mid_character() {
+        let hint: String = "a".repeat(MAX_HINT_LEN - 2) + "💥💥💥";
+        assert!(hint.len() > MAX_HINT_LEN);
+
+        let truncated = bounded_hint(&hint);
+        assert!(truncated.len() <= MAX_HINT_LEN);
+        assert!(truncated.chars().count() > 0);
+        assert!(hint.starts_with(&truncated));
+    }
+
+    #[test]
+    fn bounded_petname_under_the_limit_is_unchanged() {
+        assert_eq!(bounded_petname("bob"), "bob");
+    }
+
+    #[test]
+    fn bounded_hint_under_the_limit_is_unchanged() {
+        assert_eq!(bounded_hint("org-a.test"), "org-a.test");
     }
 }

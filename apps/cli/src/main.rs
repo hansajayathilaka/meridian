@@ -19,6 +19,7 @@ use meridian_core::signaling::{SignalError, SignalingClient, DEFAULT_OTK_COUNT};
 
 mod account;
 mod chat;
+mod contact;
 mod doctor;
 mod opacity;
 mod policy;
@@ -81,6 +82,13 @@ enum TopCommand {
         /// a server started with `allow_test_tamper = true`.
         #[arg(long)]
         tamper: bool,
+    },
+    /// Contact management (T08): petnames are strictly local — assigned only from `--petname` or
+    /// an interactive prompt, never derived from a QR payload, an `mrd1:` id, or any other wire
+    /// field (`docs/architecture/system-design.md` §3.1). See `apps/cli/src/contact.rs`.
+    Contact {
+        #[command(subcommand)]
+        cmd: ContactCommand,
     },
     /// Open an end-to-end-encrypted chat with a peer, relayed through the rendezvous (T03).
     Chat {
@@ -272,6 +280,40 @@ enum IdCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum ContactCommand {
+    /// Record a contact (TOFU-pins their current key) and, optionally, assign a local petname.
+    Add {
+        /// The peer's full `mrd1:…@domain` ID.
+        id: String,
+        /// A local display name for this contact. Never derived from `id` — this is the ONLY
+        /// wire-adjacent source this command reads, and it is used solely as `TrustStore::observe`'s
+        /// advisory hint, never as a petname. If `--petname` is omitted and stdin is an
+        /// interactive terminal, you'll be prompted (an empty line leaves it unset).
+        #[arg(long)]
+        petname: Option<String>,
+    },
+    /// List known contacts.
+    List {
+        /// Emit one JSON object per contact instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rename a contact's local petname (an empty string clears it).
+    Rename {
+        /// The peer's full `mrd1:…@domain` ID.
+        id: String,
+        /// The new petname (empty string to clear).
+        petname: String,
+    },
+    /// Block a contact by explicit local action — independent of, and never a substitute for, the
+    /// key-change block `meridian_core::trust::TrustState::Blocked` already enforces.
+    Block {
+        /// The peer's full `mrd1:…@domain` ID.
+        id: String,
+    },
+}
+
 fn main() -> ExitCode {
     // rustls 0.23 requires an explicit process-wide crypto backend selection before any `wss://`
     // connection; that install now lives in `meridian_signaling::install_crypto_provider` (called
@@ -281,6 +323,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         TopCommand::Id { cmd } => run_id(cmd),
+        TopCommand::Contact { cmd } => run_contact(cmd),
         TopCommand::Register { server, invite } => cmd_register(&server, invite),
         TopCommand::FetchBundle { id, server, tamper } => cmd_fetch_bundle(&id, &server, tamper),
         TopCommand::Chat { id, server, json } => cmd_chat(&id, &server, json),
@@ -310,6 +353,25 @@ fn run_id(cmd: IdCommand) -> Result<ExitCode, String> {
         IdCommand::Export { out } => cmd_export(&out),
         IdCommand::Import { path, store, out } => cmd_import(&path, store, out),
     }
+}
+
+/// `meridian contact …` — loads the current account's store once (same shape as `cmd_chat`/
+/// `cmd_register`) and delegates to `contact.rs`, which owns everything `TrustStore`-specific.
+fn run_contact(cmd: ContactCommand) -> Result<ExitCode, String> {
+    let descriptor = AccountDescriptor::load()?;
+    let store = load_store(&descriptor)?;
+    let handle = KeyHandle::from_label(&descriptor.label);
+    match cmd {
+        ContactCommand::Add { id, petname } => {
+            contact::cmd_add(&id, petname, store.as_ref(), &handle)?
+        }
+        ContactCommand::List { json } => contact::cmd_list(json, store.as_ref(), &handle)?,
+        ContactCommand::Rename { id, petname } => {
+            contact::cmd_rename(&id, &petname, store.as_ref(), &handle)?
+        }
+        ContactCommand::Block { id } => contact::cmd_block(&id, store.as_ref(), &handle)?,
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 // ---------------------------------------------------------------------------
