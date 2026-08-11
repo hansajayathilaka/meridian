@@ -16,22 +16,24 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Waves 1–7 of Phase 3 are done; only 3.9 (Wave 3) remains open.** This run landed
-  **3.23** — bound `serve_link`'s idle read
+- **NOW:** **Phase 3 is fully done — all 23 tasks `[x]`, no open ADR obligations.** This run
+  closed the last two items: **3.23** — bound `serve_link`'s idle read
   ([file](./phase-3/3.23-serve-link-idle-read-deadline.md)): a new, independent
   `federation.serve_idle_timeout_ms` config knob (default 10_000ms, derived from
   `request_timeout_ms`'s precedent), `serve_link`'s main loop now wraps `recv_frame` in
-  `with_deadline` so a handshaked-but-stalling peer can no longer hold a `max_links` slot forever.
-  Combined architect+security review passed the design outright but — together with a parallel
-  test-engineer mutation-check — caught a real test-soundness gap: the rewritten test's
-  permit-reclamation check relied on `dial()` returning `Ok`, which happens purely client-side and
-  doesn't actually prove the server granted a `max_links` permit. Fixed by exercising a real
-  request/reply round trip over the reclaimed link instead, then re-verified by the same mutation
-  test-engineer used to find the gap. Tree green, lints clean. Phases 0–2 are **done**.
-- **NEXT:** `/next-task` — **3.9** (dead per-partner `policy` field in `federation_map.toml`, F7)
-  is the only item left in Phase 3, and it needs an **architect decision** first (three materially
-  different fixes on the table, no default named — see
-  [phase-3/README.md](./phase-3/README.md#adr-obligations)) before it can be implemented.
+  `with_deadline` so a handshaked-but-stalling peer can no longer hold a `max_links` slot forever
+  (review + a parallel test-engineer mutation-check caught and fixed a test-soundness gap in the
+  permit-reclamation assertion before landing). And **3.9** — the dead per-partner `policy` field
+  in `federation_map.toml` ([file](./phase-3/3.9-federation-map-policy-field.md), F7): architect
+  chose reject-on-presence (a `[[partner]]` entry setting `policy` is now a fail-closed
+  config-load error, `DiscoveryError::UnsupportedPolicyField`) over plain removal (would just
+  relocate the same silent-failure bug to serde) or enforcement (out of scope — would require
+  redesigning `FederationPolicy` into a per-partner dimension, and would silently no-op under SRV
+  discovery). Both landed with clean combined-reviewer sign-offs, tree green, lints clean. Phases
+  0–2 are **done**.
+- **NEXT:** `/pick-next-phase` — Phase 3 (review of Phase 2) is closed; no fix-tasks remain and no
+  ADR obligations are outstanding. Time to pick the next **build** phase's feature(s) per the
+  [roadmap](../architecture/roadmap.md) dependency DAG.
 
 ### Live carry-forwards (not owned by any open task)
 Everything else is owned by a Phase-3 task; these are the exceptions that would otherwise evaporate:
@@ -158,7 +160,7 @@ into 2.9 or 2.11.
 - [x] **2.16** `session_connect_webrtc.rs`'s TURN-grant test hangs in real CI, root cause unconfirmed (surfaced while closing 2.15; `#[ignore]`d rather than guessed at) — [file](./phase-2/2.16-turn-grant-ci-hang.md)
 - [x] **2.17** Bound the answerer's wait for an offer (`recv_sdp`, mirror of 1.33; surfaced by 2.12's review) — [file](./phase-2/2.17-bound-offer-wait.md)
 
-### Phase 3 — Review of Phase 2 · **in progress** · [details](./phase-3/README.md)
+### Phase 3 — Review of Phase 2 · **done** · [details](./phase-3/README.md)
 Review phase. Sweeps everything built since the Phase-1 review: Phase 2 (2.1–2.17), the Phase-1
 follow-ups 1.32/1.33, and the untracked out-of-band PRs #36–#42 (figment/ADR 0018, Docker Hub
 publish, Dokploy stack, coturn fixes, CLI `wss://`). [Report](./phase-3/review-report.md): 25 findings
@@ -179,7 +181,7 @@ phase.
 - [x] **3.6** Accept-side peer identity must consider all authenticated SANs (F9) — [file](./phase-3/3.6-multi-san-peer-identity.md)
 - [x] **3.7** Reuse TLS config + one link per federated message, SRV failover (F10+N2) — [file](./phase-3/3.7-federation-link-reuse.md)
 - [x] **3.8** Count federated deliveries in `envelopes_routed_total` (F8+N4) — [file](./phase-3/3.8-fed-delivery-metrics.md)
-- [ ] **3.9** Resolve the dead per-partner `policy` field in `federation_map.toml` (F7) — [file](./phase-3/3.9-federation-map-policy-field.md)
+- [x] **3.9** Resolve the dead per-partner `policy` field in `federation_map.toml` (F7) — [file](./phase-3/3.9-federation-map-policy-field.md)
 
 **Wave 4 — parallel track** (core client + CI; no federation-server contention)
 - [x] **3.10** Bound `pending_requests` against a stranger flood (F5) — [file](./phase-3/3.10-message-request-flood-bound.md)

@@ -42,9 +42,11 @@ all. The actual shape — resolved and implemented by
 operator-edited config file parsed by `meridian_rendezvous::federation::discovery::StaticMap`
 (schema documented in that module and in the reference fixture,
 [`demo/two-orgs/federation_map.toml`](../../demo/two-orgs/federation_map.toml)): per-partner
-`domain`, `endpoint` (`host:port`), a mandatory `pinned_identity` (SAN/CN, [ADR 0017](../adr/0017-federation-trust-boundary.md)
-C4 — not a certificate/key fingerprint, hence not named `ca_pin`), and an optional `policy` carried
-through for [task 2.6](../tasks/phase-2/2.6-federation-policy-limits.md) to define.
+`domain`, `endpoint` (`host:port`), and a mandatory `pinned_identity` (SAN/CN, [ADR 0017](../adr/0017-federation-trust-boundary.md)
+C4 — not a certificate/key fingerprint, hence not named `ca_pin`). No per-partner `policy` field:
+[task 3.9](../tasks/phase-3/3.9-federation-map-policy-field.md) closed the earlier reserved-but-dead
+version of that field (parsed, never consulted) by making it a fail-closed config-load error —
+federation admission is server-wide only, via `federation.policy` ([task 2.6](../tasks/phase-2/2.6-federation-policy-limits.md), `open | allowlist | closed`), never a per-partner dimension.
 
 Deliberately absent: contact lists, message metadata beyond the mailbox row, display names, sender columns on mailbox rows (sender is inside the sealed envelope). Backup/restore stance (§10): losing this DB costs *reachability* (clients republish bundles on reconnect), never confidentiality or identity.
 

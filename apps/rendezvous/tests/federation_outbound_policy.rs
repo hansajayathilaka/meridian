@@ -252,7 +252,6 @@ async fn closed_policy_denial_makes_zero_dns_lookups_and_zero_tcp_connects() {
             priority: 0,
             weight: 0,
             pinned_identity: None,
-            policy: None,
         },
     });
 

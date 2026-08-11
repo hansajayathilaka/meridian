@@ -14,7 +14,6 @@ const TWO_PARTNER_MAP: &str = r#"
 domain = "org-a.test"
 endpoint = "fed.org-a.test:8444"
 pinned_identity = "fed.org-a.test"
-policy = "allow"
 
 [[partner]]
 domain = "org-b.test"
@@ -37,19 +36,31 @@ async fn static_map_resolves_a_known_domain() {
         resolved[0].pinned_identity.as_deref(),
         Some("fed.org-a.test")
     );
-    assert_eq!(resolved[0].policy.as_deref(), Some("allow"));
     // Static-map endpoints carry no SRV ordering information — see `Endpoint`'s doc comment.
     assert_eq!(resolved[0].priority, 0);
     assert_eq!(resolved[0].weight, 0);
 }
 
-#[tokio::test]
-async fn static_map_entry_without_policy_carries_none() {
-    let map = StaticMap::from_toml_str(TWO_PARTNER_MAP, "federation_map.toml").unwrap();
+#[test]
+fn entry_with_policy_field_is_rejected_fail_closed() {
+    // Task 3.9 / review finding F7: a `[[partner]]` entry setting a per-partner `policy` field
+    // must not be silently ignored (the field predates this task and was carried through
+    // unread) or silently dropped by serde — it is a fail-closed config-load error, pointing the
+    // operator at the real, server-wide mechanism (`federation.policy`).
+    let toml = r#"
+        [[partner]]
+        domain = "org-a.test"
+        endpoint = "fed.org-a.test:8444"
+        pinned_identity = "fed.org-a.test"
+        policy = "allow"
+    "#;
 
-    let resolved = map.resolve("org-b.test").await.unwrap();
+    let err = StaticMap::from_toml_str(toml, "federation_map.toml")
+        .expect_err("a per-partner policy field must be rejected, not silently accepted");
 
-    assert_eq!(resolved[0].policy, None);
+    assert!(
+        matches!(err, DiscoveryError::UnsupportedPolicyField { domain } if domain == "org-a.test")
+    );
 }
 
 #[tokio::test]
@@ -262,10 +273,9 @@ async fn srv_orders_by_ascending_priority_then_descending_weight() {
             "backup-b.org-b.test",    // priority 20 last
         ]
     );
-    // SRV-sourced endpoints carry no private-CA pin or policy (SRV is unauthenticated discovery
-    // only — ADR 0017 (a)).
+    // SRV-sourced endpoints carry no private-CA pin (SRV is unauthenticated discovery only — ADR
+    // 0017 (a)).
     assert!(resolved.iter().all(|e| e.pinned_identity.is_none()));
-    assert!(resolved.iter().all(|e| e.policy.is_none()));
     assert_eq!(resolved[0].priority, 0);
     assert_eq!(resolved[1].weight, 50);
 }
