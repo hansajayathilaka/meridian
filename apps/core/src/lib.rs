@@ -58,6 +58,11 @@ pub mod streams;
 /// org-default / per-user / per-contact scope, and the [`meridian_transport::IceConfig`] it yields.
 pub mod relay;
 
+/// Trust module + contact store (T08, task 4.3): the client-agnostic `new → pinned (TOFU) →
+/// verified`/`blocked` state machine every client shares, sealed at rest like `chat`'s
+/// `ChatState`. Key-change detection/blocking is task 4.4, not implemented yet.
+pub mod trust;
+
 /// Crate version — kept for build-info/diagnostics.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

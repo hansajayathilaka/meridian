@@ -233,7 +233,7 @@ inside 4.9. 28 tasks, [full DAG here](./phase-4/README.md#dependency-order).
 - [x] **4.2** ADR 0021 — client-local store & config formats — [file](./phase-4/4.2-adr-client-store-config-formats.md)
 
 **T08 track — starts immediately**
-- [~] **4.3** Trust module + contact store core — [file](./phase-4/4.3-trust-module-contact-store.md)
+- [x] **4.3** Trust module + contact store core — [file](./phase-4/4.3-trust-module-contact-store.md)
 - [ ] **4.4** Key-change handling: block/warn semantics — [file](./phase-4/4.4-key-change-block-warn-gate.md)
 - [ ] **4.5** Safety-number compare UX primitives + `meridian verify` — [file](./phase-4/4.5-safety-number-verify-cli.md)
 - [ ] **4.6** Petname assignment + contact management CLI — [file](./phase-4/4.6-petname-contact-management-cli.md)
