@@ -25,9 +25,11 @@
 //! Screens are placeholders at this stage; real screen content lands in task 4.16+.
 
 pub mod app;
+pub mod config;
 pub mod terminal;
 
 pub use app::{App, AppEvent, Effect, Screen, WorkerEvent};
+pub use config::{load as load_config, load_from as load_config_from, TuiConfig};
 pub use terminal::{spawn_signal_watch, CrosstermOps, TerminalGuard, TerminalOps};
 
 use std::io;

@@ -2880,9 +2880,12 @@ name = "meridian-tui"
 version = "0.0.0"
 dependencies = [
  "crossterm",
+ "figment",
  "meridian-core",
  "meridian-tui",
  "ratatui",
+ "serde",
+ "tempfile",
  "tokio",
 ]
 

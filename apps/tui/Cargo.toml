@@ -25,8 +25,14 @@ meridian-core = { path = "../core" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+serde = { workspace = true }
+# `config.rs` (task 4.14, ADR 0021): same figment pin as apps/cli and apps/rendezvous (not a
+# workspace dependency there either — see those crates' own Cargo.toml comments), with the `toml`
+# format feature (this crate's config.toml) and `env` (MERIDIAN_TUI__ overrides).
+figment = { version = "0.10.19", features = ["toml", "env"] }
 
 [dev-dependencies]
 # Self-dependency with test-support enabled, so tests/terminal_guard.rs (a separate crate linking
 # the normal, non-`cfg(test)` build of this lib) can reach terminal::test_support::RecordingOps.
 meridian-tui = { path = ".", features = ["test-support"] }
+tempfile = { workspace = true }
