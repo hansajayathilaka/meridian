@@ -150,7 +150,16 @@ enum TopCommand {
     /// scriptable `--json` equivalent — on `TERM=dumb`, a non-TTY stdout, or a terminal smaller
     /// than 80x24. Compiled out entirely under `--no-default-features` (ADR 0020).
     #[cfg(feature = "tui")]
-    Tui,
+    Tui {
+        /// Skip the interactive terminal entirely: decrypt every sealed local store document
+        /// (`contacts.json`, `history/*.jsonl`, `outbox.json`) and write them, unsealed, into this
+        /// directory — mirroring the sealed layout (`<path>/contacts.json`,
+        /// `<path>/history/<peer>.jsonl`, `<path>/outbox.json`), plus a copy of the already-
+        /// unsealed `state.json` (task 4.15, tui-client.md §5: "for inspection or backup — which
+        /// is why no persistent-plaintext mode is offered").
+        #[arg(long, value_name = "PATH")]
+        export_json: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -373,7 +382,10 @@ fn main() -> ExitCode {
         TopCommand::Config { cmd } => run_config(cmd),
         TopCommand::Demo { cmd } => run_demo(cmd),
         #[cfg(feature = "tui")]
-        TopCommand::Tui => tui::run(),
+        TopCommand::Tui { export_json } => match export_json {
+            Some(dest) => tui::export_json(&dest),
+            None => tui::run(),
+        },
     };
     match result {
         Ok(code) => code,

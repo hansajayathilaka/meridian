@@ -26,6 +26,14 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 serde = { workspace = true }
+# `store/` (task 4.15, ADR 0021): the sealed/unsealed JSON documents are `serde_json`-encoded, not
+# CBOR (unlike `sessions.bin`/`trust.bin`) — tui-client.md §5's "the content is plain JSON" note.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# `store/contacts.rs`'s opaque per-contact conversation handle (ADR 0021 condition 2 review fix):
+# same `getrandom::fill` pattern `apps/core/src/session.rs` already uses for locally generated
+# 128-bit ids, not a bespoke RNG.
+getrandom = { workspace = true }
 # `config.rs` (task 4.14, ADR 0021): same figment pin as apps/cli and apps/rendezvous (not a
 # workspace dependency there either — see those crates' own Cargo.toml comments), with the `toml`
 # format feature (this crate's config.toml) and `env` (MERIDIAN_TUI__ overrides).

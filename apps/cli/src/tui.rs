@@ -10,7 +10,10 @@
 //! terminal — [`run`] only supplies those inputs from the real environment.
 
 use std::io::IsTerminal;
+use std::path::Path;
 use std::process::ExitCode;
+
+use meridian_core::identity::KeyHandle;
 
 /// The terminal size the TUI needs to render (feature 17's acceptance criteria: "renders correctly
 /// at 80×24").
@@ -78,6 +81,26 @@ pub(crate) fn run() -> Result<ExitCode, String> {
     }
 
     crate::block_on(crate::runtime()?, meridian_tui::run()).map_err(|e| format!("tui: {e}"))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `meridian tui --export-json <path>` (task 4.15). Bypasses the interactive terminal entirely —
+/// no environment gate, no `App`/event loop — and delegates the actual read/decrypt/write work to
+/// `meridian_tui::store::export::export_json`, the plain function that crate exposes for exactly
+/// this purpose (its own doc comment explains the `apps/cli` vs `apps/tui` split: ADR 0020 keeps
+/// `apps/tui` core-only, so the flag lives here while the store-reading logic stays there).
+///
+/// Reuses the same account-loading path `cmd_chat`/`session connect` already use
+/// (`AccountDescriptor::load` + `crate::load_store` + `KeyHandle::from_label`) rather than
+/// inventing a second one.
+pub(crate) fn export_json(dest: &Path) -> Result<ExitCode, String> {
+    let descriptor = crate::account::AccountDescriptor::load()?;
+    let store = crate::load_store(&descriptor)?;
+    let handle = KeyHandle::from_label(&descriptor.label);
+
+    meridian_tui::store::export::export_json(dest, store.as_ref(), &handle)
+        .map_err(|e| format!("export-json: {e}"))?;
+    println!("exported unsealed store documents to {}", dest.display());
     Ok(ExitCode::SUCCESS)
 }
 

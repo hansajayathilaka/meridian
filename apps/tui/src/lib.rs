@@ -26,6 +26,7 @@
 
 pub mod app;
 pub mod config;
+pub mod store;
 pub mod terminal;
 
 pub use app::{App, AppEvent, Effect, Screen, WorkerEvent};
