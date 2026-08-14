@@ -41,6 +41,12 @@ pub mod account;
 /// persistable session store. Transport-agnostic (relay today, P2P/mailbox later).
 pub mod chat;
 
+/// Guarded receiver-side desync recovery (task 4.9, following through on task 1.18's deferred
+/// "dangerous half"): the decision + state-mutation glue for reacting to *repeated*
+/// `chat::ChatError::Desync` by fetching a fresh bundle and forcing a re-handshake, gated by
+/// `trust::TrustStore::can_send`. Still I/O-free; see the module doc.
+pub mod desync;
+
 /// The P2P **session substrate** (T04): the dial/answer state machine that carries chat over a
 /// direct WebRTC data channel with the servers out of the path, with DTLS-fingerprint binding
 /// (§4.6), the `mrd.ctrl/1` control channel, and keepalive/ICE-restart.

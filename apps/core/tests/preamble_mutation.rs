@@ -385,7 +385,6 @@ fn preamble_mutation_used_spk_to_previous_generation_is_rejected_for_free() {
     // Bob is inside the grace window, so he holds BOTH generations' secrets — the mutation points at
     // real, live material rather than at something that would fail as merely unknown.
     bob.state
-        .vault
         .expire_previous_generation(TEST_NOW_UNIX + 1 + PREV_GENERATION_GRACE_SECS - 1);
 
     alice.start(&bob_ik, &gen_n1.bundle.spk, Some(gen_n1.bundle.otks[0]));

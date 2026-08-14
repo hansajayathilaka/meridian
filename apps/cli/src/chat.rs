@@ -26,6 +26,13 @@
 //! acknowledges the canonical warning — see `send_gated`. This CLI is the scriptable reference/demo
 //! surface (`apps/cli/CLAUDE.md`), so it enforces the same invariant the TUI's modal (task 4.22)
 //! will later present more richly, rather than only ever displaying it once that lands.
+//!
+//! (task 4.9) On *repeated* `ChatError::Desync` from a peer, `handle_inbound` may hand off to
+//! `maybe_attempt_recovery`: gated first by `trust`'s `can_send` (never automatically re-handshaking
+//! a peer with an unresolved key change), it then re-fetches that peer's bundle and forces a fresh
+//! session via `meridian_core::chat::ChatState::replace_session_as_initiator` /
+//! `meridian_core::desync::attempt_recovery` — the receiver-side half task 1.18 deferred to this
+//! feature. See `docs/api/messaging-envelope-v1.md` §3 "Desync recovery" for the full guarded design.
 
 use meridian_core::chat::{ChatError, ChatState};
 use meridian_core::envelope::ChatContent;
@@ -197,7 +204,7 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
             }
             delivered = client.next_deliver() => {
                 let deliver = delivered.map_err(|e| format!("receiving: {e}"))?;
-                handle_inbound(&mut client, &mut state, &trust, store, handle, &account_pub, &deliver, &peer_hint, &peer_label, json, &mut pending, &mut awaiting_request, &mut pending_key_change_ack, &mut awaiting_key_change_ack).await?;
+                handle_inbound(&mut client, &mut state, &mut trust, store, handle, &account_pub, &deliver, &peer_hint, &peer_label, json, &mut pending, &mut awaiting_request, &mut pending_key_change_ack, &mut awaiting_key_change_ack).await?;
             }
         }
         save_state(&state, store, handle)?;
@@ -566,7 +573,7 @@ async fn answer_key_change_warning(
 async fn handle_inbound(
     client: &mut SignalingClient,
     state: &mut ChatState,
-    trust: &TrustStore,
+    trust: &mut TrustStore,
     store: &dyn SecretStore,
     handle: &KeyHandle,
     account_pub: &[u8; 32],
@@ -582,8 +589,11 @@ async fn handle_inbound(
     // Retire a superseded prekey generation whose grace window has passed *before* consulting the
     // vault, so 1.31's reconnect-race allowance stays time-bounded in a long-running process rather
     // than lasting until the next republish. Expiry is enforced here, at the point of use, because
-    // `meridian-core` is clock-free (wasm32) — see `crate::now_unix`.
-    state.vault.expire_previous_generation(crate::now_unix());
+    // `meridian-core` is clock-free (wasm32) — see `crate::now_unix`. Goes through `ChatState`'s own
+    // wrapper (task 4.9 second-round fixup), not `state.vault` directly, so the
+    // `responder_session_ek` freshness history is pruned in lockstep with the vault's own generation
+    // retirement.
+    state.expire_previous_generation(crate::now_unix());
 
     match state.open_inbound(
         store,
@@ -642,6 +652,29 @@ async fn handle_inbound(
             }
             Ok(())
         }
+        // (task 4.9) A ratchet desync. Still dropped exactly like any other rejection — see
+        // `ChatError::Desync`'s doc comment — but repeated occurrences from the same peer may now
+        // trigger the guarded receiver-side recovery below.
+        Err(e @ ChatError::Desync) => {
+            if json {
+                println!("{{\"event\":\"rejected\",\"reason\":\"{e}\"}}");
+            } else {
+                eprintln!("! rejected an envelope from {peer_label}: {e}");
+            }
+            maybe_attempt_recovery(
+                client,
+                state,
+                trust,
+                store,
+                handle,
+                account_pub,
+                &deliver.from,
+                peer_hint,
+                peer_label,
+                json,
+            )
+            .await
+        }
         Err(e) => {
             // A bad/forged envelope is dropped, loudly, never trusted.
             if json {
@@ -651,6 +684,191 @@ async fn handle_inbound(
             }
             Ok(())
         }
+    }
+}
+
+/// (task 4.9) Consult `meridian_core::chat::ChatState::recovery_recommended` after a `Desync`
+/// classification and, only once the repeated-Desync threshold is crossed, attempt the guarded
+/// receiver-side re-handshake — mirroring `fetch_with_retry`/`start_initiator_session`'s existing
+/// pattern for original first contact, but through `ChatState::replace_session_as_initiator` via
+/// `meridian_core::desync::attempt_recovery` instead.
+///
+/// **Ordering, precisely (design requirement 2).** `trust.can_send(peer_ik)` is consulted *before*
+/// any network I/O — a peer currently `Warn`/`Blocked` from an unresolved key change must not get
+/// an automatic re-handshake layered on top, and must not even cost a wasted fetch round-trip to
+/// discover that. `note_recovery_attempted` is called on this early-refusal path too (not just
+/// inside `attempt_recovery`'s own internal check, which only runs *after* a successful fetch), so
+/// a gated peer's counter is rate-limited the same way a successfully-recovered peer's is — see
+/// `DESYNC_RECOVERY_THRESHOLD`'s doc for why resetting on a refusal, not only a success, matters.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_attempt_recovery(
+    client: &mut SignalingClient,
+    state: &mut ChatState,
+    trust: &mut TrustStore,
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+    account_pub: &[u8; 32],
+    peer_ik: &[u8; 32],
+    peer_hint: &str,
+    peer_label: &str,
+    json: bool,
+) -> Result<(), String> {
+    if !state.recovery_recommended(peer_ik) {
+        return Ok(());
+    }
+
+    if let gate @ (SendGate::Warn(_) | SendGate::Blocked(_)) = trust.can_send(peer_ik) {
+        // Refused before any network I/O — see this function's doc comment.
+        state.note_recovery_attempted(peer_ik);
+        print_recovery_gate_line(&gate, peer_label, json);
+        return Ok(());
+    }
+
+    if json {
+        println!(
+            "{{\"event\":\"desync_recovery_started\",\"from\":{}}}",
+            json_string(peer_label)
+        );
+    } else {
+        println!(
+            "(recovering the session with {peer_label} after repeated failed decryption — \
+             re-establishing a fresh secure channel)"
+        );
+    }
+
+    let peer_bundle = match fetch_with_retry(client, *peer_ik, peer_hint, peer_label).await {
+        Ok(b) => b,
+        Err(e) => {
+            // A fetch failure (including a substituted-key `BundleVerification` abort, which
+            // `fetch_with_retry`'s generic, non-retried error arm already surfaces here rather than
+            // silently retrying) must not be swallowed. The stale session is left untouched —
+            // recovery simply did not happen this time, and the counter was NOT reset by this
+            // branch (only `maybe_attempt_recovery`'s early gate-refusal and
+            // `desync::attempt_recovery` itself reset it), so a fetch hiccup does not itself
+            // suppress the next genuine recovery attempt.
+            if json {
+                println!(
+                    "{{\"event\":\"desync_recovery_failed\",\"from\":{},\"reason\":{}}}",
+                    json_string(peer_label),
+                    json_string(&e)
+                );
+            } else {
+                eprintln!("! could not recover the session with {peer_label}: {e}");
+            }
+            return Ok(());
+        }
+    };
+
+    let outcome = meridian_core::desync::attempt_recovery(
+        state,
+        trust,
+        store,
+        handle,
+        account_pub,
+        peer_ik,
+        &peer_bundle.account_pub,
+        &peer_bundle.spk,
+        peer_bundle.otks.first().copied(),
+        peer_hint,
+        crate::now_unix(),
+    );
+
+    match outcome {
+        Ok(meridian_core::desync::RecoveryOutcome::Recovered) => {
+            if json {
+                println!(
+                    "{{\"event\":\"desync_recovery_complete\",\"from\":{}}}",
+                    json_string(peer_label)
+                );
+            } else {
+                println!("(session with {peer_label} re-established)");
+            }
+            Ok(())
+        }
+        Ok(meridian_core::desync::RecoveryOutcome::Gated(gate)) => {
+            print_recovery_gate_line(&gate, peer_label, json);
+            Ok(())
+        }
+        Ok(meridian_core::desync::RecoveryOutcome::KeyChangeConflict) => {
+            // (task 4.4's `TrustError::ConflictingContact` case) The fetched bundle's key already
+            // names a different, independently-known contact — refused, never merged. Extremely
+            // unlikely to be reachable via this CLI's own `fetch_bundle(peer_ik, ...)` call (see
+            // `meridian_core::desync::attempt_recovery`'s doc comment), but handled rather than
+            // assumed impossible.
+            if json {
+                println!(
+                    "{{\"event\":\"desync_recovery_conflict\",\"from\":{}}}",
+                    json_string(peer_label)
+                );
+            } else {
+                eprintln!(
+                    "! could not recover the session with {peer_label}: the fetched key already \
+                     belongs to a different known contact — refused, not merged"
+                );
+            }
+            Ok(())
+        }
+        Ok(meridian_core::desync::RecoveryOutcome::UnknownIdentitySurfaced(new_key)) => {
+            // (review fixup) The fetched bundle surfaced a key with no prior contact record for
+            // `peer_ik` at all — should not happen in practice (see
+            // `meridian_core::desync::RecoveryOutcome::UnknownIdentitySurfaced`'s doc), but handled
+            // rather than assumed impossible. No session was touched and no trust state was written
+            // by `attempt_recovery` itself; this is surfaced distinctly rather than silently
+            // TOFU-pinned and completed, mirroring how ordinary first contact always requires either
+            // receiver gating or an explicit sender-initiated action. `TODO: confirm` the exact
+            // follow-up UX with design (an explicit `meridian contact add`-style flow for the
+            // surfaced key is the natural fit, but is not itself part of this task's scope).
+            if json {
+                println!(
+                    "{{\"event\":\"desync_recovery_unknown_identity\",\"from\":{},\"surfaced_key\":{}}}",
+                    json_string(peer_label),
+                    json_string(&hex::encode(new_key))
+                );
+            } else {
+                eprintln!(
+                    "! could not recover the session with {peer_label}: the fetched bundle is \
+                     signed by a key with no prior contact record at all — this requires explicit \
+                     verification, not an automatic re-handshake"
+                );
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if json {
+                println!(
+                    "{{\"event\":\"desync_recovery_failed\",\"from\":{},\"reason\":{}}}",
+                    json_string(peer_label),
+                    json_string(&e.to_string())
+                );
+            } else {
+                eprintln!("! could not recover the session with {peer_label}: {e}");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Shared `Warn`/`Blocked` notice for a refused recovery attempt (task 4.9), in both `--json` and
+/// plain modes — mirrors `print_gate_line`'s "the canonical reason always ends up somewhere the
+/// user sees it" property, but framed as recovery being *paused* pending the existing key-change
+/// resolution rather than as a send being blocked/held.
+fn print_recovery_gate_line(gate: &SendGate, peer_label: &str, json: bool) {
+    let (kind, reason) = match gate {
+        SendGate::Warn(r) => ("warning", r.as_str()),
+        SendGate::Blocked(r) => ("blocked", r.as_str()),
+        SendGate::Ok => return,
+    };
+    if json {
+        println!(
+            "{{\"event\":\"desync_recovery_paused\",\"from\":{},\"gate\":\"{kind}\",\"reason\":{}}}",
+            json_string(peer_label),
+            json_string(reason)
+        );
+    } else {
+        println!(
+            "(recovery with {peer_label} is paused: {reason} — resolve this before an automatic \
+             re-handshake can proceed)"
+        );
     }
 }
 

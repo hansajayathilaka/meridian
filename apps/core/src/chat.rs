@@ -43,11 +43,52 @@ pub enum ChatError {
     /// The envelope's ratchet header opened under **neither** header key, so this session cannot
     /// advance: either the peer has lost its ratchet state (a genuine desync — restored backup,
     /// wiped session store) or the input is hostile. Distinguished from the general
-    /// [`Crypto`](ChatError::Crypto) case purely so callers can *report* desync diagnosably; it is a
-    /// hard rejection like any other, and callers MUST NOT react to it by resetting or re-keying the
-    /// session (task 1.18 — doing so would hand an active attacker a session-reset,
-    /// skipped-key-destruction, and prekey-depletion oracle). Recovery is driven only by the peer
-    /// that knows it lost state; see `docs/api/messaging-envelope-v1.md` §3 "Desync recovery".
+    /// [`Crypto`](ChatError::Crypto) case purely so callers can *report* desync diagnosably. Every
+    /// single occurrence is still a hard rejection, exactly like any other failure — the envelope is
+    /// dropped and [`open_bytes`](ChatState::open_bytes) itself already tries the one narrow, gated
+    /// exception inline (a fresh re-initiation from the same sender — task 4.9's discriminator fix,
+    /// see that method's doc) before ever returning this variant. **That gate is signature
+    /// verification *and* freshness, not signature verification alone** — a valid signature proves
+    /// only that the claimed sender produced these bytes at some point, never that they are fresh;
+    /// see [`open_bytes`](ChatState::open_bytes)'s doc comment for why a signature-valid replay of a
+    /// sender's own past opening envelope must additionally fail a freshness check (checking the
+    /// incoming prekey's `ek_pub` against **every** `ek_pub` that established a still-SPK-valid
+    /// responder session with that sender — not merely the most recent one; see
+    /// [`ChatState::responder_session_ek`] for why a single-value freshness record was itself found
+    /// exploitable) before it is ever allowed to attempt fresh establishment.
+    ///
+    /// **Task 1.18 vs. task 4.9 — what changed, precisely.** Task 1.18 stated flatly that callers
+    /// MUST NOT react to `Desync` by resetting or re-keying a session: doing so unconditionally
+    /// would hand an active attacker (threat-model A2, e.g. a malicious rendezvous server) a
+    /// session-reset / skipped-key-destruction / prekey-depletion oracle — a single replayed,
+    /// already-consumed envelope would be enough. **Task 4.9 relaxes that, but only under a specific,
+    /// multi-part guard**, never unconditionally:
+    /// 1. **Repeated, not first-occurrence** — [`ChatState::recovery_recommended`] tracks *consecutive*
+    ///    `Desync` from the same peer (reset on any successful decrypt) and only signals once
+    ///    [`DESYNC_RECOVERY_THRESHOLD`] is crossed; see that constant's doc for the reasoning.
+    /// 2. The actual fetch-a-bundle-and-re-handshake action goes through
+    ///    [`crate::desync::attempt_recovery`] only, which consults
+    ///    [`crate::trust::TrustStore::can_send`] (task 4.4's block/warn gate) **before** touching
+    ///    anything — a peer already flagged by an unresolved key change never gets an automatic
+    ///    re-handshake layered on top.
+    /// 3. The forced session replacement itself only happens through the separate, explicitly-named
+    ///    [`ChatState::replace_session_as_initiator`] — never as a side effect of the ordinary
+    ///    [`ChatState::start_initiator_session`] callers already use.
+    /// 4. Skipped-message keys and any other session state are never touched by the counter/threshold
+    ///    bookkeeping itself — only an actual, decided recovery attempt mutates `self.sessions`.
+    ///
+    /// This still leaves a rate-limited residual: a persistent attacker who can force
+    /// `DESYNC_RECOVERY_THRESHOLD` failures on demand can still trigger one recovery attempt (and,
+    /// if `can_send` reads `Ok`, one OTK consumption) per that many forced failures — it is a
+    /// *rate-limiting*, not an elimination, of the oracle 1.18 identified; see
+    /// `docs/api/messaging-envelope-v1.md` §3 "Desync recovery" for the full guarded design and the
+    /// honest statement of that residual.
+    ///
+    /// **This does not discharge [ADR 0016 C7](../../../docs/adr/0016-envelope-deniability.md).**
+    /// Both this classification and `open_bytes`'s discriminator fix are v1-scoped and
+    /// non-wire-breaking (no new AAD, no version field, still `mrd.env/1`, still signed); envelope v2
+    /// will still rewrite `open_bytes` under the new AAD/commit-on-decrypt rules and must re-verify
+    /// this behavior when it does.
     #[error("ratchet desync: header undecryptable under either header key")]
     Desync,
     /// (task 2.10) A first-contact envelope from a sender [`ChatState`] has never seen before was
@@ -118,6 +159,70 @@ pub const MAX_PENDING_REQUESTS: usize = 256;
 /// envelope is bound by upstream of this). See this task's Outcome section for the full
 /// reasoning.
 pub const MAX_INTRO_LEN: usize = 4096;
+
+/// Consecutive `ChatError::Desync` classifications from the **same** peer required before
+/// [`ChatState::recovery_recommended`] signals that task 4.9's guarded receiver-side re-handshake
+/// (see [`crate::desync`] and [`ChatError::Desync`]'s doc) should be attempted. Reset to zero on any
+/// successful decrypt from that peer (a live, healthy exchange proves the session recovered, or was
+/// never actually broken) and by [`ChatState::note_recovery_attempted`] the moment a recovery
+/// attempt is made, whatever its outcome.
+///
+/// `TODO: confirm`: no design doc gives a numeric count here — mirrors [`MAX_PENDING_REQUESTS`]'s
+/// own precedent for exactly this kind of open threshold. Reasoning:
+/// - **Must not be 1.** Task 1.18's whole point is that a single replayed, already-consumed
+///   envelope from a passive/malicious rendezvous server (threat-model A2) must never be enough on
+///   its own to force a re-handshake or consume one of the peer's one-time prekeys.
+/// - **2–3 is still uncomfortably close to "one bad envelope plus one coincidental retry"** — the
+///   relay may legitimately redeliver/duplicate a frame, and that alone must not be mistaken for a
+///   genuine desync.
+/// - **5** is chosen as comfortably above that noise floor while staying low enough that a
+///   genuinely desynced peer — for whom *every* subsequent message fails identically until recovery
+///   — reaches the threshold within a handful of exchanged messages, not something the user has to
+///   notice and act on manually first.
+/// - The residual: [`ChatState::note_recovery_attempted`] resets this counter the instant recovery
+///   is attempted (success or gated refusal alike), so even an attacker who can force `Desync` on
+///   demand is rate-limited to at most one recovery attempt per `DESYNC_RECOVERY_THRESHOLD` forced
+///   failures, not one per failure. This bounds, but does not eliminate, the residual oracle 1.18
+///   identified — see `docs/api/messaging-envelope-v1.md` §3 for the honest statement of that
+///   trade-off.
+pub const DESYNC_RECOVERY_THRESHOLD: u32 = 5;
+
+/// Hard cap on the number of *distinct peer identity keys* [`ChatState::responder_session_ek`]
+/// will hold entries for at once (task 4.9, third-round review fixup — the finding: this map is
+/// written on **every** ordinary first-contact responder establishment, not merely the recovery
+/// path, and OTK-free X3DH is legal, so — exactly [`MAX_PENDING_REQUESTS`]'s own precedent — a
+/// first-contact envelope costs its sender nothing but a fresh identity key. Nothing upstream of
+/// this bounded how many distinct strangers could each add a new outer-map entry to
+/// `responder_session_ek`, independently of whether their request was ever accepted, or even
+/// whether it was immediately rejected).
+///
+/// The cap is on distinct peer keys (the outer map), not total [`ResponderEk`] entries: bounding
+/// the peer count already bounds the total, since each peer's own inner `Vec` is separately
+/// bounded by generation-tied pruning (at most one entry per still-accepted SPK generation, i.e.
+/// at most two in the ordinary case — see [`ChatState::responder_session_ek`]'s doc comment for
+/// that axis) — capping peers is therefore the simpler unit to reason about and enforce without
+/// also needing to track a separate total counter.
+///
+/// Eviction is oldest-peer-first, mirroring [`evict_oldest_pending`](ChatState::evict_oldest_pending)'s
+/// own insertion-order tracking (`responder_session_ek_order`, the same technique as
+/// `request_order`) exactly: [`record_responder_ek`](ChatState::record_responder_ek) — the only
+/// writer — evicts the least-recently-*first-seen* peer before admitting a genuinely new one once
+/// this cap is reached. Additionally, and independently of the cap,
+/// [`reject_request`](ChatState::reject_request) and
+/// [`evict_oldest_pending`](ChatState::evict_oldest_pending) now also remove the rejected/evicted
+/// sender's `responder_session_ek` entries directly (mirroring how both already remove the
+/// `Session` itself) — a rejected or evicted contact is left with no trace here either, which stops
+/// the *ordinary* "user rejects every stranger" case from ever growing this map to begin with;
+/// the cap below is the backstop for a sender who is never rejected/evicted at all (e.g. because
+/// the peer stays under [`MAX_PENDING_REQUESTS`] while flooding with OTK-free-only strangers who
+/// are never explicitly decided).
+///
+/// `TODO: confirm`: no design doc gives a numeric peer cap here — mirrors `MAX_PENDING_REQUESTS`'s
+/// own precedent for exactly this kind of open threshold, and is deliberately set to the *same*
+/// value: this map's outer key space is bounded by the same attack shape (one entry per distinct,
+/// free-to-mint identity key) that `MAX_PENDING_REQUESTS` already reasons about at length, and
+/// there's no basis in the design docs for treating the two ceilings differently.
+pub const MAX_RESPONDER_SESSION_EK_PEERS: usize = 256;
 
 /// One published one-time prekey's key pair (public + X25519 secret).
 ///
@@ -330,6 +435,18 @@ pub struct MessageRequest {
     pub intro: ChatContent,
 }
 
+/// One responder-established X3DH ephemeral key, tagged with the specific signed-prekey generation
+/// (`Prekey::used_spk`) it referenced (task 4.9, second-round review fixup — see
+/// [`ChatState::responder_session_ek`]'s doc comment for why the generation tag is what makes precise
+/// pruning possible).
+#[derive(Clone, Serialize, Deserialize)]
+struct ResponderEk {
+    #[serde(with = "b32")]
+    ek_pub: [u8; 32],
+    #[serde(with = "b32")]
+    spk_public: [u8; 32],
+}
+
 /// The full persistable chat state: the prekey vault + all live sessions, keyed by peer identity,
 /// plus (task 2.10) the segregated message-request queue for senders not yet accepted.
 #[derive(Default, Serialize, Deserialize)]
@@ -362,6 +479,141 @@ pub struct ChatState {
     /// task — or any other future desync — can't leave the two out of step.
     #[serde(default)]
     request_order: Vec<[u8; 32]>,
+    /// (task 4.9) Per-peer consecutive-`Desync` counter driving [`recovery_recommended`](Self::recovery_recommended).
+    /// Pure bookkeeping — never itself touches `sessions`; see [`DESYNC_RECOVERY_THRESHOLD`]'s doc.
+    /// `#[serde(default)]` so a store sealed before this task still opens (mirrors `request_order`'s
+    /// own precedent, task 3.10) — a pre-4.9 store correctly defaults every peer to "no desyncs yet".
+    #[serde(default)]
+    desync_counts: BTreeMap<[u8; 32], u32>,
+    /// (task 4.9 review fixup — the blocking finding, fixed a **second** time after a further review
+    /// round found the first fix's own mechanism exploitable) Every [`Prekey::ek_pub`] that
+    /// established a **responder** session with each peer, for as long as the specific signed-prekey
+    /// generation it referenced ([`ResponderEk::spk_public`]) remains accepted by `self.vault` — keyed
+    /// by peer identity key. This is the freshness record `open_bytes`'s stale-session recovery
+    /// fallback consults before ever attempting fresh establishment — see that method's doc comment
+    /// for the full reasoning, and `docs/api/messaging-envelope-v1.md` §3 for the wire-level statement
+    /// of what this closes.
+    ///
+    /// **Why this is necessary, precisely.** X3DH is deterministic in its public inputs: replaying a
+    /// peer's own original opening envelope byte-for-byte reconstructs a byte-identical initial
+    /// ratchet state (this is unconditionally true whenever the referenced signed prekey is still
+    /// valid, and *always* true for OTK-free X3DH, since the SPK is never consumed on use — the OTK
+    /// case additionally requires the OTK not yet be spent). A verified signature alone proves
+    /// *authenticity* (the claimed sender really produced these bytes at some point) but says
+    /// nothing about *freshness* (whether these are the bytes they intend to send *now*). Without
+    /// this record, `open_bytes`'s fallback could not tell a hostile replay of the exact prekey
+    /// material that established the session currently held apart from a genuine new re-initiation
+    /// — both verify, and for OTK-free X3DH both establish + decrypt successfully, deterministically,
+    /// every time.
+    ///
+    /// **Why a history, not a single scalar — the second-round fix, and precisely what was wrong with
+    /// the first.** The original fixup recorded only the single most-recently-established `ek_pub` per
+    /// peer, *overwritten* on every new responder establishment for that peer — including a second,
+    /// entirely genuine one. That is reachable within one ordinary session, not a rare edge case: an
+    /// attacker who can force `DESYNC_RECOVERY_THRESHOLD` consecutive `Desync`s against the *peer's
+    /// own* inbound path can drive their guarded recovery (`attempt_recovery` /
+    /// `replace_session_as_initiator`) to produce that second, genuine establishment itself. Once the
+    /// single recorded value was overwritten to the new `ek_pub`, a replay of the *original* (still
+    /// SPK-generation-valid — a signed prekey is never consumed on use, and a real client may not
+    /// republish for the lifetime of a long-running session) opening envelope no longer matched the
+    /// recorded value, so the freshness check silently failed to fire and the replay was accepted —
+    /// exactly reconstructing that first session and rolling the live one back to it. Overwriting was
+    /// exactly *clearing*, not (as the field's doc previously, incorrectly, claimed) "strictly more
+    /// protective than clearing, never less". The fix: **every** `ek_pub` from a responder
+    /// establishment is retained, tagged with the SPK generation it was established under, for as long
+    /// as that generation stays accepted — see [`record_responder_ek`](Self::record_responder_ek) (the
+    /// only writer) and [`is_recorded_responder_ek`](Self::is_recorded_responder_ek) (the only reader,
+    /// used by `open_bytes`'s freshness gate) — rather than a single value that a second legitimate
+    /// establishment can silently displace.
+    ///
+    /// **Pruning, and why it stays bounded.** An entry is retained only as long as
+    /// `self.vault.spk_secret_for(&entry.spk_public)` still returns `Some` — i.e. its generation is
+    /// either the vault's current one or the single grace-window-retained previous one (exactly
+    /// [`PrekeyVault::spk_secret_for`]'s own acceptance rule). [`prune_responder_session_ek`](Self::prune_responder_session_ek)
+    /// removes everything else and is called by [`expire_previous_generation`](Self::expire_previous_generation)
+    /// in the same call that retires the vault's own superseded generation — callers that previously
+    /// called `state.vault.expire_previous_generation(now_unix)` directly (the CLI's inbound path,
+    /// task 1.31) now call this `ChatState`-level wrapper instead, so the two stay in lockstep and this
+    /// map's growth is bounded by exactly the mechanism that already bounds `PrevGeneration` retention
+    /// (at most one superseded generation, for at most [`PREV_GENERATION_GRACE_SECS`]), not a separate,
+    /// disconnected accumulation — this bounds the *within-one-peer* axis: while a single SPK
+    /// generation stays current for an unusually long time (a long-running process that never
+    /// republishes) and a peer's inbound path is repeatedly forced through the guarded-recovery
+    /// threshold, one peer's own entry can accumulate one `ResponderEk` per such cycle — bounded by
+    /// the same `DESYNC_RECOVERY_THRESHOLD`-gated rate the recovery machinery itself is already
+    /// rate-limited by (`ChatError::Desync`'s doc: at most one recovery attempt per that many forced
+    /// failures), not literally unbounded even before the cross-peer cap below.
+    ///
+    /// **The other axis — third-round review fixup: genuinely bounded across distinct peers too.**
+    /// Everything above only ever reasoned about one already-recorded peer's own growth. It said
+    /// nothing about the *outer* map key space: this field is written on **every** successful
+    /// responder establishment, including the ordinary first-contact branch, not merely the
+    /// recovery path — and OTK-free X3DH is legal, so (exactly [`MAX_PENDING_REQUESTS`]'s own
+    /// precedent) a first-contact envelope costs its sender nothing but a fresh identity key.
+    /// Nothing bounded how many distinct never-before-seen identities could each add a new outer-map
+    /// entry, independently of whether their request was ever accepted, or even whether it was
+    /// immediately rejected — neither [`reject_request`](Self::reject_request) nor
+    /// [`evict_oldest_pending`](Self::evict_oldest_pending) used to touch this map at all, so even a
+    /// defender who rejects every stranger on sight, or who hits [`MAX_PENDING_REQUESTS`]'s own
+    /// eviction cap, still accumulated one lingering entry per distinct attacker identity. Both fixes
+    /// now: (a) [`reject_request`](Self::reject_request) and
+    /// [`evict_oldest_pending`](Self::evict_oldest_pending) remove the rejected/evicted sender's
+    /// entry here too, in the same call that removes their `Session` — consistent, not a regression,
+    /// because once the establishing `Session` itself is gone, a later envelope from that same
+    /// sender hits `open_bytes`'s unconditional "no session at all" first-contact branch again
+    /// exactly like any other never-before-seen contact, so there is no live freshness check left for
+    /// a lingering entry to have been protecting; and (b) [`MAX_RESPONDER_SESSION_EK_PEERS`] hard-caps
+    /// the number of distinct peer keys this map holds at once, LRU-evicting the least-recently-first-
+    /// seen peer in [`record_responder_ek`](Self::record_responder_ek) — see that constant's doc for
+    /// the full reasoning. Together, this map's growth is now bounded on **both** axes: within one
+    /// peer (generation-tied pruning, above) and across distinct peers (this cap, plus rejection/
+    /// eviction cleanup that stops the ordinary "reject every stranger" case from ever needing it).
+    ///
+    /// Once an entry's generation is genuinely gone, a replay of that `ek_pub` no longer matches
+    /// anything here — but it is already independently blocked: `establish_responder_session` fails
+    /// with [`ChatError::UnknownPrekey`] (`spk_secret_for` returns `None`), which `open_bytes`'s
+    /// fallback already treats as an ordinary failed recovery attempt (falls through to `Desync`,
+    /// state left untouched) — the same fail-closed path a first-contact attempt against an expired
+    /// generation already takes today. Pruning cannot reopen this: it only ever removes entries whose
+    /// protection has already, independently, been taken over by that path.
+    ///
+    /// Still never touched by [`start_initiator_session`] or
+    /// [`replace_session_as_initiator`](Self::replace_session_as_initiator) (both establish an
+    /// **initiator** session, which is never the target of this specific replay check).
+    ///
+    /// **The "no recorded entry" case, reasoned through — unchanged from the first fixup.** If
+    /// `open_bytes`'s fallback fires for a peer with no entries here at all — either because the
+    /// currently-held session was established as an *initiator* (we dialled them; they never sent us a
+    /// prekey before, so there is nothing of theirs to replay), or because no responder session has
+    /// ever been established for them at all — the freshness check cannot fire, so the fallback
+    /// behaves exactly as before either fixup: authenticity (the signature) is the only available gate,
+    /// and the attempt is allowed. This is deliberately not "fixed" further: closing *that* gap would
+    /// mean either (a) refusing every fallback with no recorded entry, which would silently regress the
+    /// legitimate case of a first prekey envelope ever sent in that direction, or (b) inventing a
+    /// freshness signal for initiator-established sessions that this module has no cryptographic basis
+    /// for.
+    #[serde(default)]
+    responder_session_ek: BTreeMap<[u8; 32], Vec<ResponderEk>>,
+    /// First-seen order (oldest first) of the peer keys currently present in
+    /// `responder_session_ek` (task 4.9, third-round review fixup) — the exact same
+    /// insertion-order technique `request_order` uses for `pending_requests` (task 3.10), for the
+    /// same reason: this crate is deliberately clock-free (wasm32 target), so eviction order is
+    /// tracked as a plain sequence rather than by timestamp. Maintained in lockstep with
+    /// `responder_session_ek` by every path that adds or removes a peer entry —
+    /// [`record_responder_ek`](Self::record_responder_ek) (append on first sight of a peer),
+    /// [`forget_responder_session_ek`](Self::forget_responder_session_ek) (used by
+    /// [`reject_request`](Self::reject_request) and
+    /// [`evict_oldest_pending`](Self::evict_oldest_pending)), and
+    /// [`prune_responder_session_ek`](Self::prune_responder_session_ek) — which is what makes
+    /// [`evict_oldest_responder_session_ek_peer`](Self::evict_oldest_responder_session_ek_peer)'s
+    /// pick always a peer genuinely still present in `responder_session_ek`. `#[serde(default)]` so
+    /// a store sealed before this fixup (which has `responder_session_ek` populated but no order
+    /// field at all) still opens; [`reconcile_responder_session_ek_order`](Self::reconcile_responder_session_ek_order)
+    /// (called from [`open_at_rest`](Self::open_at_rest), mirroring
+    /// [`reconcile_request_order`](Self::reconcile_request_order)'s own precedent) repairs it against
+    /// `responder_session_ek` right after deserializing.
+    #[serde(default)]
+    responder_session_ek_order: Vec<[u8; 32]>,
 }
 
 impl ChatState {
@@ -400,6 +652,258 @@ impl ChatState {
     /// Safety number for a peer session, if present.
     pub fn safety_number(&self, our_ik: &[u8; 32], peer_ik: &[u8; 32]) -> Option<String> {
         self.sessions.get(peer_ik).map(|s| s.safety_number(our_ik))
+    }
+
+    // -- task 4.9: guarded receiver-side desync recovery ------------------------------------
+
+    // **Design note (review fixup — not a code change, a flagged consideration for a future
+    // task).** `self.sessions` — and therefore everything below, including the
+    // `responder_session_ek` freshness tracking and the forced-replacement recovery machinery — is
+    // shared between this (relay/mailbox) chat path and the P2P session substrate
+    // (`apps/core/src/session.rs`), which calls `open_bytes`/`establish_responder_session` directly
+    // against the exact same `Session` objects, by design ("same ratchet" — see `session.rs`'s
+    // module doc). Today the two run as separate command invocations (the CLI's relay/mailbox chat
+    // flow and its P2P dial flow are distinct processes or at least distinct, non-overlapping
+    // invocations), so there is no live interlock issue: recovery never races a P2P session that is
+    // simultaneously in use. A future single-process client that consolidates both paths in one
+    // running process (T17's interactive TUI, or the desktop/mobile clients) could change that —
+    // stale or hostile relay traffic triggering this guarded recovery could discard ratchet state
+    // that a *live* P2P session concurrently depends on, while that P2P session is mid-call. This is
+    // not fixed here (task 4.9's scope is the `open_bytes` discriminator + the freshness-replay gap,
+    // not a cross-path concurrency redesign) — flagged for whichever future task is the first to run
+    // both paths in one process to design an explicit interlock (e.g. refusing recovery while a P2P
+    // session for the same peer is active) before shipping that consolidation.
+
+    /// The current consecutive-`Desync` count for `peer_ik` (0 if none, or if never observed).
+    /// Read-only diagnostic surface; see [`recovery_recommended`](Self::recovery_recommended) for
+    /// the actual decision.
+    pub fn desync_count(&self, peer_ik: &[u8; 32]) -> u32 {
+        self.desync_counts.get(peer_ik).copied().unwrap_or(0)
+    }
+
+    /// Whether task 4.9's guarded receiver-side re-handshake should be attempted for `peer_ik` —
+    /// `true` once [`desync_count`](Self::desync_count) has reached [`DESYNC_RECOVERY_THRESHOLD`].
+    /// Callers (only [`crate::desync::attempt_recovery`] and its CLI caller today) must still
+    /// additionally consult [`crate::trust::TrustStore::can_send`] before acting on this — this
+    /// method alone says nothing about whether the peer's trust state permits an automatic
+    /// re-handshake right now.
+    pub fn recovery_recommended(&self, peer_ik: &[u8; 32]) -> bool {
+        self.desync_count(peer_ik) >= DESYNC_RECOVERY_THRESHOLD
+    }
+
+    /// Record one more consecutive `Desync` classification for `peer_ik`. Crate-private: the only
+    /// caller is [`open_bytes`](Self::open_bytes) itself, at the exact point it is about to return
+    /// [`ChatError::Desync`] — never called speculatively, and never for any other error variant.
+    fn note_desync(&mut self, peer_ik: [u8; 32]) {
+        let count = self.desync_counts.entry(peer_ik).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+
+    /// Clear `peer_ik`'s consecutive-`Desync` counter — called on every successful decrypt from that
+    /// peer (a live, healthy exchange proves the session recovered, or was never actually broken).
+    /// Crate-private for the same reason as [`note_desync`](Self::note_desync).
+    fn reset_desync(&mut self, peer_ik: &[u8; 32]) {
+        self.desync_counts.remove(peer_ik);
+    }
+
+    /// Mark that a recovery attempt for `peer_ik` has been *decided* — whatever the outcome (a
+    /// successful re-handshake, or a refusal because [`crate::trust::TrustStore::can_send`] was not
+    /// `Ok`). Resets the counter exactly like the crate-private `reset_desync` above, but is `pub`
+    /// (rather than crate-private) because the CLI's own pre-fetch gate check
+    /// (`apps/cli/src/chat.rs`) needs to call this too, on the refusal path that short-circuits
+    /// *before* ever reaching [`crate::desync::attempt_recovery`] (so it never wastes a network
+    /// round-trip on a peer it already locally knows is gated) — see [`DESYNC_RECOVERY_THRESHOLD`]'s
+    /// doc for why resetting on a refusal, not just a success, matters for the rate-limiting
+    /// property. [`crate::desync::attempt_recovery`] also calls this itself (as its very first
+    /// action), so calling it twice for the same decided attempt is harmless (idempotent — removing
+    /// an already-absent counter entry is a no-op).
+    pub fn note_recovery_attempted(&mut self, peer_ik: &[u8; 32]) {
+        self.desync_counts.remove(peer_ik);
+    }
+
+    // -- task 4.9 (second-round review fixup): responder_session_ek history -------------------
+
+    /// Record that a responder session with `peer_ik` was just established from `ek_pub` against the
+    /// signed prekey `spk_public`. The only writer of [`responder_session_ek`](Self::responder_session_ek)
+    /// — see that field's doc comment for why this *appends* rather than overwrites, and never
+    /// records a duplicate `(ek_pub, spk_public)` pair twice (harmless either way for the freshness
+    /// check itself, which only asks membership, but keeps the vector from growing on a redundant
+    /// call). Also enforces [`MAX_RESPONDER_SESSION_EK_PEERS`] (third-round review fixup): if
+    /// `peer_ik` is not already a key in `responder_session_ek` and admitting it would exceed the
+    /// cap, the least-recently-first-seen peer is evicted first
+    /// ([`evict_oldest_responder_session_ek_peer`](Self::evict_oldest_responder_session_ek_peer)) —
+    /// see that constant's doc comment for the full reasoning. `responder_session_ek_order` is kept
+    /// in lockstep here exactly like `request_order` is by `insert_pending_request`.
+    fn record_responder_ek(&mut self, peer_ik: [u8; 32], ek_pub: [u8; 32], spk_public: [u8; 32]) {
+        let is_new_peer = !self.responder_session_ek.contains_key(&peer_ik);
+        if is_new_peer && self.responder_session_ek.len() >= MAX_RESPONDER_SESSION_EK_PEERS {
+            self.evict_oldest_responder_session_ek_peer();
+        }
+        let entries = self.responder_session_ek.entry(peer_ik).or_default();
+        if !entries
+            .iter()
+            .any(|e| e.ek_pub == ek_pub && e.spk_public == spk_public)
+        {
+            entries.push(ResponderEk { ek_pub, spk_public });
+        }
+        if is_new_peer {
+            self.responder_session_ek_order.push(peer_ik);
+        }
+    }
+
+    /// Whether `ek_pub` is recorded as having established a still-SPK-valid responder session with
+    /// `peer_ik` — the only reader of [`responder_session_ek`](Self::responder_session_ek), consulted
+    /// by `open_bytes`'s freshness gate. `true` for a match against *any* recorded entry for this
+    /// peer, not merely the most recent — see that field's doc comment for why.
+    fn is_recorded_responder_ek(&self, peer_ik: &[u8; 32], ek_pub: &[u8; 32]) -> bool {
+        self.responder_session_ek
+            .get(peer_ik)
+            .is_some_and(|entries| entries.iter().any(|e| &e.ek_pub == ek_pub))
+    }
+
+    /// Drop every recorded `ek_pub` whose referenced SPK generation `self.vault` no longer accepts
+    /// (see [`PrekeyVault::spk_secret_for`]), and any peer entry left with none remaining. Crate-private:
+    /// the only caller is [`expire_previous_generation`](Self::expire_previous_generation), which runs
+    /// this in lockstep with the vault's own generation retirement — see
+    /// [`responder_session_ek`](Self::responder_session_ek)'s doc comment for why that lockstep is what
+    /// keeps this map's growth bounded.
+    fn prune_responder_session_ek(&mut self) {
+        let vault = &self.vault;
+        self.responder_session_ek.retain(|_peer, entries| {
+            entries.retain(|e| vault.spk_secret_for(&e.spk_public).is_some());
+            !entries.is_empty()
+        });
+        // Keep `responder_session_ek_order` in lockstep: drop any peer the retain above just
+        // removed entirely, same as `reconcile_request_order` does for `request_order`.
+        let remaining = &self.responder_session_ek;
+        self.responder_session_ek_order
+            .retain(|peer| remaining.contains_key(peer));
+    }
+
+    /// Remove `peer_ik`'s entry from `responder_session_ek` (and `responder_session_ek_order` in
+    /// lockstep), if present. Crate-private: called by [`reject_request`](Self::reject_request) and
+    /// [`evict_oldest_pending`](Self::evict_oldest_pending) — third-round review fixup — in the same
+    /// call each already removes the peer's `Session`, so a rejected/evicted contact leaves nothing
+    /// behind in either place. See [`responder_session_ek`](Self::responder_session_ek)'s doc comment
+    /// for why this is safe: once the establishing `Session` is gone, a later envelope from the same
+    /// sender hits `open_bytes`'s unconditional first-contact branch again regardless of what this
+    /// map holds, so there is no live freshness check left for a lingering entry to protect.
+    fn forget_responder_session_ek(&mut self, peer_ik: &[u8; 32]) {
+        if self.responder_session_ek.remove(peer_ik).is_some() {
+            self.responder_session_ek_order.retain(|k| k != peer_ik);
+        }
+    }
+
+    /// Drop the least-recently-first-seen peer in `responder_session_ek_order` (and its
+    /// `responder_session_ek` entries) to make room under [`MAX_RESPONDER_SESSION_EK_PEERS`]. Mirrors
+    /// [`evict_oldest_pending`](Self::evict_oldest_pending)'s own structure and defense-in-depth
+    /// reasoning exactly: `responder_session_ek_order` should only ever contain keys currently present
+    /// in `responder_session_ek` (every writer/remover keeps the two in lockstep — see
+    /// [`responder_session_ek_order`](Self::responder_session_ek_order)'s doc comment), but the `while`
+    /// loop below tolerates a hypothetical desync (e.g. state reconciled from an old at-rest blob by
+    /// [`reconcile_responder_session_ek_order`](Self::reconcile_responder_session_ek_order)) rather
+    /// than assume it can never happen.
+    fn evict_oldest_responder_session_ek_peer(&mut self) {
+        while !self.responder_session_ek_order.is_empty() {
+            let oldest = self.responder_session_ek_order.remove(0);
+            if self.responder_session_ek.remove(&oldest).is_some() {
+                return;
+            }
+            // Stale order entry with no matching map entry — keep looking rather than silently
+            // evict nothing (same reasoning as `evict_oldest_pending`'s own loop).
+        }
+    }
+
+    /// Repair `responder_session_ek_order` against `responder_session_ek` after deserializing an
+    /// at-rest blob — the exact same shape of repair
+    /// [`reconcile_request_order`](Self::reconcile_request_order) performs for `request_order`, for
+    /// the same reason: a blob sealed before this fixup has `responder_session_ek` populated (that
+    /// map predates this order-tracking field) but no order field at all
+    /// (`#[serde(default)]` leaves it empty). Recovered peers are appended in `responder_session_ek`'s
+    /// own (`BTreeMap`/key) order — not true first-seen order, since that was never recorded for them
+    /// — mirroring `reconcile_request_order`'s own documented, narrow, one-time residual (see that
+    /// method's doc comment; the same reasoning applies here unchanged).
+    fn reconcile_responder_session_ek_order(&mut self) {
+        let known: std::collections::BTreeSet<[u8; 32]> =
+            self.responder_session_ek.keys().copied().collect();
+        self.responder_session_ek_order
+            .retain(|k| known.contains(k));
+        let already_ordered: std::collections::BTreeSet<[u8; 32]> =
+            self.responder_session_ek_order.iter().copied().collect();
+        for k in known {
+            if !already_ordered.contains(&k) {
+                self.responder_session_ek_order.push(k);
+            }
+        }
+    }
+
+    /// Retire a superseded prekey generation whose grace window has passed
+    /// ([`PrekeyVault::expire_previous_generation`]) **and**, in the same call, prune every
+    /// [`responder_session_ek`](Self::responder_session_ek) entry that referenced it — see that
+    /// field's doc comment for why the two must stay in lockstep. This wrapper exists specifically
+    /// because that pruning needs both `self.vault` and `self.responder_session_ek` and so cannot live
+    /// on [`PrekeyVault`] alone (which — by design — knows nothing about session-establishment
+    /// bookkeeping).
+    ///
+    /// Callers that answer incoming X3DH handshakes should call this (with a real wall clock) before
+    /// opening inbound blobs — the CLI's inbound path (task 1.31) calls this exactly where it
+    /// previously called `state.vault.expire_previous_generation` directly.
+    pub fn expire_previous_generation(&mut self, now_unix: u64) {
+        self.vault.expire_previous_generation(now_unix);
+        self.prune_responder_session_ek();
+    }
+
+    /// **The sole, explicit surface for forcing a session replacement** (task 4.9). Discards any
+    /// existing session with `peer_ik` — stale or not — and establishes a brand-new **initiator**
+    /// session against a freshly fetched, verified bundle, unconditionally, even though a session
+    /// already exists.
+    ///
+    /// **Why this is a separate method, not a change to [`start_initiator_session`](Self::start_initiator_session).**
+    /// `start_initiator_session` is deliberately idempotent-as-a-no-op when a session already exists
+    /// — that is what lets an ordinary "reopen an existing chat" keep its live ratchet instead of
+    /// re-handshaking every time the CLI restarts. Weakening that behavior anywhere would silently
+    /// change every one of `start_initiator_session`'s existing callers. This method exists
+    /// specifically so the one call site that legitimately needs the opposite behavior — task 4.9's
+    /// guarded recovery, via [`crate::desync::attempt_recovery`] only — has its own clearly-named,
+    /// impossible-to-reach-by-accident surface, rather than a flag silently changing
+    /// `start_initiator_session`'s contract.
+    ///
+    /// **Build-then-swap ordering (review fixup).** [`Session::initiate`] is called *first*, against
+    /// the existing (stale-or-not) session still fully intact; the old session is only ever replaced
+    /// — via `self.sessions.insert`'s replace-on-existing-key behavior, a single atomic swap — once
+    /// construction has *fully succeeded*. A local failure inside `Session::initiate` (a keystore
+    /// error, an RNG failure, or a malformed `peer_ik`/`peer_spk`) therefore leaves the peer with
+    /// their old, working (if stale) session, exactly as if this method had never been called, rather
+    /// than the previous behavior of removing the old session unconditionally *before* attempting
+    /// construction — which left the peer with **no session at all** on any such failure, a strictly
+    /// worse outcome than the desync this method exists to recover from. `peer_ik`'s desync counter
+    /// (see [`note_recovery_attempted`](Self::note_recovery_attempted)) is still cleared regardless of
+    /// outcome — even a failed attempt was still a *decided* attempt, not a skipped one, matching
+    /// `note_recovery_attempted`'s own "whatever the outcome" contract — and is safe to call even when
+    /// this method is invoked directly (e.g. from a test) without going through
+    /// [`crate::desync::attempt_recovery`] first, which already calls it too (idempotent).
+    ///
+    /// `peer_spk`/`peer_opk` come from the caller's already-fetched, already-signature-verified
+    /// bundle (same contract as `start_initiator_session`'s own parameters) — this method does not
+    /// fetch or verify anything itself (this crate is I/O-free; see the module doc).
+    pub fn replace_session_as_initiator(
+        &mut self,
+        store: &dyn SecretStore,
+        handle: &KeyHandle,
+        our_ik: &[u8; 32],
+        peer_ik: &[u8; 32],
+        peer_spk: &[u8; 32],
+        peer_opk: Option<[u8; 32]>,
+    ) -> Result<(), ChatError> {
+        let result = Session::initiate(store, handle, our_ik, peer_ik, peer_spk, peer_opk);
+        // Whatever the outcome — decided, not skipped. See this method's doc comment.
+        self.note_recovery_attempted(peer_ik);
+        let (session, _material) = result?;
+        // Only reached once construction has fully succeeded: replaces the stale entry in a single
+        // atomic swap (`BTreeMap::insert` on an existing key overwrites in place) rather than ever
+        // leaving `peer_ik` absent from `self.sessions` in between.
+        self.sessions.insert(*peer_ik, session);
+        Ok(())
     }
 
     // -- task 2.10: message-request queue ------------------------------------------------------
@@ -462,6 +966,10 @@ impl ChatState {
             self.request_order.retain(|k| k != sender_ik);
         }
         self.sessions.remove(sender_ik);
+        // (task 4.9, third-round review fixup) Same reasoning as the `Session` removal just above,
+        // extended to the freshness-history entry it left behind: see
+        // `responder_session_ek`'s doc comment for why removing it here is safe, not a regression.
+        self.forget_responder_session_ek(sender_ik);
         had
     }
 
@@ -499,6 +1007,9 @@ impl ChatState {
             let oldest = self.request_order.remove(0);
             if self.pending_requests.remove(&oldest).is_some() {
                 self.sessions.remove(&oldest);
+                // (task 4.9, third-round review fixup) Same reasoning as `reject_request`'s own
+                // cleanup: an evicted contact leaves nothing behind here either.
+                self.forget_responder_session_ek(&oldest);
                 return;
             }
             // Stale order entry with no matching pending request — shouldn't happen given the
@@ -714,7 +1225,72 @@ impl ChatState {
     /// session on a prekey message. The generic counterpart of [`open_inbound`](Self::open_inbound),
     /// used by the substrate to open `SignalContent` on the same ratchet as chat. Every inbound
     /// envelope is signature-verified under its claimed sender key **before** decryption, and the
-    /// claimed key is checked against the routing `from` (crypto-protocols rule 4).
+    /// claimed key is checked against the routing `from` (crypto-protocols rule 4) — this ordering
+    /// is unchanged by task 4.9's discriminator fix below: `verify()` still runs first, unconditionally,
+    /// before either session-establishment branch is even reached.
+    ///
+    /// **The task 4.9 discriminator fix.** Before this task, a fresh responder session was only ever
+    /// considered when `!self.sessions.contains_key(&envelope.sender_pub)` — i.e. only on a literal
+    /// first-ever contact. That left a real bug: if the peer holds a **stale** session with the
+    /// sender (the exact desync scenario task 1.18 describes — the identity key hasn't changed, only
+    /// ratchet state diverged, e.g. the sender restored an old backup or wiped its session store and
+    /// genuinely re-ran X3DH as initiator), `contains_key` reads `true`, the fresh-establishment
+    /// branch is skipped entirely, and the incoming, legitimate re-initiation is handed to the
+    /// *stale* session's `decrypt`, which fails and reclassifies as `Desync` again — permanently.
+    /// That defeated task 1.18's own "safe half": the peer that knows it lost state re-initiates, but
+    /// the counterpart could never actually accept it.
+    ///
+    /// The fix is **not** simply "key off `envelope.prekey.is_some()` instead of `contains_key`", as
+    /// a literal reading of task 4.9's scope text might suggest — that alone is unsafe: an
+    /// *unconfirmed* initiator (see [`meridian_crypto::Session::needs_prekey`]) re-attaches the exact
+    /// same prekey preamble to **every** message until it receives a reply, so treating
+    /// `prekey.is_some()` as sufficient on its own would re-run X3DH-as-responder (re-consuming an
+    /// already-spent one-time prekey, and discarding the live ratchet's ongoing ratchet/skipped-key
+    /// state) on every single one of those otherwise-ordinary continuation messages, not just on a
+    /// genuine re-initiation. Instead: the *existing* session (if any) is always tried **first** —
+    /// exactly as before this task — and the discriminator only applies as a fallback, and only for
+    /// the one failure mode a genuine re-initiation actually produces:
+    /// [`meridian_crypto::CryptoError::UndecryptableHeader`] (the header opens under neither of the
+    /// existing session's header keys — see `DoubleRatchet::decrypt_header`). Only then, and only if
+    /// the envelope actually carries a `prekey` preamble, is a **fresh** responder session attempted
+    /// from that preamble and this same ciphertext re-tried against it:
+    /// - If establishment fails (e.g. the referenced one-time prekey was already consumed — which is
+    ///   exactly what happens for a replayed already-processed opening message, or for an ordinary
+    ///   unconfirmed-initiator continuation message once its OTK has already been spent) or the fresh
+    ///   session still fails to decrypt this ciphertext, **nothing is touched**: the stale session is
+    ///   left exactly as it was and this still returns [`ChatError::Desync`] — preserving task 1.18's
+    ///   `undecryptable_envelope_is_rejected_without_touching_the_session` invariant byte-for-byte for
+    ///   every case except a *successful* recovery.
+    /// - Only a full, successful decrypt under the freshly-established session replaces the stale
+    ///   entry.
+    ///
+    /// **A verified signature alone is not enough to gate this — it proves authenticity, not
+    /// freshness (review fixup: this doc previously overstated this point).** `verify()` proves the
+    /// envelope's claimed sender produced these bytes *at some point*; it says nothing about whether
+    /// this is the message they intend to send *now*. Because X3DH is deterministic in its public
+    /// inputs, a malicious relay/rendezvous server that has merely observed one of the sender's own
+    /// past opening envelopes can replay it byte-for-byte once the receiver's ratchet has genuinely
+    /// advanced past it (a couple of ordinary round-trips is enough), reconstructing the
+    /// byte-identical initial session and successfully decrypting the also-replayed ciphertext under
+    /// it — deterministically, every time, for OTK-free X3DH (`used_opk: None`, which is legal and
+    /// happens organically whenever a peer's one-time-prekey pool was empty). That would silently
+    /// roll a live, forward-secret-advanced session back to its own initial state, through the
+    /// ordinary `Ok` return path, with no gate and no notice — exactly the "weaker session" outcome
+    /// `docs/security/threat-model.md` goal 6 rules out. What actually closes this is the freshness
+    /// check above: [`responder_session_ek`](Self::responder_session_ek) (this struct's own field; see
+    /// its doc comment for the full reasoning, including a second-round fixup for a real gap the
+    /// first version of this check itself had) records **every** `ek_pub` that established a
+    /// responder session with this peer while its referenced SPK generation is still accepted — not
+    /// just the single most recent one — and the fallback refuses outright whenever the incoming
+    /// prekey's `ek_pub` matches *any* recorded entry — a byte-identical `ek_pub` is exactly what a
+    /// replay of that same opening material looks like, whereas a genuine re-initiator always draws a
+    /// fresh random ephemeral key per [`meridian_crypto::Session::initiate`] call, including the "no
+    /// recorded entry" case that field's doc comment reasons through.
+    ///
+    /// This is v1-scoped and non-wire-breaking: no new AAD, no version field, still `mrd.env/1`,
+    /// still signed. It does **not** discharge [ADR 0016 C7](../../../docs/adr/0016-envelope-deniability.md)
+    /// — envelope v2 will still rewrite this whole function under the new AAD/commit-on-decrypt rules
+    /// and must re-verify this behavior when it does.
     pub fn open_bytes(
         &mut self,
         store: &dyn SecretStore,
@@ -736,50 +1312,141 @@ impl ChatState {
             return Err(ChatError::BadSignature);
         }
 
-        // Establish a responder session on the first (prekey) message, if we don't have one.
+        // Establish a responder session on the first (prekey) message, if we don't have one at all.
+        // Unconditional and unguarded by the freshness check below — this is the "safe half" (task
+        // 1.18): a peer with no session at all must always accept a fresh, signature-verified
+        // prekey envelope, replay or not, because there is nothing yet to roll back.
         if !self.sessions.contains_key(&envelope.sender_pub) {
             let prekey = envelope.prekey.as_ref().ok_or(ChatError::NoSession)?;
-            let material = PrekeyMaterial {
-                ek_pub: prekey.ek_pub,
-                used_spk: prekey.used_spk,
-                used_opk: prekey.used_opk,
-            };
-            let spk_secret = self
-                .vault
-                .spk_secret_for(&prekey.used_spk)
-                .ok_or(ChatError::UnknownPrekey)?;
-            let opk_secret = match prekey.used_opk {
-                Some(opk) => Some(
-                    self.vault
-                        .take_otk_secret(&opk)
-                        .ok_or(ChatError::UnknownPrekey)?,
-                ),
-                None => None,
-            };
-            let session = Session::respond(
+            let ek_pub = prekey.ek_pub;
+            let used_spk = prekey.used_spk;
+            let session = self.establish_responder_session(
                 store,
                 handle,
                 our_ik,
                 &envelope.sender_pub,
-                &material,
-                &spk_secret,
-                opk_secret,
+                prekey,
             )?;
             self.sessions.insert(envelope.sender_pub, session);
+            self.record_responder_ek(envelope.sender_pub, ek_pub, used_spk);
         }
 
         let session = self
             .sessions
             .get_mut(&envelope.sender_pub)
             .ok_or(ChatError::NoSession)?;
-        // Classify an undecryptable header as `Desync` so callers can *report* it distinguishably
-        // from malformed/tampered input (task 1.18). This changes no rejection decision: the
-        // envelope is dropped either way and the session is left untouched. Callers MUST NOT treat
-        // `Desync` as a trigger to reset or re-key — see the variant's doc comment.
-        session.decrypt(&envelope.ct).map_err(|e| match e {
-            meridian_crypto::CryptoError::UndecryptableHeader => ChatError::Desync,
-            other => ChatError::Crypto(other),
-        })
+        match session.decrypt(&envelope.ct) {
+            Ok(pt) => {
+                self.reset_desync(&envelope.sender_pub);
+                Ok(pt)
+            }
+            Err(meridian_crypto::CryptoError::UndecryptableHeader) => {
+                // (task 4.9, review fixup, fixed a second time) See this method's doc comment above
+                // for the full reasoning, and `responder_session_ek`'s own doc for why this freshness
+                // check exists at all and why it checks a *history*, not a single value. Only a
+                // prekey-carrying envelope is even considered, and only a genuinely successful fresh
+                // establishment + decrypt replaces the stale session — any failure along the way
+                // falls through to the untouched-state `Desync` return below, unchanged from task
+                // 1.18's original behavior.
+                //
+                // **The freshness gate.** Before attempting anything, check the incoming prekey's
+                // `ek_pub` against *every* `ek_pub` recorded as having established a still-SPK-valid
+                // responder session with this peer (if any — see `responder_session_ek`'s doc for the
+                // "no recorded entry" case). A match against any of them means this is a replay of
+                // material that established a session we (still-validly) hold or once held: refuse
+                // the fallback outright, exactly as if no fallback existed at all, rather than let a
+                // signature-valid but stale replay roll the session back to that earlier state. A
+                // verified signature proves authenticity only, never freshness — X3DH is
+                // deterministic in its public inputs, so replaying the same opening envelope
+                // reconstructs the same initial ratchet state deterministically (always for OTK-free
+                // X3DH, since the SPK is never consumed on use) and would otherwise decrypt this
+                // same, also-replayed ciphertext successfully every time.
+                let is_replay_of_current_session = envelope.prekey.as_ref().is_some_and(|prekey| {
+                    self.is_recorded_responder_ek(&envelope.sender_pub, &prekey.ek_pub)
+                });
+                if !is_replay_of_current_session {
+                    if let Some(prekey) = envelope.prekey.clone() {
+                        if let Ok(mut fresh) = self.establish_responder_session(
+                            store,
+                            handle,
+                            our_ik,
+                            &envelope.sender_pub,
+                            &prekey,
+                        ) {
+                            if let Ok(pt) = fresh.decrypt(&envelope.ct) {
+                                self.sessions.insert(envelope.sender_pub, fresh);
+                                self.record_responder_ek(
+                                    envelope.sender_pub,
+                                    prekey.ek_pub,
+                                    prekey.used_spk,
+                                );
+                                self.reset_desync(&envelope.sender_pub);
+                                return Ok(pt);
+                            }
+                        }
+                    }
+                }
+                // Classify an undecryptable header as `Desync` so callers can *report* it
+                // distinguishably from malformed/tampered input (task 1.18), and record it for task
+                // 4.9's repeated-Desync recovery signal. This changes no rejection decision here: the
+                // envelope is dropped either way and `self.sessions` is left untouched — see
+                // `ChatError::Desync`'s doc comment for the full guard this counter feeds.
+                self.note_desync(envelope.sender_pub);
+                Err(ChatError::Desync)
+            }
+            Err(other) => Err(ChatError::Crypto(other)),
+        }
+    }
+
+    /// Shared X3DH-responder establishment, used both by [`open_bytes`](Self::open_bytes)'s
+    /// original first-contact branch and by its task-4.9 fallback recovery attempt. Does **not**
+    /// insert the resulting [`Session`] into `self.sessions` — callers decide that (immediately, for
+    /// first contact; only after a successful decrypt, for the recovery fallback).
+    ///
+    /// Note the OTK-consumption side effect this shares with the pre-existing first-contact path:
+    /// [`PrekeyVault::take_otk_secret`] removes the referenced one-time prekey as soon as it is
+    /// found, even if the caller goes on to discard the resulting `Session` (e.g. because the
+    /// fallback's subsequent decrypt attempt fails). This mirrors the already-accepted
+    /// OTK-consumption behavior documented on `apps/core/src/session.rs`'s `ANSWER_TIMEOUT` (task
+    /// 1.33) and on this method's own first-contact call site — restructuring to avoid it would
+    /// reintroduce the handshake-ordering problems those notes exist to avoid. It is not a new
+    /// concern for the recovery fallback specifically: a failed fallback attempt can only consume an
+    /// OTK that genuinely exists and is unconsumed, so it costs nothing beyond what an ordinary
+    /// (accepted or rejected) first-contact attempt already costs.
+    fn establish_responder_session(
+        &mut self,
+        store: &dyn SecretStore,
+        handle: &KeyHandle,
+        our_ik: &[u8; 32],
+        peer_ik: &[u8; 32],
+        prekey: &Prekey,
+    ) -> Result<Session, ChatError> {
+        let material = PrekeyMaterial {
+            ek_pub: prekey.ek_pub,
+            used_spk: prekey.used_spk,
+            used_opk: prekey.used_opk,
+        };
+        let spk_secret = self
+            .vault
+            .spk_secret_for(&prekey.used_spk)
+            .ok_or(ChatError::UnknownPrekey)?;
+        let opk_secret = match prekey.used_opk {
+            Some(opk) => Some(
+                self.vault
+                    .take_otk_secret(&opk)
+                    .ok_or(ChatError::UnknownPrekey)?,
+            ),
+            None => None,
+        };
+        Ok(Session::respond(
+            store,
+            handle,
+            our_ik,
+            peer_ik,
+            &material,
+            &spk_secret,
+            opk_secret,
+        )?)
     }
 
     /// Serialize and seal the whole state under a key derived from the account key in `store`.
@@ -809,6 +1476,9 @@ impl ChatState {
         // (`#[serde(default)]` leaves it empty regardless of `pending_requests`); repair it here
         // rather than let `evict_oldest_pending` ever see a mismatch between the two.
         state.reconcile_request_order();
+        // (task 4.9, third-round review fixup) Same reasoning, for `responder_session_ek_order`
+        // against `responder_session_ek` — see `reconcile_responder_session_ek_order`'s doc.
+        state.reconcile_responder_session_ek_order();
         Ok(state)
     }
 
@@ -1029,5 +1699,171 @@ mod tests {
             assert!(state.has_session(k));
         }
         assert_eq!(&state.request_order, &expected_order[1..]);
+    }
+
+    /// Direct, crypto-free unit test of the `responder_session_ek` history/pruning machinery itself
+    /// (task 4.9, second-round review fixup): the freshness gate in `open_bytes` and the exploit in
+    /// `apps/core/tests/desync_recovery.rs` exercise this end-to-end through real X3DH, but this cell
+    /// isolates the bookkeeping so `record_responder_ek`/`is_recorded_responder_ek`/
+    /// `prune_responder_session_ek` are checked precisely, independent of ratchet state.
+    #[test]
+    fn responder_session_ek_history_tracks_multiple_entries_and_prunes_on_generation_expiry() {
+        let mut state = ChatState::default();
+        let peer = [0xAAu8; 32];
+
+        let gen1_spk_pub = [1u8; 32];
+        let gen1_spk_secret = [2u8; 32];
+        let gen2_spk_pub = [3u8; 32];
+        let gen2_spk_secret = [4u8; 32];
+        let ek_pub_1 = [5u8; 32];
+        let ek_pub_2 = [6u8; 32];
+
+        state
+            .vault
+            .set_bundle(gen1_spk_pub, gen1_spk_secret, Vec::new(), 1_000);
+        state.record_responder_ek(peer, ek_pub_1, gen1_spk_pub);
+        assert!(state.is_recorded_responder_ek(&peer, &ek_pub_1));
+
+        // Republish rotates generation 1 into the bounded "previous" slot (task 1.31) rather than
+        // dropping it immediately.
+        state
+            .vault
+            .set_bundle(gen2_spk_pub, gen2_spk_secret, Vec::new(), 1_001);
+        state.record_responder_ek(peer, ek_pub_2, gen2_spk_pub);
+
+        // Both entries are tracked: generation 1 is retained (grace window), generation 2 is
+        // current — the core property the first (scalar) fix got wrong.
+        assert!(state.is_recorded_responder_ek(&peer, &ek_pub_1));
+        assert!(state.is_recorded_responder_ek(&peer, &ek_pub_2));
+
+        // Pruning before the grace window fully passes changes nothing.
+        state.expire_previous_generation(1_001 + PREV_GENERATION_GRACE_SECS - 1);
+        assert!(state.is_recorded_responder_ek(&peer, &ek_pub_1));
+        assert!(state.is_recorded_responder_ek(&peer, &ek_pub_2));
+
+        // Once generation 1's grace window genuinely passes, its entry is pruned; generation 2's
+        // entry — still current — survives.
+        state.expire_previous_generation(1_001 + PREV_GENERATION_GRACE_SECS);
+        assert!(
+            !state.is_recorded_responder_ek(&peer, &ek_pub_1),
+            "an entry referencing a genuinely expired SPK generation must be pruned"
+        );
+        assert!(
+            state.is_recorded_responder_ek(&peer, &ek_pub_2),
+            "an entry referencing the still-current generation must survive pruning"
+        );
+
+        // Pruning a peer down to zero remaining entries removes the peer's own map entry too,
+        // rather than leaving an empty `Vec` behind forever.
+        assert!(state.responder_session_ek.contains_key(&peer));
+        state.record_responder_ek(peer, ek_pub_2, gen2_spk_pub); // no-op: already recorded
+        assert_eq!(state.responder_session_ek.get(&peer).unwrap().len(), 1);
+    }
+
+    /// Third-round review fixup, test (a): many distinct never-before-seen identities each
+    /// contributing exactly one responder establishment (the OTK-free-X3DH-first-contact shape
+    /// [`MAX_RESPONDER_SESSION_EK_PEERS`]'s doc reasons through — free for an attacker to repeat
+    /// with a fresh identity key each time) must not grow `responder_session_ek` without bound.
+    /// Drives well past the cap and confirms the oldest-first-seen peers are evicted while the
+    /// most recent survivors within the cap remain.
+    #[test]
+    fn responder_session_ek_peer_count_is_capped_with_oldest_first_eviction() {
+        let mut state = ChatState::default();
+        let spk_pub = [9u8; 32];
+        let spk_secret = [10u8; 32];
+        state
+            .vault
+            .set_bundle(spk_pub, spk_secret, Vec::new(), 1_000);
+
+        let total = MAX_RESPONDER_SESSION_EK_PEERS + 10;
+        let mut peers: Vec<[u8; 32]> = Vec::with_capacity(total);
+        for i in 0..total {
+            let mut peer = [0u8; 32];
+            peer[0..2].copy_from_slice(&(i as u16).to_be_bytes());
+            state.record_responder_ek(peer, peer, spk_pub);
+            peers.push(peer);
+        }
+
+        assert_eq!(
+            state.responder_session_ek.len(),
+            MAX_RESPONDER_SESSION_EK_PEERS,
+            "the outer map must never exceed MAX_RESPONDER_SESSION_EK_PEERS distinct peers, no \
+             matter how many distinct identities have each been seen exactly once"
+        );
+        assert_eq!(
+            state.responder_session_ek_order.len(),
+            MAX_RESPONDER_SESSION_EK_PEERS,
+            "the order-tracking vector must stay in lockstep with the map it orders"
+        );
+
+        for evicted in &peers[..10] {
+            assert!(
+                !state.responder_session_ek.contains_key(evicted),
+                "an early-seen peer must have been evicted once the cap was exceeded"
+            );
+        }
+        for survivor in &peers[10..] {
+            assert!(
+                state.responder_session_ek.contains_key(survivor),
+                "the most-recently-seen peers, within the cap, must survive"
+            );
+        }
+    }
+
+    /// Third-round review fixup, test (b): rejecting (or evicting) a pending request's sender must
+    /// also remove that peer's `responder_session_ek` entry — not just their `Session` — so a
+    /// rejected or evicted contact leaves no trace here either.
+    #[test]
+    fn reject_and_evict_also_forget_responder_session_ek() {
+        let store = MemorySecretStore::new();
+        let account = generate_account(&store, "chat.forget.self").unwrap();
+        let our_ik = *account.public_key().as_bytes();
+
+        let mut state = ChatState::default();
+        let spk_pub = [11u8; 32];
+        let spk_secret = [12u8; 32];
+        state
+            .vault
+            .set_bundle(spk_pub, spk_secret, Vec::new(), 1_000);
+
+        // Sender A: gated request + responder-establishment freshness record, then explicitly
+        // rejected.
+        let sender_a = generate_account(&store, "chat.forget.a").unwrap();
+        let a_ik = *sender_a.public_key().as_bytes();
+        state.pending_requests.insert(a_ik, intro(1));
+        state.request_order.push(a_ik);
+        state
+            .start_initiator_session(&store, account.handle(), &our_ik, &a_ik, &[7u8; 32], None)
+            .unwrap();
+        state.record_responder_ek(a_ik, [21u8; 32], spk_pub);
+        assert!(state.responder_session_ek.contains_key(&a_ik));
+
+        assert!(state.reject_request(&a_ik));
+        assert!(
+            !state.responder_session_ek.contains_key(&a_ik),
+            "reject_request must also forget the rejected sender's responder_session_ek entry"
+        );
+        assert!(!state.responder_session_ek_order.contains(&a_ik));
+
+        // Sender B: same shape, but forced out through space-eviction instead of an explicit
+        // reject.
+        let sender_b = generate_account(&store, "chat.forget.b").unwrap();
+        let b_ik = *sender_b.public_key().as_bytes();
+        state.pending_requests.insert(b_ik, intro(2));
+        state.request_order.push(b_ik);
+        state
+            .start_initiator_session(&store, account.handle(), &our_ik, &b_ik, &[7u8; 32], None)
+            .unwrap();
+        state.record_responder_ek(b_ik, [22u8; 32], spk_pub);
+        assert!(state.responder_session_ek.contains_key(&b_ik));
+
+        state.evict_oldest_pending();
+        assert!(state.pending_request(&b_ik).is_none());
+        assert!(!state.has_session(&b_ik));
+        assert!(
+            !state.responder_session_ek.contains_key(&b_ik),
+            "evict_oldest_pending must also forget the evicted sender's responder_session_ek entry"
+        );
+        assert!(!state.responder_session_ek_order.contains(&b_ik));
     }
 }
