@@ -226,6 +226,15 @@ pub struct TrustStore {
     /// warn-not-block behavior.
     #[serde(default)]
     escalate_pinned_key_change: bool,
+    /// (task 4.8) Org directory-attestation suggestions — see [`crate::directory`]'s module doc
+    /// for why this field's own type ([`crate::directory::DirectoryStore`]) is what actually
+    /// enforces the provenance-not-authority boundary: it has no way to reach `contacts` above,
+    /// structurally, not just by convention. Embedded here purely so it rides the same
+    /// `seal_at_rest`/`open_at_rest` sealed blob as everything else in this store.
+    /// `#[serde(default)]` so a store sealed before this task still opens (mirrors
+    /// `escalate_pinned_key_change`'s precedent).
+    #[serde(default)]
+    directory: crate::directory::DirectoryStore,
 }
 
 /// (task 4.4) The outcome of consulting [`TrustStore::can_send`] — the un-softenable send gate
@@ -581,6 +590,33 @@ impl TrustStore {
         Ok(())
     }
 
+    /// (task 4.8) Verify and ingest an org directory attestation, per
+    /// `docs/security/directory-attestation.md`. **One-line pass-through** to
+    /// [`crate::directory::DirectoryStore::ingest_directory`] — the actual verification/upsert
+    /// logic lives entirely in `directory.rs`, on a type ([`crate::directory::DirectoryStore`])
+    /// that has no way to reach `contacts`, [`Self::observe`], [`Self::set_petname`],
+    /// [`Self::mark_verified`], or [`Self::set_user_blocked`] at all — see that module's doc
+    /// comment for why this is a structural property of the type, not just a convention this
+    /// method happens to follow. This method itself calls nothing else on `self`.
+    pub fn ingest_directory(
+        &mut self,
+        artifact: &crate::directory::DirectoryAttestation,
+        expected_org_signing_pub: &[u8; 32],
+    ) -> Result<usize, crate::directory::DirectoryError> {
+        self.directory
+            .ingest_directory(artifact, expected_org_signing_pub)
+    }
+
+    /// (task 4.8) Every [`crate::directory::DirectorySuggestion`] on record for `account_pub` —
+    /// zero or more, read-only. Never merged into [`Contact::petname`]; a CLI/TUI layer displays
+    /// these (or not) alongside a contact, never instead of it.
+    pub fn directory_suggestions(
+        &self,
+        account_pub: &[u8; 32],
+    ) -> impl Iterator<Item = &crate::directory::DirectorySuggestion> {
+        self.directory.suggestions(account_pub)
+    }
+
     /// Serialize and seal the whole store under a key derived from the account key in `store` —
     /// identical mechanism to `chat.rs`'s `ChatState::seal_at_rest` (ADR 0021: one key derivation,
     /// shared by every client-local sealed store).
@@ -609,35 +645,41 @@ impl TrustStore {
     ) -> Result<Self, TrustError> {
         let key = store_key(store, handle)?;
         let plaintext = at_rest::open(&key, sealed)?;
-        let state: Self = ciborium::from_reader(&plaintext[..])
+        let mut state: Self = ciborium::from_reader(&plaintext[..])
             .map_err(|e| meridian_proto::CodecError::Decode(e.to_string()))?;
+        // (task 4.8) A blob sealed before this task has no `directory.total` field at all
+        // (`#[serde(default)]` leaves it 0 regardless of `directory.suggestions`); repair it here
+        // rather than let `ingest_directory`'s cap check ever see a stale count.
+        state.directory.reconcile_total();
         Ok(state)
     }
 }
 
-/// Truncate `hint` to [`MAX_HINT_LEN`] bytes at a UTF-8 char boundary.
-fn bounded_hint(hint: &str) -> String {
-    if hint.len() <= MAX_HINT_LEN {
-        return hint.to_string();
+/// Truncate `s` to `max_bytes` bytes at a UTF-8 char boundary — the shared implementation behind
+/// [`bounded_hint`]/[`bounded_petname`] (this module) and `directory.rs`'s `bounded_hr_name`
+/// (task 4.8), which reuses this rather than duplicating the truncation loop. `pub(crate)` so a
+/// sibling module can share it cleanly per this crate's own precedent, without exposing it as
+/// public API.
+pub(crate) fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
     }
-    let mut end = MAX_HINT_LEN;
-    while !hint.is_char_boundary(end) {
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
         end -= 1;
     }
-    hint[..end].to_string()
+    s[..end].to_string()
+}
+
+/// Truncate `hint` to [`MAX_HINT_LEN`] bytes at a UTF-8 char boundary.
+fn bounded_hint(hint: &str) -> String {
+    truncate_utf8(hint, MAX_HINT_LEN)
 }
 
 /// Truncate `petname` to [`MAX_PETNAME_LEN`] bytes at a UTF-8 char boundary — mirrors
 /// [`bounded_hint`] exactly, just for the local-only petname bound.
 fn bounded_petname(petname: &str) -> String {
-    if petname.len() <= MAX_PETNAME_LEN {
-        return petname.to_string();
-    }
-    let mut end = MAX_PETNAME_LEN;
-    while !petname.is_char_boundary(end) {
-        end -= 1;
-    }
-    petname[..end].to_string()
+    truncate_utf8(petname, MAX_PETNAME_LEN)
 }
 
 /// (task 4.4) The next [`TrustState`] a contact currently at `prior_state` reaches after

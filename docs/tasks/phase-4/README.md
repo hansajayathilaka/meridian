@@ -167,7 +167,7 @@ same function under the new AAD/commit-on-decrypt rules and must re-verify this 
 - [x] **4.5** Safety-number compare UX primitives + `meridian verify` — [file](./4.5-safety-number-verify-cli.md)
 - [x] **4.6** Petname assignment + contact management CLI — [file](./4.6-petname-contact-management-cli.md)
 - [x] **4.7** Message-request UX finalization (from T06) — [file](./4.7-message-request-finalization.md)
-- [ ] **4.8** Org directory-attestation ingest — [file](./4.8-directory-attestation-ingest.md)
+- [x] **4.8** Org directory-attestation ingest — [file](./4.8-directory-attestation-ingest.md)
 - [ ] **4.9** Desync detection → guarded fresh-X3DH re-handshake (1.18 follow-through; includes the
   `open_bytes` short-circuit fix) — [file](./4.9-desync-guarded-rehandshake.md)
 - [ ] **4.10** `meridian-mitm-sim` trust-state matrix — [file](./4.10-mitm-sim-trust-matrix.md)

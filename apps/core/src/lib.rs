@@ -64,6 +64,12 @@ pub mod relay;
 /// un-softenable `can_send` gate (`SendGate`) documented in `docs/security/verification-ux.md`.
 pub mod trust;
 
+/// Org directory-attestation ingest (T08, task 4.8): verify + ingest a signed, org-issued
+/// HR-name→account-key mapping as a display-name suggestion with recorded provenance — never a
+/// key authority, never merged into `trust::Contact::petname`. See the module doc comment for the
+/// structural (not just tested) enforcement of that boundary.
+pub mod directory;
+
 /// Crate version — kept for build-info/diagnostics.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
