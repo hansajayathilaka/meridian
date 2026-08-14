@@ -240,7 +240,7 @@ inside 4.9. 28 tasks, [full DAG here](./phase-4/README.md#dependency-order).
 - [x] **4.7** Message-request UX finalization (from T06) — [file](./phase-4/4.7-message-request-finalization.md)
 - [x] **4.8** Org directory-attestation ingest — [file](./phase-4/4.8-directory-attestation-ingest.md)
 - [x] **4.9** Desync detection → guarded fresh-X3DH re-handshake (incl. `open_bytes` short-circuit fix) — [file](./phase-4/4.9-desync-guarded-rehandshake.md)
-- [ ] **4.10** `meridian-mitm-sim` trust-state matrix — [file](./phase-4/4.10-mitm-sim-trust-matrix.md)
+- [x] **4.10** `meridian-mitm-sim` trust-state matrix — [file](./phase-4/4.10-mitm-sim-trust-matrix.md)
 
 **T17 infra — no T08 dependency**
 - [x] **4.11** `apps/tui` crate skeleton + terminal guard — [file](./phase-4/4.11-tui-crate-skeleton-terminal-guard.md)

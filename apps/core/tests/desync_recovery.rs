@@ -378,6 +378,33 @@ fn recovery_recommended_only_crosses_at_exactly_the_threshold() {
 
 // -- deliverable 3, bullet 3: a substituted key is never silently accepted ----------------------
 
+/// The canonical wording (`docs/security/verification-ux.md`) must, in substance: name the safety
+/// number, name the benign explanation, name the interception possibility, and offer verification
+/// — never collapse into pure reassurance. Mirrors `key_change_gate.rs`'s own
+/// `assert_canonical_substance` (task 4.4's own coverage of `trust.rs`'s wording functions
+/// directly); duplicated here in miniature, rather than factored into a shared test-support crate,
+/// since this is the only other call site and the check is a handful of `contains` assertions —
+/// not worth the extra Cargo wiring for one reuse (task 4.10 judgment call).
+fn assert_canonical_substance(reason: &str) {
+    let lower = reason.to_lowercase();
+    assert!(
+        lower.contains("safety number"),
+        "must name what changed: {reason}"
+    );
+    assert!(
+        lower.contains("reinstalled") || lower.contains("switched devices"),
+        "must state the benign explanation: {reason}"
+    );
+    assert!(
+        lower.contains("intercept"),
+        "must state the interception possibility, never soften into pure reassurance: {reason}"
+    );
+    assert!(
+        lower.contains("verify"),
+        "must offer a Verify action: {reason}"
+    );
+}
+
 #[test]
 fn attempt_recovery_routes_a_surfaced_key_change_through_the_gate_never_bypassing_it() {
     let mut alice = Party::new("subst.a");
@@ -410,9 +437,15 @@ fn attempt_recovery_routes_a_surfaced_key_change_through_the_gate_never_bypassin
         TEST_NOW_UNIX + 1,
     )
     .unwrap();
+    let reason = match &outcome {
+        RecoveryOutcome::Gated(SendGate::Warn(reason)) => reason.clone(),
+        other => panic!("got: {other:?}"),
+    };
+    assert_canonical_substance(&reason);
     assert!(
-        matches!(outcome, RecoveryOutcome::Gated(SendGate::Warn(_))),
-        "got: {outcome:?}"
+        reason.to_lowercase().contains("pause"),
+        "a pinned-contact substitution must say sends are PAUSED (Warn), not blocked outright: \
+         {reason}"
     );
     assert_eq!(trust.trust_state(&mallory_ik), TrustState::PinnedKeyChanged);
     assert!(
@@ -421,7 +454,10 @@ fn attempt_recovery_routes_a_surfaced_key_change_through_the_gate_never_bypassin
     );
 
     // Case 2: Bob is a *verified* contact — the same surfaced substitution hard-blocks, no bypass
-    // "because a recovery flow was already in progress".
+    // "because a recovery flow was already in progress". Mirrors
+    // `key_change_gate.rs::verified_contact_key_change_blocks_sends_with_no_bypass`'s
+    // reason-string substance assertions, driven this time through `attempt_recovery` itself
+    // rather than directly against `TrustStore`.
     let mut trust2 = TrustStore::default();
     trust2.observe(bob_ik, "subst.b", TEST_NOW_UNIX);
     trust2.mark_verified(&bob_ik).unwrap();
@@ -440,11 +476,36 @@ fn attempt_recovery_routes_a_surfaced_key_change_through_the_gate_never_bypassin
         TEST_NOW_UNIX + 2,
     )
     .unwrap();
+    let reason2 = match &outcome2 {
+        RecoveryOutcome::Gated(SendGate::Blocked(reason)) => reason.clone(),
+        other => panic!(
+            "a surfaced key-change substitution against a VERIFIED contact must hard-block \
+             (SendGate::Blocked), never merely warn or — worse — silently recover just because a \
+             recovery flow was already in progress. got: {other:?}"
+        ),
+    };
+    assert_canonical_substance(&reason2);
     assert!(
-        matches!(outcome2, RecoveryOutcome::Gated(SendGate::Blocked(_))),
-        "got: {outcome2:?}"
+        reason2.to_lowercase().contains("block"),
+        "a verified-contact substitution must say sends are BLOCKED, not merely paused: {reason2}"
     );
-    assert!(!alice.state.has_session(&mallory_ik));
+    assert_eq!(trust2.trust_state(&mallory_ik), TrustState::Blocked);
+    assert!(
+        !alice.state.has_session(&mallory_ik),
+        "no session may be installed under the substituted key while blocked"
+    );
+
+    // Adversarial: the pinned-case escape hatch (`acknowledge_key_change`) must not silently clear
+    // a Blocked (verified-contact) key change either — mirrors `key_change_gate.rs`'s own bypass
+    // sweep, checked here on the SAME `TrustStore` `attempt_recovery` just gated, not a fresh one.
+    let err = trust2
+        .acknowledge_key_change(&mallory_ik)
+        .expect_err("acknowledging a Blocked (verified) key change must be a hard error");
+    assert!(matches!(
+        err,
+        meridian_core::trust::TrustError::NotAcknowledgeable
+    ));
+    assert_eq!(trust2.can_send(&mallory_ik), SendGate::Blocked(reason2));
 }
 
 // -- deliverable 3, bullet 4: signature check still runs before the new branch ------------------

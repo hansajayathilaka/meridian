@@ -170,7 +170,7 @@ same function under the new AAD/commit-on-decrypt rules and must re-verify this 
 - [x] **4.8** Org directory-attestation ingest — [file](./4.8-directory-attestation-ingest.md)
 - [x] **4.9** Desync detection → guarded fresh-X3DH re-handshake (1.18 follow-through; includes the
   `open_bytes` short-circuit fix) — [file](./4.9-desync-guarded-rehandshake.md)
-- [ ] **4.10** `meridian-mitm-sim` trust-state matrix — [file](./4.10-mitm-sim-trust-matrix.md)
+- [x] **4.10** `meridian-mitm-sim` trust-state matrix — [file](./4.10-mitm-sim-trust-matrix.md)
 
 **T17 infra — no dependency on T08; starts alongside it once 4.1 lands** (4.13 has zero dependencies —
 start it day 1)
