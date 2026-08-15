@@ -19,11 +19,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use meridian_core::trust::{PinnedKey, TrustState};
 
+use crate::screens::chat::{self, ChatState};
 use crate::screens::contact_detail::{self, ContactDetailState};
 use crate::screens::contacts::{self, ContactsState};
 use crate::screens::onboarding::{self, OnboardingState};
 use crate::screens::unlock::{self, UnlockState};
 use crate::store::contacts::PolicyOverride;
+use crate::store::history::HistoryEntry;
 
 /// Events the runtime feeds into [`App::update`]. Produced by crossterm input, the worker-response
 /// channel, or the 250ms tick — see the event-loop diagram in tui-client.md §4.
@@ -382,20 +384,85 @@ pub struct DeleteContactEffect {
     pub outcome: Option<()>,
 }
 
+/// Inputs for [`Effect::SendMessage`] (task 4.20, `crate::screens::chat`): seal and route one
+/// `mrd.chat/1` text message to `peer_pubkey`, mirroring `apps/cli/src/chat.rs::send_text`'s own
+/// seal-then-`route_tolerant` path exactly. **Dispatched only after `crate::screens::chat` has
+/// already consulted `meridian_core::trust::TrustStore::can_send(peer_pubkey)` and gotten
+/// [`meridian_core::trust::SendGate::Ok`]** — see that module's doc for the full gate-wiring
+/// rationale; this request's own fields carry no gate-bypass path of any kind.
+///
+/// Deliberately carries no `mid`/timestamp: minting the locally-generated 128-bit message id and
+/// reading the wall clock are both the kind of impure, effect-side operation this crate's `update`
+/// never performs itself (mirrors [`GenerateAccountRequest`]'s fresh-keypair minting, and
+/// `crate::store::contacts`'s own `getrandom::fill`-based conversation-handle generation, which
+/// likewise happens only at the storage/worker boundary, never inside a screen's pure `handle_key`).
+/// The worker that executes this effect mints both and reports them back via [`SentMessage`].
+///
+/// **Note for the worker that eventually executes this (not built by this task):** needs the same
+/// account/session context [`RegisterRequest`]/[`PublishBundleRequest`] already cache
+/// (`account_pub`, the unlocked `SecretStore`/`KeyHandle`, and an established `SignalingClient` +
+/// `meridian_core::chat::ChatState` session for this peer) — out of this task's scope to plumb
+/// through, exactly like those two requests' own "not built by this task" notes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendMessageRequest {
+    pub peer_pubkey: [u8; 32],
+    pub peer_hint: String,
+    pub body: String,
+}
+
+/// What sending actually produced: the worker-minted `mid` (matches
+/// `crate::store::history::HistoryEntry::mid`'s shape), the worker's wall-clock read at the moment
+/// of sending, and whether the peer was reachable right now — mirrors
+/// `apps/cli/src/chat.rs::send_text`'s own `delivered: bool` (`route_tolerant`'s return value)
+/// exactly. `delivered == false` is the pre-T07 "peer offline" case
+/// ([tui-client.md §7](../../../docs/architecture/tui-client.md#7-what-the-user-sees-when-things-go-wrong)),
+/// never "queued for later delivery" — see `crate::screens::chat::offline_failure_copy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentMessage {
+    pub mid: String,
+    pub ts: u64,
+    pub delivered: bool,
+}
+
+/// [`Effect::SendMessage`]'s payload — same request/outcome shape as [`GenerateAccountEffect`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendMessageEffect {
+    pub request: SendMessageRequest,
+    pub outcome: Option<SentMessage>,
+}
+
+/// Inputs for [`Effect::PersistHistory`] (task 4.20, `crate::screens::chat`): append `entry` to
+/// `peer_pubkey`'s sealed transcript — `crate::store::history::append`/`append_at` (task 4.15),
+/// mirroring how every other sealed-store write in this crate (`AddContactRequest`'s
+/// `contacts.json` write, etc.) only ever happens behind an [`Effect`], never inside `update`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistHistoryRequest {
+    pub peer_pubkey: [u8; 32],
+    pub entry: HistoryEntry,
+}
+
+/// [`Effect::PersistHistory`]'s payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistHistoryEffect {
+    pub request: PersistHistoryRequest,
+    pub outcome: Option<()>,
+}
+
 /// The only path from `update` to the network, the keystore, or disk. A worker task executes these
 /// and reports the outcome back as [`WorkerEvent`] / [`AppEvent::Worker`], so a slow rendezvous can
-/// never freeze the UI. `SendMessage`/`FetchBundle`/`PersistHistory` are still placeholders
-/// (payloads land with the tasks that give each effect real behavior — composer/session wiring,
-/// 4.20+); `GenerateAccount`/`Register`/`PublishBundle` are onboarding's (task 4.16) three
-/// I/O-requiring sub-steps; `Unlock` is the returning-user counterpart (task 4.17);
+/// never freeze the UI. `FetchBundle` is still a placeholder (no task needs it yet);
+/// `SendMessage`/`PersistHistory` are task 4.20's (`crate::screens::chat`) two — see
+/// [`SendMessageEffect`]/[`PersistHistoryEffect`]; `GenerateAccount`/`Register`/`PublishBundle` are
+/// onboarding's (task 4.16) three I/O-requiring sub-steps; `Unlock` is the returning-user
+/// counterpart (task 4.17);
 /// `AddContact`/`ImportContactQr`/`SetPetname`/`SetUserBlocked`/`SetPolicyOverride`/`DeleteContact`
 /// are the contacts/contact-detail screens' (task 4.19) six.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
-    SendMessage,
+    SendMessage(SendMessageEffect),
     FetchBundle,
     PublishBundle(PublishBundleEffect),
-    PersistHistory,
+    PersistHistory(PersistHistoryEffect),
     Unlock(UnlockRequest),
     GenerateAccount(GenerateAccountEffect),
     Register(RegisterRequest),
@@ -463,6 +530,21 @@ pub enum Screen {
     /// so `Esc` pops back to the contacts list it came from — the ordinary screen-stack pattern
     /// (tui-client.md §2), not a root screen of its own.
     ContactDetail(Box<ContactDetailState>),
+    /// The main conversation screen: scrollback, composer, delivery state, restart-persistent
+    /// history — see [`crate::screens::chat`]. Boxed for the same reason as the other large
+    /// variants above.
+    ///
+    /// **Not constructed by [`App::new`] yet, and not yet reachable from [`Screen::Contacts`]'s own
+    /// `Enter` handling either** — same caveat as [`Screen::Unlock`]/[`Screen::Contacts`]:
+    /// [`crate::screens::contacts`]'s own module doc already documents that `Enter` opens
+    /// `ContactDetail` today only because `Screen::Chat` didn't exist yet, and that repointing
+    /// `Enter` at this screen (giving `ContactDetail` its own dedicated key) is deliberately left
+    /// to a future navigation-integration task rather than done here, to keep this task's diff
+    /// scoped to `chat.rs` plus the `Effect`/`Screen` plumbing it needs. This variant exists fully
+    /// wired (`handle_key`/`handle_worker`/`render` all dispatch to it below) and independently
+    /// reachable via [`App::push_screen`], exactly like `Screen::Unlock` was before its own
+    /// Preflight routing landed.
+    Chat(Box<ChatState>),
     /// A feature-registered pane or screen (task 4.18, `docs/architecture/tui-client.md §8`) —
     /// e.g. a transfer list (T09) or a call status panel (T10). This is the **one** `Screen`
     /// variant every future feature's pane reaches the stack through: a feature implements
@@ -485,6 +567,7 @@ impl fmt::Debug for Screen {
             Screen::Unlock(state) => f.debug_tuple("Unlock").field(state).finish(),
             Screen::Contacts(state) => f.debug_tuple("Contacts").field(state).finish(),
             Screen::ContactDetail(state) => f.debug_tuple("ContactDetail").field(state).finish(),
+            Screen::Chat(state) => f.debug_tuple("Chat").field(state).finish(),
             Screen::Extension(pane) => f.debug_tuple("Extension").field(&pane.title()).finish(),
         }
     }
@@ -643,6 +726,19 @@ impl App {
                 }
                 effects
             }
+            Some(Screen::Chat(state)) => {
+                // `chat::handle_key` owns its own nested-mode `Esc` (cancelling an in-flight
+                // key-change acknowledgment prompt back to normal composing, never leaving the
+                // screen) exactly like `ContactDetail`'s sub-modes — see that module's doc. Only
+                // the outermost `Esc` asks to pop, and (unlike `ContactDetail`) there is nothing to
+                // reconcile back into a screen beneath it yet (see `Screen::Chat`'s own doc on why
+                // navigation wiring is deferred).
+                let (effects, exit) = chat::handle_key(state, key);
+                if exit {
+                    self.pop_screen();
+                }
+                effects
+            }
             Some(Screen::Extension(pane)) => {
                 // `Esc` always means "back" (tui-client.md §3) and is handled generically here,
                 // exactly like the catch-all arm below — an extension pane never sees an `Esc`
@@ -701,6 +797,7 @@ impl App {
                 }
                 effects
             }
+            Some(Screen::Chat(state)) => chat::handle_worker(state, event),
             _ => Vec::new(),
         }
     }
@@ -726,6 +823,7 @@ impl App {
             Screen::Unlock(state) => unlock::render(state, frame),
             Screen::Contacts(state) => contacts::render(state, frame),
             Screen::ContactDetail(state) => contact_detail::render(state, frame),
+            Screen::Chat(state) => chat::render(state, frame),
             Screen::Extension(pane) => pane.render(frame),
             Screen::Placeholder => render_placeholder(frame),
         }

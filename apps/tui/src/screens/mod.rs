@@ -5,6 +5,7 @@
 //! file (docs/architecture/tui-client.md §2/§8's extension-contract shape, applied within this
 //! crate to its own screens).
 
+pub mod chat;
 pub mod contact_detail;
 pub mod contacts;
 pub mod onboarding;

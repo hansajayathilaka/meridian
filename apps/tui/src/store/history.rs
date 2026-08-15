@@ -56,7 +56,13 @@ struct HistoryHeader {
 }
 
 /// One transcript entry — one line of the `.jsonl` document.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// **`Eq` (task 4.20 addition).** Every field here (`u64`, `String`, [`Direction`], [`MessageState`])
+/// is already `Eq`-capable — this was simply never derived until `crate::app::Effect` grew a
+/// [`crate::app::PersistHistoryEffect`] variant embedding a whole `HistoryEntry`, at which point
+/// `Effect`'s own `#[derive(..., Eq)]` needed every field type to be `Eq` too. Purely additive: no
+/// change to the schema, serialization, or any existing behavior.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub v: u64,
     /// A locally generated 128-bit message id (hex), used for dedup and matching delivery

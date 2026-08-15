@@ -24,7 +24,9 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
 
-use meridian_tui::app::{App, AppEvent, Effect, Screen, WorkerEvent};
+use meridian_tui::app::{
+    App, AppEvent, Effect, Screen, SendMessageEffect, SendMessageRequest, WorkerEvent,
+};
 use meridian_tui::store::history::{Direction as HistDir, HistoryEntry, MessageState};
 use meridian_tui::surface::{
     placeholder_text, register_message_renderer, register_palette_command, ExtensionPane,
@@ -314,7 +316,14 @@ fn palette_command_registration_is_last_write_wins() {
         name: "Second",
         description: "the second registration",
         keybinding: None,
-        action: PaletteAction::Effect(Box::new(Effect::SendMessage)),
+        action: PaletteAction::Effect(Box::new(Effect::SendMessage(SendMessageEffect {
+            request: SendMessageRequest {
+                peer_pubkey: [0u8; 32],
+                peer_hint: String::new(),
+                body: String::new(),
+            },
+            outcome: None,
+        }))),
     });
 
     assert_eq!(
@@ -326,7 +335,7 @@ fn palette_command_registration_is_last_write_wins() {
     assert_eq!(command.name, "Second");
     assert!(matches!(
         &command.action,
-        PaletteAction::Effect(effect) if matches!(**effect, Effect::SendMessage)
+        PaletteAction::Effect(effect) if matches!(**effect, Effect::SendMessage(_))
     ));
 }
 
