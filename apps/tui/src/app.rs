@@ -18,6 +18,7 @@ use ratatui::Frame;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::screens::onboarding::{self, OnboardingState};
+use crate::screens::unlock::{self, UnlockState};
 
 /// Events the runtime feeds into [`App::update`]. Produced by crossterm input, the worker-response
 /// channel, or the 250ms tick — see the event-loop diagram in tui-client.md §4.
@@ -148,19 +149,47 @@ pub struct PublishBundleEffect {
     pub outcome: Option<PublishedBundle>,
 }
 
+/// [`Effect::Unlock`]'s payload (task 4.17): unwrap a passphrase-protected keyfile —
+/// `meridian_core::store::FileSecretStore::new(keyfile, passphrase)` followed by an unwrap
+/// attempt (e.g. `export_seed`/`use_key`), mirroring `apps/cli/src/main.rs::load_store`'s
+/// `StoreKind::File` branch. Carries no separate outcome payload, same as [`RegisterRequest`]: a
+/// wrong passphrase surfaces as `meridian_core::store::StoreError::Unwrap` inside
+/// `WorkerEvent::Failed`'s message, and the mere fact of `WorkerEvent::Completed` arriving is the
+/// only signal [`crate::screens::unlock`] needs — there is no extra data to carry forward into
+/// `Screen::Main` from this pure-UI layer (the unlocked store itself is a worker-side concern).
+///
+/// **`passphrase` is a live secret** — hand-rolled, unconditionally redacted [`fmt::Debug`], same
+/// discipline as [`StoreChoice::File`]'s, since this type sits directly inside [`Effect`], which
+/// `#[derive(Debug)]`s and is itself dumped by this crate's own `panic!("{other:?}")` test
+/// fallbacks.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UnlockRequest {
+    pub keyfile: std::path::PathBuf,
+    pub passphrase: String,
+}
+
+impl fmt::Debug for UnlockRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnlockRequest")
+            .field("keyfile", &self.keyfile)
+            .field("passphrase", &"<redacted>")
+            .finish()
+    }
+}
+
 /// The only path from `update` to the network, the keystore, or disk. A worker task executes these
 /// and reports the outcome back as [`WorkerEvent`] / [`AppEvent::Worker`], so a slow rendezvous can
-/// never freeze the UI. `SendMessage`/`FetchBundle`/`PersistHistory`/`Unlock` are still placeholders
+/// never freeze the UI. `SendMessage`/`FetchBundle`/`PersistHistory` are still placeholders
 /// (payloads land with the tasks that give each effect real behavior — composer/session wiring,
-/// 4.17+); `GenerateAccount`/`Register`/`PublishBundle` are onboarding's (task 4.16) three
-/// I/O-requiring sub-steps.
+/// 4.19+); `GenerateAccount`/`Register`/`PublishBundle` are onboarding's (task 4.16) three
+/// I/O-requiring sub-steps; `Unlock` is the returning-user counterpart (task 4.17).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     SendMessage,
     FetchBundle,
     PublishBundle(PublishBundleEffect),
     PersistHistory,
-    Unlock,
+    Unlock(UnlockRequest),
     GenerateAccount(GenerateAccountEffect),
     Register(RegisterRequest),
 }
@@ -188,6 +217,18 @@ pub enum Screen {
     /// `clippy::large_enum_variant` flags the resulting size gap between `Screen`'s variants
     /// otherwise.
     Onboarding(Box<OnboardingState>),
+    /// Unlock a returning user's existing **file-backed** account — see [`crate::screens::unlock`].
+    /// Boxed for the same `clippy::large_enum_variant` reason as [`Screen::Onboarding`].
+    ///
+    /// **Not constructed by [`App::new`] yet.** Deciding *whether* a run needs `Unlock` at all
+    /// (account exists? file-backed vs. OS keystore?) is the `Preflight` routing decision from
+    /// `docs/architecture/diagrams/tui-screen-flow.mermaid`
+    /// (`Preflight --> Unlock: account exists, file-backed store`), which is out of this task's
+    /// (4.17) scope and does not exist anywhere in this crate yet — `App::new` still always starts
+    /// on [`Screen::Onboarding`] (see its doc comment). This variant exists so the screen itself is
+    /// fully wired and independently testable/reachable via [`App::push_screen`]; a future task
+    /// (Preflight) only needs to decide *when* to push it, not build the dispatch plumbing below.
+    Unlock(Box<UnlockState>),
 }
 
 /// Owns all application state. Constructed once by the runtime; `update` and `render` are the only
@@ -206,9 +247,11 @@ impl Default for App {
 
 impl App {
     /// A fresh app starts on [`Screen::Onboarding`] — this crate has no way (yet) to detect an
-    /// existing `account.json` and skip straight past it (that's the returning-user Unlock path,
-    /// task 4.17, explicitly out of scope here) — so every run starts a new user from the top of
-    /// the onboarding flow.
+    /// existing `account.json` and route to [`Screen::Unlock`] or straight to `Main` instead (the
+    /// `Preflight` step from `docs/architecture/diagrams/tui-screen-flow.mermaid`, still
+    /// unbuilt) — so every run starts a new user from the top of the onboarding flow. `Screen::
+    /// Unlock` itself exists and is fully wired (task 4.17); only the decision to construct and
+    /// push it here is missing.
     pub fn new() -> Self {
         Self {
             screens: vec![Screen::Onboarding(Box::default())],
@@ -287,6 +330,22 @@ impl App {
                 }
                 effects
             }
+            Some(Screen::Unlock(state)) => {
+                // Same rationale as the `Onboarding` arm above: `Unlock` owns its own key handling,
+                // including Esc (a no-op — `Unlock` has nothing beneath it either, and the mermaid
+                // diagram gives it no "back" transition, only retry-in-place or global quit via
+                // Ctrl+Q) — see `crate::screens::unlock::handle_key`.
+                let (effects, finished) = unlock::handle_key(state, key);
+                if finished {
+                    // Unlock → Main on a passphrase accepted. Same `Screen::Placeholder` stand-in
+                    // as onboarding's completion, pending `Screen::Main` (4.19/4.20+).
+                    *self
+                        .screens
+                        .last_mut()
+                        .expect("screens invariant: never empty") = Screen::Placeholder;
+                }
+                effects
+            }
             _ => {
                 if key.code == KeyCode::Esc {
                     self.pop_screen();
@@ -299,6 +358,16 @@ impl App {
     fn handle_worker(&mut self, event: WorkerEvent) -> Vec<Effect> {
         match self.screens.last_mut() {
             Some(Screen::Onboarding(state)) => onboarding::handle_worker(state, event),
+            Some(Screen::Unlock(state)) => {
+                let (effects, finished) = unlock::handle_worker(state, event);
+                if finished {
+                    *self
+                        .screens
+                        .last_mut()
+                        .expect("screens invariant: never empty") = Screen::Placeholder;
+                }
+                effects
+            }
             _ => Vec::new(),
         }
     }
@@ -308,6 +377,7 @@ impl App {
     pub fn render(&self, frame: &mut Frame<'_>) {
         match self.current_screen() {
             Screen::Onboarding(state) => onboarding::render(state, frame),
+            Screen::Unlock(state) => unlock::render(state, frame),
             Screen::Placeholder => render_placeholder(frame),
         }
     }
@@ -426,5 +496,60 @@ mod tests {
         let debug = format!("{choice:?}");
         assert!(!debug.contains("correct horse battery staple"));
         assert!(debug.contains("redacted"));
+    }
+
+    /// Same redaction discipline as [`store_choice_debug_redacts_file_passphrase`], for
+    /// [`UnlockRequest`] (task 4.17) — it sits directly inside [`Effect`]/[`WorkerEvent`], both
+    /// `derive(Debug)`, so it needs the same unconditional hand-rolled redaction `StoreChoice::File`
+    /// has.
+    #[test]
+    fn unlock_request_debug_redacts_passphrase() {
+        let req = UnlockRequest {
+            keyfile: std::path::PathBuf::from("/home/user/.config/meridian/account.age"),
+            passphrase: "correct horse battery staple".into(),
+        };
+        let debug = format!("{req:?}");
+        assert!(!debug.contains("correct horse battery staple"));
+        assert!(debug.contains("redacted"));
+    }
+
+    fn unlock_state() -> UnlockState {
+        UnlockState::new(
+            std::path::PathBuf::from("/home/user/.config/meridian/account.age"),
+            "mrd1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@chat.example".into(),
+        )
+    }
+
+    /// `Screen::Unlock` is fully dispatched at the `App` level (task 4.17): a submitted passphrase
+    /// dispatches `Effect::Unlock`, and a `WorkerEvent::Completed(Effect::Unlock(_))` swaps the
+    /// screen to `Screen::Placeholder` — the same completion mechanism `App::handle_key`'s
+    /// `Onboarding` arm uses, exercised here through `handle_worker` instead since Unlock signals
+    /// success directly from a worker event rather than via a confirmation keypress.
+    #[test]
+    fn unlock_screen_completes_to_placeholder_on_worker_success() {
+        let mut app = App::new();
+        *app.screens.last_mut().unwrap() = Screen::Unlock(Box::new(unlock_state()));
+
+        for c in "hunter2".chars() {
+            app.update(AppEvent::Key(key(KeyCode::Char(c), KeyModifiers::NONE)));
+        }
+        let effects = app.update(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(effects.len(), 1);
+        let effect = effects.into_iter().next().unwrap();
+        assert!(matches!(app.current_screen(), Screen::Unlock(_)));
+
+        app.update(AppEvent::Worker(WorkerEvent::Completed(effect)));
+        assert!(matches!(app.current_screen(), Screen::Placeholder));
+    }
+
+    /// `render` must work for `Screen::Unlock` too, against an in-memory backend — same property
+    /// `render_is_pure_and_works_against_test_backend` checks for the default `Onboarding` root.
+    #[test]
+    fn render_unlock_screen_works_against_test_backend() {
+        let mut app = App::new();
+        app.push_screen(Screen::Unlock(Box::new(unlock_state())));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
     }
 }

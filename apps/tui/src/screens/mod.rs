@@ -6,3 +6,4 @@
 //! crate to its own screens).
 
 pub mod onboarding;
+pub mod unlock;

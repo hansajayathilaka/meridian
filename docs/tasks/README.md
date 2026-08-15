@@ -249,7 +249,7 @@ inside 4.9. 28 tasks, [full DAG here](./phase-4/README.md#dependency-order).
 - [x] **4.14** `meridian-tui::config` — [file](./phase-4/4.14-tui-config.md)
 - [x] **4.15** `meridian-tui::store` — [file](./phase-4/4.15-tui-store.md)
 - [x] **4.16** Onboarding screen — [file](./phase-4/4.16-onboarding-screen.md)
-- [ ] **4.17** Unlock screen — [file](./phase-4/4.17-unlock-screen.md)
+- [x] **4.17** Unlock screen — [file](./phase-4/4.17-unlock-screen.md)
 - [ ] **4.18** Extension registry (`meridian-tui::surface`) — [file](./phase-4/4.18-extension-registry.md)
 
 **T17 screens — converge at 4.19**
