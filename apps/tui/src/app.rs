@@ -203,9 +203,14 @@ pub enum WorkerEvent {
 
 /// A screen on the navigation stack (tui-client.md §2 for the full eventual set: Onboarding,
 /// Unlock, Main, Add contact, Requests, Verify, Contact detail, Settings, Diagnostics, Help,
-/// Palette). [`Screen::Onboarding`] (task 4.16) is the first real one; every other screen is still
-/// a stand-in until its own task lands.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Palette). [`Screen::Onboarding`] (task 4.16) is the first real one; every other built-in screen
+/// is still a stand-in until its own task lands.
+///
+/// **Not `Clone`/`PartialEq`/`Eq`.** [`Screen::Extension`] (task 4.18) holds a `Box<dyn
+/// ExtensionPane>` trait object, which none of those three can be derived for — and nothing in
+/// this crate ever actually clones or compares a `Screen` (the tests below use `matches!` and
+/// stack-length assertions), so the derives were never load-bearing to begin with. `Debug` is
+/// hand-rolled instead of derived for the same reason — see the `impl` below.
 pub enum Screen {
     /// Stand-in root screen until real screens land — also onboarding's own completion target: a
     /// future task (4.19/4.20+) swaps this for `Screen::Main` without redesigning the onboarding
@@ -229,6 +234,29 @@ pub enum Screen {
     /// fully wired and independently testable/reachable via [`App::push_screen`]; a future task
     /// (Preflight) only needs to decide *when* to push it, not build the dispatch plumbing below.
     Unlock(Box<UnlockState>),
+    /// A feature-registered pane or screen (task 4.18, `docs/architecture/tui-client.md §8`) —
+    /// e.g. a transfer list (T09) or a call status panel (T10). This is the **one** `Screen`
+    /// variant every future feature's pane reaches the stack through: a feature implements
+    /// [`crate::surface::ExtensionPane`] and pushes `Screen::Extension(Box::new(pane))` (typically
+    /// via a [`crate::surface::PaletteAction::PushPane`] factory), so adding a new feature's pane
+    /// never means adding a new `Screen` variant here.
+    Extension(Box<dyn crate::surface::ExtensionPane>),
+}
+
+impl fmt::Debug for Screen {
+    /// Hand-rolled because [`Screen::Extension`]'s `Box<dyn ExtensionPane>` cannot derive `Debug` —
+    /// it prints the pane's [`crate::surface::ExtensionPane::title`] instead of its (arbitrary,
+    /// feature-owned) internal state, mirroring how [`StoreChoice`]/[`UnlockRequest`] above
+    /// hand-roll `Debug` to keep a live secret out of a dump, just for a different reason (no
+    /// `Debug` impl exists at all here, rather than one existing but needing redaction).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Screen::Placeholder => write!(f, "Placeholder"),
+            Screen::Onboarding(state) => f.debug_tuple("Onboarding").field(state).finish(),
+            Screen::Unlock(state) => f.debug_tuple("Unlock").field(state).finish(),
+            Screen::Extension(pane) => f.debug_tuple("Extension").field(&pane.title()).finish(),
+        }
+    }
 }
 
 /// Owns all application state. Constructed once by the runtime; `update` and `render` are the only
@@ -346,6 +374,19 @@ impl App {
                 }
                 effects
             }
+            Some(Screen::Extension(pane)) => {
+                // `Esc` always means "back" (tui-client.md §3) and is handled generically here,
+                // exactly like the catch-all arm below — an extension pane never sees an `Esc`
+                // key event and therefore never needs to special-case it (see
+                // `crate::surface::ExtensionPane::handle_key`'s doc comment). Every other key
+                // routes to the pane.
+                if key.code == KeyCode::Esc {
+                    self.pop_screen();
+                    Vec::new()
+                } else {
+                    pane.handle_key(key)
+                }
+            }
             _ => {
                 if key.code == KeyCode::Esc {
                     self.pop_screen();
@@ -358,6 +399,7 @@ impl App {
     fn handle_worker(&mut self, event: WorkerEvent) -> Vec<Effect> {
         match self.screens.last_mut() {
             Some(Screen::Onboarding(state)) => onboarding::handle_worker(state, event),
+            Some(Screen::Extension(pane)) => pane.handle_worker(event),
             Some(Screen::Unlock(state)) => {
                 let (effects, finished) = unlock::handle_worker(state, event);
                 if finished {
@@ -378,6 +420,7 @@ impl App {
         match self.current_screen() {
             Screen::Onboarding(state) => onboarding::render(state, frame),
             Screen::Unlock(state) => unlock::render(state, frame),
+            Screen::Extension(pane) => pane.render(frame),
             Screen::Placeholder => render_placeholder(frame),
         }
     }

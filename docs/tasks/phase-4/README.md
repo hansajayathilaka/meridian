@@ -181,7 +181,7 @@ start it day 1)
 - [x] **4.15** `meridian-tui::store` — [file](./4.15-tui-store.md)
 - [x] **4.16** Onboarding screen — [file](./4.16-onboarding-screen.md)
 - [x] **4.17** Unlock screen — [file](./4.17-unlock-screen.md)
-- [ ] **4.18** Extension registry (`meridian-tui::surface`) — [file](./4.18-extension-registry.md)
+- [x] **4.18** Extension registry (`meridian-tui::surface`) — [file](./4.18-extension-registry.md)
 
 **T17 screens — the rendezvous point; 4.19 is the first task needing both tracks**
 - [ ] **4.19** Contact list + add-contact + contact detail — [file](./4.19-contact-list-detail-screens.md)

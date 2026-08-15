@@ -25,11 +25,17 @@
 //! Real screen content lives in [`screens`], one module per [`app::Screen`] variant — starting
 //! with [`screens::onboarding`] (task 4.16); the rest are still [`app::Screen::Placeholder`] stand-
 //! ins until their own tasks land.
+//!
+//! [`surface`] (task 4.18) is the extension registry every *later* feature's TUI surface plugs
+//! into: a message renderer keyed by stream-type id, palette commands, and/or a pane pushed onto
+//! the screen stack via `Screen::Extension` — registered there, never added by editing this
+//! crate's core (docs/architecture/tui-client.md §8).
 
 pub mod app;
 pub mod config;
 pub mod screens;
 pub mod store;
+pub mod surface;
 pub mod terminal;
 
 pub use app::{App, AppEvent, Effect, Screen, WorkerEvent};
