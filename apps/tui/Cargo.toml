@@ -24,6 +24,10 @@ test-support = []
 meridian-core = { path = "../core" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+# Task 4.19 (contacts/contact-detail screens): truncated-pubkey display (the "fingerprint alongside
+# the petname" security rule, tui-client.md §6 rule 2) reuses `meridian_core::trust::contact_label`'s
+# own `hex::encode(...)[..12]` convention — same crate, not a bespoke encoder.
+hex = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 serde = { workspace = true }
 # `store/` (task 4.15, ADR 0021): the sealed/unsealed JSON documents are `serde_json`-encoded, not

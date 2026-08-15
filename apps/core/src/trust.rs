@@ -148,7 +148,12 @@ pub enum TrustState {
 /// History (not just the current key) is retained so a future key-change check (task 4.4) can
 /// tell "this is a key we've pinned before, just not the most recent one" from "this key has
 /// never been seen for this contact" — the distinction the feature spec's blocking semantics need.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// `PartialEq`/`Eq` (task 4.19 review fix): a TUI/CLI-side effect-outcome payload that carries a
+/// real `Vec<PinnedKey>` back from a worker (`meridian_tui::app::AddedContact`) needs these to
+/// derive `PartialEq`/`Eq` itself — plain byte/integer fields, so this is exact structural
+/// equality, nothing crypto-sensitive about comparing it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PinnedKey {
     #[serde(with = "b32")]
     pub pubkey: [u8; 32],

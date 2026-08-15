@@ -184,7 +184,7 @@ start it day 1)
 - [x] **4.18** Extension registry (`meridian-tui::surface`) — [file](./4.18-extension-registry.md)
 
 **T17 screens — the rendezvous point; 4.19 is the first task needing both tracks**
-- [ ] **4.19** Contact list + add-contact + contact detail — [file](./4.19-contact-list-detail-screens.md)
+- [x] **4.19** Contact list + add-contact + contact detail — [file](./4.19-contact-list-detail-screens.md)
 - [ ] **4.20** Chat / conversation screen — [file](./4.20-chat-screen.md)
 - [ ] **4.21** Message-request queue screen — [file](./4.21-message-request-queue-screen.md)
 - [ ] **4.22** Verification screen — [file](./4.22-verification-screen.md)

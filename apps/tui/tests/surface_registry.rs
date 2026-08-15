@@ -277,7 +277,7 @@ fn palette_command_registers_and_is_findable_by_binding() {
         name: "Ping",
         description: "a synthetic demo command",
         keybinding: Some(KeyBinding::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
-        action: PaletteAction::Effect(Effect::FetchBundle),
+        action: PaletteAction::Effect(Box::new(Effect::FetchBundle)),
     });
 
     assert_eq!(registry.iter().count(), 1);
@@ -286,8 +286,8 @@ fn palette_command_registers_and_is_findable_by_binding() {
         .expect("binding should be found");
     assert_eq!(found.id, "demo.ping");
     assert!(matches!(
-        found.action,
-        PaletteAction::Effect(Effect::FetchBundle)
+        &found.action,
+        PaletteAction::Effect(effect) if matches!(**effect, Effect::FetchBundle)
     ));
 
     // An unrelated key never matches.
@@ -307,14 +307,14 @@ fn palette_command_registration_is_last_write_wins() {
         name: "First",
         description: "the first registration",
         keybinding: None,
-        action: PaletteAction::Effect(Effect::FetchBundle),
+        action: PaletteAction::Effect(Box::new(Effect::FetchBundle)),
     });
     registry.register(PaletteCommand {
         id: "demo.collide",
         name: "Second",
         description: "the second registration",
         keybinding: None,
-        action: PaletteAction::Effect(Effect::SendMessage),
+        action: PaletteAction::Effect(Box::new(Effect::SendMessage)),
     });
 
     assert_eq!(
@@ -325,8 +325,8 @@ fn palette_command_registration_is_last_write_wins() {
     let command = registry.get("demo.collide").expect("command present");
     assert_eq!(command.name, "Second");
     assert!(matches!(
-        command.action,
-        PaletteAction::Effect(Effect::SendMessage)
+        &command.action,
+        PaletteAction::Effect(effect) if matches!(**effect, Effect::SendMessage)
     ));
 }
 
@@ -341,7 +341,7 @@ fn surface_registry_bundles_renderers_and_commands_with_zero_cross_edits() {
             name: "Ping",
             description: "a synthetic demo command",
             keybinding: None,
-            action: PaletteAction::Effect(Effect::FetchBundle),
+            action: PaletteAction::Effect(Box::new(Effect::FetchBundle)),
         },
     );
 
@@ -462,9 +462,9 @@ fn worker_events_route_to_the_extension_pane() {
     let mut app = App::new();
     app.push_screen(Screen::Extension(Box::new(CounterPane::new("demo-pane"))));
 
-    let effects = app.update(AppEvent::Worker(WorkerEvent::Completed(
+    let effects = app.update(AppEvent::Worker(Box::new(WorkerEvent::Completed(
         Effect::FetchBundle,
-    )));
+    ))));
     assert!(effects.is_empty());
     let text = render_current(&app);
     assert!(text.contains("workers=1"));
@@ -496,9 +496,9 @@ fn two_stacked_extension_panes_route_only_to_the_top_and_esc_reveals_the_correct
     assert!(render_current(&app).contains("top-pane keys=2 workers=0"));
 
     // A worker event likewise routes only to the top pane.
-    app.update(AppEvent::Worker(WorkerEvent::Completed(
+    app.update(AppEvent::Worker(Box::new(WorkerEvent::Completed(
         Effect::FetchBundle,
-    )));
+    ))));
     assert!(render_current(&app).contains("top-pane keys=2 workers=1"));
 
     // Esc pops exactly the top pane, revealing the bottom one — its counts are still zero, since

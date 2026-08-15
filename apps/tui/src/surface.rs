@@ -176,7 +176,13 @@ impl KeyBinding {
 /// than share/reuse a single instance across invocations.
 pub enum PaletteAction {
     /// Dispatch this effect for the (future) worker to execute.
-    Effect(Effect),
+    ///
+    /// Boxed (task 4.19 review fix): once [`crate::app::AddedContact`] grew a real
+    /// `Vec<meridian_core::trust::PinnedKey>` (Finding 1 — the effect-outcome payload must carry
+    /// back a contact's *actual* trust state/history, not an assumed-fresh shape), [`Effect`] grew
+    /// large enough that `PaletteAction`'s size gap against `PushPane`'s thin `Arc` tripped
+    /// `clippy::large_enum_variant` — the same reason `crate::app::AppEvent::Worker` is boxed.
+    Effect(Box<Effect>),
     /// Push a freshly constructed extension pane onto the screen stack
     /// (`Screen::Extension(pane())`).
     PushPane(Arc<dyn Fn() -> Box<dyn ExtensionPane> + Send + Sync>),
@@ -424,7 +430,7 @@ mod tests {
             name: "Test",
             description: "a test command",
             keybinding: Some(KeyBinding::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
-            action: PaletteAction::Effect(Effect::FetchBundle),
+            action: PaletteAction::Effect(Box::new(Effect::FetchBundle)),
         });
         assert!(registry.get("test.cmd").is_some());
         assert_eq!(registry.iter().count(), 1);
@@ -445,7 +451,7 @@ mod tests {
                 name: "Test",
                 description: "a test command",
                 keybinding: None,
-                action: PaletteAction::Effect(Effect::FetchBundle),
+                action: PaletteAction::Effect(Box::new(Effect::FetchBundle)),
             },
         );
         assert!(registry.renderers().supports("mrd.exotic/1"));

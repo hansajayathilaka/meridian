@@ -145,7 +145,7 @@ async fn run_worker(
 ) {
     while let Some(effect) = effects.recv().await {
         let outcome = WorkerEvent::Completed(effect);
-        if replies.send(AppEvent::Worker(outcome)).is_err() {
+        if replies.send(AppEvent::Worker(Box::new(outcome))).is_err() {
             break;
         }
     }
