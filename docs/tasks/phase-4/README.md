@@ -179,7 +179,7 @@ start it day 1)
 - [x] **4.13** Extract shared account/home-layout helpers into `meridian-core` — [file](./4.13-extract-account-home-layout-core.md)
 - [x] **4.14** `meridian-tui::config` — [file](./4.14-tui-config.md)
 - [x] **4.15** `meridian-tui::store` — [file](./4.15-tui-store.md)
-- [ ] **4.16** Onboarding screen — [file](./4.16-onboarding-screen.md)
+- [x] **4.16** Onboarding screen — [file](./4.16-onboarding-screen.md)
 - [ ] **4.17** Unlock screen — [file](./4.17-unlock-screen.md)
 - [ ] **4.18** Extension registry (`meridian-tui::surface`) — [file](./4.18-extension-registry.md)
 

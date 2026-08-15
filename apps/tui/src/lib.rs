@@ -22,10 +22,13 @@
 //! [`AppEvent::Worker`]. The terminal's raw mode + alternate screen are owned by an RAII guard whose
 //! `Drop`, panic hook, and `SIGINT`/`SIGTERM` handler all restore it — see [`terminal`].
 //!
-//! Screens are placeholders at this stage; real screen content lands in task 4.16+.
+//! Real screen content lives in [`screens`], one module per [`app::Screen`] variant — starting
+//! with [`screens::onboarding`] (task 4.16); the rest are still [`app::Screen::Placeholder`] stand-
+//! ins until their own tasks land.
 
 pub mod app;
 pub mod config;
+pub mod screens;
 pub mod store;
 pub mod terminal;
 
