@@ -25,6 +25,7 @@ use crate::screens::contacts::{self, ContactsState};
 use crate::screens::onboarding::{self, OnboardingState};
 use crate::screens::requests::{self, RequestsState};
 use crate::screens::unlock::{self, UnlockState};
+use crate::screens::verify::{self, VerifyState};
 use crate::store::contacts::PolicyOverride;
 use crate::store::history::HistoryEntry;
 
@@ -508,6 +509,46 @@ pub struct RejectRequestEffect {
     pub outcome: Option<()>,
 }
 
+/// Inputs for [`Effect::MarkVerified`] (task 4.22, `crate::screens::verify`): persist a
+/// [`meridian_core::trust::TrustStore::mark_verified`] transition to disk. **The pure state
+/// transition itself is already applied, synchronously, in-memory** by
+/// `crate::screens::verify::apply_action` — mirrors `crate::screens::chat`'s own
+/// `TrustStore::acknowledge_key_change` precedent: this screen's `TrustStore` handle is already a
+/// live, in-memory copy, not a display-only join like `crate::screens::contacts::ContactEntry` — so
+/// this effect exists purely for a future worker to re-seal the real, persisted `trust.bin` to
+/// match, the same "the screen already knows the answer, the worker's only job is durability" shape
+/// [`SetPetnameEffect`]/[`SetUserBlockedEffect`] already use. `pubkey` is carried so a future
+/// worker's completion/failure event can be correlated back to *this* peer specifically — see
+/// `crate::screens::verify`'s module doc for why that correlation is load-bearing (the same bug
+/// class tasks 4.20 and 4.21 both hit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkVerifiedRequest {
+    pub pubkey: [u8; 32],
+}
+
+/// [`Effect::MarkVerified`]'s payload. No separate outcome data — same contract as
+/// [`SetPetnameEffect`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkVerifiedEffect {
+    pub request: MarkVerifiedRequest,
+    pub outcome: Option<()>,
+}
+
+/// Inputs for [`Effect::AcknowledgeKeyChange`] (task 4.22, `crate::screens::verify`): persist a
+/// [`meridian_core::trust::TrustStore::acknowledge_key_change`] transition to disk — same
+/// already-applied-locally-then-persisted-by-a-future-worker shape as [`MarkVerifiedRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcknowledgeKeyChangeRequest {
+    pub pubkey: [u8; 32],
+}
+
+/// [`Effect::AcknowledgeKeyChange`]'s payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcknowledgeKeyChangeEffect {
+    pub request: AcknowledgeKeyChangeRequest,
+    pub outcome: Option<()>,
+}
+
 /// The only path from `update` to the network, the keystore, or disk. A worker task executes these
 /// and reports the outcome back as [`WorkerEvent`] / [`AppEvent::Worker`], so a slow rendezvous can
 /// never freeze the UI. `FetchBundle` is still a placeholder (no task needs it yet);
@@ -517,7 +558,10 @@ pub struct RejectRequestEffect {
 /// counterpart (task 4.17);
 /// `AddContact`/`ImportContactQr`/`SetPetname`/`SetUserBlocked`/`SetPolicyOverride`/`DeleteContact`
 /// are the contacts/contact-detail screens' (task 4.19) six; `AcceptRequest`/`RejectRequest` are the
-/// message-request queue's (task 4.21) two — see [`AcceptRequestEffect`]/[`RejectRequestEffect`].
+/// message-request queue's (task 4.21) two — see [`AcceptRequestEffect`]/[`RejectRequestEffect`];
+/// `MarkVerified`/`AcknowledgeKeyChange` are the verify screen's (task 4.22) two new ones —
+/// `SetUserBlocked` is reused as-is for that screen's own block action — see
+/// [`MarkVerifiedEffect`]/[`AcknowledgeKeyChangeEffect`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     SendMessage(SendMessageEffect),
@@ -535,6 +579,8 @@ pub enum Effect {
     DeleteContact(DeleteContactEffect),
     AcceptRequest(AcceptRequestEffect),
     RejectRequest(RejectRequestEffect),
+    MarkVerified(MarkVerifiedEffect),
+    AcknowledgeKeyChange(AcknowledgeKeyChangeEffect),
 }
 
 /// The outcome of a worker task executing an [`Effect`], reported back as [`AppEvent::Worker`].
@@ -623,6 +669,24 @@ pub enum Screen {
     /// real, loaded `ChatState` (the same Preflight step those other screens are waiting on) is what
     /// should replace `Vec::new()` at both push sites with a real snapshot.
     Requests(Box<RequestsState>),
+    /// The verification screen: 60-digit safety number + QR, mark-verified, block, and the two
+    /// un-softenable key-change modals — see [`crate::screens::verify`]. Boxed for the same
+    /// `clippy::large_enum_variant` reason as the other large variants above.
+    ///
+    /// **Reached by `^V` on a selected contact** (tui-client.md §2), **not yet wired**: like
+    /// [`Screen::Chat`]/[`Screen::Requests`] before their own navigation-integration tasks,
+    /// `crate::screens::contacts`'s own `v` key handler still shows its task-4.19-authored "Verify
+    /// is not implemented yet (task 4.22)" stand-in notice rather than pushing this screen —
+    /// wiring that requires `crate::screens::contacts::ContactsState` to carry both `own_pubkey`
+    /// (to compute the safety number) and a live `meridian_core::trust::TrustStore` handle, neither
+    /// of which it holds today (its own module doc explains why: it works off `ContactEntry`, a
+    /// display-only join, not a live `TrustStore`). That plumbing is exactly the kind of "future
+    /// task that gives `App` a real, loaded `TrustStore`" [`Screen::Requests`]'s own doc comment
+    /// already anticipates for itself; this variant exists fully wired
+    /// (`handle_key`/`handle_worker`/`render` all dispatch to it below) and independently reachable
+    /// via [`App::push_screen`] in the meantime, exactly like every other screen in this crate
+    /// before its own live-navigation task landed.
+    Verify(Box<VerifyState>),
     /// A feature-registered pane or screen (task 4.18, `docs/architecture/tui-client.md §8`) —
     /// e.g. a transfer list (T09) or a call status panel (T10). This is the **one** `Screen`
     /// variant every future feature's pane reaches the stack through: a feature implements
@@ -647,6 +711,7 @@ impl fmt::Debug for Screen {
             Screen::ContactDetail(state) => f.debug_tuple("ContactDetail").field(state).finish(),
             Screen::Chat(state) => f.debug_tuple("Chat").field(state).finish(),
             Screen::Requests(state) => f.debug_tuple("Requests").field(state).finish(),
+            Screen::Verify(state) => f.debug_tuple("Verify").field(state).finish(),
             Screen::Extension(pane) => f.debug_tuple("Extension").field(&pane.title()).finish(),
         }
     }
@@ -849,6 +914,21 @@ impl App {
                 }
                 effects
             }
+            Some(Screen::Verify(state)) => {
+                // `verify::handle_key` owns its own nested-mode `Esc` (cancelling an in-flight
+                // verify/block/acknowledge confirmation back to `VerifyMode::View`, never leaving
+                // the screen) exactly like `Chat`'s/`Requests`'s own sub-modes — see that module's
+                // doc. Only the outermost `Esc` asks to pop; popping never touches `state.trust`, so
+                // leaving this screen can never be mistaken for resolving a key-change block/warning
+                // — the send gate this screen exists to resolve is computed fresh from `TrustStore`
+                // wherever it's consulted (chat.rs's composer, this screen's own `gate()`), never
+                // cached.
+                let (effects, exit) = verify::handle_key(state, key);
+                if exit {
+                    self.pop_screen();
+                }
+                effects
+            }
             Some(Screen::Extension(pane)) => {
                 // `Esc` always means "back" (tui-client.md §3) and is handled generically here,
                 // exactly like the catch-all arm below — an extension pane never sees an `Esc`
@@ -909,6 +989,7 @@ impl App {
             }
             Some(Screen::Chat(state)) => chat::handle_worker(state, event),
             Some(Screen::Requests(state)) => requests::handle_worker(state, event),
+            Some(Screen::Verify(state)) => verify::handle_worker(state, event),
             _ => Vec::new(),
         }
     }
@@ -936,6 +1017,7 @@ impl App {
             Screen::ContactDetail(state) => contact_detail::render(state, frame),
             Screen::Chat(state) => chat::render(state, frame),
             Screen::Requests(state) => requests::render(state, frame),
+            Screen::Verify(state) => verify::render(state, frame),
             Screen::Extension(pane) => pane.render(frame),
             Screen::Placeholder => render_placeholder(frame),
         }

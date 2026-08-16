@@ -256,7 +256,7 @@ inside 4.9. 28 tasks, [full DAG here](./phase-4/README.md#dependency-order).
 - [x] **4.19** Contact list + add-contact + contact detail — [file](./phase-4/4.19-contact-list-detail-screens.md)
 - [x] **4.20** Chat / conversation screen — [file](./phase-4/4.20-chat-screen.md)
 - [x] **4.21** Message-request queue screen — [file](./phase-4/4.21-message-request-queue-screen.md)
-- [ ] **4.22** Verification screen — [file](./phase-4/4.22-verification-screen.md)
+- [x] **4.22** Verification screen — [file](./phase-4/4.22-verification-screen.md)
 - [ ] **4.23** Key-change adversarial test — [file](./phase-4/4.23-key-change-adversarial-test.md)
 - [ ] **4.24** Settings screen — [file](./phase-4/4.24-settings-screen.md)
 - [ ] **4.25** Help overlay + command palette + diagnostics — [file](./phase-4/4.25-help-palette-diagnostics.md)
