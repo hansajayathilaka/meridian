@@ -33,6 +33,7 @@
 
 pub mod app;
 pub mod config;
+pub mod config_write;
 pub mod screens;
 pub mod store;
 pub mod surface;

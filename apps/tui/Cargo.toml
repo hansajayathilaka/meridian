@@ -42,6 +42,12 @@ getrandom = { workspace = true }
 # workspace dependency there either — see those crates' own Cargo.toml comments), with the `toml`
 # format feature (this crate's config.toml) and `env` (MERIDIAN_TUI__ overrides).
 figment = { version = "0.10.19", features = ["toml", "env"] }
+# `config_write.rs` (task 4.24): comment-preserving `config.toml` write-back — a genuinely different
+# job from figment's read-only, comment-discarding deserialization above. Pinned to the exact
+# version figment's own dependency tree (via `toml` 0.8.23) already resolves to
+# (`cargo tree -p meridian-tui -i toml_edit`), so adding it as a direct dependency here doesn't add
+# a second copy at a different version.
+toml_edit = "0.22.27"
 
 [dev-dependencies]
 # Self-dependency with test-support enabled, so tests/terminal_guard.rs (a separate crate linking

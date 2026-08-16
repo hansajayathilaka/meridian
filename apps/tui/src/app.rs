@@ -24,6 +24,7 @@ use crate::screens::contact_detail::{self, ContactDetailState};
 use crate::screens::contacts::{self, ContactsState};
 use crate::screens::onboarding::{self, OnboardingState};
 use crate::screens::requests::{self, RequestsState};
+use crate::screens::settings::{self, SettingsState};
 use crate::screens::unlock::{self, UnlockState};
 use crate::screens::verify::{self, VerifyState};
 use crate::store::contacts::PolicyOverride;
@@ -549,6 +550,103 @@ pub struct AcknowledgeKeyChangeEffect {
     pub outcome: Option<()>,
 }
 
+/// Identifies exactly one editable `config.toml` field (task 4.24, `crate::screens::settings`) —
+/// the settings screen's own row/cursor identity, and (via [`SettingValue::field`]) the correlation
+/// key [`crate::screens::settings::handle_worker`] matches a completion/failure event back to,
+/// applying the now-three-times-documented lesson from tasks 4.20/4.21/4.22: never trust an
+/// `Effect::SaveSetting` completion's *shape* alone to mean "the field I'm currently waiting on
+/// resolved" — see that module's own doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingField {
+    ServerUrl,
+    RelayPolicy,
+    Theme,
+    Timestamps,
+    Bell,
+    RetainDays,
+    MaxMessagesPerConversation,
+    ReconnectBackoffMs,
+}
+
+/// A new value for exactly one [`SettingField`] — both the payload [`Effect::SaveSetting`] carries
+/// out to a future worker (`crate::config_write::write_setting_at`, task 4.24) and what
+/// `crate::screens::settings` applies to its own in-memory [`crate::config::TuiConfig`] copy
+/// (immediately, synchronously — the same "screen already knows the answer, the worker's only job
+/// is durability" shape [`MarkVerifiedRequest`]/[`SetPetnameRequest`] already use, and, per that
+/// module's own doc, exactly what makes "session-only" a meaningful outcome rather than a discarded
+/// one: the change really did take effect for this running session even on a persist failure).
+/// Deliberately carries its own field identity (via [`SettingValue::field`]) rather than a
+/// free-floating `SettingField` alongside it, so the two can never drift out of sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingValue {
+    ServerUrl(Option<String>),
+    RelayPolicy(crate::config::NetworkPolicy),
+    Theme(crate::config::Theme),
+    Timestamps(crate::config::Timestamps),
+    Bell(crate::config::Bell),
+    RetainDays(u32),
+    MaxMessagesPerConversation(u32),
+    ReconnectBackoffMs(Vec<u64>),
+}
+
+impl SettingValue {
+    /// The [`SettingField`] this value belongs to — see the type's own doc for why this is derived
+    /// rather than stored alongside as a separate field.
+    pub fn field(&self) -> SettingField {
+        match self {
+            SettingValue::ServerUrl(_) => SettingField::ServerUrl,
+            SettingValue::RelayPolicy(_) => SettingField::RelayPolicy,
+            SettingValue::Theme(_) => SettingField::Theme,
+            SettingValue::Timestamps(_) => SettingField::Timestamps,
+            SettingValue::Bell(_) => SettingField::Bell,
+            SettingValue::RetainDays(_) => SettingField::RetainDays,
+            SettingValue::MaxMessagesPerConversation(_) => SettingField::MaxMessagesPerConversation,
+            SettingValue::ReconnectBackoffMs(_) => SettingField::ReconnectBackoffMs,
+        }
+    }
+
+    /// Applies this value to `config` in place — the synchronous, local half of the "apply now,
+    /// persist later" split described on the type's own doc comment.
+    pub fn apply_to(&self, config: &mut crate::config::TuiConfig) {
+        match self {
+            SettingValue::ServerUrl(v) => config.account.server = v.clone(),
+            SettingValue::RelayPolicy(v) => config.network.policy = *v,
+            SettingValue::Theme(v) => config.ui.theme = *v,
+            SettingValue::Timestamps(v) => config.ui.timestamps = *v,
+            SettingValue::Bell(v) => config.ui.bell = *v,
+            SettingValue::RetainDays(v) => config.history.retain_days = *v,
+            SettingValue::MaxMessagesPerConversation(v) => {
+                config.history.max_messages_per_conversation = *v
+            }
+            SettingValue::ReconnectBackoffMs(v) => config.network.reconnect_backoff_ms = v.clone(),
+        }
+    }
+}
+
+/// Inputs for [`Effect::SaveSetting`] (task 4.24, `crate::screens::settings`): write one field's new
+/// value back into `config_path`'s on-disk `config.toml`, preserving every comment/blank line/key
+/// this change doesn't touch — `crate::config_write::write_setting_at`, the comment-preserving
+/// `toml_edit`-based write-back path `crate::config`'s own module doc names as "a later task's
+/// concern". `config_path` travels with every request rather than being assumed
+/// (`crate::config::default_config_path()`) so a future worker never has to re-derive it, mirroring
+/// how [`UnlockRequest::keyfile`] carries its own path rather than assuming a default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveSettingRequest {
+    pub config_path: std::path::PathBuf,
+    pub value: SettingValue,
+}
+
+/// [`Effect::SaveSetting`]'s payload. No separate outcome data — same contract as
+/// [`SetPetnameEffect`]/[`MarkVerifiedEffect`]: the mere fact of `WorkerEvent::Completed` vs.
+/// `WorkerEvent::Failed` arriving (and, on failure, its carried message) is everything
+/// `crate::screens::settings` needs — see that module's doc for what each outcome does to the
+/// screen's own `notice`/`last_persist` state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveSettingEffect {
+    pub request: SaveSettingRequest,
+    pub outcome: Option<()>,
+}
+
 /// The only path from `update` to the network, the keystore, or disk. A worker task executes these
 /// and reports the outcome back as [`WorkerEvent`] / [`AppEvent::Worker`], so a slow rendezvous can
 /// never freeze the UI. `FetchBundle` is still a placeholder (no task needs it yet);
@@ -561,7 +659,8 @@ pub struct AcknowledgeKeyChangeEffect {
 /// message-request queue's (task 4.21) two — see [`AcceptRequestEffect`]/[`RejectRequestEffect`];
 /// `MarkVerified`/`AcknowledgeKeyChange` are the verify screen's (task 4.22) two new ones —
 /// `SetUserBlocked` is reused as-is for that screen's own block action — see
-/// [`MarkVerifiedEffect`]/[`AcknowledgeKeyChangeEffect`].
+/// [`MarkVerifiedEffect`]/[`AcknowledgeKeyChangeEffect`]; `SaveSetting` is the settings screen's
+/// (task 4.24) one new one — see [`SaveSettingEffect`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     SendMessage(SendMessageEffect),
@@ -581,6 +680,7 @@ pub enum Effect {
     RejectRequest(RejectRequestEffect),
     MarkVerified(MarkVerifiedEffect),
     AcknowledgeKeyChange(AcknowledgeKeyChangeEffect),
+    SaveSetting(SaveSettingEffect),
 }
 
 /// The outcome of a worker task executing an [`Effect`], reported back as [`AppEvent::Worker`].
@@ -687,6 +787,17 @@ pub enum Screen {
     /// via [`App::push_screen`] in the meantime, exactly like every other screen in this crate
     /// before its own live-navigation task landed.
     Verify(Box<VerifyState>),
+    /// A form over `config.toml`'s fields — see [`crate::screens::settings`]. Boxed for the same
+    /// `clippy::large_enum_variant` reason as the other large variants above.
+    ///
+    /// **"Reached from the command palette" (tui-client.md §2), not yet wired**: like every other
+    /// screen in this crate before its own navigation-integration task, `PaletteRegistry::
+    /// find_binding` is not yet called from [`App::handle_key`] at all (deferred to task 4.25 — see
+    /// tasks 4.18/4.23's own findings), so there is no live keybinding that pushes this screen
+    /// today. This variant exists fully wired (`handle_key`/`handle_worker`/`render` all dispatch to
+    /// it below) and independently reachable via [`App::push_screen`], exactly like
+    /// [`Screen::Verify`] before its own navigation task.
+    Settings(Box<SettingsState>),
     /// A feature-registered pane or screen (task 4.18, `docs/architecture/tui-client.md §8`) —
     /// e.g. a transfer list (T09) or a call status panel (T10). This is the **one** `Screen`
     /// variant every future feature's pane reaches the stack through: a feature implements
@@ -712,6 +823,7 @@ impl fmt::Debug for Screen {
             Screen::Chat(state) => f.debug_tuple("Chat").field(state).finish(),
             Screen::Requests(state) => f.debug_tuple("Requests").field(state).finish(),
             Screen::Verify(state) => f.debug_tuple("Verify").field(state).finish(),
+            Screen::Settings(state) => f.debug_tuple("Settings").field(state).finish(),
             Screen::Extension(pane) => f.debug_tuple("Extension").field(&pane.title()).finish(),
         }
     }
@@ -929,6 +1041,17 @@ impl App {
                 }
                 effects
             }
+            Some(Screen::Settings(state)) => {
+                // `settings::handle_key` owns its own nested-mode `Esc` (cancelling an in-flight
+                // text edit back to `SettingsMode::List`, never leaving the screen) exactly like
+                // `Verify`'s/`Requests`'s own sub-modes — see that module's doc. Only the outermost
+                // `Esc` asks to pop.
+                let (effects, exit) = settings::handle_key(state, key);
+                if exit {
+                    self.pop_screen();
+                }
+                effects
+            }
             Some(Screen::Extension(pane)) => {
                 // `Esc` always means "back" (tui-client.md §3) and is handled generically here,
                 // exactly like the catch-all arm below — an extension pane never sees an `Esc`
@@ -990,6 +1113,7 @@ impl App {
             Some(Screen::Chat(state)) => chat::handle_worker(state, event),
             Some(Screen::Requests(state)) => requests::handle_worker(state, event),
             Some(Screen::Verify(state)) => verify::handle_worker(state, event),
+            Some(Screen::Settings(state)) => settings::handle_worker(state, event),
             _ => Vec::new(),
         }
     }
@@ -1018,6 +1142,7 @@ impl App {
             Screen::Chat(state) => chat::render(state, frame),
             Screen::Requests(state) => requests::render(state, frame),
             Screen::Verify(state) => verify::render(state, frame),
+            Screen::Settings(state) => settings::render(state, frame),
             Screen::Extension(pane) => pane.render(frame),
             Screen::Placeholder => render_placeholder(frame),
         }

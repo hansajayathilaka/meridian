@@ -10,5 +10,6 @@ pub mod contact_detail;
 pub mod contacts;
 pub mod onboarding;
 pub mod requests;
+pub mod settings;
 pub mod unlock;
 pub mod verify;
