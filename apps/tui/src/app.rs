@@ -23,6 +23,7 @@ use crate::screens::chat::{self, ChatState};
 use crate::screens::contact_detail::{self, ContactDetailState};
 use crate::screens::contacts::{self, ContactsState};
 use crate::screens::onboarding::{self, OnboardingState};
+use crate::screens::requests::{self, RequestsState};
 use crate::screens::unlock::{self, UnlockState};
 use crate::store::contacts::PolicyOverride;
 use crate::store::history::HistoryEntry;
@@ -448,6 +449,65 @@ pub struct PersistHistoryEffect {
     pub outcome: Option<()>,
 }
 
+/// Inputs for [`Effect::AcceptRequest`] (task 4.21, `crate::screens::requests`): accept a pending
+/// message request and TOFU-pin its sender, mirroring `apps/cli/src/chat.rs::answer_request`'s
+/// accept branch **order** exactly — `meridian_core::chat::ChatState::accept_request(sender_ik)`
+/// first, *then* `meridian_core::trust::TrustStore::observe(sender_ik, hint, now_unix())` (task
+/// 4.7's own fix: never pin before the user decides). Both calls are pure, synchronous, in-memory
+/// mutations of the real, persisted `ChatState`/`TrustStore` this crate has no live handle to yet —
+/// see `crate::screens::requests`'s module doc for why that pair of calls (and re-sealing the
+/// results to disk) is deferred to a future worker rather than run inside `update`, mirroring
+/// [`AddContactEffect`]'s identical split.
+///
+/// **No `peer_hint` field, unlike [`AddContactRequest`].** `meridian_core::chat::MessageRequest`
+/// (task 2.10) carries only `sender_ik`/`safety_number`/`intro` — no advisory hint, unlike
+/// `apps/cli/src/chat.rs::answer_request`, which already has one in scope from the CLI's own `chat
+/// run <peer>` invocation (the operator typed the peer's full `mrd1:…@hint` id to start that
+/// session). A message request can arrive from a sender this client never dialed, so no hint is
+/// available here to carry forward; the future worker executing this effect calls
+/// `TrustStore::observe(sender_ik, "", now_unix())` — `observe`'s own contract accepts an empty
+/// hint (it simply leaves `Contact::hint` empty) — which is the honest behavior, not a fabricated
+/// one. `TODO: confirm` whether a later task should extend `MessageRequest`/the wire protocol to
+/// carry a sender-supplied display hint; today none exists to pass through.
+///
+/// **Does not itself deliver `intro` into a conversation transcript.** Mirrors
+/// `crate::screens::chat`'s own "no receive-path wiring" scope note: there is no
+/// `Effect`/history-append plumbing in this crate yet for an inbound message arriving outside an
+/// active `Screen::Chat` session. A future task that wires `Screen::Requests` → `Screen::Chat`
+/// navigation is also what should decide how the accepted `intro` reaches that peer's transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptRequestRequest {
+    pub sender_ik: [u8; 32],
+}
+
+/// [`Effect::AcceptRequest`]'s payload. No separate outcome data — same contract as
+/// [`SetPetnameEffect`]/[`RegisterRequest`]: the mere fact of `WorkerEvent::Completed` arriving is
+/// the only signal [`crate::screens::requests`] needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptRequestEffect {
+    pub request: AcceptRequestRequest,
+    pub outcome: Option<()>,
+}
+
+/// Inputs for [`Effect::RejectRequest`] (task 4.21, `crate::screens::requests`):
+/// `meridian_core::chat::ChatState::reject_request(sender_ik)` against the real, persisted
+/// `ChatState` — discards the held request *and* the already-established session behind it, with no
+/// wire signal of any kind (see that method's own doc comment). **This is the one property this
+/// task's own tests are built to pin at the UI layer**: rejecting must leave
+/// `crate::screens::requests::RequestsState` in exactly the same shape for `sender_ik` as if it had
+/// never been in the queue at all — see that module's own "leaves no trace" doc section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectRequestRequest {
+    pub sender_ik: [u8; 32],
+}
+
+/// [`Effect::RejectRequest`]'s payload. Same request/outcome shape as [`AcceptRequestEffect`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectRequestEffect {
+    pub request: RejectRequestRequest,
+    pub outcome: Option<()>,
+}
+
 /// The only path from `update` to the network, the keystore, or disk. A worker task executes these
 /// and reports the outcome back as [`WorkerEvent`] / [`AppEvent::Worker`], so a slow rendezvous can
 /// never freeze the UI. `FetchBundle` is still a placeholder (no task needs it yet);
@@ -456,7 +516,8 @@ pub struct PersistHistoryEffect {
 /// onboarding's (task 4.16) three I/O-requiring sub-steps; `Unlock` is the returning-user
 /// counterpart (task 4.17);
 /// `AddContact`/`ImportContactQr`/`SetPetname`/`SetUserBlocked`/`SetPolicyOverride`/`DeleteContact`
-/// are the contacts/contact-detail screens' (task 4.19) six.
+/// are the contacts/contact-detail screens' (task 4.19) six; `AcceptRequest`/`RejectRequest` are the
+/// message-request queue's (task 4.21) two — see [`AcceptRequestEffect`]/[`RejectRequestEffect`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     SendMessage(SendMessageEffect),
@@ -472,6 +533,8 @@ pub enum Effect {
     SetUserBlocked(SetUserBlockedEffect),
     SetPolicyOverride(SetPolicyOverrideEffect),
     DeleteContact(DeleteContactEffect),
+    AcceptRequest(AcceptRequestEffect),
+    RejectRequest(RejectRequestEffect),
 }
 
 /// The outcome of a worker task executing an [`Effect`], reported back as [`AppEvent::Worker`].
@@ -545,6 +608,21 @@ pub enum Screen {
     /// reachable via [`App::push_screen`], exactly like `Screen::Unlock` was before its own
     /// Preflight routing landed.
     Chat(Box<ChatState>),
+    /// The message-request queue: sender key, safety number, intro, accept/reject — see
+    /// [`crate::screens::requests`]. Boxed for the same reason as the other large variants above.
+    ///
+    /// **Reachable two ways** (tui-client.md §2's own "`^R`, or the Requests section of the contacts
+    /// pane"), both wired at the bottom of [`App::handle_key`]: a global `Ctrl+R` (checked
+    /// unconditionally, same top-level treatment as `Ctrl+Q`), and `r` from
+    /// [`Screen::Contacts`]'s own plain list-navigation mode (`crate::screens::contacts`'s newly
+    /// added [`contacts::ContactsAction::OpenRequests`]). Both push with an **empty** queue today:
+    /// this crate has no live `meridian_core::chat::ChatState` handle anywhere yet to snapshot
+    /// `pending_requests()` from — the same "not constructed with real data yet" gap
+    /// [`Screen::Unlock`]/[`Screen::Contacts`]/[`Screen::Chat`] each flagged in their own doc
+    /// comments before their own Preflight/Main routing existed. A future task that gives `App` a
+    /// real, loaded `ChatState` (the same Preflight step those other screens are waiting on) is what
+    /// should replace `Vec::new()` at both push sites with a real snapshot.
+    Requests(Box<RequestsState>),
     /// A feature-registered pane or screen (task 4.18, `docs/architecture/tui-client.md §8`) —
     /// e.g. a transfer list (T09) or a call status panel (T10). This is the **one** `Screen`
     /// variant every future feature's pane reaches the stack through: a feature implements
@@ -568,6 +646,7 @@ impl fmt::Debug for Screen {
             Screen::Contacts(state) => f.debug_tuple("Contacts").field(state).finish(),
             Screen::ContactDetail(state) => f.debug_tuple("ContactDetail").field(state).finish(),
             Screen::Chat(state) => f.debug_tuple("Chat").field(state).finish(),
+            Screen::Requests(state) => f.debug_tuple("Requests").field(state).finish(),
             Screen::Extension(pane) => f.debug_tuple("Extension").field(&pane.title()).finish(),
         }
     }
@@ -648,6 +727,19 @@ impl App {
             return Vec::new();
         }
 
+        // Global, regardless of screen (tui-client.md §2: "Requests | ... | `^R`, or the Requests
+        // section of the contacts pane") — same top-level, unconditional treatment as `Ctrl+Q`
+        // above, mirrored here since pushing a screen is never destructive (unlike quitting) so
+        // there is no reason to gate it behind whichever screen happens to be current. A no-op if
+        // `Screen::Requests` is already on top, so repeated `Ctrl+R` doesn't stack duplicates — see
+        // `Screen::Requests`'s own doc comment for why this pushes an empty queue today.
+        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if !matches!(self.current_screen(), Screen::Requests(_)) {
+                self.push_screen(Screen::Requests(Box::new(RequestsState::new(Vec::new()))));
+            }
+            return Vec::new();
+        }
+
         match self.screens.last_mut() {
             Some(Screen::Onboarding(state)) => {
                 // Onboarding owns its own key handling entirely, *including* what Esc means —
@@ -705,6 +797,13 @@ impl App {
                     contacts::ContactsAction::Pop => {
                         self.pop_screen();
                     }
+                    // Same "empty until a future Preflight loads real data" caveat as the global
+                    // `Ctrl+R` handler above — see `Screen::Requests`'s own doc comment.
+                    contacts::ContactsAction::OpenRequests => {
+                        self.push_screen(Screen::Requests(Box::new(
+                            RequestsState::new(Vec::new()),
+                        )));
+                    }
                     contacts::ContactsAction::None => {}
                 }
                 effects
@@ -734,6 +833,17 @@ impl App {
                 // reconcile back into a screen beneath it yet (see `Screen::Chat`'s own doc on why
                 // navigation wiring is deferred).
                 let (effects, exit) = chat::handle_key(state, key);
+                if exit {
+                    self.pop_screen();
+                }
+                effects
+            }
+            Some(Screen::Requests(state)) => {
+                // `requests::handle_key` owns its own nested-mode `Esc` (cancelling an in-flight
+                // accept/reject confirmation back to `RequestsMode::List`, never leaving the
+                // screen) exactly like `ContactDetail`'s/`Chat`'s sub-modes — see that module's
+                // doc. Only the outermost `Esc` asks to pop.
+                let (effects, exit) = requests::handle_key(state, key);
                 if exit {
                     self.pop_screen();
                 }
@@ -798,6 +908,7 @@ impl App {
                 effects
             }
             Some(Screen::Chat(state)) => chat::handle_worker(state, event),
+            Some(Screen::Requests(state)) => requests::handle_worker(state, event),
             _ => Vec::new(),
         }
     }
@@ -824,6 +935,7 @@ impl App {
             Screen::Contacts(state) => contacts::render(state, frame),
             Screen::ContactDetail(state) => contact_detail::render(state, frame),
             Screen::Chat(state) => chat::render(state, frame),
+            Screen::Requests(state) => requests::render(state, frame),
             Screen::Extension(pane) => pane.render(frame),
             Screen::Placeholder => render_placeholder(frame),
         }
@@ -1090,6 +1202,66 @@ mod tests {
         app.push_screen(Screen::ContactDetail(Box::new(ContactDetailState::new(
             entry,
         ))));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+    }
+
+    // -----------------------------------------------------------------------
+    // Requests dispatch (task 4.21) — the App-level plumbing
+    // `apps/tui/tests/screens_requests.rs` doesn't cover, since that file drives
+    // `crate::screens::requests` directly rather than through `App`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ctrl_r_pushes_the_requests_screen_from_anywhere_and_is_idempotent() {
+        let mut app = App::new();
+        assert!(matches!(app.current_screen(), Screen::Onboarding(_)));
+
+        let effects = app.update(AppEvent::Key(key(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(effects.is_empty());
+        assert!(matches!(app.current_screen(), Screen::Requests(_)));
+        assert_eq!(app.screens.len(), 2);
+
+        // Pressing it again while already on Requests doesn't stack a duplicate.
+        app.update(AppEvent::Key(key(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        )));
+        assert_eq!(app.screens.len(), 2);
+    }
+
+    #[test]
+    fn plain_r_does_not_trigger_the_requests_screen_globally() {
+        let mut app = App::new();
+        app.push_screen(Screen::Placeholder);
+        app.update(AppEvent::Key(key(KeyCode::Char('r'), KeyModifiers::NONE)));
+        assert!(matches!(app.current_screen(), Screen::Placeholder));
+    }
+
+    #[test]
+    fn contacts_screen_r_opens_requests_and_esc_pops_back_to_contacts() {
+        let mut app = App::new();
+        *app.screens.last_mut().unwrap() =
+            Screen::Contacts(Box::new(ContactsState::new(Vec::new())));
+
+        let effects = app.update(AppEvent::Key(key(KeyCode::Char('r'), KeyModifiers::NONE)));
+        assert!(effects.is_empty());
+        assert!(matches!(app.current_screen(), Screen::Requests(_)));
+
+        app.update(AppEvent::Key(key(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(matches!(app.current_screen(), Screen::Contacts(_)));
+    }
+
+    #[test]
+    fn render_requests_screen_works_against_test_backend() {
+        let mut app = App::new();
+        app.push_screen(Screen::Requests(Box::new(
+            crate::screens::requests::RequestsState::new(Vec::new()),
+        )));
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test backend");
         terminal.draw(|frame| app.render(frame)).expect("draw");

@@ -9,4 +9,5 @@ pub mod chat;
 pub mod contact_detail;
 pub mod contacts;
 pub mod onboarding;
+pub mod requests;
 pub mod unlock;

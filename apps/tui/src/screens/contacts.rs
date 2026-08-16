@@ -310,6 +310,14 @@ pub enum ContactsAction {
     /// filtering) — `App` should pop this screen, same outcome as the generic catch-all Esc-pop
     /// handler every other non-owning screen gets.
     Pop,
+    /// `r` in plain list-navigation mode (tui-client.md §2's keymap table: "Contacts | ... · `r`
+    /// requests ..."): push `Screen::Requests` (task 4.21) — this screen owns no message-request
+    /// data itself (unlike `AddContact`'s `ContactEntry`/`AddedContact` payloads, there is nothing
+    /// for this action to carry), so `App` is what actually constructs
+    /// `crate::screens::requests::RequestsState` — see that variant's own doc comment for the
+    /// "empty until a future Preflight loads real data" caveat this shares with the crate's other
+    /// not-yet-fully-wired screens.
+    OpenRequests,
 }
 
 /// Handles one key event. See [`ContactsAction`] for what `App` does with the second return value.
@@ -368,6 +376,9 @@ pub fn handle_key(state: &mut ContactsState, key: KeyEvent) -> (Vec<Effect>, Con
         }
         KeyCode::Char('n') if is_plain_char(key.modifiers) => {
             state.add = Some(AddContactState::EnterId(EnterId::default()));
+        }
+        KeyCode::Char('r') if is_plain_char(key.modifiers) => {
+            return (Vec::new(), ContactsAction::OpenRequests);
         }
         KeyCode::Char('/') => state.filtering = true,
         KeyCode::Char('v') if is_plain_char(key.modifiers) => {
@@ -916,6 +927,6 @@ fn footer_hint(state: &ContactsState) -> String {
     } else if state.filtering {
         "type to filter · Enter/Esc done".to_string()
     } else {
-        "↑↓/jk move · Enter open · n add · v verify · / filter".to_string()
+        "↑↓/jk move · Enter open · n add · r requests · v verify · / filter".to_string()
     }
 }
