@@ -167,6 +167,42 @@ impl KeyBinding {
     }
 }
 
+impl fmt::Display for KeyBinding {
+    /// Human-readable form used by `crate::screens::help`/`crate::screens::palette` (task 4.25) —
+    /// e.g. `"Ctrl+K"`, `"F1"`, `"y"`, `"Shift+Tab"`. **Not** a `config.toml` serialization format:
+    /// nothing in this crate parses a `[keys]` rebind string back into a [`KeyBinding`] yet (see
+    /// `crate::config`'s own module doc) — this exists purely for display.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.modifiers.contains(KeyModifiers::CONTROL) {
+            write!(f, "Ctrl+")?;
+        }
+        if self.modifiers.contains(KeyModifiers::ALT) {
+            write!(f, "Alt+")?;
+        }
+        if self.modifiers.contains(KeyModifiers::SHIFT) {
+            write!(f, "Shift+")?;
+        }
+        match self.code {
+            KeyCode::Char(c) => write!(f, "{c}"),
+            KeyCode::F(n) => write!(f, "F{n}"),
+            KeyCode::Enter => write!(f, "Enter"),
+            KeyCode::Esc => write!(f, "Esc"),
+            KeyCode::Tab => write!(f, "Tab"),
+            KeyCode::BackTab => write!(f, "Shift+Tab"),
+            KeyCode::Backspace => write!(f, "Backspace"),
+            KeyCode::Up => write!(f, "Up"),
+            KeyCode::Down => write!(f, "Down"),
+            KeyCode::Left => write!(f, "Left"),
+            KeyCode::Right => write!(f, "Right"),
+            KeyCode::Home => write!(f, "Home"),
+            KeyCode::End => write!(f, "End"),
+            KeyCode::PageUp => write!(f, "PageUp"),
+            KeyCode::PageDown => write!(f, "PageDown"),
+            other => write!(f, "{other:?}"),
+        }
+    }
+}
+
 /// What triggering a [`PaletteCommand`] does — consistent with the existing [`Effect`]/
 /// [`crate::app::Screen`] split (`docs/architecture/tui-client.md §4`): either dispatch a fixed
 /// effect for the worker to run, or push a freshly built [`ExtensionPane`] onto the screen stack.
@@ -257,23 +293,21 @@ impl PaletteRegistry {
         self.commands.get(id)
     }
 
-    /// Every registered command, in id order — what the (future) palette and help screens iterate.
+    /// Every registered command, in id order — what [`crate::screens::help`] and
+    /// [`crate::screens::palette`] iterate to build their content.
     pub fn iter(&self) -> impl Iterator<Item = &PaletteCommand> {
         self.commands.values()
     }
 
-    /// The registered command (if any) whose [`KeyBinding`] matches `key` — what the (future) global
-    /// key-dispatch step consults before falling through to a screen's own handling.
+    /// The registered command (if any) whose [`KeyBinding`] matches `key` — the global key-dispatch
+    /// step `crate::app::App::handle_key` consults before falling through to a screen's own handling.
     ///
-    /// **Orphaned wiring (architect review, task 4.18 fix pass):** nothing in `App::handle_key`
-    /// constructs or consults a [`PaletteRegistry`] yet — only the hardcoded `Ctrl+Q` quit check is a
-    /// true global key. This method exists and is fully correct in isolation (see the tests in
-    /// `surface_registry.rs`), but the "fire a command's keybinding without opening the palette"
-    /// dispatch step this doc comment describes has no owner yet. Task 4.25 (help/palette/
-    /// diagnostics) is the intended owner — see the addendum to its `## Scope` section — since it
-    /// already builds the palette/help screens that read this same binding table; it must also wire
-    /// `App::handle_key` to consult a `PaletteRegistry` via this method before falling through to a
-    /// screen's own handling, not just have the palette/help screens read it passively.
+    /// **Wired (task 4.25, closing the gap the 4.18 fix pass flagged here):** `App::handle_key` calls
+    /// this method directly, after its own fixed, hardcoded global checks (`Ctrl+Q`/`Ctrl+R`/`F1`/
+    /// `Ctrl+K`) and strictly before any screen-specific handling — see that method's own doc comment
+    /// for the exact ordering and `app.rs`'s `#[cfg(test)] mod tests` for the ordering-regression
+    /// coverage (a registered binding intercepts a screen's own same-key use; an unregistered key is
+    /// completely unaffected).
     ///
     /// **Tie-break contract for two commands sharing a [`KeyBinding`]:** undefined by iteration order
     /// today — whichever command happens to come first in [`BTreeMap`] key (id) order wins. Not
@@ -340,6 +374,19 @@ pub trait ExtensionPane: Send + Sync {
 pub struct SurfaceRegistry {
     renderers: MessageRendererRegistry,
     commands: PaletteRegistry,
+}
+
+impl fmt::Debug for SurfaceRegistry {
+    /// Hand-rolled (task 4.25, `crate::app::App` grew a `SurfaceRegistry` field and needs `App`'s own
+    /// `#[derive(Debug)]` to keep working): [`MessageRendererRegistry`] holds `Arc<dyn
+    /// MessageRenderer>` trait objects with no `Debug` impl to derive through, so `renderers` is
+    /// represented opaquely; `commands` is real (`PaletteRegistry` already derives `Debug`).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SurfaceRegistry")
+            .field("renderers", &"<opaque>")
+            .field("commands", &self.commands)
+            .finish()
+    }
 }
 
 impl SurfaceRegistry {

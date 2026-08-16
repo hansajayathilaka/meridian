@@ -8,6 +8,7 @@
 //! that are genuinely global (quit, the screen stack).
 
 use std::fmt;
+use std::sync::Arc;
 
 use ratatui::layout::Alignment;
 use ratatui::style::{Modifier, Style};
@@ -22,13 +23,17 @@ use meridian_core::trust::{PinnedKey, TrustState};
 use crate::screens::chat::{self, ChatState};
 use crate::screens::contact_detail::{self, ContactDetailState};
 use crate::screens::contacts::{self, ContactsState};
+use crate::screens::diagnostics::DiagnosticsPane;
+use crate::screens::help::{self, HelpState};
 use crate::screens::onboarding::{self, OnboardingState};
+use crate::screens::palette::{self, PaletteOutcome, PaletteState};
 use crate::screens::requests::{self, RequestsState};
 use crate::screens::settings::{self, SettingsState};
 use crate::screens::unlock::{self, UnlockState};
 use crate::screens::verify::{self, VerifyState};
 use crate::store::contacts::PolicyOverride;
 use crate::store::history::HistoryEntry;
+use crate::surface::{ExtensionPane, PaletteAction, PaletteCommand, SurfaceRegistry};
 
 /// Events the runtime feeds into [`App::update`]. Produced by crossterm input, the worker-response
 /// channel, or the 250ms tick — see the event-loop diagram in tui-client.md §4.
@@ -647,6 +652,46 @@ pub struct SaveSettingEffect {
     pub outcome: Option<()>,
 }
 
+/// Inputs for [`Effect::RunDoctor`] (task 4.25, `crate::screens::diagnostics`): invoke the already-
+/// built `meridian doctor --json` binary as a **subprocess** and parse its captured stdout —
+/// `crate::screens::diagnostics::run_doctor_binary`/`parse_doctor_json` — never a direct, in-process
+/// call into `apps/cli::doctor::run`, which this crate cannot depend on (ADR 0020;
+/// `tools/lint-tui-no-cli.sh`). See that module's own doc comment for the full "wrapping the existing
+/// `doctor` output" design rationale this field's own doc references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunDoctorRequest {
+    /// The binary to invoke — `"meridian"` (resolved via `PATH`) in every real construction site
+    /// today ([`crate::screens::diagnostics::DOCTOR_BINARY`]); a distinct field (rather than a bare
+    /// constant baked into a future worker) so a test can substitute a bogus name to prove the
+    /// binary-not-found path produces real, honest text, not something silently swallowed.
+    pub binary: String,
+}
+
+/// One NAT-matrix row from `meridian doctor --json`'s output — mirrors `apps/cli/src/doctor.rs`'s own
+/// per-cell JSON object shape (`nat`/`host`/`srflx`/`relay`/`path`) field-for-field, since this is
+/// literally that binary's own output parsed back, not a redesigned shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorCell {
+    pub nat: String,
+    pub host: bool,
+    pub srflx: bool,
+    pub relay: bool,
+    pub path: String,
+}
+
+/// The full parsed report — one [`DoctorCell`] per NAT scenario `meridian doctor --json` printed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DoctorReport {
+    pub cells: Vec<DoctorCell>,
+}
+
+/// [`Effect::RunDoctor`]'s payload — same request/outcome shape as [`GenerateAccountEffect`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunDoctorEffect {
+    pub request: RunDoctorRequest,
+    pub outcome: Option<DoctorReport>,
+}
+
 /// The only path from `update` to the network, the keystore, or disk. A worker task executes these
 /// and reports the outcome back as [`WorkerEvent`] / [`AppEvent::Worker`], so a slow rendezvous can
 /// never freeze the UI. `FetchBundle` is still a placeholder (no task needs it yet);
@@ -660,7 +705,8 @@ pub struct SaveSettingEffect {
 /// `MarkVerified`/`AcknowledgeKeyChange` are the verify screen's (task 4.22) two new ones —
 /// `SetUserBlocked` is reused as-is for that screen's own block action — see
 /// [`MarkVerifiedEffect`]/[`AcknowledgeKeyChangeEffect`]; `SaveSetting` is the settings screen's
-/// (task 4.24) one new one — see [`SaveSettingEffect`].
+/// (task 4.24) one new one — see [`SaveSettingEffect`]; `RunDoctor` is the diagnostics screen's (task
+/// 4.25) one new one — see [`RunDoctorEffect`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     SendMessage(SendMessageEffect),
@@ -681,6 +727,7 @@ pub enum Effect {
     MarkVerified(MarkVerifiedEffect),
     AcknowledgeKeyChange(AcknowledgeKeyChangeEffect),
     SaveSetting(SaveSettingEffect),
+    RunDoctor(RunDoctorEffect),
 }
 
 /// The outcome of a worker task executing an [`Effect`], reported back as [`AppEvent::Worker`].
@@ -790,20 +837,41 @@ pub enum Screen {
     /// A form over `config.toml`'s fields — see [`crate::screens::settings`]. Boxed for the same
     /// `clippy::large_enum_variant` reason as the other large variants above.
     ///
-    /// **"Reached from the command palette" (tui-client.md §2), not yet wired**: like every other
-    /// screen in this crate before its own navigation-integration task, `PaletteRegistry::
-    /// find_binding` is not yet called from [`App::handle_key`] at all (deferred to task 4.25 — see
-    /// tasks 4.18/4.23's own findings), so there is no live keybinding that pushes this screen
-    /// today. This variant exists fully wired (`handle_key`/`handle_worker`/`render` all dispatch to
-    /// it below) and independently reachable via [`App::push_screen`], exactly like
-    /// [`Screen::Verify`] before its own navigation task.
+    /// **"Reached from the command palette" (tui-client.md §2), still not wired — a deliberate,
+    /// documented scope boundary of task 4.25, not an oversight.** Task 4.25 wires
+    /// `PaletteRegistry::find_binding` into [`App::handle_key`] (see that method's own doc comment)
+    /// and gives the palette ([`Screen::Palette`]) a real, generic dispatch path
+    /// (`App::dispatch_palette_action`) for any *registered* command — but registering a working
+    /// "open Settings" command would need a real, already-loaded [`crate::config::TuiConfig`]/
+    /// `config_path` to construct a [`SettingsState`] from, and `App` has no live config anywhere
+    /// yet (the same `Preflight`-shaped gap [`Screen::Unlock`]/[`Screen::Contacts`]/[`Screen::Chat`]
+    /// all flag in their own doc comments — task 4.25 is a discoverability task, not the task that
+    /// threads a real config into `App`). This variant exists fully wired
+    /// (`handle_key`/`handle_worker`/`render` all dispatch to it below) and independently reachable
+    /// via [`App::push_screen`], exactly like [`Screen::Verify`] before its own navigation task; only
+    /// the palette-registration step is left for whichever future task gives `App` that real config.
     Settings(Box<SettingsState>),
+    /// The generated help overlay (task 4.25) — `F1`, built from a snapshot of
+    /// [`App`]'s registered [`crate::surface::PaletteRegistry`] taken at push time. See
+    /// [`crate::screens::help`]'s module doc for why the snapshot (not a live reference) and why one
+    /// small section of its content is deliberately hand-written rather than generated.
+    Help(Box<HelpState>),
+    /// The fuzzy command palette (task 4.25) — `Ctrl+K`, same registry-snapshot construction as
+    /// [`Screen::Help`]. A dedicated `Screen` variant, **not** a [`Screen::Extension`] pane, because
+    /// it needs [`App::push_screen`] access to dispatch a selected command's
+    /// [`crate::surface::PaletteAction::PushPane`] — which
+    /// [`crate::surface::ExtensionPane::handle_key`]'s `Vec<Effect>`-only return cannot reach. See
+    /// [`crate::screens::palette`]'s module doc for the full reasoning.
+    Palette(Box<PaletteState>),
     /// A feature-registered pane or screen (task 4.18, `docs/architecture/tui-client.md §8`) —
     /// e.g. a transfer list (T09) or a call status panel (T10). This is the **one** `Screen`
     /// variant every future feature's pane reaches the stack through: a feature implements
     /// [`crate::surface::ExtensionPane`] and pushes `Screen::Extension(Box::new(pane))` (typically
     /// via a [`crate::surface::PaletteAction::PushPane`] factory), so adding a new feature's pane
-    /// never means adding a new `Screen` variant here.
+    /// never means adding a new `Screen` variant here. Task 4.25's own
+    /// [`crate::screens::diagnostics::DiagnosticsPane`] is the first real (non-test) consumer of this
+    /// mechanism, registered into `App::new`'s built-in [`crate::surface::PaletteRegistry`] exactly
+    /// like a future third-party feature's pane would be.
     Extension(Box<dyn crate::surface::ExtensionPane>),
 }
 
@@ -824,9 +892,31 @@ impl fmt::Debug for Screen {
             Screen::Requests(state) => f.debug_tuple("Requests").field(state).finish(),
             Screen::Verify(state) => f.debug_tuple("Verify").field(state).finish(),
             Screen::Settings(state) => f.debug_tuple("Settings").field(state).finish(),
+            Screen::Help(state) => f.debug_tuple("Help").field(state).finish(),
+            Screen::Palette(state) => f.debug_tuple("Palette").field(state).finish(),
             Screen::Extension(pane) => f.debug_tuple("Extension").field(&pane.title()).finish(),
         }
     }
+}
+
+/// Registers this crate's own built-in [`crate::surface::PaletteCommand`]s into `surface` — the same
+/// mechanism a future third-party feature would use (`crate::surface::SurfaceRegistry::
+/// register_command`), applied here to this task's own `Diagnostics` screen. `App::new` is the only
+/// caller. Deliberately a free function (not inlined into `App::new`) so it reads as one clearly-
+/// bounded registration step, mirroring how `crate::surface`'s own doc frames registration as the one
+/// thing a feature does, never a core edit.
+fn register_builtin_commands(surface: &mut SurfaceRegistry) {
+    surface.register_command(PaletteCommand {
+        id: "nav.diagnostics",
+        name: "Diagnostics",
+        description: "connection/transport/relay-policy diagnostics (wraps `meridian doctor`)",
+        // No direct keybinding — tui-client.md §2's screen table names only "palette → Diagnostics"
+        // for this screen, no global chord.
+        keybinding: None,
+        action: PaletteAction::PushPane(Arc::new(|| {
+            Box::new(DiagnosticsPane::new()) as Box<dyn ExtensionPane>
+        })),
+    });
 }
 
 /// Owns all application state. Constructed once by the runtime; `update` and `render` are the only
@@ -835,6 +925,13 @@ impl fmt::Debug for Screen {
 pub struct App {
     screens: Vec<Screen>,
     should_quit: bool,
+    /// The registered [`crate::surface::PaletteCommand`] set this run started with (task 4.25) —
+    /// seeded by [`register_builtin_commands`], extended by nothing else yet (no other feature
+    /// registers into a live `App` today; see [`App::commands`]'s own doc comment). Read by
+    /// [`App::handle_key`]'s global `PaletteRegistry::find_binding` dispatch step and by
+    /// [`Screen::Help`]/[`Screen::Palette`]'s own construction (a snapshot taken at push time, not a
+    /// live reference — see those screens' module docs).
+    surface: SurfaceRegistry,
 }
 
 impl Default for App {
@@ -851,9 +948,12 @@ impl App {
     /// Unlock` itself exists and is fully wired (task 4.17); only the decision to construct and
     /// push it here is missing.
     pub fn new() -> Self {
+        let mut surface = SurfaceRegistry::new();
+        register_builtin_commands(&mut surface);
         Self {
             screens: vec![Screen::Onboarding(Box::default())],
             should_quit: false,
+            surface,
         }
     }
 
@@ -861,6 +961,17 @@ impl App {
     /// restore the terminal.
     pub fn should_quit(&self) -> bool {
         self.should_quit
+    }
+
+    /// The registered command set this run started with. `pub` so a test (or, in the future, a
+    /// startup routine that wants to confirm what shipped built in) can inspect it without reaching
+    /// into `App`'s private fields. **Not** a general "register a command into this running `App`"
+    /// seam — no caller outside this module does that today (every command `App` knows about comes
+    /// from [`register_builtin_commands`] at construction time); a future task that lets a live
+    /// feature extend a running `App`'s registry can add a `&mut` accessor then, when something
+    /// actually needs it.
+    pub fn commands(&self) -> &crate::surface::PaletteRegistry {
+        self.surface.commands()
     }
 
     /// The screen currently on top of the stack.
@@ -915,6 +1026,51 @@ impl App {
                 self.push_screen(Screen::Requests(Box::new(RequestsState::new(Vec::new()))));
             }
             return Vec::new();
+        }
+
+        // Global, regardless of screen (task 4.25, tui-client.md §3's "Global" row): `F1` opens the
+        // generated help overlay. Joins `Ctrl+Q`/`Ctrl+R` above at the same unconditional tier —
+        // reachable mid-onboarding, mid-edit, from any sub-mode, exactly like those two already are.
+        // Idempotent (a no-op if `Screen::Help` is already on top), same discipline as `Ctrl+R`.
+        if key.code == KeyCode::F(1) {
+            if !matches!(self.current_screen(), Screen::Help(_)) {
+                self.push_screen(Screen::Help(Box::new(HelpState::new(
+                    self.surface.commands().clone(),
+                ))));
+            }
+            return Vec::new();
+        }
+
+        // Global, regardless of screen: `Ctrl+K` opens the fuzzy command palette. Same tier and
+        // idempotency discipline as `F1` above.
+        if key.code == KeyCode::Char('k') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if !matches!(self.current_screen(), Screen::Palette(_)) {
+                self.push_screen(Screen::Palette(Box::new(PaletteState::new(
+                    self.surface.commands().clone(),
+                ))));
+            }
+            return Vec::new();
+        }
+
+        // The addendum's own "real, non-optional scope": any *registered* command's keybinding fires
+        // globally, without opening the palette — `crate::surface::PaletteRegistry::find_binding`'s
+        // own doc comment names this exact dispatch step as orphaned before this task. Checked last
+        // among the global, unconditional checks (after the four fixed chords above, which are never
+        // themselves registrable commands) but still strictly before any screen-specific handling
+        // below — so a registered global binding always wins over whatever a screen might otherwise
+        // do with that same chord, the same precedence `Ctrl+Q`/`Ctrl+R` already have. This is a
+        // deliberate, accepted trade (documented, not a bug): a future feature that registers a
+        // keybinding is responsible for choosing one that doesn't collide with a screen's own
+        // meaningfully-used local keys, exactly the same responsibility `Ctrl+Q`/`Ctrl+R` already
+        // implicitly placed on every screen's own key handling before this task. `find_binding`
+        // returns `None` for the overwhelming majority of keys — ordinary typing, screen-local
+        // navigation — so this never intercepts a key with no matching registration; see
+        // `App::dispatch_palette_action`'s own doc comment for what happens once one *does* match, and
+        // `#[cfg(test)] mod tests` below (`a_registered_global_binding_intercepts_before_any_screens_
+        // own_use_of_the_same_key`) for the ordering pinned end to end.
+        if let Some(command) = self.surface.commands().find_binding(&key) {
+            let action = command.action.clone();
+            return self.dispatch_palette_action(action);
         }
 
         match self.screens.last_mut() {
@@ -1052,6 +1208,34 @@ impl App {
                 }
                 effects
             }
+            Some(Screen::Help(state)) => {
+                // `help::handle_key` has nothing to do beyond `Esc` — see that module's doc.
+                let (effects, exit) = help::handle_key(state, key);
+                if exit {
+                    self.pop_screen();
+                }
+                effects
+            }
+            Some(Screen::Palette(state)) => {
+                // `palette::handle_key` never dispatches anything itself — it reports what to do via
+                // `PaletteOutcome` (see that module's own doc for why: it has no `push_screen`
+                // access). Selecting a command always closes the palette, whether or not the action
+                // it names was actually a screen push.
+                let (effects, outcome) = palette::handle_key(state, key);
+                match outcome {
+                    PaletteOutcome::Close => {
+                        self.pop_screen();
+                        effects
+                    }
+                    PaletteOutcome::Run(action) => {
+                        self.pop_screen();
+                        let mut dispatched = self.dispatch_palette_action(action);
+                        dispatched.extend(effects);
+                        dispatched
+                    }
+                    PaletteOutcome::None => effects,
+                }
+            }
             Some(Screen::Extension(pane)) => {
                 // `Esc` always means "back" (tui-client.md §3) and is handled generically here,
                 // exactly like the catch-all arm below — an extension pane never sees an `Esc`
@@ -1074,10 +1258,50 @@ impl App {
         }
     }
 
+    /// Turns a selected/triggered [`PaletteAction`] into what `App` actually does — the one place
+    /// that runs a [`PaletteAction`], shared by [`App::handle_key`]'s global `find_binding` dispatch
+    /// step and the `Screen::Palette` arm's own `PaletteOutcome::Run` handling above, so the two
+    /// dispatch paths (fire a binding directly vs. select it from the palette UI) can never diverge in
+    /// what triggering a given command actually does.
+    ///
+    /// **Review fix (task 4.25, Finding 1): `PushPane` is idempotent, same discipline as the `F1`/
+    /// `Ctrl+K`/`Ctrl+R` checks in [`App::handle_key`] above.** Without a guard, repeatedly dispatching
+    /// the same palette command (e.g. `Ctrl+K` → `Enter` on `nav.diagnostics` fired several times with
+    /// no `Esc` in between — reachable through ordinary use: re-opening the palette and re-selecting
+    /// the same entry, or a terminal's key-repeat firing several `Enter`s) would push a fresh
+    /// `Screen::Extension` on top every single time, stacking unboundedly (`pop_screen`/`push_screen`
+    /// have no depth limit) and forcing the user to `Esc` once per accumulated layer to get back to the
+    /// root. [`ExtensionPane`] carries no factory/command identity to compare against (unlike
+    /// `Screen::Help`/`Screen::Palette`, which are distinguished by `Screen` variant alone), so this
+    /// builds the candidate pane first and compares its [`ExtensionPane::title`] against the topmost
+    /// screen's, mirroring the other three checks' "already on this exact screen" test as closely as
+    /// this trait's surface allows — the guard is therefore keyed on pane identity (title), not on
+    /// which registered command produced it, so two distinct commands that happened to build
+    /// same-titled panes would also be treated as "the same pane"; no built-in command collides on
+    /// title today.
+    fn dispatch_palette_action(&mut self, action: PaletteAction) -> Vec<Effect> {
+        match action {
+            PaletteAction::Effect(effect) => vec![*effect],
+            PaletteAction::PushPane(factory) => {
+                let pane = factory();
+                let already_open = matches!(
+                    self.current_screen(),
+                    Screen::Extension(current) if current.title() == pane.title()
+                );
+                if !already_open {
+                    self.push_screen(Screen::Extension(pane));
+                }
+                Vec::new()
+            }
+        }
+    }
+
     fn handle_worker(&mut self, event: WorkerEvent) -> Vec<Effect> {
         match self.screens.last_mut() {
             Some(Screen::Onboarding(state)) => onboarding::handle_worker(state, event),
             Some(Screen::Extension(pane)) => pane.handle_worker(event),
+            Some(Screen::Help(state)) => help::handle_worker(state, event),
+            Some(Screen::Palette(state)) => palette::handle_worker(state, event),
             Some(Screen::Unlock(state)) => {
                 let (effects, finished) = unlock::handle_worker(state, event);
                 if finished {
@@ -1143,6 +1367,8 @@ impl App {
             Screen::Requests(state) => requests::render(state, frame),
             Screen::Verify(state) => verify::render(state, frame),
             Screen::Settings(state) => settings::render(state, frame),
+            Screen::Help(state) => help::render(state, frame),
+            Screen::Palette(state) => palette::render(state, frame),
             Screen::Extension(pane) => pane.render(frame),
             Screen::Placeholder => render_placeholder(frame),
         }
@@ -1469,6 +1695,292 @@ mod tests {
         app.push_screen(Screen::Requests(Box::new(
             crate::screens::requests::RequestsState::new(Vec::new()),
         )));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+    }
+
+    // -----------------------------------------------------------------------
+    // Help / Palette / global dispatch wiring (task 4.25) — the App-level plumbing
+    // `apps/tui/tests/screens_help_palette.rs` doesn't cover, since that file drives
+    // `crate::screens::help`/`crate::screens::palette` directly and only exercises `App`'s *built-in*
+    // registered set (never a synthetic keybinding — `App` has no public seam to inject one). The
+    // ordering-regression coverage below needs private `App` access this external test file doesn't
+    // have, via the `#[cfg(test)]`-only `register_test_command` seam just below.
+    // -----------------------------------------------------------------------
+
+    impl App {
+        /// Test-only seam for exercising [`App::handle_key`]'s global `PaletteRegistry::find_binding`
+        /// dispatch step against a synthetic command with a real keybinding.
+        /// [`register_builtin_commands`] deliberately ships no keybinding-bearing command yet
+        /// (`Diagnostics` is palette-only, per tui-client.md's own screen table), so this is the only
+        /// way to prove the *mechanism* fires correctly without waiting for a real future feature to
+        /// register one. `#[cfg(test)]`-gated: no public API surface added for production callers.
+        fn register_test_command(&mut self, command: PaletteCommand) {
+            self.surface.register_command(command);
+        }
+    }
+
+    #[test]
+    fn f1_opens_help_and_is_idempotent() {
+        let mut app = App::new();
+        let effects = app.update(AppEvent::Key(key(KeyCode::F(1), KeyModifiers::NONE)));
+        assert!(effects.is_empty());
+        assert!(matches!(app.current_screen(), Screen::Help(_)));
+        assert_eq!(app.screens.len(), 2);
+
+        app.update(AppEvent::Key(key(KeyCode::F(1), KeyModifiers::NONE)));
+        assert_eq!(
+            app.screens.len(),
+            2,
+            "F1 while already on Help must not stack a duplicate"
+        );
+    }
+
+    #[test]
+    fn esc_from_help_pops_back() {
+        let mut app = App::new();
+        app.update(AppEvent::Key(key(KeyCode::F(1), KeyModifiers::NONE)));
+        assert!(matches!(app.current_screen(), Screen::Help(_)));
+        app.update(AppEvent::Key(key(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(matches!(app.current_screen(), Screen::Onboarding(_)));
+    }
+
+    #[test]
+    fn ctrl_k_opens_palette_and_is_idempotent() {
+        let mut app = App::new();
+        let effects = app.update(AppEvent::Key(key(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(effects.is_empty());
+        assert!(matches!(app.current_screen(), Screen::Palette(_)));
+        assert_eq!(app.screens.len(), 2);
+
+        app.update(AppEvent::Key(key(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+        )));
+        assert_eq!(
+            app.screens.len(),
+            2,
+            "Ctrl+K while already on Palette must not stack a duplicate"
+        );
+    }
+
+    #[test]
+    fn plain_k_does_not_open_the_palette() {
+        let mut app = App::new();
+        app.update(AppEvent::Key(key(KeyCode::Char('k'), KeyModifiers::NONE)));
+        assert!(!matches!(app.current_screen(), Screen::Palette(_)));
+    }
+
+    #[test]
+    fn esc_from_palette_pops_back_without_dispatching_anything() {
+        let mut app = App::new();
+        app.update(AppEvent::Key(key(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+        )));
+        let effects = app.update(AppEvent::Key(key(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(effects.is_empty());
+        assert!(matches!(app.current_screen(), Screen::Onboarding(_)));
+    }
+
+    /// The built-in `Diagnostics` command (registered by `register_builtin_commands`) must be
+    /// reachable end to end: `Ctrl+K` opens the palette showing it, `Enter` selects the only entry
+    /// and dispatches its `PaletteAction::PushPane`, landing on `Screen::Extension` (the
+    /// `DiagnosticsPane`) with the palette itself closed.
+    #[test]
+    fn built_in_diagnostics_command_is_reachable_end_to_end_from_the_palette() {
+        let mut app = App::new();
+        assert_eq!(
+            app.commands().iter().count(),
+            1,
+            "exactly the built-in Diagnostics command"
+        );
+
+        app.update(AppEvent::Key(key(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(matches!(app.current_screen(), Screen::Palette(_)));
+
+        let effects = app.update(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(effects.is_empty(), "PushPane dispatches no worker Effect");
+        assert!(matches!(app.current_screen(), Screen::Extension(_)));
+        // The palette itself is gone, not left underneath as a second stacked screen.
+        assert_eq!(app.screens.len(), 2);
+
+        // The pane pops on Esc like any other extension pane, back to the root.
+        app.update(AppEvent::Key(key(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(matches!(app.current_screen(), Screen::Onboarding(_)));
+    }
+
+    /// Review fix (task 4.25, Finding 1): repeated dispatch of the same palette command must not
+    /// stack duplicate `Screen::Extension` panes. Drives `Ctrl+K` → `Enter` on the built-in
+    /// `Diagnostics` command twice in a row with no `Esc` in between — reproducing "re-open the
+    /// palette and re-select the same entry" (or a terminal's key-repeat firing several `Enter`s) —
+    /// and asserts the screen stack is the same shape/depth after the second dispatch as after the
+    /// first.
+    #[test]
+    fn repeated_palette_dispatch_of_the_same_command_does_not_stack_duplicate_panes() {
+        let mut app = App::new();
+
+        // First round: Ctrl+K, Enter → lands on Screen::Extension, palette closed.
+        app.update(AppEvent::Key(key(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+        )));
+        app.update(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(matches!(app.current_screen(), Screen::Extension(_)));
+        assert_eq!(app.screens.len(), 2);
+
+        // Second round, no Esc in between: re-open the palette and re-select the same entry.
+        app.update(AppEvent::Key(key(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+        )));
+        let effects = app.update(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(effects.is_empty());
+        assert!(matches!(app.current_screen(), Screen::Extension(_)));
+        assert_eq!(
+            app.screens.len(),
+            2,
+            "re-selecting the same palette command must not stack a second Extension pane"
+        );
+
+        // A single Esc returns all the way to the root — proof there was only ever one layer.
+        app.update(AppEvent::Key(key(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(matches!(app.current_screen(), Screen::Onboarding(_)));
+    }
+
+    /// `Ctrl+Q` and `Ctrl+R` (pre-existing global keys) must keep working unchanged now that `F1`,
+    /// `Ctrl+K`, and the `find_binding` dispatch step sit alongside them — this is the ordering
+    /// regression the task's own constraints call out by name. (`ctrl_q_sets_should_quit_and_emits_
+    /// no_effects`/`ctrl_r_pushes_the_requests_screen_from_anywhere_and_is_idempotent` above already
+    /// re-run unmodified as part of this same test module, since this task's new checks were inserted
+    /// *after* both existing ones, not reordered ahead of them; this test additionally proves the two
+    /// still work with a *registered* command present, in case a registration ever shadowed them.)
+    #[test]
+    fn ctrl_q_and_ctrl_r_still_work_with_a_registered_command_present() {
+        let mut app = App::new();
+        app.register_test_command(PaletteCommand {
+            id: "test.unrelated",
+            name: "Unrelated",
+            description: "synthetic, bound to a key nothing else uses",
+            keybinding: Some(crate::surface::KeyBinding::new(
+                KeyCode::Char('z'),
+                KeyModifiers::CONTROL,
+            )),
+            action: PaletteAction::Effect(Box::new(Effect::FetchBundle)),
+        });
+
+        app.update(AppEvent::Key(key(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(matches!(app.current_screen(), Screen::Requests(_)));
+
+        let effects = app.update(AppEvent::Key(key(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(effects.is_empty());
+        assert!(app.should_quit());
+    }
+
+    /// The addendum's core ask: a registered command's keybinding fires globally — the effect it
+    /// names is returned directly from `update`, without opening the palette at all.
+    #[test]
+    fn find_binding_fires_a_registered_commands_effect_without_opening_the_palette() {
+        let mut app = App::new();
+        app.register_test_command(PaletteCommand {
+            id: "test.ping",
+            name: "Ping",
+            description: "synthetic",
+            keybinding: Some(crate::surface::KeyBinding::new(
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            )),
+            action: PaletteAction::Effect(Box::new(Effect::FetchBundle)),
+        });
+
+        let effects = app.update(AppEvent::Key(key(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        )));
+        assert_eq!(effects, vec![Effect::FetchBundle]);
+        // No palette was opened — still on the root screen.
+        assert!(matches!(app.current_screen(), Screen::Onboarding(_)));
+        assert_eq!(app.screens.len(), 1);
+    }
+
+    /// The documented, accepted precedence: a registered global binding intercepts *before* a
+    /// screen's own use of the identical chord — here, plain `j` (Settings' "move selection down"
+    /// vim binding). Not a bug: `App::handle_key`'s own doc comment names this ordering explicitly, as
+    /// does `crate::surface::PaletteRegistry::find_binding`'s. A real future feature registering a
+    /// binding is responsible for avoiding a collision like this one if it wants both to work.
+    #[test]
+    fn a_registered_global_binding_intercepts_before_a_screens_own_use_of_the_same_key() {
+        let mut app = App::new();
+        app.register_test_command(PaletteCommand {
+            id: "test.intercept",
+            name: "Test intercept",
+            description: "synthetic, deliberately colliding with Settings' own 'j' binding",
+            keybinding: Some(crate::surface::KeyBinding::new(
+                KeyCode::Char('j'),
+                KeyModifiers::NONE,
+            )),
+            action: PaletteAction::Effect(Box::new(Effect::FetchBundle)),
+        });
+        *app.screens.last_mut().unwrap() = Screen::Settings(Box::new(SettingsState::new(
+            crate::config::TuiConfig::default(),
+            std::path::PathBuf::from("/nonexistent/config.toml"),
+        )));
+
+        let effects = app.update(AppEvent::Key(key(KeyCode::Char('j'), KeyModifiers::NONE)));
+        assert_eq!(effects, vec![Effect::FetchBundle]);
+        match app.current_screen() {
+            // Settings' own selection cursor did not move — it would have, absent the interception.
+            Screen::Settings(state) => assert_eq!(state.selected, 0),
+            other => panic!("expected Settings, got {other:?}"),
+        }
+    }
+
+    /// The mirror image of the previous test: with **no** registration on a given chord,
+    /// `find_binding` returns `None` and every screen's own key handling is completely unaffected —
+    /// the property that makes the new global check safe to run unconditionally ahead of every
+    /// screen's own match arm.
+    #[test]
+    fn an_unregistered_key_reaches_screen_specific_handling_normally() {
+        let mut app = App::new();
+        *app.screens.last_mut().unwrap() = Screen::Settings(Box::new(SettingsState::new(
+            crate::config::TuiConfig::default(),
+            std::path::PathBuf::from("/nonexistent/config.toml"),
+        )));
+
+        app.update(AppEvent::Key(key(KeyCode::Char('j'), KeyModifiers::NONE)));
+        match app.current_screen() {
+            Screen::Settings(state) => assert_eq!(state.selected, 1, "moved down normally"),
+            other => panic!("expected Settings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_help_and_palette_screens_work_against_test_backend() {
+        let mut app = App::new();
+        app.push_screen(Screen::Help(Box::new(HelpState::new(
+            app.commands().clone(),
+        ))));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+
+        let mut app = App::new();
+        app.push_screen(Screen::Palette(Box::new(PaletteState::new(
+            app.commands().clone(),
+        ))));
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test backend");
         terminal.draw(|frame| app.render(frame)).expect("draw");

@@ -35,6 +35,7 @@ pub mod app;
 pub mod config;
 pub mod config_write;
 pub mod screens;
+pub mod statusbar;
 pub mod store;
 pub mod surface;
 pub mod terminal;

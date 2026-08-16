@@ -8,7 +8,10 @@
 pub mod chat;
 pub mod contact_detail;
 pub mod contacts;
+pub mod diagnostics;
+pub mod help;
 pub mod onboarding;
+pub mod palette;
 pub mod requests;
 pub mod settings;
 pub mod unlock;
