@@ -7,11 +7,11 @@
 //! gap-closure tasks (4.31–4.34) extend the same `match` with their own groups rather than inlining
 //! everything into one growing function.
 //!
-//! Every [`Effect`] variant this module does not yet own (contacts/trust/settings/chat/…) falls
-//! through `dispatch`'s final arm, which preserves this crate's original task-4.11 placeholder
-//! behavior — echoing the effect straight back as [`WorkerEvent::Completed`] — so screens whose real
-//! execution hasn't landed yet keep behaving exactly as they did before this task, out of this
-//! task's scope per its own task file.
+//! Every [`Effect`] variant this module does not yet own (chat/settings/…) falls through
+//! `dispatch`'s final arm, which preserves this crate's original task-4.11 placeholder behavior —
+//! echoing the effect straight back as [`WorkerEvent::Completed`] — so screens whose real execution
+//! hasn't landed yet keep behaving exactly as they did before this task, out of this task's scope
+//! per its own task file.
 //!
 //! Mirrors `apps/cli/src/main.rs::cmd_new`/`cmd_register`'s exact call sequence
 //! (`generate_account` → `AccountDescriptor::save`; `SignalingClient::connect` →
@@ -28,10 +28,13 @@ use meridian_core::signaling::SignalingClient;
 use meridian_core::trust::{Contact, PinnedKey, TrustState, TrustStore};
 
 use crate::app::{
-    AddContactEffect, AddContactRequest, AddedContact, DeleteContactEffect, DeleteContactRequest,
-    Effect, GenerateAccountEffect, GenerateAccountRequest, GeneratedAccount, ImportContactQrEffect,
-    ImportContactQrRequest, LoadSessionEffect, LoadSessionOutcome, PublishBundleEffect,
-    PublishedBundle, RegisterRequest, SessionOutcome, SetPetnameEffect, SetPetnameRequest,
+    AcceptRequestEffect, AcceptRequestRequest, AcknowledgeKeyChangeEffect,
+    AcknowledgeKeyChangeRequest, AddContactEffect, AddContactRequest, AddedContact,
+    DeleteContactEffect, DeleteContactRequest, Effect, GenerateAccountEffect,
+    GenerateAccountRequest, GeneratedAccount, ImportContactQrEffect, ImportContactQrRequest,
+    LoadSessionEffect, LoadSessionOutcome, MarkVerifiedEffect, MarkVerifiedRequest,
+    PublishBundleEffect, PublishedBundle, RegisterRequest, RejectRequestEffect,
+    RejectRequestRequest, SessionOutcome, SetPetnameEffect, SetPetnameRequest,
     SetPolicyOverrideEffect, SetPolicyOverrideRequest, SetUserBlockedEffect, SetUserBlockedRequest,
     StoreChoice, UnlockEffect, UnlockRequest, WorkerEvent,
 };
@@ -156,9 +159,14 @@ pub async fn dispatch(effect: Effect, session: &mut OnboardingSession) -> Worker
         Effect::SetUserBlocked(effect) => handle_set_user_blocked(effect).await,
         Effect::SetPolicyOverride(effect) => handle_set_policy_override(effect).await,
         Effect::DeleteContact(effect) => handle_delete_contact(effect).await,
-        // Not this task's scope (trust/requests/chat/settings/diagnostics/… — see later
-        // gap-closure tasks 4.32-4.34). Preserves task 4.11's original placeholder behavior so
-        // screens whose real execution hasn't landed yet are unaffected by this change.
+        // Task 4.32: message-request-queue / verify-screen trust persistence.
+        Effect::AcceptRequest(effect) => handle_accept_request(effect).await,
+        Effect::RejectRequest(effect) => handle_reject_request(effect).await,
+        Effect::MarkVerified(effect) => handle_mark_verified(effect).await,
+        Effect::AcknowledgeKeyChange(effect) => handle_acknowledge_key_change(effect).await,
+        // Not this task's scope (chat/settings/diagnostics/… — see later gap-closure tasks
+        // 4.33-4.34). Preserves task 4.11's original placeholder behavior so screens whose real
+        // execution hasn't landed yet are unaffected by this change.
         other => WorkerEvent::Completed(other),
     }
 }
@@ -828,6 +836,239 @@ fn run_delete_contact(request: &DeleteContactRequest) -> Result<(), String> {
     let pubkey_hex = hex::encode(request.pubkey);
     doc.contacts.retain(|c| c.pubkey != pubkey_hex);
     crate::store::contacts::save(&doc, store.as_ref(), &handle).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Message-request queue / verify-screen trust persistence (task 4.32)
+//
+// Every handler below shares the shape this task's own file names: the screen has already computed
+// the answer, synchronously, in-memory (`crate::screens::requests`'s confirm step;
+// `crate::screens::verify::apply_action`) — these handlers exist purely to make that already-decided
+// answer durable. None of them re-derives or second-guesses the decision: `run_mark_verified`/
+// `run_acknowledge_key_change` propagate `TrustStore`'s own `Result` faithfully (including
+// `TrustError::NotAcknowledgeable`) rather than treating a refusal as success, and
+// `run_accept_request`/`run_reject_request` replay `ChatState::accept_request`/`reject_request`
+// exactly as `apps/cli/src/chat.rs::answer_request` does — same calls, same order, just reloaded
+// fresh from disk and resealed rather than applied to an already-open in-memory value. Only
+// `trust.bin`/`sessions.bin` are touched here — never `contacts.json` (this task's own scope note;
+// `crate::screens::requests`'s and `crate::screens::verify`'s own module docs name no
+// `contacts.json` interaction for any of these four effects, unlike `handle_add_contact`/
+// `handle_set_petname` above).
+// ---------------------------------------------------------------------------
+
+// --- AcceptRequest -------------------------------------------------------------------------------
+
+async fn handle_accept_request(effect: AcceptRequestEffect) -> WorkerEvent {
+    let AcceptRequestEffect { request, .. } = effect;
+    match run_accept_request(&request) {
+        Ok(()) => WorkerEvent::Completed(Effect::AcceptRequest(AcceptRequestEffect {
+            request,
+            outcome: Some(()),
+        })),
+        Err(message) => WorkerEvent::Failed(
+            Effect::AcceptRequest(AcceptRequestEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Mirrors `apps/cli/src/chat.rs::answer_request`'s accept branch exactly, and in the same order
+/// (task 4.7's own fix, named again by [`AcceptRequestRequest`]'s own doc comment in `crate::app`):
+/// `ChatState::accept_request(sender_ik)` first — resealing `sessions.bin` immediately — and only
+/// *then* `TrustStore::observe(sender_ik, "", now_unix())` to TOFU-pin the sender, resealing
+/// `trust.bin` separately. The empty hint mirrors `AcceptRequestRequest`'s own doc comment exactly:
+/// `MessageRequest` carries no advisory hint for this worker to pass through.
+///
+/// If `accept_request` finds no pending request for `sender_ik` (e.g. this effect is a stale retry
+/// of one that already completed), that mirrors `answer_request`'s own `if let Some(req) = ...`
+/// guard: nothing to accept, so `TrustStore::observe` is never reached either — no unrelated pin
+/// created for a decision that was never actually made against a real pending request.
+///
+/// **Review fix (partial-failure idempotency):** this writes two separate sealed files
+/// (`sessions.bin` then `trust.bin`), not one atomic transaction. If `save_chat` above succeeds but
+/// the pin step's own `save_trust` then fails (disk I/O error, permission change, …), the whole
+/// function still returns `Err` and the UI can retry the identical effect — but on that retry
+/// `chat.accept_request(sender_ik)` now returns `None` (already removed from `pending_requests` by
+/// the first, partially-successful attempt), so a naive `if accepted { … }` guard would skip the pin
+/// forever, leaving a live, delivering session with no `TrustStore` record at all. The correct signal
+/// for "does this sender still need pinning" is not "did `accept_request` just now return `Some`" but
+/// "does `TrustStore` already have a `Contact` record for `sender_ik`" — so the pin step also runs on
+/// a retry that finds the trust side still outstanding (`trust.contact(sender_ik).is_none()`).
+///
+/// That signal alone is not quite sufficient, though: a **phantom** `sender_ik` that was never
+/// accepted at all (no pending request ever existed, so `chat.has_session` is also false) would
+/// equally read `accepted == false` and `trust.contact(..).is_none()` — indistinguishable from the
+/// genuine partial-failure retry by `trust.contact` alone, and pinning it would recreate exactly the
+/// "unrelated pin for a decision never actually made" bug this function's own doc comment (above)
+/// already guards against for that case. `chat.has_session(sender_ik)` disambiguates the two: it is
+/// true only once a request for `sender_ik` was genuinely accepted (accept never touches the session
+/// map — the crypto session was already established when the request was gated, well before
+/// `accept_request` ever runs — so it stays true across a same-effect retry), and false for a sender
+/// who was never accepted at all. So the pin step runs when **either** `accepted` is true (a genuine
+/// first-time accept), **or** the trust side is still outstanding for a sender who *was* genuinely
+/// accepted (`chat.has_session(sender_ik) && trust.contact(sender_ik).is_none()`) — a fully-completed
+/// retry (both saves already succeeded once) has an existing `Contact` record and takes no action, and
+/// a phantom/never-accepted sender has no session and likewise takes no action, exactly as today.
+fn run_accept_request(request: &AcceptRequestRequest) -> Result<(), String> {
+    let (store, handle) = open_account_store()?;
+
+    let mut chat = load_chat(store.as_ref(), &handle)?;
+    let accepted = chat.accept_request(&request.sender_ik).is_some();
+    let has_session = chat.has_session(&request.sender_ik);
+    save_chat(&chat, store.as_ref(), &handle)?;
+
+    let mut trust = load_trust(store.as_ref(), &handle)?;
+    let pin_still_owed = has_session && trust.contact(&request.sender_ik).is_none();
+    if accepted || pin_still_owed {
+        trust.observe(request.sender_ik, "", now_unix());
+        save_trust(&trust, store.as_ref(), &handle)?;
+    }
+    Ok(())
+}
+
+// --- RejectRequest -------------------------------------------------------------------------------
+
+async fn handle_reject_request(effect: RejectRequestEffect) -> WorkerEvent {
+    let RejectRequestEffect { request, .. } = effect;
+    match run_reject_request(&request) {
+        Ok(()) => WorkerEvent::Completed(Effect::RejectRequest(RejectRequestEffect {
+            request,
+            outcome: Some(()),
+        })),
+        Err(message) => WorkerEvent::Failed(
+            Effect::RejectRequest(RejectRequestEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Mirrors `apps/cli/src/chat.rs::answer_request`'s reject branch exactly:
+/// `ChatState::reject_request(sender_ik)` only — no `TrustStore` interaction of any kind, per
+/// [`RejectRequestRequest`]'s own doc comment ("leaves no trace"). `reject_request` discards both the
+/// held [`meridian_core::chat::MessageRequest`] *and* the already-established session behind it
+/// (ratchet/X3DH material zeroized), so once `sessions.bin` is resealed here, a fresh
+/// `TrustStore::open_at_rest`/`ChatState::open_at_rest` reload sees exactly the same state for
+/// `sender_ik` as if it had never been contacted at all — the property this task's own tests
+/// (`reject_leaves_no_trace_*` below) pin via a real before/after comparison, not just a successful
+/// return.
+fn run_reject_request(request: &RejectRequestRequest) -> Result<(), String> {
+    let (store, handle) = open_account_store()?;
+    let mut chat = load_chat(store.as_ref(), &handle)?;
+    chat.reject_request(&request.sender_ik);
+    save_chat(&chat, store.as_ref(), &handle)
+}
+
+// --- MarkVerified --------------------------------------------------------------------------------
+
+async fn handle_mark_verified(effect: MarkVerifiedEffect) -> WorkerEvent {
+    let MarkVerifiedEffect { request, .. } = effect;
+    match run_mark_verified(&request) {
+        Ok(()) => WorkerEvent::Completed(Effect::MarkVerified(MarkVerifiedEffect {
+            request,
+            outcome: Some(()),
+        })),
+        Err(message) => WorkerEvent::Failed(
+            Effect::MarkVerified(MarkVerifiedEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Replays `crate::screens::verify::apply_action`'s already-applied-in-memory
+/// [`TrustStore::mark_verified`] call against the real, persisted `trust.bin` — never re-deciding
+/// whether verification was warranted (that judgment call already happened, out of band, before the
+/// screen dispatched this effect). Faithfully propagates [`TrustError::UnknownContact`] (e.g. a
+/// concurrently-deleted contact) as a real [`WorkerEvent::Failed`], never swallowed into a silent
+/// success.
+fn run_mark_verified(request: &MarkVerifiedRequest) -> Result<(), String> {
+    let (store, handle) = open_account_store()?;
+    let mut trust = load_trust(store.as_ref(), &handle)?;
+    trust
+        .mark_verified(&request.pubkey)
+        .map_err(|e| e.to_string())?;
+    save_trust(&trust, store.as_ref(), &handle)
+}
+
+// --- AcknowledgeKeyChange -------------------------------------------------------------------------
+
+async fn handle_acknowledge_key_change(effect: AcknowledgeKeyChangeEffect) -> WorkerEvent {
+    let AcknowledgeKeyChangeEffect { request, .. } = effect;
+    match run_acknowledge_key_change(&request) {
+        Ok(()) => {
+            WorkerEvent::Completed(Effect::AcknowledgeKeyChange(AcknowledgeKeyChangeEffect {
+                request,
+                outcome: Some(()),
+            }))
+        }
+        Err(message) => WorkerEvent::Failed(
+            Effect::AcknowledgeKeyChange(AcknowledgeKeyChangeEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Replays `crate::screens::verify::apply_action`'s already-applied-in-memory
+/// [`TrustStore::acknowledge_key_change`] call against the real, persisted `trust.bin`. **Never
+/// softens [`TrustError::NotAcknowledgeable`]** — if the real, freshly-reloaded `trust.bin` disagrees
+/// with the screen's in-memory copy (the contact is not currently `PinnedKeyChanged`, most
+/// importantly because it is `Blocked`, or because `escalate_pinned_key_change` force-transitioned it
+/// to `Blocked` on this very call), that refusal is propagated verbatim as [`WorkerEvent::Failed`],
+/// exactly the "no bypass" invariant [`TrustStore::acknowledge_key_change`]'s own doc comment
+/// requires (tasks 4.4/4.23) — this worker has no authority to retry it as a `mark_verified` or any
+/// other weaker substitute.
+///
+/// **Review fix (persistence gap):** `TrustStore::acknowledge_key_change`'s own escalation branch
+/// mutates `contact.state` to [`TrustState::Blocked`] *and then* returns
+/// `Err(TrustError::NotAcknowledgeable)` — a real, in-memory state change riding along on an `Err`
+/// path. A naive `?` immediately after the call (as this function used to have) would propagate that
+/// `Err` before ever reaching [`save_trust`], silently discarding the force-block instead of sealing
+/// it into `trust.bin` — exactly the retroactive-escalation bypass that method's own doc comment says
+/// must never happen (a later plain acknowledge, with escalation off again, would still succeed and
+/// silently re-pin). So the real [`TrustState`] is snapshotted both before and after the call, and
+/// [`save_trust`] runs whenever it actually changed — on **either** outcome, not just `Ok` — while the
+/// already-covered "no mutation at all" case (a contact that is not `PinnedKeyChanged` and not under
+/// escalation, e.g. already `Verified`/`Pinned`) still takes no save at all: `trust.bin` stays
+/// byte-for-byte untouched, never even resealed-and-rewritten-identically.
+fn run_acknowledge_key_change(request: &AcknowledgeKeyChangeRequest) -> Result<(), String> {
+    let (store, handle) = open_account_store()?;
+    let mut trust = load_trust(store.as_ref(), &handle)?;
+    let state_before = trust.contact(&request.pubkey).map(|c| c.state);
+    let result = trust.acknowledge_key_change(&request.pubkey);
+    let state_after = trust.contact(&request.pubkey).map(|c| c.state);
+    if state_before != state_after {
+        save_trust(&trust, store.as_ref(), &handle)?;
+    }
+    result.map_err(|e| e.to_string())
+}
+
+/// Seals and writes `chat` to `sessions.bin` — mirrors [`save_trust`] (and
+/// `apps/cli/src/chat.rs::save_state`) exactly.
+fn save_chat(
+    chat: &CoreChatState,
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+) -> Result<(), String> {
+    let path = account::sessions_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+    }
+    let sealed = chat
+        .seal_at_rest(store, handle)
+        .map_err(|e| format!("sealing session store: {e}"))?;
+    std::fs::write(&path, sealed).map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
 // ---------------------------------------------------------------------------

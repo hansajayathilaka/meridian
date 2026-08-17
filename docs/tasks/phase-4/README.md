@@ -213,7 +213,7 @@ reopened) lives in each task file's own text plus the architect consult recorded
 - [x] **4.29** `Effect::LoadSession` + `LiveSession` assembly — [file](./4.29-load-session-live-session.md)
 - [x] **4.30** Real `run_worker`: account lifecycle — [file](./4.30-run-worker-account-lifecycle.md)
 - [x] **4.31** Real `run_worker`: contacts & contact-detail persistence — [file](./4.31-run-worker-contacts-persistence.md)
-- [ ] **4.32** Real `run_worker`: trust & request-queue persistence — [file](./4.32-run-worker-trust-request-persistence.md)
+- [x] **4.32** Real `run_worker`: trust & request-queue persistence — [file](./4.32-run-worker-trust-request-persistence.md)
 - [ ] **4.33** Real `run_worker`: outbound chat — [file](./4.33-run-worker-outbound-chat.md)
 - [ ] **4.34** Real `run_worker`: settings & diagnostics — [file](./4.34-run-worker-settings-diagnostics.md)
 - [ ] **4.35** Inbound delivery stream — [file](./4.35-inbound-delivery-stream.md)
