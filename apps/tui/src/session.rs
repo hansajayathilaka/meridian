@@ -132,6 +132,7 @@ mod tests {
             keyfile: None,
             service: Some("meridian".to_string()),
             label: "a".repeat(64),
+            server: None,
         }
     }
 

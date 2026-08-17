@@ -47,6 +47,14 @@ pub struct AccountDescriptor {
     pub service: Option<String>,
     /// The store label (keychain entry user) for the private key — the public-key hex.
     pub label: String,
+    /// The rendezvous server this account last successfully registered with — populated by a
+    /// shim's own registration flow (e.g. `meridian-tui`'s `handle_register`), never by this
+    /// crate directly, and read back by later effects that need a server but carry no field of
+    /// their own for one (`meridian-tui`'s `worker::resolve_server`). `#[serde(default)]` so a
+    /// descriptor written before this field existed still deserializes — it simply loads as
+    /// `None`, exactly today's (pre-this-field) behavior, never a hard parse failure.
+    #[serde(default)]
+    pub server: Option<String>,
 }
 
 impl AccountDescriptor {
@@ -60,6 +68,7 @@ impl AccountDescriptor {
             service: None,
             label: pubkey.clone(),
             pubkey,
+            server: None,
         }
     }
 
@@ -73,6 +82,7 @@ impl AccountDescriptor {
             service: Some(service.to_string()),
             label: pubkey.clone(),
             pubkey,
+            server: None,
         }
     }
 
@@ -94,6 +104,7 @@ impl AccountDescriptor {
             keyfile: keyfile.map(|p| absolutize(&p)),
             service,
             label: label.to_string(),
+            server: None,
         })
     }
 
@@ -267,5 +278,62 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = EnvGuard::set(tmp.path());
         assert!(AccountDescriptor::load().is_err());
+    }
+
+    /// A pre-`server`-field `account.json` (written by a version of this crate before that field
+    /// existed) must still deserialize — `#[serde(default)]` fills the gap with `None` rather than
+    /// failing to parse, so an already-onboarded user is never locked out of their account by this
+    /// purely-additive schema change.
+    #[test]
+    fn descriptor_without_a_server_field_in_the_json_still_loads_as_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set(tmp.path());
+
+        let hex64 = "11".repeat(32);
+        let pre_field_json = format!(
+            r#"{{
+            "v": 1,
+            "pubkey": "{hex64}",
+            "hint": "example.org",
+            "store": "file",
+            "keyfile": "/tmp/key.age",
+            "service": null,
+            "label": "{hex64}"
+        }}"#
+        );
+        std::fs::write(descriptor_path().unwrap(), pre_field_json).expect("write legacy json");
+
+        let loaded =
+            AccountDescriptor::load().expect("load a legacy descriptor with no server key");
+        assert_eq!(loaded.server, None);
+    }
+
+    /// The new field survives a save/load round trip once set, and an old descriptor that never had
+    /// it can be upgraded in place (load, set, save) exactly the way `handle_register` does.
+    #[test]
+    fn descriptor_server_field_round_trips_and_can_be_upgraded_in_place() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = EnvGuard::set(tmp.path());
+
+        let store = MemorySecretStore::new();
+        let account = generate_account(&store, "example.org").expect("generate_account");
+        AccountDescriptor::new_file(&account, Path::new("key.age"))
+            .save()
+            .expect("save");
+        assert_eq!(
+            AccountDescriptor::load().expect("load").server,
+            None,
+            "freshly minted descriptor has no server yet"
+        );
+
+        let mut descriptor = AccountDescriptor::load().expect("load");
+        descriptor.server = Some("wss://rendezvous.example.org".to_string());
+        descriptor.save().expect("re-save with server set");
+
+        let loaded = AccountDescriptor::load().expect("load after upgrade");
+        assert_eq!(
+            loaded.server.as_deref(),
+            Some("wss://rendezvous.example.org")
+        );
     }
 }

@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 use meridian_core::account::{self, AccountDescriptor, StoreKind};
 use meridian_core::chat::ChatState as CoreChatState;
+use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{
     generate_account, FileSecretStore, KeyHandle, MemorySecretStore, OsSecretStore, SecretStore,
 };
@@ -33,8 +34,9 @@ use crate::app::{
     DeleteContactEffect, DeleteContactRequest, Effect, GenerateAccountEffect,
     GenerateAccountRequest, GeneratedAccount, ImportContactQrEffect, ImportContactQrRequest,
     LoadSessionEffect, LoadSessionOutcome, MarkVerifiedEffect, MarkVerifiedRequest,
-    PublishBundleEffect, PublishedBundle, RegisterRequest, RejectRequestEffect,
-    RejectRequestRequest, SessionOutcome, SetPetnameEffect, SetPetnameRequest,
+    PersistHistoryEffect, PersistHistoryRequest, PublishBundleEffect, PublishedBundle,
+    RegisterRequest, RejectRequestEffect, RejectRequestRequest, SendMessageEffect,
+    SendMessageRequest, SentMessage, SessionOutcome, SetPetnameEffect, SetPetnameRequest,
     SetPolicyOverrideEffect, SetPolicyOverrideRequest, SetUserBlockedEffect, SetUserBlockedRequest,
     StoreChoice, UnlockEffect, UnlockRequest, WorkerEvent,
 };
@@ -164,9 +166,12 @@ pub async fn dispatch(effect: Effect, session: &mut OnboardingSession) -> Worker
         Effect::RejectRequest(effect) => handle_reject_request(effect).await,
         Effect::MarkVerified(effect) => handle_mark_verified(effect).await,
         Effect::AcknowledgeKeyChange(effect) => handle_acknowledge_key_change(effect).await,
-        // Not this task's scope (chat/settings/diagnostics/… — see later gap-closure tasks
-        // 4.33-4.34). Preserves task 4.11's original placeholder behavior so screens whose real
-        // execution hasn't landed yet are unaffected by this change.
+        // Task 4.33: outbound chat (the send half of the T17 demo's "both sides chat" step).
+        Effect::SendMessage(effect) => handle_send_message(effect).await,
+        Effect::PersistHistory(effect) => handle_persist_history(effect).await,
+        // Not this task's scope (settings/diagnostics/… — see later gap-closure task 4.34, and
+        // 4.35 for the receive path). Preserves task 4.11's original placeholder behavior so
+        // screens whose real execution hasn't landed yet are unaffected by this change.
         other => WorkerEvent::Completed(other),
     }
 }
@@ -277,11 +282,35 @@ async fn handle_register(request: RegisterRequest, session: &mut OnboardingSessi
     .await
     {
         Ok(client) => {
+            // Persist the server this account just registered with onto `account.json` — closing
+            // the gap `resolve_server`'s own doc comment used to describe as an open TODO: a later
+            // `SendMessage` (or any other chat effect) reads this back when `config.toml` carries
+            // no `[account] server` override, matching tui-client.md §5's documented "default: the
+            // value used at registration" contract exactly. `run_generate_account` already wrote
+            // this same descriptor (with `server: None`) earlier in onboarding, so this is a
+            // load-mutate-save upgrade in place, not a fresh write.
+            if let Err(message) = persist_registered_server(&request.server) {
+                return WorkerEvent::Failed(Effect::Register(request), message);
+            }
             session.cache(account_pub, client, store);
             WorkerEvent::Completed(Effect::Register(request))
         }
         Err(e) => WorkerEvent::Failed(Effect::Register(request), e.to_string()),
     }
+}
+
+/// Loads the current `account.json`, sets its `server` field to `server`, and re-saves it — the
+/// exact load-mutate-save upgrade [`AccountDescriptor::server`]'s own doc comment describes.
+/// Failure here (e.g. `account.json` went missing between `GenerateAccount` and `Register`, which
+/// should never happen in a normal onboarding run but is not this function's job to rule out) is
+/// reported as a real `Register` failure rather than silently dropped: without this write,
+/// `resolve_server` has no fallback and every later send fails closed anyway, so surfacing it now
+/// — while the user is still on the registration step and can retry — is strictly more useful than
+/// deferring the same failure to their first `SendMessage`.
+fn persist_registered_server(server: &str) -> Result<(), String> {
+    let mut descriptor = AccountDescriptor::load()?;
+    descriptor.server = Some(server.to_string());
+    descriptor.save()
 }
 
 // ---------------------------------------------------------------------------
@@ -470,8 +499,8 @@ fn run_load_session() -> Result<LoadSessionOutcome, String> {
 /// Resolves the `SecretStore`/`KeyHandle` pair every handler below needs, fresh from the real,
 /// already-onboarded `account.json` — never from a request field (none of
 /// [`AddContactRequest`]/[`SetPetnameRequest`]/[`SetUserBlockedRequest`]/
-/// [`SetPolicyOverrideRequest`]/[`DeleteContactRequest`] carries one; see `crate::app`'s own doc
-/// comments on each).
+/// [`SetPolicyOverrideRequest`]/[`DeleteContactRequest`]/[`SendMessageRequest`]/
+/// [`PersistHistoryRequest`] carries one; see `crate::app`'s own doc comments on each).
 ///
 /// **`StoreKind::Os` only, today.** Mirrors [`run_load_session`]'s own `StoreKind::Os` branch
 /// exactly (`init_os_keystore` -> `OsSecretStore::new(service)` -> `KeyHandle::from_label`) — the
@@ -502,12 +531,25 @@ fn open_account_store() -> Result<(Box<dyn SecretStore>, KeyHandle), String> {
             Ok((Box::new(OsSecretStore::new(&service)), handle))
         }
         StoreKind::File => Err(
-            "this account is passphrase-protected — contact changes from a live TUI session \
-             aren't supported yet for file-backed accounts (no cached, already-unlocked store to \
-             reuse); re-run `meridian contact` from the CLI instead"
+            "this account is passphrase-protected — this action from a live TUI session isn't \
+             supported yet for file-backed accounts (no cached, already-unlocked store to reuse); \
+             use the CLI instead"
                 .to_string(),
         ),
     }
+}
+
+/// [`AccountDescriptor::pubkey`] as raw bytes — mirrors `apps/cli/src/main.rs::account_pub_bytes`
+/// exactly. [`open_account_store`] resolves the `SecretStore`/`KeyHandle` pair from the same
+/// descriptor but has no reason to also decode `pubkey`; [`run_send_message`] is the one caller in
+/// this module that needs the raw `account_pub` too (as `ChatState::seal_outbound`'s `our_ik` and
+/// `SignalingClient::connect`'s own `account_pub` argument), so it is a separate, small helper
+/// rather than widening [`open_account_store`]'s return shape for every other caller.
+fn account_pub_bytes(descriptor: &AccountDescriptor) -> Result<[u8; 32], String> {
+    let raw = hex::decode(&descriptor.pubkey).map_err(|_| "descriptor pubkey is not valid hex")?;
+    raw.as_slice()
+        .try_into()
+        .map_err(|_| "descriptor pubkey is not 32 bytes".to_string())
 }
 
 /// This module's own wall-clock read (mirrors `apps/cli/src/main.rs::now_unix` exactly) — the one
@@ -1053,6 +1095,307 @@ fn run_acknowledge_key_change(request: &AcknowledgeKeyChangeRequest) -> Result<(
     result.map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Outbound chat: SendMessage / PersistHistory (task 4.33)
+//
+// The send half of the T17 demo's "both sides chat" step — the receive path (a persistent
+// connection, unlike this one) is task 4.35's, materially different mechanism, not this module's
+// concern yet. Mirrors `apps/cli/src/chat.rs::send_text`'s exact seal-then-`route_tolerant`
+// sequence, including its first-send session establishment (`fetch_with_retry` +
+// `start_initiator_session`, gated on `initiator && !has_session` exactly like
+// `apps/cli/src/chat.rs::run`) — see this task's own file for why that mirroring is load-bearing
+// rather than a stylistic choice. **Deliberately opens and closes its own `SignalingClient`
+// connection per dispatch**, unlike `OnboardingSession`'s held-open `Register` -> `PublishBundle`
+// connection: this task's own file calls that out as a documented v1 simplification (avoids
+// coupling to 4.35's persistent-connection design for the receive path), not a correctness gap.
+//
+// **`SendGate` is never consulted here.** `crate::screens::chat`'s own module doc names
+// `dispatch_gated_send` as the *only* place in this whole crate that ever constructs
+// `Effect::SendMessage`, and it does so only after `meridian_core::trust::TrustStore::can_send`
+// already returned `SendGate::Ok` — this module has no `TrustStore` handle in scope anywhere below
+// and must never acquire one just to re-derive that same decision (this task's own binding
+// constraint: a second, possibly-drifting gate check here is exactly the class of defect the
+// un-softenable key-change UI exists to prevent).
+// ---------------------------------------------------------------------------
+
+async fn handle_send_message(effect: SendMessageEffect) -> WorkerEvent {
+    let SendMessageEffect { request, .. } = effect;
+    match run_send_message(&request).await {
+        Ok(sent) => WorkerEvent::Completed(Effect::SendMessage(SendMessageEffect {
+            request,
+            outcome: Some(sent),
+        })),
+        Err(message) => WorkerEvent::Failed(
+            Effect::SendMessage(SendMessageEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Resolves the rendezvous server URL a chat effect should connect to. Unlike
+/// [`RegisterRequest`]/`PublishBundleRequest` (onboarding-time effects the user types a server
+/// into directly), [`SendMessageRequest`] carries no server field of its own — see that request's
+/// own doc comment in `crate::app`. tui-client.md §5's `config.toml` template documents
+/// `[account] server` as defaulting to "the value used at registration" — now a real fallback,
+/// not just documented copy: [`handle_register`] persists that value onto `account.json`'s
+/// [`AccountDescriptor::server`] the moment registration succeeds, and this function reads it back
+/// whenever `config.toml` carries no override, matching the contract exactly.
+///
+/// Fails closed with an actionable message only when genuinely neither source has a value — an
+/// `account.json` written before this field existed, or a file-backed/imported account that was
+/// never registered through this worker (e.g. registered once through `meridian-cli` instead,
+/// which has no equivalent persistence step of its own — see this module's own review notes).
+///
+/// Takes the caller's already-loaded [`AccountDescriptor`] rather than loading its own — the one
+/// caller ([`run_send_message`]) already paid for `AccountDescriptor::load()` a few lines above
+/// (to derive `account_pub`), so re-reading `account.json` here a second time would be a pointless
+/// duplicate disk hit for the same file in the same call.
+fn resolve_server(descriptor: &AccountDescriptor) -> Result<String, String> {
+    let config = crate::config::load(&[]).map_err(|e| format!("loading config: {e}"))?;
+    if let Some(server) = config.account.server {
+        return Ok(server);
+    }
+    descriptor.server.clone().ok_or_else(|| {
+        "no rendezvous server configured — set [account] server in config.toml before sending a \
+         message"
+            .to_string()
+    })
+}
+
+/// Mirrors `apps/cli/src/chat.rs::send_text`'s exact seal-then-route sequence, plus the
+/// first-send session establishment `apps/cli/src/chat.rs::run` performs before ever reaching
+/// `send_text` — see this task's own file's "Required reading" list for both call sites this
+/// mirrors line-for-line rather than reinvents.
+///
+/// **Mints `mid`/timestamp here, never in `crate::screens::chat`'s pure `update`** — exactly
+/// [`SendMessageRequest`]'s own doc comment requires ([`getrandom::fill`] for the 128-bit id,
+/// matching `crate::store::history::HistoryEntry::mid`'s shape; [`now_unix`] for the wall clock).
+///
+/// **Persistence ordering (review-anticipated).** `sessions.bin` is resealed and written twice on
+/// the first-send path: once immediately after `start_initiator_session` succeeds (mirrors
+/// `apps/cli/src/chat.rs::run`'s own `save_state` call right after establishing the session, line
+/// 148 — a genuinely-established session must survive even if the seal/route step below then fails
+/// for an unrelated reason), and again immediately after `seal_outbound` succeeds — **before**
+/// `route_tolerant` is even attempted. `seal_outbound` already advanced the local ratchet chain the
+/// moment it returned `Ok`, regardless of whether the peer is reachable right now, so that advance
+/// is persisted unconditionally — never reused or replayed by a later retry — independent of the
+/// delivery outcome `route_tolerant` reports next.
+///
+/// This is a deliberate **tightening** beyond the CLI's own ordering, not parity with it: the CLI's
+/// outer loop (`apps/cli/src/chat.rs::run`, lines 180-212) only calls its own loop-body
+/// `save_state` *after* the whole per-message call (`send_gated`, including the `route_tolerant`-
+/// equivalent network round trip) has already returned — so the CLI's crash window spans the full
+/// network call, while this worker's window is only the in-memory, synchronous ratchet advance
+/// itself. A future reader comparing the two call sites should read this as the worker doing
+/// strictly better, not as the two behaving identically.
+async fn run_send_message(request: &SendMessageRequest) -> Result<SentMessage, String> {
+    let (store, handle) = open_account_store()?;
+    let descriptor = AccountDescriptor::load()?;
+    let account_pub = account_pub_bytes(&descriptor)?;
+    let server = resolve_server(&descriptor)?;
+    let peer_label =
+        meridian_core::identity::to_id_string(&request.peer_pubkey, &request.peer_hint)
+            .unwrap_or_else(|_| hex::encode(request.peer_pubkey));
+
+    let mut chat = load_chat(store.as_ref(), &handle)?;
+
+    let mut client =
+        SignalingClient::connect(&server, store.as_ref(), &handle, account_pub, None, 1)
+            .await
+            .map_err(|e| format!("connecting to {server}: {e}"))?;
+
+    // Role decided by key order (mirrors `apps/cli/src/chat.rs::run` exactly), so two peers who
+    // both reach out establish exactly one X3DH session rather than racing two. A non-initiator
+    // with no session yet has nothing to initiate here: `seal_outbound` below fails closed with
+    // `ChatError::NoSession` in that case, exactly as the CLI's own loop simply buffers pending
+    // text (`pending.push(text)`) rather than sending until a responder session arrives via an
+    // inbound receive — this worker has no receive path to wait on (that's task 4.35), so it
+    // reports the failure immediately instead of buffering silently.
+    let initiator = account_pub.as_slice() <= request.peer_pubkey.as_slice();
+    if initiator && !chat.has_session(&request.peer_pubkey) {
+        let peer_bundle = fetch_with_retry(
+            &mut client,
+            request.peer_pubkey,
+            &request.peer_hint,
+            &peer_label,
+        )
+        .await?;
+        chat.start_initiator_session(
+            store.as_ref(),
+            &handle,
+            &account_pub,
+            &request.peer_pubkey,
+            &peer_bundle.spk,
+            peer_bundle.otks.first().copied(),
+        )
+        .map_err(|e| format!("establishing session: {e}"))?;
+        save_chat(&chat, store.as_ref(), &handle)?;
+    }
+
+    let mut id = [0u8; 16];
+    getrandom::fill(&mut id).map_err(|e| e.to_string())?;
+    let blob = chat
+        .seal_outbound(
+            store.as_ref(),
+            &handle,
+            &account_pub,
+            &request.peer_pubkey,
+            &ChatContent::Text {
+                id,
+                body: request.body.clone(),
+            },
+        )
+        .map_err(|e| format!("sealing message: {e}"))?;
+    save_chat(&chat, store.as_ref(), &handle)?;
+
+    let delivered = route_tolerant(
+        &mut client,
+        request.peer_pubkey,
+        &request.peer_hint,
+        blob,
+        &peer_label,
+    )
+    .await;
+    let _ = client.close().await;
+    let delivered = delivered?;
+
+    Ok(SentMessage {
+        mid: hex::encode(id),
+        ts: now_unix(),
+        delivered,
+    })
+}
+
+/// Fetch + verify the peer's bundle, retrying while the peer has not published yet — mirrors
+/// `apps/cli/src/chat.rs::fetch_with_retry` exactly (same 40-attempt/250ms-backoff bound), minus
+/// its `eprintln!` progress lines: this worker's [`WorkerEvent`] has only `Completed`/`Failed`, no
+/// interim-progress variant to report through.
+async fn fetch_with_retry(
+    client: &mut SignalingClient,
+    peer_ik: [u8; 32],
+    peer_hint: &str,
+    peer_label: &str,
+) -> Result<meridian_core::proto::PrekeyBundle, String> {
+    use meridian_core::signaling::SignalError;
+    // Set once a `not_found_at_hint` is observed, so the final message — if every attempt
+    // exhausts — can name the reachability-specific outcome instead of the generic "did not
+    // publish" text used for a purely local `not_found`.
+    let mut stale_hint = false;
+    for _ in 0..40u32 {
+        match client
+            .fetch_bundle(peer_ik, Some(peer_hint.to_string()), false)
+            .await
+        {
+            Ok(bundle) => return Ok(bundle),
+            // "not_found" (local): no bundle here yet — retry, the peer may publish soon.
+            Err(SignalError::Server(e)) if e.code == "not_found" => {
+                stale_hint = false;
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            // `not_found_at_hint`: the hinted org doesn't hold this account — retry the same
+            // bounded number of times as the local case, but report the distinct "unreachable at
+            // hint" outcome below if every attempt exhausts this way (never a security warning).
+            Err(SignalError::NotFoundAtHint { .. }) => {
+                stale_hint = true;
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            // `fed_denied`/`fed_unreachable` (and anything else): definitive policy/connectivity
+            // outcomes, never retried.
+            Err(e) => return Err(federation_error_line(&e, peer_label, "fetching")),
+        }
+    }
+    if stale_hint {
+        Err(format!(
+            "{peer_label} unreachable at hint {peer_hint}: no account found there after \
+             retrying — the hint may be stale (the peer may have re-registered elsewhere); this \
+             is a reachability issue, never a security warning"
+        ))
+    } else {
+        Err(format!("{peer_label} did not publish a bundle in time"))
+    }
+}
+
+/// Render a definitive (non-retried) fetch/route failure as one diagnosable line — mirrors
+/// `apps/cli/src/chat.rs::federation_error_line` exactly.
+fn federation_error_line(
+    e: &meridian_core::signaling::SignalError,
+    peer_label: &str,
+    action: &str,
+) -> String {
+    use meridian_core::signaling::SignalError;
+    match e {
+        SignalError::FedDenied { hint, detail } => format!(
+            "federation denied: {hint} is not accepting requests for {peer_label} ({detail}) — \
+             a policy outcome, not a security warning"
+        ),
+        SignalError::FedUnreachable { hint, detail } => format!(
+            "{peer_label} unreachable at hint {hint}: could not reach that server ({detail})"
+        ),
+        other => format!("{action} {peer_label}: {other}"),
+    }
+}
+
+/// Route a blob, treating a `not_connected` server reply as "not delivered" rather than a fatal
+/// error — mirrors `apps/cli/src/chat.rs::route_tolerant` exactly: a momentarily-offline peer must
+/// not be reported as a harder failure than it is (offline delivery is the T07 mailbox, out of
+/// scope for this whole phase — see [`SentMessage`]'s own doc comment on what `delivered: false`
+/// must never imply).
+async fn route_tolerant(
+    client: &mut SignalingClient,
+    to: [u8; 32],
+    hint: &str,
+    blob: Vec<u8>,
+    peer_label: &str,
+) -> Result<bool, String> {
+    use meridian_core::proto::error_codes::NOT_CONNECTED;
+    use meridian_core::signaling::SignalError;
+    match client
+        .route_with_hint(to, Some(hint.to_string()), blob)
+        .await
+    {
+        Ok(delivered) => Ok(delivered),
+        Err(SignalError::Server(e)) if e.code == NOT_CONNECTED => Ok(false),
+        Err(e) => Err(federation_error_line(&e, peer_label, "routing message to")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PersistHistory (task 4.33)
+// ---------------------------------------------------------------------------
+
+async fn handle_persist_history(effect: PersistHistoryEffect) -> WorkerEvent {
+    let PersistHistoryEffect { request, .. } = effect;
+    match run_persist_history(&request) {
+        Ok(()) => WorkerEvent::Completed(Effect::PersistHistory(PersistHistoryEffect {
+            request,
+            outcome: Some(()),
+        })),
+        Err(message) => WorkerEvent::Failed(
+            Effect::PersistHistory(PersistHistoryEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Appends `request.entry` to `request.peer_pubkey`'s sealed transcript — `crate::store::history::
+/// append` (task 4.15), fresh `SecretStore`/`KeyHandle` via [`open_account_store`] like every other
+/// handler in this module, never a request field (see [`PersistHistoryRequest`]'s own doc comment
+/// in `crate::app`). The screen already deduped by `mid` before dispatching this effect
+/// (`crate::screens::chat::insert_deduped`), so this appends unconditionally rather than
+/// re-deriving that decision here.
+fn run_persist_history(request: &PersistHistoryRequest) -> Result<(), String> {
+    let (store, handle) = open_account_store()?;
+    let peer_pubkey_hex = hex::encode(request.peer_pubkey);
+    crate::store::history::append(&peer_pubkey_hex, &request.entry, store.as_ref(), &handle)
+        .map_err(|e| e.to_string())
+}
+
 /// Seals and writes `chat` to `sessions.bin` — mirrors [`save_trust`] (and
 /// `apps/cli/src/chat.rs::save_state`) exactly.
 fn save_chat(
@@ -1249,6 +1592,7 @@ mod tests {
             keyfile: None,
             service: Some(OS_KEYSTORE_SERVICE.to_string()),
             label: "a".repeat(64),
+            server: None,
         }
     }
 
