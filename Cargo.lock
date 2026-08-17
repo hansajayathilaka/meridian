@@ -2885,6 +2885,7 @@ dependencies = [
  "figment",
  "getrandom 0.3.4",
  "hex",
+ "image",
  "keyring",
  "meridian-core",
  "meridian-proto",

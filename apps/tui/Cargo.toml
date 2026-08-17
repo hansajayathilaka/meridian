@@ -63,6 +63,14 @@ unicode-segmentation = "1.13.3"
 # the real platform credential store into `keyring-core`, which `meridian_core::identity::
 # OsSecretStore` then uses. Same version pin as `apps/cli/Cargo.toml`'s own `keyring` dependency.
 keyring = "4.1.4"
+# `worker.rs` (task 4.31): `Effect::ImportContactQr`'s worker execution mirrors
+# `apps/cli/src/verify.rs::scan_and_compare`'s own `image::open(...).to_luma8()` call exactly, so
+# the `ImageBuffer<Luma<u8>, Vec<u8>>` type `meridian_core::identity::decode_luma` (re-exported
+# straight through from `meridian-identity`, not redefined) takes has to come from this crate
+# directly — `meridian-identity`/`meridian-core` don't re-export the `image` crate's own types.
+# Workspace-pinned version, PNG-only feature set — same as `apps/cli/Cargo.toml`'s own `image`
+# dependency (the only QR image format either client's demo produces).
+image = { workspace = true, features = ["png"] }
 
 [dev-dependencies]
 # Self-dependency with test-support enabled, so tests/terminal_guard.rs (a separate crate linking

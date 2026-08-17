@@ -25,14 +25,18 @@ use meridian_core::identity::{
     generate_account, FileSecretStore, KeyHandle, MemorySecretStore, OsSecretStore, SecretStore,
 };
 use meridian_core::signaling::SignalingClient;
-use meridian_core::trust::TrustStore;
+use meridian_core::trust::{Contact, PinnedKey, TrustState, TrustStore};
 
 use crate::app::{
-    Effect, GenerateAccountEffect, GenerateAccountRequest, GeneratedAccount, LoadSessionEffect,
-    LoadSessionOutcome, PublishBundleEffect, PublishedBundle, RegisterRequest, SessionOutcome,
+    AddContactEffect, AddContactRequest, AddedContact, DeleteContactEffect, DeleteContactRequest,
+    Effect, GenerateAccountEffect, GenerateAccountRequest, GeneratedAccount, ImportContactQrEffect,
+    ImportContactQrRequest, LoadSessionEffect, LoadSessionOutcome, PublishBundleEffect,
+    PublishedBundle, RegisterRequest, SessionOutcome, SetPetnameEffect, SetPetnameRequest,
+    SetPolicyOverrideEffect, SetPolicyOverrideRequest, SetUserBlockedEffect, SetUserBlockedRequest,
     StoreChoice, UnlockEffect, UnlockRequest, WorkerEvent,
 };
 use crate::session::LiveSession;
+use crate::store::contacts::{ContactRecord, ContactsDocument, PinnedKeyRecord, TrustLabel};
 
 /// The exact keychain "service" string `apps/cli/src/main.rs::OS_KEYSTORE_SERVICE` uses. Must stay
 /// identical between clients: an account minted with `--store os` by the CLI (or by this worker's
@@ -145,8 +149,15 @@ pub async fn dispatch(effect: Effect, session: &mut OnboardingSession) -> Worker
         Effect::PublishBundle(e) => handle_publish_bundle(e, session).await,
         Effect::Unlock(effect) => handle_unlock(*effect).await,
         Effect::LoadSession(effect) => handle_load_session(effect).await,
-        // Not this task's scope (contacts/trust/settings/chat/diagnostics/… — see later
-        // gap-closure tasks 4.31-4.34). Preserves task 4.11's original placeholder behavior so
+        // Task 4.31: contacts / contact-detail persistence.
+        Effect::AddContact(effect) => handle_add_contact(effect).await,
+        Effect::ImportContactQr(effect) => handle_import_contact_qr(effect).await,
+        Effect::SetPetname(effect) => handle_set_petname(effect).await,
+        Effect::SetUserBlocked(effect) => handle_set_user_blocked(effect).await,
+        Effect::SetPolicyOverride(effect) => handle_set_policy_override(effect).await,
+        Effect::DeleteContact(effect) => handle_delete_contact(effect).await,
+        // Not this task's scope (trust/requests/chat/settings/diagnostics/… — see later
+        // gap-closure tasks 4.32-4.34). Preserves task 4.11's original placeholder behavior so
         // screens whose real execution hasn't landed yet are unaffected by this change.
         other => WorkerEvent::Completed(other),
     }
@@ -434,6 +445,389 @@ fn run_load_session() -> Result<LoadSessionOutcome, String> {
                 .to_string(),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Contacts / contact-detail persistence (task 4.31)
+//
+// Every handler below follows the same load-fresh-from-disk -> apply-the-real-mutation ->
+// reseal/save -> report round trip `at_rest_audit.rs`'s own "harness-as-worker" section had to
+// hand-roll before this task existed (task 4.27's own prior art, named by this task's own file) —
+// `TrustStore::observe` -> conditional `set_petname` -> re-read the real post-mutation `Contact` ->
+// `seal_at_rest`, never a held-open session (see `open_account_store`'s own doc comment for why
+// each dispatch re-derives its `SecretStore`/`KeyHandle` rather than reusing one cached across
+// calls, unlike `OnboardingSession`).
+// ---------------------------------------------------------------------------
+
+/// Resolves the `SecretStore`/`KeyHandle` pair every handler below needs, fresh from the real,
+/// already-onboarded `account.json` — never from a request field (none of
+/// [`AddContactRequest`]/[`SetPetnameRequest`]/[`SetUserBlockedRequest`]/
+/// [`SetPolicyOverrideRequest`]/[`DeleteContactRequest`] carries one; see `crate::app`'s own doc
+/// comments on each).
+///
+/// **`StoreKind::Os` only, today.** Mirrors [`run_load_session`]'s own `StoreKind::Os` branch
+/// exactly (`init_os_keystore` -> `OsSecretStore::new(service)` -> `KeyHandle::from_label`) — the
+/// OS keystore needs no additional secret from this call site, so a fresh [`OsSecretStore`] can be
+/// (re-)constructed on every single effect dispatch with no state carried between them, exactly
+/// this task's own "single, complete disk round-trip" scope.
+///
+/// **`StoreKind::File` fails closed here**, with a message naming the real gap rather than
+/// attempting (and failing more confusingly) a `FileSecretStore` operation with no passphrase:
+/// unlike [`run_unlock`], none of this module's six contacts-group requests carry one, and unlike
+/// [`OnboardingSession`], `crate::app::App` has no `Option<LiveSession>` field yet to have cached
+/// an already-unwrapped store in from a prior `Effect::Unlock` — [`crate::session::LiveSession`]'s
+/// own module doc names this exact "known gap" (`App` discarding the `LiveSession` a successful
+/// file-backed `Effect::Unlock` already builds) and defers wiring it to a later task (4.36/4.37).
+/// `TODO: confirm`: once that wiring lands, this function (or its caller) is the natural place to
+/// thread the already-unlocked store through instead of re-deriving one per effect for the
+/// file-backed case — not invented here, since no design doc this task read specifies it.
+fn open_account_store() -> Result<(Box<dyn SecretStore>, KeyHandle), String> {
+    let descriptor = AccountDescriptor::load()?;
+    match descriptor.store {
+        StoreKind::Os => {
+            init_os_keystore()?;
+            let service = descriptor
+                .service
+                .clone()
+                .unwrap_or_else(|| OS_KEYSTORE_SERVICE.to_string());
+            let handle = KeyHandle::from_label(&descriptor.label);
+            Ok((Box::new(OsSecretStore::new(&service)), handle))
+        }
+        StoreKind::File => Err(
+            "this account is passphrase-protected — contact changes from a live TUI session \
+             aren't supported yet for file-backed accounts (no cached, already-unlocked store to \
+             reuse); re-run `meridian contact` from the CLI instead"
+                .to_string(),
+        ),
+    }
+}
+
+/// This module's own wall-clock read (mirrors `apps/cli/src/main.rs::now_unix` exactly) — the one
+/// place in this crate that reads it for the contacts-group effects, keeping `crate::screens`
+/// itself pure/deterministic per this crate's Elm-architecture split (see [`AddedContact`]'s own
+/// doc comment in `crate::app`: "this crate's `update` stays pure/deterministic — no
+/// `SystemTime::now()` call anywhere in `crate::screens`").
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Seals and writes `trust` to `trust.bin` — mirrors `apps/cli/src/contact.rs::save_trust` exactly
+/// (same parent-dir creation, same error shape).
+fn save_trust(
+    trust: &TrustStore,
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+) -> Result<(), String> {
+    let path = account::trust_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+    }
+    let sealed = trust
+        .seal_at_rest(store, handle)
+        .map_err(|e| format!("sealing trust store: {e}"))?;
+    std::fs::write(&path, sealed).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// [`TrustState`] -> `contacts.json`'s [`TrustLabel`] — mirrors `tests/at_rest_audit.rs`'s own
+/// `to_trust_label` exactly (same `PinnedKeyChanged -> Pinned` approximation, since `TrustLabel`'s
+/// four-value enum structurally cannot represent it — see `crate::screens::contacts`' module doc).
+fn to_trust_label(state: TrustState) -> TrustLabel {
+    match state {
+        TrustState::New => TrustLabel::New,
+        TrustState::Pinned => TrustLabel::Pinned,
+        TrustState::Verified => TrustLabel::Verified,
+        TrustState::Blocked => TrustLabel::Blocked,
+        TrustState::PinnedKeyChanged => TrustLabel::Pinned,
+    }
+}
+
+/// [`PinnedKey`] history -> `contacts.json`'s [`PinnedKeyRecord`] history — mirrors
+/// `tests/at_rest_audit.rs`'s own `to_pinned_key_records` exactly.
+fn to_pinned_key_records(history: &[PinnedKey]) -> Vec<PinnedKeyRecord> {
+    history
+        .iter()
+        .map(|k| PinnedKeyRecord {
+            pubkey: hex::encode(k.pubkey),
+            first_seen: k.first_seen_unix,
+            last_seen: k.last_seen_unix,
+        })
+        .collect()
+}
+
+/// Upserts `contact`'s display row into `doc`, keyed by pubkey hex (`contacts.json`'s primary
+/// key — see `crate::store::contacts`'s own module doc). On a re-add of an already-known pubkey
+/// whose `contacts.json` row still exists, this updates the row's `TrustStore`-owned fields
+/// (`id`/`hint`/`petname`/`trust`/`pinned_key_history`) in place and bumps `last_activity_at`, but
+/// leaves the row's purely-local fields (`added_at`, `policy_override`, `conv_handle`, `unread`)
+/// untouched — `TrustStore::observe` has no bearing on any of them, and clobbering a real per-contact
+/// policy override or unread count on a mere re-observe would be a worse regression than leaving
+/// them be. `TODO: confirm`: no doc this task read pins down re-add semantics for these four fields
+/// specifically; this is a considered, conservative default, not a documented one.
+fn upsert_contact_record(doc: &mut ContactsDocument, id: &str, contact: &Contact, now: u64) {
+    let pubkey_hex = hex::encode(contact.pubkey);
+    if let Some(existing) = doc.contacts.iter_mut().find(|c| c.pubkey == pubkey_hex) {
+        existing.id = id.to_string();
+        existing.hint = contact.hint.clone();
+        existing.petname = contact.petname.clone();
+        existing.trust = to_trust_label(contact.state);
+        existing.pinned_key_history = to_pinned_key_records(&contact.pinned_key_history);
+        existing.last_activity_at = now;
+    } else {
+        doc.contacts.push(ContactRecord {
+            pubkey: pubkey_hex,
+            id: id.to_string(),
+            hint: contact.hint.clone(),
+            petname: contact.petname.clone(),
+            trust: to_trust_label(contact.state),
+            pinned_key_history: to_pinned_key_records(&contact.pinned_key_history),
+            device_record_version_seen: None,
+            policy_override: None,
+            added_at: now,
+            last_activity_at: now,
+            unread: 0,
+            conv_handle: None,
+        });
+    }
+}
+
+// --- AddContact --------------------------------------------------------------------------------
+
+async fn handle_add_contact(effect: AddContactEffect) -> WorkerEvent {
+    let AddContactEffect { request, .. } = effect;
+    match run_add_contact(&request) {
+        Ok(added) => WorkerEvent::Completed(Effect::AddContact(AddContactEffect {
+            request,
+            outcome: Some(added),
+        })),
+        Err(message) => WorkerEvent::Failed(
+            Effect::AddContact(AddContactEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Mirrors `apps/cli/src/contact.rs::cmd_add`'s exact call sequence: `TrustStore::observe`
+/// unconditionally, then `TrustStore::set_petname` only if [`AddContactRequest::petname`] is
+/// `Some` — never derived from `id`/`pubkey`/`hint` (see that request's own doc comment in
+/// `crate::app`). [`AddedContact`] is built from the real post-mutation [`Contact`] read back via
+/// `TrustStore::contact`, never an assumed fresh-TOFU shape — the task 4.19 Finding 1 fix
+/// [`AddedContact`]'s own doc comment requires.
+fn run_add_contact(request: &AddContactRequest) -> Result<AddedContact, String> {
+    let (store, handle) = open_account_store()?;
+    let now = now_unix();
+
+    let mut trust = load_trust(store.as_ref(), &handle)?;
+    trust.observe(request.pubkey, &request.hint, now);
+    if let Some(petname) = request.petname.clone() {
+        trust
+            .set_petname(&request.pubkey, Some(petname))
+            .map_err(|e| e.to_string())?;
+    }
+    let contact = trust
+        .contact(&request.pubkey)
+        .cloned()
+        .expect("just observed above — always present");
+    save_trust(&trust, store.as_ref(), &handle)?;
+
+    let mut doc = crate::store::contacts::load_or_default(store.as_ref(), &handle)
+        .map_err(|e| e.to_string())?;
+    upsert_contact_record(&mut doc, &request.id, &contact, now);
+    crate::store::contacts::save(&doc, store.as_ref(), &handle).map_err(|e| e.to_string())?;
+
+    Ok(AddedContact {
+        pubkey: request.pubkey,
+        id: request.id.clone(),
+        hint: contact.hint,
+        petname: contact.petname,
+        added_at: now,
+        trust: contact.state,
+        user_blocked: contact.user_blocked,
+        pinned_key_history: contact.pinned_key_history,
+    })
+}
+
+// --- ImportContactQr ----------------------------------------------------------------------------
+
+async fn handle_import_contact_qr(effect: ImportContactQrEffect) -> WorkerEvent {
+    let ImportContactQrEffect { request, .. } = effect;
+    match run_import_contact_qr(&request) {
+        Ok(decoded) => WorkerEvent::Completed(Effect::ImportContactQr(ImportContactQrEffect {
+            request,
+            outcome: Some(decoded),
+        })),
+        Err(message) => WorkerEvent::Failed(
+            Effect::ImportContactQr(ImportContactQrEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Mirrors `apps/cli/src/verify.rs::scan_and_compare`'s own headless QR-scan path exactly, per
+/// [`ImportContactQrEffect`]'s own doc comment in `crate::app`: `image::open` + `to_luma8()`, then
+/// `meridian_core::identity::decode_luma` to recover the raw `mrd1:…` candidate string. Never calls
+/// `parse_id` and never touches `TrustStore`/`contacts.json` itself — that is
+/// `crate::screens::contacts`' own job, treating the decoded string exactly like a pasted one.
+fn run_import_contact_qr(request: &ImportContactQrRequest) -> Result<String, String> {
+    let img = image::open(&request.path)
+        .map_err(|e| e.to_string())?
+        .to_luma8();
+    meridian_core::identity::decode_luma(&img).map_err(|e| e.to_string())
+}
+
+// --- SetPetname ----------------------------------------------------------------------------------
+
+async fn handle_set_petname(effect: SetPetnameEffect) -> WorkerEvent {
+    let SetPetnameEffect { request, .. } = effect;
+    match run_set_petname(&request) {
+        Ok(()) => WorkerEvent::Completed(Effect::SetPetname(SetPetnameEffect {
+            request,
+            outcome: Some(()),
+        })),
+        Err(message) => WorkerEvent::Failed(
+            Effect::SetPetname(SetPetnameEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Mirrors `apps/cli/src/contact.rs::cmd_rename`'s write path: `TrustStore::set_petname`, then the
+/// matching `contacts.json` `ContactRecord.petname` — both writes, per [`SetPetnameEffect`]'s own
+/// doc comment in `crate::app`, unlike [`SetUserBlockedEffect`] (`trust.bin` only).
+fn run_set_petname(request: &SetPetnameRequest) -> Result<(), String> {
+    let (store, handle) = open_account_store()?;
+
+    let mut trust = load_trust(store.as_ref(), &handle)?;
+    trust
+        .set_petname(&request.pubkey, request.petname.clone())
+        .map_err(|e| e.to_string())?;
+    let petname = trust
+        .contact(&request.pubkey)
+        .expect("set_petname succeeded — contact exists")
+        .petname
+        .clone();
+    save_trust(&trust, store.as_ref(), &handle)?;
+
+    let mut doc = crate::store::contacts::load_or_default(store.as_ref(), &handle)
+        .map_err(|e| e.to_string())?;
+    let pubkey_hex = hex::encode(request.pubkey);
+    if let Some(record) = doc.contacts.iter_mut().find(|c| c.pubkey == pubkey_hex) {
+        record.petname = petname;
+        crate::store::contacts::save(&doc, store.as_ref(), &handle).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// --- SetUserBlocked --------------------------------------------------------------------------------
+
+async fn handle_set_user_blocked(effect: SetUserBlockedEffect) -> WorkerEvent {
+    let SetUserBlockedEffect { request, .. } = effect;
+    match run_set_user_blocked(&request) {
+        Ok(()) => WorkerEvent::Completed(Effect::SetUserBlocked(SetUserBlockedEffect {
+            request,
+            outcome: Some(()),
+        })),
+        Err(message) => WorkerEvent::Failed(
+            Effect::SetUserBlocked(SetUserBlockedEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Mirrors `apps/cli/src/contact.rs::cmd_block`'s write path: `TrustStore::set_user_blocked` only
+/// — deliberately never mirrored into `contacts.json` (see [`SetUserBlockedEffect`]'s own doc
+/// comment in `crate::app`: that document's `TrustLabel` enum has no field for a user-initiated
+/// block).
+fn run_set_user_blocked(request: &SetUserBlockedRequest) -> Result<(), String> {
+    let (store, handle) = open_account_store()?;
+    let mut trust = load_trust(store.as_ref(), &handle)?;
+    trust
+        .set_user_blocked(&request.pubkey, request.blocked)
+        .map_err(|e| e.to_string())?;
+    save_trust(&trust, store.as_ref(), &handle)
+}
+
+// --- SetPolicyOverride -----------------------------------------------------------------------------
+
+async fn handle_set_policy_override(effect: SetPolicyOverrideEffect) -> WorkerEvent {
+    let SetPolicyOverrideEffect { request, .. } = effect;
+    match run_set_policy_override(&request) {
+        Ok(()) => WorkerEvent::Completed(Effect::SetPolicyOverride(SetPolicyOverrideEffect {
+            request,
+            outcome: Some(()),
+        })),
+        Err(message) => WorkerEvent::Failed(
+            Effect::SetPolicyOverride(SetPolicyOverrideEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Writes only `contacts.json`'s `ContactRecord.policy_override` — `TrustStore` has no concept of
+/// relay policy at all, per [`SetPolicyOverrideEffect`]'s own doc comment in `crate::app`.
+fn run_set_policy_override(request: &SetPolicyOverrideRequest) -> Result<(), String> {
+    let (store, handle) = open_account_store()?;
+    let mut doc = crate::store::contacts::load_or_default(store.as_ref(), &handle)
+        .map_err(|e| e.to_string())?;
+    let pubkey_hex = hex::encode(request.pubkey);
+    let record = doc
+        .contacts
+        .iter_mut()
+        .find(|c| c.pubkey == pubkey_hex)
+        .ok_or_else(|| "no contact recorded for this pubkey — add it first".to_string())?;
+    record.policy_override = request.policy_override;
+    crate::store::contacts::save(&doc, store.as_ref(), &handle).map_err(|e| e.to_string())
+}
+
+// --- DeleteContact ---------------------------------------------------------------------------------
+
+async fn handle_delete_contact(effect: DeleteContactEffect) -> WorkerEvent {
+    let DeleteContactEffect { request, .. } = effect;
+    match run_delete_contact(&request) {
+        Ok(()) => WorkerEvent::Completed(Effect::DeleteContact(DeleteContactEffect {
+            request,
+            outcome: Some(()),
+        })),
+        Err(message) => WorkerEvent::Failed(
+            Effect::DeleteContact(DeleteContactEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Removes only the local `contacts.json` display row — never touches `TrustStore`/`trust.bin`, per
+/// [`DeleteContactEffect`]'s own doc comment in `crate::app` (a deliberate, already-reviewed
+/// judgment call: no core primitive exists to forget TOFU pinned-key history, by design). Deleting
+/// an already-absent row is a no-op, not an error — idempotent, matching "delete" being a
+/// lower-stakes, purely-local list-membership action.
+fn run_delete_contact(request: &DeleteContactRequest) -> Result<(), String> {
+    let (store, handle) = open_account_store()?;
+    let mut doc = crate::store::contacts::load_or_default(store.as_ref(), &handle)
+        .map_err(|e| e.to_string())?;
+    let pubkey_hex = hex::encode(request.pubkey);
+    doc.contacts.retain(|c| c.pubkey != pubkey_hex);
+    crate::store::contacts::save(&doc, store.as_ref(), &handle).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
