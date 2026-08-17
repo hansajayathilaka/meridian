@@ -19,6 +19,9 @@ Every cell is adversarial and asserts a *negative* property. Per
 | 1.32 | Relay **drops** a blob while acking `delivered: true` | conceded DoS (threat-model goal 6); asserts denial stays denial | `meridian-cli::relay_attacks` |
 | 1.32 | Relay **cross-delivers** one session's envelope to another peer | X3DH prekey lookup → `UnknownPrekey` | `meridian-cli::relay_attacks` |
 | 1.32 / [ADR 0016](../../docs/adr/0016-envelope-deniability.md) | X3DH **preamble mutation** + prekey depletion | envelope signature covers the preamble; rejection consumes no OTK and installs no session | `meridian-core::preamble_mutation` |
+| 4.10 (T08) | Rendezvous substitutes a bundle's key against a contact alice **already has a trust record for** (not just first contact) | same exact-key pin as T02; failed attempt leaves the pre-existing trust record byte-identical | `meridian-cli::mitm_preexisting_contact` |
+| 4.10 (T08) | A substituted key is surfaced during task 4.9's guarded desync-recovery bundle-refetch window, against a **pinned** contact | routed through the identical task-4.4 key-change gate — `SendGate::Warn`, `TrustState::PinnedKeyChanged`, canonical `verification-ux.md` wording, no session installed | `meridian-core::desync_recovery::attempt_recovery_routes_a_surfaced_key_change_through_the_gate_never_bypassing_it` |
+| 4.10 (T08) | Same, against a **verified** contact | `SendGate::Blocked`, `TrustState::Blocked`, canonical `verification-ux.md` wording, no session installed, `acknowledge_key_change` refused | same test, verified-state case |
 
 ## Scope boundaries (read before extending)
 
@@ -62,4 +65,17 @@ Every cell is adversarial and asserts a *negative* property. Per
   Tracked as [task 2.13](../../docs/tasks/phase-2/2.13-ratchet-replay-dos.md); the replay cell
   deliberately asserts only "never accepted twice", because asserting today's behaviour would
   entrench it.
-* T08 extends this harness with the tofu/verified trust-state matrix — do not delete existing cells.
+* **T08's matrix (task 4.10) does not re-attack the fetch layer three times.** `meridian_signaling::
+  verify_bundle` pins every live fetch to the *exact requested key*, regardless of the caller's
+  pre-existing trust state — a substitution is rejected before `TrustStore` is ever consulted, which
+  T02 already proves for a fresh contact. What 4.10 actually adds is the two places that claim was
+  not yet load-bearing: (a) that the same fetch-layer rejection holds — and, the part T02 alone does
+  not check, leaves the trust record untouched — once alice already has a relationship with the
+  target (`mitm_preexisting_contact`), and (b) the *one* path in the system where a genuinely
+  different signing key can legitimately reach `TrustStore` at all: task 4.9's guarded desync
+  recovery, whose `attempt_recovery` takes the fetched bundle's owner key as a parameter separate
+  from the peer identity precisely so this is testable without a live network layer (see
+  `apps/core/src/desync.rs`'s own doc comment). "tofu" (brand-new contact) has no separate 4.10 cell
+  of its own: the state a first-contact bundle substitution is tested from is exactly what T02
+  already exercises, and desync recovery is only reachable once a session already exists — a
+  same-attack-different-starting-state cell there would be vacuous.

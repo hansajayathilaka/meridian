@@ -24,6 +24,12 @@ getrandom = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 # Zeroizes superseded prekey-generation secrets (task 1.31), matching meridian-crypto's convention.
 zeroize = { workspace = true }
+# account.rs (task 4.13): the account-descriptor JSON + `$MERIDIAN_HOME` layout helpers, relocated
+# from meridian-cli so meridian-tui (ADR 0020: core-only, never meridian-cli) can reach them too.
+serde_json = { workspace = true }
+hex = { workspace = true }
+# Matches apps/cli/Cargo.toml's figment pin exactly (not a workspace dependency there either).
+figment = { version = "0.10.19", features = ["json", "env"] }
 
 [features]
 default = []
@@ -40,3 +46,5 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 # after a rejected envelope — the check that stops a future contributor adding a reset-on-desync
 # oracle.
 ciborium = { workspace = true }
+# account.rs tests (task 4.13) need a scratch $MERIDIAN_HOME directory.
+tempfile = { workspace = true }

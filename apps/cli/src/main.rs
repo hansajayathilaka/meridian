@@ -19,11 +19,16 @@ use meridian_core::signaling::{SignalError, SignalingClient, DEFAULT_OTK_COUNT};
 
 mod account;
 mod chat;
+mod contact;
+mod directory;
 mod doctor;
 mod opacity;
 mod policy;
 mod session;
 mod session_connect;
+#[cfg(feature = "tui")]
+mod tui;
+mod verify;
 use account::{AccountDescriptor, StoreKind};
 
 const OS_KEYSTORE_SERVICE: &str = "meridian";
@@ -80,6 +85,35 @@ enum TopCommand {
         #[arg(long)]
         tamper: bool,
     },
+    /// Contact management (T08): petnames are strictly local — assigned only from `--petname` or
+    /// an interactive prompt, never derived from a QR payload, an `mrd1:` id, or any other wire
+    /// field (`docs/architecture/system-design.md` §3.1). See `apps/cli/src/contact.rs`.
+    Contact {
+        #[command(subcommand)]
+        cmd: ContactCommand,
+    },
+    /// Safety-number compare/verify (T08): displays the 60-digit number + QR for out-of-band
+    /// compare with the peer, or — with `--scan-file` — headlessly compares a scanned QR image
+    /// against the number computed locally. Marks the contact verified on a confirmed match
+    /// (see `apps/cli/src/verify.rs` and `docs/security/verification-ux.md`). Requires the peer
+    /// to already be a known contact (`meridian contact add` first).
+    Verify {
+        /// The peer's full `mrd1:…@domain` ID.
+        id: String,
+        /// Headless compare: path to a QR image (e.g. scanned from the peer's device) to decode
+        /// and compare against the safety number computed locally, instead of the interactive
+        /// display + confirm prompt.
+        #[arg(long)]
+        scan_file: Option<PathBuf>,
+    },
+    /// Org directory-attestation ingest (T08, task 4.8): a signed org HR-name→account-key
+    /// mapping, ingested as a **display-name suggestion with recorded provenance** — never a
+    /// petname assignment, never a trust decision. See `apps/cli/src/directory.rs` and
+    /// `docs/security/directory-attestation.md`.
+    Directory {
+        #[command(subcommand)]
+        cmd: DirectoryCommand,
+    },
     /// Open an end-to-end-encrypted chat with a peer, relayed through the rendezvous (T03).
     Chat {
         /// The peer's full `mrd1:…@domain` ID.
@@ -111,6 +145,20 @@ enum TopCommand {
     Demo {
         #[command(subcommand)]
         cmd: DemoCommand,
+    },
+    /// Launch the interactive terminal client (T17). Refuses gracefully — pointing at the
+    /// scriptable `--json` equivalent — on `TERM=dumb`, a non-TTY stdout, or a terminal smaller
+    /// than 80x24. Compiled out entirely under `--no-default-features` (ADR 0020).
+    #[cfg(feature = "tui")]
+    Tui {
+        /// Skip the interactive terminal entirely: decrypt every sealed local store document
+        /// (`contacts.json`, `history/*.jsonl`, `outbox.json`) and write them, unsealed, into this
+        /// directory — mirroring the sealed layout (`<path>/contacts.json`,
+        /// `<path>/history/<peer>.jsonl`, `<path>/outbox.json`), plus a copy of the already-
+        /// unsealed `state.json` (task 4.15, tui-client.md §5: "for inspection or backup — which
+        /// is why no persistent-plaintext mode is offered").
+        #[arg(long, value_name = "PATH")]
+        export_json: Option<PathBuf>,
     },
 }
 
@@ -265,6 +313,55 @@ enum IdCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum DirectoryCommand {
+    /// Import a signed `.mrdir` directory-attestation artifact, pinned against a caller-supplied
+    /// org signing key (never the artifact's own self-claimed key alone — mirrors
+    /// `federation_map.toml`'s `pinned_identity`).
+    Import {
+        /// Path to the artifact file (raw CBOR bytes; `.mrdir` is the conventional extension).
+        path: PathBuf,
+        /// The org's signing public key, hex-encoded (64 hex chars / 32 bytes) — the trust
+        /// anchor, distributed by the org out-of-band, pinned locally.
+        #[arg(long = "org-key")]
+        org_key: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContactCommand {
+    /// Record a contact (TOFU-pins their current key) and, optionally, assign a local petname.
+    Add {
+        /// The peer's full `mrd1:…@domain` ID.
+        id: String,
+        /// A local display name for this contact. Never derived from `id` — this is the ONLY
+        /// wire-adjacent source this command reads, and it is used solely as `TrustStore::observe`'s
+        /// advisory hint, never as a petname. If `--petname` is omitted and stdin is an
+        /// interactive terminal, you'll be prompted (an empty line leaves it unset).
+        #[arg(long)]
+        petname: Option<String>,
+    },
+    /// List known contacts.
+    List {
+        /// Emit one JSON object per contact instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rename a contact's local petname (an empty string clears it).
+    Rename {
+        /// The peer's full `mrd1:…@domain` ID.
+        id: String,
+        /// The new petname (empty string to clear).
+        petname: String,
+    },
+    /// Block a contact by explicit local action — independent of, and never a substitute for, the
+    /// key-change block `meridian_core::trust::TrustState::Blocked` already enforces.
+    Block {
+        /// The peer's full `mrd1:…@domain` ID.
+        id: String,
+    },
+}
+
 fn main() -> ExitCode {
     // rustls 0.23 requires an explicit process-wide crypto backend selection before any `wss://`
     // connection; that install now lives in `meridian_signaling::install_crypto_provider` (called
@@ -274,6 +371,9 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         TopCommand::Id { cmd } => run_id(cmd),
+        TopCommand::Contact { cmd } => run_contact(cmd),
+        TopCommand::Directory { cmd } => run_directory(cmd),
+        TopCommand::Verify { id, scan_file } => run_verify(&id, scan_file.as_deref()),
         TopCommand::Register { server, invite } => cmd_register(&server, invite),
         TopCommand::FetchBundle { id, server, tamper } => cmd_fetch_bundle(&id, &server, tamper),
         TopCommand::Chat { id, server, json } => cmd_chat(&id, &server, json),
@@ -281,6 +381,11 @@ fn main() -> ExitCode {
         TopCommand::Doctor { json } => run_doctor(json),
         TopCommand::Config { cmd } => run_config(cmd),
         TopCommand::Demo { cmd } => run_demo(cmd),
+        #[cfg(feature = "tui")]
+        TopCommand::Tui { export_json } => match export_json {
+            Some(dest) => tui::export_json(&dest),
+            None => tui::run(),
+        },
     };
     match result {
         Ok(code) => code,
@@ -301,6 +406,50 @@ fn run_id(cmd: IdCommand) -> Result<ExitCode, String> {
         IdCommand::Export { out } => cmd_export(&out),
         IdCommand::Import { path, store, out } => cmd_import(&path, store, out),
     }
+}
+
+/// `meridian contact …` — loads the current account's store once (same shape as `cmd_chat`/
+/// `cmd_register`) and delegates to `contact.rs`, which owns everything `TrustStore`-specific.
+fn run_contact(cmd: ContactCommand) -> Result<ExitCode, String> {
+    let descriptor = AccountDescriptor::load()?;
+    let store = load_store(&descriptor)?;
+    let handle = KeyHandle::from_label(&descriptor.label);
+    match cmd {
+        ContactCommand::Add { id, petname } => {
+            contact::cmd_add(&id, petname, store.as_ref(), &handle)?
+        }
+        ContactCommand::List { json } => contact::cmd_list(json, store.as_ref(), &handle)?,
+        ContactCommand::Rename { id, petname } => {
+            contact::cmd_rename(&id, &petname, store.as_ref(), &handle)?
+        }
+        ContactCommand::Block { id } => contact::cmd_block(&id, store.as_ref(), &handle)?,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `meridian directory …` — loads the current account's store once (same shape as `run_contact`)
+/// and delegates to `directory.rs`, which owns everything `DirectoryStore`-specific.
+fn run_directory(cmd: DirectoryCommand) -> Result<ExitCode, String> {
+    let descriptor = AccountDescriptor::load()?;
+    let store = load_store(&descriptor)?;
+    let handle = KeyHandle::from_label(&descriptor.label);
+    match cmd {
+        DirectoryCommand::Import { path, org_key } => {
+            directory::cmd_import(&path, &org_key, store.as_ref(), &handle)?
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `meridian verify …` — loads the current account (same shape as `run_contact`) and delegates to
+/// `verify.rs`.
+fn run_verify(id: &str, scan_file: Option<&Path>) -> Result<ExitCode, String> {
+    let descriptor = AccountDescriptor::load()?;
+    let own_pubkey = account_pub_bytes(&descriptor)?;
+    let store = load_store(&descriptor)?;
+    let handle = KeyHandle::from_label(&descriptor.label);
+    verify::cmd_verify(id, &own_pubkey, scan_file, store.as_ref(), &handle)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 // ---------------------------------------------------------------------------

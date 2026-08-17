@@ -1,69 +1,121 @@
+%% Reconciled against shipped code as of task 4.28 (Phase 4 exit gate). This diagram shows what
+%% `meridian tui` actually does today, not the original T17 design's aspiration — see
+%% tui-client.md's "Current implementation status (as of 4.28)" section for the full writeup this
+%% diagram is the picture of. Two things are load-bearing and easy to miss from the diagram shape
+%% alone, so they are called out again here:
+%% 1. `apps/tui/src/lib.rs::run_worker` is still an inert stub (unchanged since task 4.11's own
+%%    placeholder scope): it echoes every dispatched `Effect` straight back as
+%%    `WorkerEvent::Completed` with no outcome populated, never calling `meridian-core`. A real
+%%    session therefore cannot progress past Onboarding's "Generating identity" step — confirmed
+%%    empirically (4.28): the TUI hangs indefinitely on "please wait…" once the org hint is
+%%    submitted. `Ctrl-Q` still quits and restores the terminal cleanly from that stuck state.
+%% 2. There is no `Preflight` routing step and no `Screen::Main`. `App::new()` unconditionally
+%%    starts on `Screen::Onboarding`; onboarding's own completion swaps to a bare
+%%    `Screen::Placeholder`, never a real "Main" screen, because none exists. `Screen::Unlock`,
+%%    `Contacts`, `ContactDetail`, `Chat`, `Verify`, and `Settings` are each fully built and
+%%    unit-tested (`ratatui::backend::TestBackend`) but are reachable in this crate's own tests only
+%%    by constructing them directly and pushing them onto the stack — nothing in
+%%    `App::handle_key`/`App::handle_worker` ever pushes any of them during a live run.
 stateDiagram-v2
   [*] --> Launch
 
-  Launch --> Preflight: meridian tui
-  Preflight --> Bail: not a TTY / TERM=dumb / terminal too small
+  Launch --> EnvGate: meridian tui
+  EnvGate --> Bail: not a TTY / TERM=dumb / smaller than 80x24
   Bail --> [*]: print the equivalent headless CLI command, exit 1
+  note right of EnvGate
+    Real and tested (apps/cli/src/tui.rs::check_environment).
+    The one part of this whole diagram that is both live-wired
+    AND reachable exactly as designed.
+  end note
 
-  Preflight --> Onboarding: no account.json in MERIDIAN_HOME
-  Preflight --> Unlock: account exists, file-backed store
-  Preflight --> Main: account exists, OS keystore
+  EnvGate --> Onboarding: environment OK, always (no Preflight routing step exists)
 
   state Onboarding {
     [*] --> ChooseStore
     ChooseStore --> OrgHint: OS keystore or passphrase keyfile
-    OrgHint --> Generate: enter the @domain hint
-    Generate --> ShowIdentity: Ed25519 keypair minted via meridian-identity
-    ShowIdentity --> Register: mrd1 ID plus QR shown, copy or save
-    Register --> PublishBundle: connect to rendezvous, optional invite token
-    PublishBundle --> [*]: prekey bundle published
-    note right of ShowIdentity
-      The private key never leaves the
-      SecretStore and is never rendered.
+    OrgHint --> Generating: enter the @domain hint
+    Generating --> ShowIdentity: GenerateAccount effect resolves
+    ShowIdentity --> Registering: connect to rendezvous, optional invite token
+    Registering --> PublishingBundle: registered
+    PublishingBundle --> [*]: prekey bundle published
+    note right of Generating
+      NEVER RESOLVES in a real run today — see this
+      file's header note (1). The sub-step machine
+      itself is real (task 4.16); only the worker
+      executing its Effect is missing.
     end note
   }
-  Onboarding --> Main: registered
 
-  Unlock --> Main: passphrase accepted
-  Unlock --> Unlock: wrong passphrase, retry with attempt count
-  Unlock --> [*]: user quits
-
-  state Main {
-    [*] --> Conversation
-    Conversation --> Contacts: Tab
-    Contacts --> Conversation: Enter on a contact
-    Contacts --> AddContact: n
-    AddContact --> Contacts: paste mrd1 ID or import QR, assign a local petname
-    Contacts --> Requests: r
-    Requests --> Contacts: accept promotes to pinned, reject drops the request
-    Contacts --> Verify: v
-    Verify --> Contacts: safety numbers match, mark verified or block
-    Conversation --> Diagnostics: palette
-    Diagnostics --> Conversation: Esc
-    Conversation --> Settings: palette
-    Settings --> Conversation: Esc
-  }
-
-  Main --> Help: F1
-  Help --> Main: Esc
-  Main --> Palette: Ctrl-K
-  Palette --> Main: Esc or run a command
-
-  Main --> KeyChangeWarning: pinned contact key changed
-  KeyChangeWarning --> Main: acknowledged, contact re-pinned
-  KeyChangeWarning --> Main: Verify is the primary action, opens the Verify screen
-
-  Main --> KeyChangeBlocked: VERIFIED contact key or device record changed
-  KeyChangeBlocked --> Main: re-verified out of band, sends resume
-  KeyChangeBlocked --> Blocked: user blocks the contact
-  Blocked --> Main: contact stays blocked, sends refused
-  note right of KeyChangeBlocked
-    Composer is DISABLED. No dismiss,
-    no trust-anyway, no timed accept.
-    Wording is canonical per
-    security/verification-ux.md.
+  Onboarding --> Help: F1 (global, wired — reachable even while stuck on Generating)
+  Help --> Onboarding: Esc
+  Onboarding --> Palette: Ctrl-K (global, wired — reachable even while stuck on Generating)
+  Palette --> Onboarding: Esc or run a registered command
+  Onboarding --> Requests: Ctrl-R (global, wired — reachable even while stuck on Generating)
+  Requests --> Onboarding: Esc
+  note right of Onboarding
+    F1 / Ctrl-K / Ctrl-R are checked unconditionally in
+    App::handle_key before any per-screen dispatch, so they
+    reach Help/Palette/Requests from EVERY screen, not just
+    Placeholder — confirmed live even while stuck on
+    Generating's "please wait…" step. The edges here and on
+    Placeholder are the same three global chords, drawn
+    twice only because those are the two states this diagram
+    otherwise shows; treat them as always-available, not
+    Placeholder/Onboarding-specific.
   end note
 
-  Main --> Quit: Ctrl-Q
-  Quit --> Main: cancelled, unsent input preserved
-  Quit --> [*]: terminal restored by the RAII guard
+  Onboarding --> Placeholder: onboarding finished (only reachable if Generating's worker gap above is fixed)
+  note right of Placeholder
+    Screen::Placeholder is a bare "screen content lands in
+    later tasks" stand-in. Screen::Main does not exist.
+  end note
+
+  Placeholder --> [*]: Ctrl-Q, global, wired, confirmed the terminal is restored cleanly, incl. from a stuck Onboarding screen
+  Placeholder --> Help: F1 (global, wired)
+  Help --> Placeholder: Esc
+  Placeholder --> Palette: Ctrl-K (global, wired)
+  Palette --> Placeholder: Esc or run a registered command
+  Palette --> Diagnostics: Diagnostics, the one command registered at startup today
+  Diagnostics --> Placeholder: Esc
+  Placeholder --> Requests: Ctrl-R, global, wired, always pushes an EMPTY queue, no live chat session to snapshot pending requests from
+  Requests --> Placeholder: Esc
+
+  state "Fully built and screen-snapshot-tested, reached ONLY by direct construction in this crate's own tests, no live route from Onboarding or Placeholder exists anywhere in the app's key/worker dispatch" as NotLiveWired {
+    Unlock
+    Contacts
+    ContactDetail
+    Chat
+    Verify
+    Settings
+
+    Contacts --> ContactDetail: Enter on a contact (this one screen-to-screen edge is really wired, once Contacts is on the stack at all)
+    ContactDetail --> Contacts: Esc
+    note right of Contacts
+      "Enter" opens ContactDetail, never a chat screen —
+      Screen::Chat exists and is fully wired but nothing
+      pushes it from here. "v" shows a "Verify is not
+      implemented yet (task 4.22) — press v again to
+      dismiss" stand-in notice instead of pushing
+      Screen::Verify, which also exists and is fully wired,
+      just not reachable from here.
+    end note
+
+    note right of Chat
+      Composer send-gate logic (Ok / Warn / Blocked, per
+      meridian_core::trust::TrustStore::can_send) is real
+      and adversarially tested (task 4.23): a verified
+      contact's key change disables the composer with the
+      canonical verification-ux.md wording, no dismiss-
+      without-verify path. Only the SCREEN's own internal
+      logic is proven — Chat itself is never pushed by a
+      live run (see the "NotLiveWired" note above).
+    end note
+
+    note right of Verify
+      Same story as Chat: mark-verified / block / acknowledge
+      and the two un-softenable key-change banners are real,
+      reviewed T08-primitive-backed logic (task 4.22), proven
+      via TestBackend snapshots — just never reached from a
+      live run.
+    end note
+  }

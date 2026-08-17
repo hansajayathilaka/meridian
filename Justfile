@@ -23,6 +23,9 @@ lint-invariants:
     # Guards the guard: proves the cargo-tree check still trips on a TRANSITIVE core dependency
     # (the route the old grep-based version could never see) rather than silently regressing.
     bash tools/lint-server-no-core.sh --selftest
+    # ADR 0020 condition 3: meridian-tui depends on meridian-core only, never meridian-cli.
+    bash tools/lint-tui-no-cli.sh
+    bash tools/lint-tui-no-cli.sh --selftest
     bash tools/lint-no-serde-on-blob.sh
     # Guards the guard: proves check-3 above still trips on the F15 bypass patterns (module-
     # qualified type paths, multi-line `let x: T = ... .decode()`) rather than silently regressing.

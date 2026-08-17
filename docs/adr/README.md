@@ -26,6 +26,8 @@ are the stack/repo decisions (extracted from [stack](../architecture/stack.md) �
 | [0017](./0017-federation-trust-boundary.md) | Federation trust boundary: peer-cert identity pinned to the hint domain, `fed_route` carries a server-asserted `from` (Accepted; extends 0002, scope-corrects 0016 R4) | Phase-2 planning |
 | [0018](./0018-rendezvous-config-loading.md) | `figment` for rendezvous + CLI-store config loading; `account.json` gets no `Env` layer (Accepted) | PR #37 follow-up |
 | [0019](./0019-container-image-distribution.md) | `ghcr.io` distribution channel + `:latest`/short-sha tags (Accepted); signing deferred with a named residual/trigger | Phase-3 review, task 3.19 |
+| [0020](./0020-tui-packaging.md) | `apps/tui` crate (`meridian-tui`), launched by `meridian tui` behind a default-on `tui` feature; depends on `meridian-core` only (Accepted) | Phase-4 planning, task 4.1 |
+| [0021](./0021-client-local-store-config-formats.md) | TUI local store sealed via `at_rest::seal` (except `config.toml`/`state.json`); `config.toml` via figment; `--export-json` as the only unsealed export (Accepted) | Phase-4 planning, task 4.2 |
 
 **Previously-open decisions, now resolved at handoff:** [0011 ratchet library](./0011-ratchet-library.md)
 X3DH layer → hand-wired over RustCrypto primitives (unchanged); Double Ratchet mechanism → composed

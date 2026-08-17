@@ -27,6 +27,9 @@ jobs:
           # Guards the guard: fails CI if the cargo-tree check stops catching a TRANSITIVE core
           # dependency — the route the old grep-based lint could never see (F21).
           bash tools/lint-server-no-core.sh --selftest
+          # ADR 0020 condition 3: meridian-tui depends on meridian-core only, never meridian-cli.
+          bash tools/lint-tui-no-cli.sh
+          bash tools/lint-tui-no-cli.sh --selftest
           bash tools/lint-no-serde-on-blob.sh
           # Guards the guard: fails CI if a future edit to the lint silently regresses its
           # module-qualified-path / multi-line bypass coverage (F15).
@@ -117,6 +120,20 @@ jobs:
           cargo test -p meridian-transport --features webrtc
           cargo test -p meridian-core --features webrtc
           cargo test -p meridian-cli --features webrtc
+      # ADR 0020 condition 2 / task 4.12: --no-default-features must still build (and must not pull
+      # in ratatui/crossterm via the default-on `tui` feature) — the lean build shape demo/CI
+      # scripts rely on. Not a one-time local check: this is the ongoing CI enforcement the ADR's
+      # Consequence section calls for.
+      - name: meridian-cli --no-default-features stays lean (ADR 0020)
+        run: |
+          cargo build -p meridian-cli --no-default-features
+          tree=$(cargo tree -p meridian-cli --no-default-features -e normal)
+          if printf '%s\n' "$tree" | grep -qE 'meridian-tui|ratatui|crossterm'; then
+            echo "::error::meridian-cli --no-default-features pulled in meridian-tui/ratatui/crossterm — the tui feature must be fully optional (ADR 0020 condition 2)." >&2
+            printf '%s\n' "$tree" >&2
+            exit 1
+          fi
+          echo "OK: --no-default-features build carries no TUI dependency tree."
       - name: Adversarial harnesses
         run: |
           bash harnesses/opacity-audit/run.sh

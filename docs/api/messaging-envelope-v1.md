@@ -86,18 +86,124 @@ message key     = HKDF-SHA256(salt = 0*32, ikm = MK, info = "Meridian/MsgKey/v1"
 - **Message AEAD**: `XChaCha20Poly1305(key, nonce, plaintext, aad = AD ‖ enc_header)`.
 - **Skipped keys**: retained keyed by `(header_key, N)`; bounded by `MAX_SKIP = 1000` per chain and
   `MAX_SKIPPED_STORED = 2000` overall (out-of-order / dropped-message delivery).
-- **Desync recovery (v1 — no automatic teardown).** An `enc_header` that opens under neither `HKr` nor
-  `NHKr` is rejected and the envelope dropped; **the receiving session is left untouched** — an
-  undecryptable inbound message never resets, tears down, or re-keys a live session. Recovery is driven
-  only by the peer that *knows* it lost state (restored backup, missing/corrupt session store): having
-  no session for that peer, it fetches a fresh signature-verified bundle and re-initiates X3DH, which
-  the counterpart accepts as an ordinary prekey message (§4 receiver rules). A peer whose own session is
-  healthy requires **user/operator action** (deleting the session) to recover. Automatic
-  detection-and-renegotiation on the *receiving* side is deliberately deferred: reacting to
-  undecryptable traffic would hand an active attacker (threat-model A2) a session-reset,
-  skipped-key-destruction, and prekey-depletion oracle, and it must not ship before verified-contact
-  block-on-key-change ([Feature 08](../architecture/features/08-verification-trust.md), threat-model
-  goal 2) guards the re-handshake's bundle fetch. Decision recorded in task 1.18.
+- **Desync recovery (v1).** An `enc_header` that opens under neither `HKr` nor `NHKr` is rejected and
+  the envelope dropped; on its own, **the receiving session is left untouched** — an undecryptable
+  inbound message never resets, tears down, or re-keys a live session by itself. Two paths recover
+  from this, both landed, and both guarded:
+  - **The "safe half" (task 1.18, freshness-gated since a 4.9 review fixup).** The peer that *knows*
+    it lost state (restored backup, missing/corrupt session store) has no session for the
+    counterpart, so it fetches a fresh signature-verified bundle and re-initiates X3DH. The
+    counterpart accepts this as an ordinary prekey message (§4 receiver rules) — including, since
+    task 4.9, when it still holds a **stale** session for that identity key rather than no session
+    at all: `open_bytes` first tries the existing session as usual, and only on an
+    `UndecryptableHeader` failure — and only if the envelope actually carries a fresh X3DH prekey
+    preamble — attempts a fresh responder establishment from that preamble and re-tries the same
+    ciphertext against it. Any failure along the way (e.g. the referenced one-time prekey was
+    already consumed) leaves the stale session completely untouched and the envelope still
+    classifies as desync, exactly as before.
+    - **This case only — no existing session at all — is genuinely unconditional on freshness**,
+      because there is no live session yet to roll back: `open_bytes`'s first-contact branch
+      accepts a fresh, signature-verified prekey envelope immediately, replay or not.
+    - **The stale-session fallback (the case above) is additionally gated on freshness, not just
+      signature validity — this is the fix for a real, previously-shipped-in-review vulnerability.**
+      A verified signature proves only that the claimed sender produced these bytes *at some point*,
+      never that they are fresh. X3DH is deterministic in its public inputs, so a malicious
+      relay/rendezvous server that has merely observed one of the sender's own past opening
+      envelopes could replay it byte-for-byte once the receiver's ratchet had genuinely advanced
+      past it (a couple of ordinary round-trips is enough), reconstructing the byte-identical
+      initial session and decrypting the also-replayed ciphertext successfully — deterministically,
+      every time, for OTK-free X3DH (`used_opk: None`, legal and common), since the signed prekey is
+      never consumed on use. That would have silently rolled a live, forward-secret-advanced session
+      back to its own initial state through the ordinary success path, with no gate and no notice —
+      exactly the "weaker session" outcome `docs/security/threat-model.md` goal 6 rules out, and the
+      same oracle class task 1.18's `attempt_recovery`/threshold/gate machinery exists to prevent,
+      reintroduced through this different, ungated code path.
+      **The fix (second-round — the first version of this fix was itself exploitable).** The first
+      fixup had `ChatState` record only the single most-recently-established `ek_pub` per peer,
+      *overwritten* on every new responder establishment. A further review round (architect +
+      security-reviewer, independently) found that overwritable-scalar design itself exploitable
+      within one ordinary session: an attacker who can force `DESYNC_RECOVERY_THRESHOLD` desyncs
+      against the *peer's own* inbound path can drive that peer's guarded recovery to produce a
+      second, entirely genuine responder establishment for the same identity — which silently
+      displaces the recorded `ek_pub`, so a subsequent replay of the *original* opening envelope (its
+      referenced signed prekey generation still unexpired — a signed prekey is never consumed on use,
+      and a real client may not republish for the lifetime of a long-running session) no longer
+      matched anything and was accepted again, exactly reconstructing that first session and rolling
+      the live one back to it.
+      **The corrected design:** `ChatState` records **every** `ek_pub` that established a responder
+      session with a peer, each tagged with the specific signed-prekey generation it referenced, for
+      as long as that generation remains accepted by the local prekey vault (the vault's current
+      generation, or the single grace-window-retained previous one — task 1.31). Before the
+      stale-session fallback attempts fresh establishment, it checks the incoming envelope's
+      `prekey.ek_pub` against **every** still-generation-valid recorded entry for that peer, not just
+      the most recent. A match against any of them means this is a replay of material that already
+      established a session currently or previously held — the fallback is refused outright, exactly
+      as if it did not exist, and the envelope classifies as an ordinary desync. A genuine
+      re-initiator always draws a fresh random ephemeral key per X3DH initiation, so this never
+      rejects a real re-initiation; a peer with no recorded `ek_pub` at all (never went through
+      responder establishment — e.g. the current session was established as an *initiator*) has no
+      freshness signal available, so the fallback behaves exactly as before either fixup for that
+      case, relying on signature validity alone.
+      **Pruning, and why it stays bounded.** An entry is dropped once its referenced generation is no
+      longer accepted — pruned in the same call that retires the prekey vault's own superseded
+      generation (`PrekeyVault::expire_previous_generation`, via `ChatState`'s own wrapper), so this
+      history's growth is bounded by exactly the mechanism that already bounds that generation's own
+      retention (at most one superseded generation, for at most `PREV_GENERATION_GRACE_SECS`), not a
+      separate, disconnected accumulation. Within a single still-current generation, repeated
+      attacker-forced re-establishment cycles can still add one entry each — bounded by the same
+      `DESYNC_RECOVERY_THRESHOLD`-gated rate the recovery machinery is already rate-limited by (see
+      the "dangerous half" residual below), not literally unbounded, but not capped by count either;
+      a hard per-peer cap was judged unnecessary scope given that existing rate limit. Once an entry
+      is pruned because its generation genuinely expired, a replay referencing it is not left
+      unprotected: it instead fails inside the fallback's own fresh-establishment attempt
+      (`UnknownPrekey`, since the vault no longer holds that generation's secret at all), which
+      `open_bytes` already treats as an ordinary failed recovery attempt — the envelope still
+      classifies as desync, the session still untouched.
+      **Residual, stated honestly.** This closes the specific replay-of-verbatim-prekey-material
+      attack, for as long as the referenced material's generation stays accepted at all — genuinely
+      expired material is independently blocked by the ordinary unknown-prekey failure path, not by
+      this freshness check. It does not, and is not intended to, protect against a peer whose *own*
+      private key material has been compromised (an attacker who can compute a genuinely new, valid
+      X3DH handshake is cryptographically indistinguishable from the real peer — no freshness check
+      can or should catch that; that is a key-compromise scenario outside what any receiver-side
+      replay check can address). It also does not change the "dangerous half" residual described
+      below, which is a separate, already-stated trade-off.
+  - **The "dangerous half" (task 4.9, following through on task 1.18's deferred decision).** A peer
+    whose *own* session looks healthy but whose inbound decryption keeps failing (an active
+    attacker replaying/corrupting traffic — threat-model A2 — or the counterpart having genuinely
+    lost its state) MAY now recover automatically, but only under a specific, multi-part guard:
+    1. **Repeated, never single.** A per-peer counter tracks *consecutive* desync classifications,
+       reset on any successful decrypt from that peer; only once a threshold is crossed
+       (`DESYNC_RECOVERY_THRESHOLD` in `apps/core/src/chat.rs`, `TODO: confirm` the exact number —
+       currently 5) does recovery become eligible. A single replayed or corrupted envelope is never
+       enough on its own to force anything.
+    2. **Gated by the block/warn key-change gate ([Feature 08](../architecture/features/08-verification-trust.md),
+       task 4.4).** Before fetching anything, the client consults the peer's `SendGate`
+       (`TrustStore::can_send`); a peer currently `Warn`/`Blocked` from an unresolved key change is
+       refused an automatic re-handshake — surfaced to the user as recovery being *paused* pending
+       that existing resolution, never silently skipped or silently proceeded past.
+    3. **A key change surfaced mid-recovery is an ordinary key-change event, never a bypass.** If
+       the fetch ever reveals the peer's identity key genuinely changed, that is routed through
+       `TrustStore::observe_key_change` (block on verified, warn on pinned) exactly like any other
+       key-change discovery — never silently accepted "because a recovery flow is already in
+       progress". In practice this branch is close to unreachable via the shipped client, since the
+       bundle fetch is pinned to the exact expected key (`verify_bundle` aborts on any substitution
+       before a bundle is even returned) — but the recovery function's own contract enforces it
+       regardless, for any future fetch strategy that could resolve differently.
+    4. **The forced session replacement is a separate, explicit surface**
+       (`ChatState::replace_session_as_initiator`), never a side effect of the ordinary
+       `start_initiator_session` path every other caller already uses (which stays
+       idempotent-as-a-no-op when a session exists, for the normal "reopen a chat" case). Only a
+       decided recovery attempt ever discards a session; the counter/threshold bookkeeping never
+       touches `sessions` or skipped-message keys on its own.
+    5. **User-visible notice.** An actual automatic recovery is never silent.
+    - **Residual, stated honestly.** This rate-limits, but does not eliminate, the oracle 1.18
+      identified: an attacker able to force `DESYNC_RECOVERY_THRESHOLD` desync classifications on
+      demand can still trigger one recovery attempt (and, if the gate reads `Ok`, one one-time-prekey
+      consumption) per that many forced failures — bounded, not zero.
+
+  A peer whose own session is healthy and whose desync count never crosses the threshold still falls
+  back to **user/operator action** (deleting the session) exactly as before this task.
 
 ### Ratchet message framing
 

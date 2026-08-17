@@ -50,6 +50,12 @@ rules keep them from drifting:
 One window, a **screen stack** (push/pop, `Esc` pops), with the main screen being a three-region
 chat layout. Overlays (help, palette, modals) render on top without unmounting what is beneath.
 
+**The mockup below is the design's target composed screen — it does not exist as a single rendered
+view today.** No `Screen::Main` combines Contacts + conversation + composer + status bar into one
+layout; each pane it shows (Contacts, Chat, Requests) is a separate, independently-built and
+independently-tested `Screen` today. See
+[§10](#10-current-implementation-status-as-of-task-428) for what is actually reachable in a live run.
+
 ```
 ┌ Meridian ─────────────────────────── mrd1:ab12…7f@org-a.test ── ● connected ─┐
 │ Contacts ⌕            │ bob · verified ✓                                      │
@@ -62,21 +68,24 @@ chat layout. Overlays (help, palette, modals) render on top without unmounting w
 ├───────────────────────┴──────────────────────────────────────────────────────┤
 │ ▏type a message…                                             Enter send        │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│ ^K palette  ^N contact  ^V verify  F1 help │ P2P direct │ policy: direct │ ▲2  │
+│ ^K palette  n contact  v verify  F1 help │ P2P direct │ policy: direct │ ▲2    │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Screens
-Full transitions: [tui-screen-flow.mermaid](./diagrams/tui-screen-flow.mermaid).
+Full transitions: [tui-screen-flow.mermaid](./diagrams/tui-screen-flow.mermaid). **This table is the
+design's target shape.** As of task 4.28 several "Reached by" cells describe a route that does not
+exist yet in `App::handle_key`/`App::handle_worker` — see
+[§10](#10-current-implementation-status-as-of-task-428) for exactly which, and why.
 
-| Screen | Purpose | Reached by |
+| Screen | Purpose | Reached by (design) |
 |---|---|---|
 | **Onboarding** | No account on disk → keystore choice, org hint, keypair generation, ID + QR, register + publish bundle | first run |
 | **Unlock** | Existing file-backed account → masked passphrase | startup (OS keystore skips it) |
 | **Main** | Contacts + conversation + composer + status bar | after unlock |
-| **Add contact** | Paste an `mrd1:` ID or import a QR image, assign a petname | `^N` |
-| **Requests** | First-contact gate queue (§3.5): sender key, safety number, intro, accept/reject | `^R`, or the Requests section of the contacts pane |
-| **Verify** | 60-digit safety number + QR, mark verified, block | `^V` on a selected contact |
+| **Add contact** | Paste an `mrd1:` ID or import a QR image, assign a petname | `n` on the Contacts screen |
+| **Requests** | First-contact gate queue (§3.5): sender key, safety number, intro, accept/reject | `^R` (global), or `r` on the Contacts screen |
+| **Verify** | 60-digit safety number + QR, mark verified, block | `v` on a selected contact |
 | **Contact detail** | Trust state, key history, per-contact relay policy, petname, block/delete | `Enter` on a contact with the detail toggle |
 | **Settings** | Server URL, relay policy, theme, timestamps, bell, retention | palette → *Settings* |
 | **Diagnostics** | `doctor` output, live connection/transport state, why a path was chosen | palette → *Diagnostics* |
@@ -98,10 +107,16 @@ optional and off by default (it steals terminal text selection, which users rely
 
 | Scope | Keys |
 |---|---|
-| Global | `F1` help · `^K` palette · `^Q` quit (confirm if unsent input) · `Tab`/`S-Tab` cycle panes · `Esc` back / close overlay |
+| Global | `F1` help · `^K` palette · `^Q` quit · `Esc` back / close overlay |
 | Contacts | `↑↓`/`j k` move · `Enter` open · `n` new · `r` requests · `v` verify · `p` petname · `b` block · `/` filter |
 | Conversation | `PgUp`/`PgDn`, `^U`/`^D` scroll · `Home`/`End` · `g`/`G` top/bottom · `u` jump to first unread |
 | Composer | `Enter` send · `A-Enter`/`^J` newline · `^U` clear · `↑` recall last sent · `^W` delete word |
+
+`Tab` is bound per-screen with a different local meaning each time (composer/transcript focus in
+Chat, id/QR-path focus in Contacts, field focus in Onboarding) — there is no global "cycle panes"
+binding, and `Shift-Tab`/`S-Tab` is not bound anywhere in this crate today. `^Q` quits immediately and
+unconditionally; there is no confirmation prompt for unsent composer input. See
+[§10](#10-current-implementation-status-as-of-task-428).
 
 Rules:
 - **Every command is reachable from the palette**, so nothing is discoverable only by memory. The
@@ -379,3 +394,99 @@ Per [testing/strategy.md](../testing/strategy.md), with the TUI's own additions:
   assertion for a newer schema version.
 - **Update-function unit tests** — because `update` is pure, most interaction logic is testable
   without a terminal at all.
+
+---
+
+## 10. Current implementation status (as of task 4.28)
+
+Sections 1–9 above are this document's design of record — the target shape T17 was scoped to. This
+section is the honest, as-shipped picture task 4.28 (the phase's exit gate) is required to keep in
+sync with it, written after actually running `meridian tui` end to end (not just reading source).
+**Read this section before treating any "reached by" cell above, or the mockup in §2, as something you
+can do in a real session today.**
+
+### What is real and live-reachable today
+- The **environment gate** (`apps/cli/src/tui.rs::check_environment`): `TERM=dumb`, a non-TTY stdout,
+  and a terminal smaller than 80×24 are all refused with the documented plain-text message and exit
+  code 1, exactly as §3 describes. Confirmed by this task and by its own unit tests.
+- The **terminal guard**: raw mode/alternate screen are restored on normal exit, and `Ctrl-Q` quits
+  cleanly and restores the terminal even from a screen stuck mid-effect (see below) — confirmed
+  empirically in this task, not just by the panic-restores-terminal unit test.
+- **Onboarding's own sub-step state machine** (`ChooseStore → OrgHint → Generating → ShowIdentity →
+  Registering → PublishingBundle`), up to the point where it needs a worker to actually do something
+  (see the blocking gap below).
+- Four **global key chords**, checked unconditionally ahead of whatever screen is on top:
+  `Ctrl-Q` (quit), `F1` (Help), `Ctrl-K` (Palette), `Ctrl-R` (push `Screen::Requests` with an **empty**
+  queue — there is no live `meridian_core::chat::ChatState` anywhere in this crate yet to snapshot
+  `pending_requests()` from). Any *registered* palette command's own binding also fires globally; today
+  exactly one command is registered (`nav.diagnostics`).
+- **Every individual screen** — Onboarding, Unlock, Contacts, Contact detail, Chat, Requests, Verify,
+  Settings, Help, Palette, Diagnostics — is fully built, with real `handle_key`/`handle_worker`/`render`
+  logic, and independently proven via `ratatui::backend::TestBackend` snapshot tests and unit tests
+  (including the security-critical ones: the key-change adversarial test, the at-rest audit, the
+  fingerprint-alongside-petname checks). None of this is fake or stubbed *inside* a screen.
+- Config loading, the sealed local store round-trip, and the at-rest audit are real and pass against
+  the actual on-disk files these screens would write.
+
+### The two gaps that mean no live session exists end to end
+
+**1. There is no `Preflight` step and no `Screen::Main`.** `App::new()` unconditionally starts on
+`Screen::Onboarding` — it never checks for an existing `account.json` to route to `Screen::Unlock` or
+past onboarding entirely, the way §2's screen table and the (now-corrected)
+[screen-flow diagram](./diagrams/tui-screen-flow.mermaid) describe. Onboarding's own completion swaps
+to a bare `Screen::Placeholder` ("screen content lands in later tasks"), because `Screen::Main` does
+not exist. `Screen::Unlock`, `Contacts`, `ContactDetail`, `Chat`, `Verify`, and `Settings` are each
+fully built and tested (above) but are reached in this crate's own test suite **only** by constructing
+them directly and calling `App::push_screen` — nothing in `App::handle_key`/`App::handle_worker` ever
+pushes any of them during a live run. The one real exception is `Contacts → ContactDetail` via `Enter`,
+which *is* wired screen-to-screen — but only once `Contacts` is already on the stack, which today only
+happens in a test. `Contacts`'s own `v` key shows a "Verify is not implemented yet (task 4.22) — press
+v again to dismiss" stand-in notice rather than pushing the real (fully built) `Screen::Verify`.
+
+**2. `apps/tui/src/lib.rs::run_worker` is still an inert stub.** Unchanged since task 4.11's own
+placeholder scope, it does not execute an `Effect` against `meridian-core` at all — it just echoes
+whatever `Effect` it received straight back wrapped in `WorkerEvent::Completed`, with no outcome ever
+populated (`crate::screens::diagnostics`'s own module doc names this precisely: "today's
+unconditional-success, no-op-payload stub"). Every screen's `handle_worker` only advances past a
+`WorkerEvent::Completed` carrying a **populated** outcome (e.g. `GenerateAccountEffect { outcome:
+Some(account), .. }`); since the stub never populates one, the match falls through to a no-op and the
+screen simply never moves on.
+
+**This second gap is the one that actually blocks the acceptance demo, and it is more fundamental than
+gap 1.** It means a real `meridian tui` session cannot progress past Onboarding's own first effect —
+confirmed empirically for this task:
+
+```
+$ meridian tui                          # passphrase-wrapped keyfile, hint "org-a.test"
+  … ChooseStore → OrgHint proceed normally …
+  "Generating your identity for @org-a.test… please wait…"
+  ← hangs here indefinitely. No error, no timeout, no progress.
+  Ctrl-Q still quits and restores the terminal cleanly.
+```
+
+### What this means for the T17 acceptance demo
+
+**The demo script in
+[17-terminal-tui-client.md](./features/17-terminal-tui-client.md)'s "Working output" section —
+onboarding → verified chat → restart-persists → key-change-blocks, driven entirely by `meridian tui` —
+does not run end to end today.** It gets exactly as far as submitting the org-domain hint on a fresh
+account and then hangs forever on "Generating your identity…". Nothing past that point (registration,
+bundle publish, the contact list, chat, verification, restart) is reachable from a live run, even
+though every one of those screens' own internal logic is genuinely built and tested in isolation.
+
+This was never a task in this phase's 28-task breakdown — each of 4.16–4.27 explicitly, repeatedly
+scoped "wiring this screen into live navigation" and "wiring `run_worker` to actually execute this
+`Effect`" out, deferring both to "a future task" in nearly every module's own doc comments (see e.g.
+`Screen::Chat`'s, `Screen::Verify`'s, and `crate::screens::diagnostics`'s doc comments). No task ever
+was that future task. Closing it needs at least:
+- A **Preflight** step (detect `account.json`, route to `Unlock`/`Onboarding`/past both) and a real
+  **`Main`** screen (or equivalent live navigation) that actually pushes `Contacts`/`Chat`/`Verify`/
+  `Requests`/`Settings` with real, loaded data, per every screen's own "future Preflight step" doc
+  comments.
+- A **real `run_worker`** that dispatches each `Effect` variant to the matching `meridian-core` call
+  (`generate_account`, `SignalingClient::connect`/`publish_bundle`, `route_tolerant`, the sealed-store
+  read/write helpers, …) and reports a populated outcome back — not the task-4.11 stub.
+
+Tracked as follow-up in [docs/tasks/phase-4/README.md](../tasks/phase-4/README.md)'s exit criteria
+and [docs/tasks/README.md](../tasks/README.md)'s carry-forward section, mirroring how this phase
+already carries forward 4.22's Verify-screen-height note into 4.26.

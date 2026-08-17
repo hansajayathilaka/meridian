@@ -3,7 +3,10 @@
 
 # Phase 4 — Verification & Trust + Terminal TUI Client
 
-**Kind:** build · **Status:** planning · **Reviews phase(s):** n/a (build phase; Phase 5 will review it)
+**Kind:** build · **Status:** in progress — 28/28 originally planned tasks done, but per the
+task-tracking skill's own §7 ("a build phase isn't done until its acceptance demo runs"), the phase is
+**not actually closed**: task 4.28 found T17's acceptance demo does not run end to end, and tasks
+4.29–4.38 (added post-4.28 to close that gap) are pending · **Reviews phase(s):** n/a (build phase; Phase 5 will review it)
 
 ## Goal
 Ship **Feature 08 — Verification & Contact Trust** and **Feature 17 — Terminal TUI Client** together,
@@ -158,44 +161,65 @@ same function under the new AAD/commit-on-decrypt rules and must re-verify this 
 <!-- Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
 
 **ADR track — block all T17 code, not T08** (4.1, 4.2 can run together)
-- [ ] **4.1** ADR 0020 — TUI packaging — [file](./4.1-adr-tui-packaging.md)
-- [ ] **4.2** ADR 0021 — client-local store & config formats — [file](./4.2-adr-client-store-config-formats.md)
+- [x] **4.1** ADR 0020 — TUI packaging — [file](./4.1-adr-tui-packaging.md)
+- [x] **4.2** ADR 0021 — client-local store & config formats — [file](./4.2-adr-client-store-config-formats.md)
 
 **T08 track — starts immediately, independent of the ADRs** (the phase's longest critical-path chain)
-- [ ] **4.3** Trust module + contact store core — [file](./4.3-trust-module-contact-store.md)
-- [ ] **4.4** Key-change handling: block/warn semantics — [file](./4.4-key-change-block-warn-gate.md)
-- [ ] **4.5** Safety-number compare UX primitives + `meridian verify` — [file](./4.5-safety-number-verify-cli.md)
-- [ ] **4.6** Petname assignment + contact management CLI — [file](./4.6-petname-contact-management-cli.md)
-- [ ] **4.7** Message-request UX finalization (from T06) — [file](./4.7-message-request-finalization.md)
-- [ ] **4.8** Org directory-attestation ingest — [file](./4.8-directory-attestation-ingest.md)
-- [ ] **4.9** Desync detection → guarded fresh-X3DH re-handshake (1.18 follow-through; includes the
+- [x] **4.3** Trust module + contact store core — [file](./4.3-trust-module-contact-store.md)
+- [x] **4.4** Key-change handling: block/warn semantics — [file](./4.4-key-change-block-warn-gate.md)
+- [x] **4.5** Safety-number compare UX primitives + `meridian verify` — [file](./4.5-safety-number-verify-cli.md)
+- [x] **4.6** Petname assignment + contact management CLI — [file](./4.6-petname-contact-management-cli.md)
+- [x] **4.7** Message-request UX finalization (from T06) — [file](./4.7-message-request-finalization.md)
+- [x] **4.8** Org directory-attestation ingest — [file](./4.8-directory-attestation-ingest.md)
+- [x] **4.9** Desync detection → guarded fresh-X3DH re-handshake (1.18 follow-through; includes the
   `open_bytes` short-circuit fix) — [file](./4.9-desync-guarded-rehandshake.md)
-- [ ] **4.10** `meridian-mitm-sim` trust-state matrix — [file](./4.10-mitm-sim-trust-matrix.md)
+- [x] **4.10** `meridian-mitm-sim` trust-state matrix — [file](./4.10-mitm-sim-trust-matrix.md)
 
 **T17 infra — no dependency on T08; starts alongside it once 4.1 lands** (4.13 has zero dependencies —
 start it day 1)
-- [ ] **4.11** `apps/tui` crate skeleton + terminal guard — [file](./4.11-tui-crate-skeleton-terminal-guard.md)
-- [ ] **4.12** `meridian tui` subcommand + environment gate — [file](./4.12-tui-subcommand-env-gate.md)
-- [ ] **4.13** Extract shared account/home-layout helpers into `meridian-core` — [file](./4.13-extract-account-home-layout-core.md)
-- [ ] **4.14** `meridian-tui::config` — [file](./4.14-tui-config.md)
-- [ ] **4.15** `meridian-tui::store` — [file](./4.15-tui-store.md)
-- [ ] **4.16** Onboarding screen — [file](./4.16-onboarding-screen.md)
-- [ ] **4.17** Unlock screen — [file](./4.17-unlock-screen.md)
-- [ ] **4.18** Extension registry (`meridian-tui::surface`) — [file](./4.18-extension-registry.md)
+- [x] **4.11** `apps/tui` crate skeleton + terminal guard — [file](./4.11-tui-crate-skeleton-terminal-guard.md)
+- [x] **4.12** `meridian tui` subcommand + environment gate — [file](./4.12-tui-subcommand-env-gate.md)
+- [x] **4.13** Extract shared account/home-layout helpers into `meridian-core` — [file](./4.13-extract-account-home-layout-core.md)
+- [x] **4.14** `meridian-tui::config` — [file](./4.14-tui-config.md)
+- [x] **4.15** `meridian-tui::store` — [file](./4.15-tui-store.md)
+- [x] **4.16** Onboarding screen — [file](./4.16-onboarding-screen.md)
+- [x] **4.17** Unlock screen — [file](./4.17-unlock-screen.md)
+- [x] **4.18** Extension registry (`meridian-tui::surface`) — [file](./4.18-extension-registry.md)
 
 **T17 screens — the rendezvous point; 4.19 is the first task needing both tracks**
-- [ ] **4.19** Contact list + add-contact + contact detail — [file](./4.19-contact-list-detail-screens.md)
-- [ ] **4.20** Chat / conversation screen — [file](./4.20-chat-screen.md)
-- [ ] **4.21** Message-request queue screen — [file](./4.21-message-request-queue-screen.md)
-- [ ] **4.22** Verification screen — [file](./4.22-verification-screen.md)
-- [ ] **4.23** Key-change adversarial test — [file](./4.23-key-change-adversarial-test.md)
-- [ ] **4.24** Settings screen — [file](./4.24-settings-screen.md)
-- [ ] **4.25** Help overlay + command palette + diagnostics — [file](./4.25-help-palette-diagnostics.md)
-- [ ] **4.26** Terminal-constraint degradation — [file](./4.26-terminal-constraint-degradation.md)
-- [ ] **4.27** At-rest audit harness — [file](./4.27-at-rest-audit-harness.md)
+- [x] **4.19** Contact list + add-contact + contact detail — [file](./4.19-contact-list-detail-screens.md)
+- [x] **4.20** Chat / conversation screen — [file](./4.20-chat-screen.md)
+- [x] **4.21** Message-request queue screen — [file](./4.21-message-request-queue-screen.md)
+- [x] **4.22** Verification screen — [file](./4.22-verification-screen.md)
+- [x] **4.23** Key-change adversarial test — [file](./4.23-key-change-adversarial-test.md)
+- [x] **4.24** Settings screen — [file](./4.24-settings-screen.md)
+- [x] **4.25** Help overlay + command palette + diagnostics — [file](./4.25-help-palette-diagnostics.md)
+- [x] **4.26** Terminal-constraint degradation — [file](./4.26-terminal-constraint-degradation.md)
+- [x] **4.27** At-rest audit harness — [file](./4.27-at-rest-audit-harness.md)
 
-**Phase exit gate**
-- [ ] **4.28** Docs sync + phase acceptance-demo wiring — [file](./4.28-docs-sync-acceptance-demo.md)
+**Phase exit gate (first attempt — found the gap below, honestly, rather than papering over it)**
+- [x] **4.28** Docs sync + phase acceptance-demo wiring — [file](./4.28-docs-sync-acceptance-demo.md)
+
+**T17 gap closure — added post-4.28.** Per the task-tracking skill's own §7, a build phase isn't done
+until its acceptance demo runs; 4.28 found T17's doesn't. These 10 tasks close it: real `run_worker`
+effect execution (split into five independently-testable groups by which store files/screens each
+touches — 4.30–4.34), a previously-unscoped third gap found during planning (no live inbound-message
+receive path at all — 4.35), the missing `Preflight`/`Screen::Main` live navigation (4.36/4.37), the
+shared `LiveSession` plumbing all of the above need (4.29), and a second, now-successful acceptance-demo
+closure (4.38) mirroring 4.28's own role. Full planning rationale (including the judgment calls on how
+the `run_worker` split was chosen, why `LiveSession` is a dedicated task, and why 4.28 itself was never
+reopened) lives in each task file's own text plus the architect consult recorded in
+[tui-client.md §4](../../architecture/tui-client.md) once folded in by 4.38.
+- [ ] **4.29** `Effect::LoadSession` + `LiveSession` assembly — [file](./4.29-load-session-live-session.md)
+- [ ] **4.30** Real `run_worker`: account lifecycle — [file](./4.30-run-worker-account-lifecycle.md)
+- [ ] **4.31** Real `run_worker`: contacts & contact-detail persistence — [file](./4.31-run-worker-contacts-persistence.md)
+- [ ] **4.32** Real `run_worker`: trust & request-queue persistence — [file](./4.32-run-worker-trust-request-persistence.md)
+- [ ] **4.33** Real `run_worker`: outbound chat — [file](./4.33-run-worker-outbound-chat.md)
+- [ ] **4.34** Real `run_worker`: settings & diagnostics — [file](./4.34-run-worker-settings-diagnostics.md)
+- [ ] **4.35** Inbound delivery stream — [file](./4.35-inbound-delivery-stream.md)
+- [ ] **4.36** `Screen::Main` + live navigation — [file](./4.36-screen-main-live-navigation.md)
+- [ ] **4.37** Preflight routing — [file](./4.37-preflight-routing.md)
+- [ ] **4.38** T17 acceptance-demo closure (phase re-exit gate) — [file](./4.38-t17-acceptance-demo-closure.md)
 
 ### Dependency order
 ```
@@ -221,6 +245,16 @@ start it day 1)
 4.20 ──► 4.26
 4.15,4.16,4.19,4.20,4.22 ──► 4.27
 everything ──► 4.28
+
+-- T17 gap closure (added post-4.28) --
+4.13,4.15,4.3 ──► 4.29 ─┬─► 4.35 (inbound stream)
+                        └─► 4.36 (Screen::Main + nav) ──► 4.37 (Preflight, also needs 4.29)
+4.16,4.17 ──► 4.30 (run_worker: account)         ─┐
+4.19      ──► 4.31 (run_worker: contacts)         │  4.30-4.34 independent of each other and of
+4.21,4.22,4.4 ──► 4.32 (run_worker: trust/reqs)   │  4.29/4.35/4.36/4.37, but share run_worker's
+4.20      ──► 4.33 (run_worker: outbound chat)    │  match statement — must land as sequential
+4.24,4.25 ──► 4.34 (run_worker: settings/diag)   ─┘  commits (any order among themselves)
+4.29–4.37 (all of them) ──► 4.38 (re-exit gate)
 ```
 **Parallel tracks.** Track ADR (4.1, 4.2) — no code. Track T08 (4.3→4.10) — the phase's longest
 sequential chain, zero dependency on the ADRs or on any T17 task. Track T17-infra (4.13 independent;
@@ -230,13 +264,52 @@ in parallel with T08's later tasks (they touch disjoint files: `apps/tui` vs. `a
 petname API (4.6); everything downstream in T17 (4.20–4.27) serializes behind both tracks converging
 there. 4.24 and 4.13 are the most freely schedulable — use them to fill slack.
 
+**T17 gap-closure tracks (4.29–4.38).** Wave 1 — fully parallel, each depends only on already-done
+Phase 4 tasks: 4.30, 4.31, 4.32, 4.33, 4.34 (the five `run_worker` groups) plus 4.29 (`LiveSession`).
+Wave 2 — each needs only 4.29: 4.35 (inbound stream), 4.36 (`Screen::Main`). Wave 3: 4.37 (Preflight,
+needs 4.29 + 4.36). Wave 4: 4.38 (needs everything). Scheduling note: **4.30 is the highest-value single
+task to land first** even though it has no hard dependency on anything in this set — it is the exact fix
+for the specific hang 4.28 reproduced ("Generating your identity…"), so it turns a completely stuck
+onboarding into a runnable (if not yet fully navigable) session soonest.
+
 ## Exit criteria
-- All Phase 4 tasks `[x]`, tree green (`just build`, `cargo clippy --workspace --all-targets -D
-  warnings` clean), docs synced.
-- T08's acceptance demo runs: `meridian-mitm-sim` matrix — 0 silent successes against `verified`, 0
-  successes against `pinned` without the exact `verification-ux.md` warning shown.
-- T17's acceptance demo runs: onboarding → verified chat → restart-persists → key-change blocks, all
-  from `meridian tui` alone, at 80×24, with the at-rest audit and panic-restores-terminal test green.
-- The envelope-v2 obligation above is either discharged this phase or re-deferred with a concrete,
-  recorded trigger — not silently dropped again.
-- Then: `/start-review-phase` for Phase 5.
+
+**Assessed honestly by task 4.28** (the phase's first exit-gate attempt) — see its own file for the full
+diff and [tui-client.md §10](../../architecture/tui-client.md#10-current-implementation-status-as-of-task-428)
+for the complete writeup of the one criterion below that does **not** hold today. Task 4.38 is the
+**second, planned-to-succeed** exit-gate attempt, once 4.29–4.37 close the gap 4.28 found.
+
+- [x] All 28 originally-planned Phase 4 tasks (4.1–4.28) are `[x]` in the tracker (see
+  [dependency order](#dependency-order)). **Not sufficient for phase closure** — see the next item.
+- [x] Tree green: `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings`
+  clean (re-run fresh by 4.28, not assumed from prior tasks' own gates). Docs synced: `bash
+  tools/check-docs.sh` clean (2301 relative links checked, 0 broken); the screen-flow diagram
+  re-validated syntactically via `mermaid-cli` (not available as a bare `mmdc` in this environment,
+  same as every earlier task's own check — fetched on demand via `npx` for this one-time validation
+  pass, and reconciled against the real screen stack while at it).
+- [x] **T08's acceptance demo runs, confirmed end to end by 4.28**: `bash harnesses/mitm-sim/run.sh`
+  exits 0 — 0 silent successes against `verified`, 0 successes against `pinned` without the exact
+  `verification-ux.md` warning shown, across every cell including the T08 trust-state matrix (task
+  4.10). The literal `meridian-mitm-sim --attack substitute-key --against <state>` invocation in
+  [08-verification-trust.md](../../architecture/features/08-verification-trust.md)'s "Working output"
+  is illustrative shorthand for this harness (there is no standalone `meridian-mitm-sim` binary with
+  those flags — see task [4.10](./4.10-mitm-sim-trust-matrix.md)'s own Status section, which already
+  recorded this); the harness itself is what actually ships and actually runs.
+- [ ] **T17's acceptance demo does NOT run end to end today — confirmed empirically by 4.28, not
+  assumed.** `meridian tui` reaches Onboarding, but hangs indefinitely on "Generating your identity…"
+  once the org hint is submitted, because `apps/tui/src/lib.rs::run_worker` (unchanged since task
+  4.11's own placeholder scope) never executes an `Effect` against `meridian-core` — every screen past
+  that point (contacts, chat, verify, restart, key-change block) is fully built and unit/snapshot-
+  tested in isolation but has no live route from a real session. `Ctrl-Q` does restore the terminal
+  cleanly from the stuck state, and the at-rest audit / panic-restores-terminal tests are green in
+  isolation — but the demo as a whole, driven "from `meridian tui` alone," does not complete. Full
+  writeup: [tui-client.md §10](../../architecture/tui-client.md#10-current-implementation-status-as-of-task-428).
+  **No longer un-owned**: tasks [4.29–4.38](#tasks-todo) close this gap (real `run_worker` execution,
+  a previously-unscoped third gap found during their own planning — no live inbound-message receive
+  path at all — plus the missing `Preflight`/`Screen::Main` navigation), with 4.38 re-running this exact
+  exit-gate check once they land. This checkbox flips only when 4.38 confirms the demo genuinely passes,
+  not when 4.29–4.37's code merges.
+- [x] The envelope-v2 obligation above was re-deferred with a concrete, mechanical trigger (see
+  [above](#envelope-v2-re-deferred--the-concrete-trigger)) — not silently dropped.
+- Then: `/start-review-phase` for Phase 5, which inherits the T17 live-navigation/worker-wiring gap as
+  a known, documented finding rather than a surprise.

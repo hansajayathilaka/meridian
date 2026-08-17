@@ -1,0 +1,73 @@
+[package]
+name = "meridian-tui"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The interactive ratatui client (T17). Owns all terminal-rendering code in the workspace — see
+# ADR 0020 (docs/adr/0020-tui-packaging.md): this crate depends on meridian-core ONLY, never on
+# meridian-cli (meridian-cli depends on meridian-tui, launching it via a `meridian tui` subcommand,
+# task 4.12). No protocol logic lands here; it orchestrates meridian-core exactly like the CLI does.
+[lib]
+name = "meridian_tui"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Exposes terminal::test_support::RecordingOps (a fake TerminalOps that records raw-mode/alt-screen
+# transitions instead of touching a real TTY) so the integration test in tests/ can reach it. Never
+# enabled by a normal consumer (meridian-cli) — mirrors apps/signaling's "test-support" pattern.
+test-support = []
+
+[dependencies]
+meridian-core = { path = "../core" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+# Task 4.19 (contacts/contact-detail screens): truncated-pubkey display (the "fingerprint alongside
+# the petname" security rule, tui-client.md §6 rule 2) reuses `meridian_core::trust::contact_label`'s
+# own `hex::encode(...)[..12]` convention — same crate, not a bespoke encoder.
+hex = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+serde = { workspace = true }
+# `store/` (task 4.15, ADR 0021): the sealed/unsealed JSON documents are `serde_json`-encoded, not
+# CBOR (unlike `sessions.bin`/`trust.bin`) — tui-client.md §5's "the content is plain JSON" note.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# `store/contacts.rs`'s opaque per-contact conversation handle (ADR 0021 condition 2 review fix):
+# same `getrandom::fill` pattern `apps/core/src/session.rs` already uses for locally generated
+# 128-bit ids, not a bespoke RNG.
+getrandom = { workspace = true }
+# `config.rs` (task 4.14, ADR 0021): same figment pin as apps/cli and apps/rendezvous (not a
+# workspace dependency there either — see those crates' own Cargo.toml comments), with the `toml`
+# format feature (this crate's config.toml) and `env` (MERIDIAN_TUI__ overrides).
+figment = { version = "0.10.19", features = ["toml", "env"] }
+# `config_write.rs` (task 4.24): comment-preserving `config.toml` write-back — a genuinely different
+# job from figment's read-only, comment-discarding deserialization above. Pinned to the exact
+# version figment's own dependency tree (via `toml` 0.8.23) already resolves to
+# (`cargo tree -p meridian-tui -i toml_edit`), so adding it as a direct dependency here doesn't add
+# a second copy at a different version.
+toml_edit = "0.22.27"
+# `screens/verify.rs`'s `wrapped_row_count` (task 4.26 review fix): measures word width in actual
+# terminal display cells, matching ratatui's own `WordWrapper` (which measures via
+# `StyledGrapheme::symbol.cell_width()`, backed by these same two crates), not Unicode scalar
+# (`char`) count — a `char`-count measurement undercounts any double-width character (CJK
+# ideographs, fullwidth forms, many emoji) by up to 2x. Pinned to the exact versions already
+# resolved via ratatui's own dependency tree (`cargo tree -p meridian-tui -i unicode-width` /
+# `-i unicode-segmentation`), so adding them as direct dependencies here doesn't add a second copy
+# at a different version — same precedent as `toml_edit` above.
+unicode-width = "0.2.2"
+unicode-segmentation = "1.13.3"
+
+[dev-dependencies]
+# Self-dependency with test-support enabled, so tests/terminal_guard.rs (a separate crate linking
+# the normal, non-`cfg(test)` build of this lib) can reach terminal::test_support::RecordingOps.
+meridian-tui = { path = ".", features = ["test-support"] }
+tempfile = { workspace = true }
+# tests/at_rest_audit.rs (task 4.27 review fixup): `trust.bin`/`sessions.bin` are CBOR
+# (`ciborium`) pre-seal, not JSON — decoding the raw sealed bytes directly as the real pre-seal
+# CBOR type (and asserting that decode fails) is what actually falsifies "sealing was skipped" for
+# those two files, unlike a JSON-parseability check. Same pin as every other CBOR user in the
+# workspace (`apps/core`, `apps/crypto`, `apps/proto`); dev-only — never a normal-build dependency
+# of this crate.
+ciborium = { workspace = true }

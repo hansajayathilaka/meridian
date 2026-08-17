@@ -94,3 +94,44 @@ cargo test -q -p meridian-rendezvous --features test-tamper-hook --test federati
 echo "[mitm-sim] OK: org B lying about bob's bundle over the FEDERATED fetch path is caught by"
 echo "  alice's own client-side verify_bundle check (SignalError::BundleVerification), even though"
 echo "  alice never talks to org B directly."
+
+# T08 (task 4.10): the tofu/pinned/verified TRUST-STATE MATRIX — the headline acceptance criterion
+# of Feature 08. Everything above proves a fully malicious rendezvous cannot complete an undetected
+# substitution on FIRST contact (no prior trust record at all). This section closes the remaining
+# question: can it complete one against a contact alice ALREADY has a relationship with — including
+# during task 4.9's guarded desync re-handshake window, the one place in the whole system where a
+# *different* signing key can legitimately reach TrustStore at all (every live fetch path pins the
+# signature to the exact requested key, per meridian_signaling::verify_bundle, and rejects a
+# substitution before TrustStore is ever consulted — see apps/core/src/desync.rs's own doc comment).
+echo "[mitm-sim] T08 trust-state matrix: substitute-key attacks against tofu / pinned / verified…"
+
+echo "  -- network+CLI layer: tampered fetch against a PRE-EXISTING (already-pinned) contact --"
+cargo test -q -p meridian-cli --test mitm_preexisting_contact
+echo "     OK: fails closed identically to the fresh-contact case (T02), AND leaves the"
+echo "     pre-existing trust record byte-identical — no phantom key-change state, no new contact"
+echo "     row for the attacker's key."
+
+echo "  -- decision-gate layer: a substituted key surfaced during 4.9's recovery window --"
+cargo test -q -p meridian-core --test desync_recovery \
+  attempt_recovery_routes_a_surfaced_key_change_through_the_gate_never_bypassing_it
+echo "     OK: routed through the IDENTICAL task-4.4 key-change gate as any other key-change"
+echo "     discovery — never bypassed just because a recovery flow was already in progress."
+
+echo "  -- decision-gate layer: gated (Warn/Blocked) refusals never leave a stale bypass window --"
+cargo test -q -p meridian-core --test desync_recovery \
+  attempt_recovery_is_refused_while_gated_and_succeeds_once_the_gate_clears
+echo "     OK: a gated recovery attempt touches no session state; only an explicit, genuine"
+echo "     mark_verified/acknowledge_key_change clears it."
+
+echo ""
+echo "[mitm-sim] T08 pass/fail matrix (0 = attacker success, silent or otherwise):"
+echo "  state    | live substitution (fresh contact, T02) | live substitution (pre-existing"
+echo "           |                                         | contact, this section)          | substitution during 4.9 recovery window"
+echo "  ---------+-----------------------------------------+----------------------------------+----------------------------------------"
+echo "  tofu/new | 0 successes (BundleVerification, fatal) | n/a (this section starts pinned) | n/a (recovery requires an existing session)"
+echo "  pinned   | 0 successes (BundleVerification, fatal) | 0 successes, trust unchanged     | 0 silent successes; Warn shown, exact"
+echo "           |                                         |                                  | verification-ux.md wording, no session installed"
+echo "  verified | 0 successes (BundleVerification, fatal) | n/a (fresh-contact cell is tofu) | 0 successes; Blocked, exact"
+echo "           |                                         |                                  | verification-ux.md wording, no session installed"
+echo "[mitm-sim] OK: 0 silent successes against verified; 0 successes against pinned without the"
+echo "  exact verification-ux.md warning shown."

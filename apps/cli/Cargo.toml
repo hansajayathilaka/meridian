@@ -11,14 +11,22 @@ name = "meridian"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["tui"]
 # Forwards to meridian-core/webrtc so `--transport webrtc` can construct a real WebRtcTransport
 # (1.15's real ICE/SCTP/DTLS backend) instead of the deterministic LoopbackTransport. Off by default
 # for the same reason as the underlying crates: heavy dependency tree, needs real UDP/ICE.
 webrtc = ["meridian-core/webrtc"]
+# T17 / ADR 0020: the `meridian tui` subcommand, launching `meridian-tui`'s interactive ratatui
+# client (task 4.12). Default-on so a normal build/install gets the TUI; `--no-default-features`
+# keeps ratatui/crossterm's dependency tree out of the lean demo/CI build shape ADR 0020 condition 2
+# requires — `meridian tui` must not exist at all in that build, not just be a no-op.
+tui = ["dep:meridian-tui"]
 
 [dependencies]
 meridian-core = { path = "../core" }
+# Optional, gated by the `tui` feature above (default-on). ADR 0020 condition 3: meridian-cli depends
+# on meridian-tui, never the reverse — checked by tools/lint-tui-no-cli.sh.
+meridian-tui = { path = "../tui", optional = true }
 # `keyring` (the all-in-one v1 wrapper) installs a real platform credential store for `--store os`.
 keyring = "4.1.4"
 clap = { workspace = true }
@@ -27,6 +35,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 age = { workspace = true }
 hex = { workspace = true }
+# `meridian verify --scan-file`: loads a QR image from disk to hand to
+# `meridian_core::identity::decode_luma` (task 4.5). The workspace default has no format codecs
+# enabled (just the core `ImageBuffer` types `qr.rs` needs); this crate is the one that actually
+# reads/writes image files, so it opts into PNG here.
+image = { workspace = true, features = ["png"] }
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
 getrandom = { workspace = true }
 figment = { version = "0.10.19", features = ["json", "env"] }

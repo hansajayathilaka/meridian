@@ -82,7 +82,7 @@ impl Party {
     /// Retire a superseded prekey generation whose grace window has passed, exactly as the CLI's
     /// inbound path does before opening a delivered blob (task 1.31).
     fn vault_expire(&mut self, now_unix: u64) {
-        self.state.vault.expire_previous_generation(now_unix);
+        self.state.expire_previous_generation(now_unix);
     }
     /// Like [`recv`](Self::recv) but surfaces the real error, for tests that assert on which
     /// rejection happened rather than merely that one did.
@@ -417,6 +417,25 @@ fn state_bytes(state: &ChatState) -> Vec<u8> {
     out
 }
 
+/// Same as [`state_bytes`], but with the `desync_counts` map stripped out first (task 4.9): that
+/// field is new bookkeeping this task adds specifically so it *can* change on a `Desync`
+/// classification — that is its entire purpose (`ChatState::recovery_recommended`'s repeated-Desync
+/// counter) — so it is deliberately excluded from this test's byte-identical comparison rather than
+/// weakening what the comparison actually proves. Every other part of the "a rejected undecryptable
+/// envelope touches nothing else" invariant this test guards (`sessions`, `vault`,
+/// `pending_requests`, `request_order`) is still compared byte-for-byte.
+fn state_bytes_excluding_desync_counts(state: &ChatState) -> Vec<u8> {
+    use ciborium::value::Value;
+    let bytes = state_bytes(state);
+    let mut value: Value = ciborium::from_reader(&bytes[..]).unwrap();
+    if let Value::Map(entries) = &mut value {
+        entries.retain(|(k, _)| !matches!(k, Value::Text(t) if t == "desync_counts"));
+    }
+    let mut out = Vec::new();
+    ciborium::into_writer(&value, &mut out).unwrap();
+    out
+}
+
 /// An undecryptable envelope is rejected as `Desync` and leaves the session **byte-identically**
 /// unchanged — no reset, no re-key, no discarded skipped-message keys.
 #[test]
@@ -459,12 +478,17 @@ fn undecryptable_envelope_is_rejected_without_touching_the_session() {
     );
     bob.recv(&alice_ik, &later).ok().unwrap(); // out of order -> skipped key retained for `held`
 
-    let before = state_bytes(&bob.state);
+    let before = state_bytes_excluding_desync_counts(&bob.state);
 
     // An *authentic* envelope from Alice whose ratchet header opens under neither of Bob's header
     // keys: mangle a byte inside the encrypted header, then re-sign as Alice so it passes the
     // signature and sender checks and reaches the ratchet. This is precisely the input a naive
-    // "N undecryptable envelopes => re-handshake" rule would react to.
+    // "N undecryptable envelopes => re-handshake" rule would react to. Note this envelope still
+    // carries Alice's (unconfirmed-initiator) prekey preamble — Bob never replied in this test — so
+    // this also exercises task 4.9's `open_bytes` fallback path: it is attempted, but must fail
+    // (the preamble's one-time prekey was already consumed by the opening message above), which is
+    // exactly what keeps the byte-identical assertion below meaningful for this task too, not just
+    // for 1.18's original (pre-4.9) code path.
     let mut env = MessageEnvelope::from_blob(&alice.send(
         &bob_ik,
         &ChatContent::Text {
@@ -484,11 +508,18 @@ fn undecryptable_envelope_is_rejected_without_touching_the_session() {
         None => panic!("an undecryptable envelope must be rejected, not accepted"),
     }
 
+    // (task 4.9) The repeated-Desync counter DOES change — that is its entire purpose — but nothing
+    // else does: this is a single occurrence, well below `DESYNC_RECOVERY_THRESHOLD`, so
+    // `recovery_recommended` must still read `false`.
+    assert_eq!(bob.state.desync_count(&alice_ik), 1);
+    assert!(!bob.state.recovery_recommended(&alice_ik));
+
     assert_eq!(
         before,
-        state_bytes(&bob.state),
+        state_bytes_excluding_desync_counts(&bob.state),
         "a rejected undecryptable envelope must leave the session byte-identically unchanged — no \
-         reset, no re-key, no discarded skipped-message keys (task 1.18)"
+         reset, no re-key, no discarded skipped-message keys (task 1.18) — aside from the new, \
+         separately-asserted task-4.9 desync counter"
     );
 
     // And the session is genuinely still live: the held-back message still opens from its retained
