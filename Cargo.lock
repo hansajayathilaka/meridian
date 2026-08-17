@@ -2879,12 +2879,16 @@ dependencies = [
 name = "meridian-tui"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "ciborium",
  "crossterm",
  "figment",
  "getrandom 0.3.4",
  "hex",
+ "keyring",
  "meridian-core",
+ "meridian-proto",
+ "meridian-rendezvous",
  "meridian-tui",
  "ratatui",
  "serde",
