@@ -3,7 +3,10 @@
 
 # Phase 4 — Verification & Trust + Terminal TUI Client
 
-**Kind:** build · **Status:** in progress (27/28 tasks done; 4.28 itself closes out the phase) · **Reviews phase(s):** n/a (build phase; Phase 5 will review it)
+**Kind:** build · **Status:** in progress — 28/28 originally planned tasks done, but per the
+task-tracking skill's own §7 ("a build phase isn't done until its acceptance demo runs"), the phase is
+**not actually closed**: task 4.28 found T17's acceptance demo does not run end to end, and tasks
+4.29–4.38 (added post-4.28 to close that gap) are pending · **Reviews phase(s):** n/a (build phase; Phase 5 will review it)
 
 ## Goal
 Ship **Feature 08 — Verification & Contact Trust** and **Feature 17 — Terminal TUI Client** together,
@@ -194,8 +197,29 @@ start it day 1)
 - [x] **4.26** Terminal-constraint degradation — [file](./4.26-terminal-constraint-degradation.md)
 - [x] **4.27** At-rest audit harness — [file](./4.27-at-rest-audit-harness.md)
 
-**Phase exit gate**
+**Phase exit gate (first attempt — found the gap below, honestly, rather than papering over it)**
 - [x] **4.28** Docs sync + phase acceptance-demo wiring — [file](./4.28-docs-sync-acceptance-demo.md)
+
+**T17 gap closure — added post-4.28.** Per the task-tracking skill's own §7, a build phase isn't done
+until its acceptance demo runs; 4.28 found T17's doesn't. These 10 tasks close it: real `run_worker`
+effect execution (split into five independently-testable groups by which store files/screens each
+touches — 4.30–4.34), a previously-unscoped third gap found during planning (no live inbound-message
+receive path at all — 4.35), the missing `Preflight`/`Screen::Main` live navigation (4.36/4.37), the
+shared `LiveSession` plumbing all of the above need (4.29), and a second, now-successful acceptance-demo
+closure (4.38) mirroring 4.28's own role. Full planning rationale (including the judgment calls on how
+the `run_worker` split was chosen, why `LiveSession` is a dedicated task, and why 4.28 itself was never
+reopened) lives in each task file's own text plus the architect consult recorded in
+[tui-client.md §4](../../architecture/tui-client.md) once folded in by 4.38.
+- [ ] **4.29** `Effect::LoadSession` + `LiveSession` assembly — [file](./4.29-load-session-live-session.md)
+- [ ] **4.30** Real `run_worker`: account lifecycle — [file](./4.30-run-worker-account-lifecycle.md)
+- [ ] **4.31** Real `run_worker`: contacts & contact-detail persistence — [file](./4.31-run-worker-contacts-persistence.md)
+- [ ] **4.32** Real `run_worker`: trust & request-queue persistence — [file](./4.32-run-worker-trust-request-persistence.md)
+- [ ] **4.33** Real `run_worker`: outbound chat — [file](./4.33-run-worker-outbound-chat.md)
+- [ ] **4.34** Real `run_worker`: settings & diagnostics — [file](./4.34-run-worker-settings-diagnostics.md)
+- [ ] **4.35** Inbound delivery stream — [file](./4.35-inbound-delivery-stream.md)
+- [ ] **4.36** `Screen::Main` + live navigation — [file](./4.36-screen-main-live-navigation.md)
+- [ ] **4.37** Preflight routing — [file](./4.37-preflight-routing.md)
+- [ ] **4.38** T17 acceptance-demo closure (phase re-exit gate) — [file](./4.38-t17-acceptance-demo-closure.md)
 
 ### Dependency order
 ```
@@ -221,6 +245,16 @@ start it day 1)
 4.20 ──► 4.26
 4.15,4.16,4.19,4.20,4.22 ──► 4.27
 everything ──► 4.28
+
+-- T17 gap closure (added post-4.28) --
+4.13,4.15,4.3 ──► 4.29 ─┬─► 4.35 (inbound stream)
+                        └─► 4.36 (Screen::Main + nav) ──► 4.37 (Preflight, also needs 4.29)
+4.16,4.17 ──► 4.30 (run_worker: account)         ─┐
+4.19      ──► 4.31 (run_worker: contacts)         │  4.30-4.34 independent of each other and of
+4.21,4.22,4.4 ──► 4.32 (run_worker: trust/reqs)   │  4.29/4.35/4.36/4.37, but share run_worker's
+4.20      ──► 4.33 (run_worker: outbound chat)    │  match statement — must land as sequential
+4.24,4.25 ──► 4.34 (run_worker: settings/diag)   ─┘  commits (any order among themselves)
+4.29–4.37 (all of them) ──► 4.38 (re-exit gate)
 ```
 **Parallel tracks.** Track ADR (4.1, 4.2) — no code. Track T08 (4.3→4.10) — the phase's longest
 sequential chain, zero dependency on the ADRs or on any T17 task. Track T17-infra (4.13 independent;
@@ -230,14 +264,23 @@ in parallel with T08's later tasks (they touch disjoint files: `apps/tui` vs. `a
 petname API (4.6); everything downstream in T17 (4.20–4.27) serializes behind both tracks converging
 there. 4.24 and 4.13 are the most freely schedulable — use them to fill slack.
 
+**T17 gap-closure tracks (4.29–4.38).** Wave 1 — fully parallel, each depends only on already-done
+Phase 4 tasks: 4.30, 4.31, 4.32, 4.33, 4.34 (the five `run_worker` groups) plus 4.29 (`LiveSession`).
+Wave 2 — each needs only 4.29: 4.35 (inbound stream), 4.36 (`Screen::Main`). Wave 3: 4.37 (Preflight,
+needs 4.29 + 4.36). Wave 4: 4.38 (needs everything). Scheduling note: **4.30 is the highest-value single
+task to land first** even though it has no hard dependency on anything in this set — it is the exact fix
+for the specific hang 4.28 reproduced ("Generating your identity…"), so it turns a completely stuck
+onboarding into a runnable (if not yet fully navigable) session soonest.
+
 ## Exit criteria
 
-**Assessed honestly by task 4.28** (the phase's own exit-gate task) — see its own file for the full
+**Assessed honestly by task 4.28** (the phase's first exit-gate attempt) — see its own file for the full
 diff and [tui-client.md §10](../../architecture/tui-client.md#10-current-implementation-status-as-of-task-428)
-for the complete writeup of the one criterion below that does **not** hold today.
+for the complete writeup of the one criterion below that does **not** hold today. Task 4.38 is the
+**second, planned-to-succeed** exit-gate attempt, once 4.29–4.37 close the gap 4.28 found.
 
-- [x] All Phase 4 tasks `[x]` in the tracker except 4.28 itself, which is `[~]` pending this review
-  (4.1–4.27 all done; see [dependency order](#dependency-order)).
+- [x] All 28 originally-planned Phase 4 tasks (4.1–4.28) are `[x]` in the tracker (see
+  [dependency order](#dependency-order)). **Not sufficient for phase closure** — see the next item.
 - [x] Tree green: `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings`
   clean (re-run fresh by 4.28, not assumed from prior tasks' own gates). Docs synced: `bash
   tools/check-docs.sh` clean (2301 relative links checked, 0 broken); the screen-flow diagram
@@ -260,12 +303,12 @@ for the complete writeup of the one criterion below that does **not** hold today
   tested in isolation but has no live route from a real session. `Ctrl-Q` does restore the terminal
   cleanly from the stuck state, and the at-rest audit / panic-restores-terminal tests are green in
   isolation — but the demo as a whole, driven "from `meridian tui` alone," does not complete. Full
-  writeup, and exactly what's missing (a Preflight/Main navigation task plus real `run_worker` effect
-  execution — never scoped to any of this phase's 28 tasks):
-  [tui-client.md §10](../../architecture/tui-client.md#10-current-implementation-status-as-of-task-428).
-  Carried forward as an un-owned obligation in
-  [docs/tasks/README.md](../README.md#live-carry-forwards-not-owned-by-any-open-task) for a future
-  build phase to schedule.
+  writeup: [tui-client.md §10](../../architecture/tui-client.md#10-current-implementation-status-as-of-task-428).
+  **No longer un-owned**: tasks [4.29–4.38](#tasks-todo) close this gap (real `run_worker` execution,
+  a previously-unscoped third gap found during their own planning — no live inbound-message receive
+  path at all — plus the missing `Preflight`/`Screen::Main` navigation), with 4.38 re-running this exact
+  exit-gate check once they land. This checkbox flips only when 4.38 confirms the demo genuinely passes,
+  not when 4.29–4.37's code merges.
 - [x] The envelope-v2 obligation above was re-deferred with a concrete, mechanical trigger (see
   [above](#envelope-v2-re-deferred--the-concrete-trigger)) — not silently dropped.
 - Then: `/start-review-phase` for Phase 5, which inherits the T17 live-navigation/worker-wiring gap as

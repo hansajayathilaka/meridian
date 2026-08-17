@@ -16,29 +16,42 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **`/plan-phase` broke Phase 4 (T08 + T17) into 28 tasks (4.1–4.28), fully
-  dependency-ordered.** [Phase 4 README](./phase-4/README.md) has the complete task list, DAG, and
-  parallel tracks. Two tracks run independently until they converge: **Track T08** (4.3→4.10 —
-  trust module, key-change gate, safety-number UX, petnames, message-request finalization, directory
-  attestation, guarded desync re-handshake, `meridian-mitm-sim`) and **Track T17-infra** (4.11–4.18 —
-  crate skeleton + terminal guard, subcommand wiring, the `$MERIDIAN_HOME` extraction into
-  `meridian-core`, config, store, onboarding, unlock, extension registry), both gated behind
-  **4.1/4.2** (ADRs 0020 TUI packaging, 0021 store/config formats) for T17's code only — T08 has no
-  ADR dependency and starts immediately. The two tracks converge at **4.19** (contact list, the first
-  T17 screen needing T08's trust module), after which T17's remaining screens (4.20–4.27) and the
-  phase exit gate (4.28) serialize. **The envelope-v2 obligation was resolved, not dropped**: an
-  architect call (recorded in [Phase 4's README](./phase-4/README.md#envelope-v2-re-deferred--the-concrete-trigger))
-  determined full envelope-v2 doesn't block T08/T17 and stays out of this phase for the same
-  "one coherent reviewable unit" reason Phase 2 kept T09 out of Phase 2 — but a narrow, v1-scoped fix
-  to `open_bytes`'s stale-session short-circuit (which T08's own desync-recovery deliverable
-  otherwise silently fails to accomplish) lands inside **4.9**. The re-defer trigger is now
-  mechanical, not prose: [roadmap.md](../architecture/roadmap.md)'s dependency table lists T07's deps
-  as `03, 06, envelope-v2` — the same table `task-picker` reads every `/pick-next-phase` run — so T07
-  (and T14, transitively) cannot be read as pickable again until an envelope-v2 task/phase exists with
-  status done. Phases 0–3 are **done**.
-- **NEXT:** `/next-task` — start with **4.1/4.2** (ADRs) and **4.3** (T08 trust module) and **4.13**
-  (account/home-layout extraction) in parallel; see [Phase 4's dependency order](./phase-4/README.md#dependency-order)
-  for the full sequencing.
+- **NOW:** **Phase 4 (T08 + T17) is 28/28 originally-planned tasks done, but NOT closed.** T08's track
+  (4.3→4.10) and T17's screen-build track (4.11–4.27) are both fully complete and their own tests green.
+  Task **4.28** (the phase's first exit-gate attempt) ran both feature specs' acceptance demos for real
+  rather than assuming, and found: T08's genuinely passes (`meridian-mitm-sim`, 0 silent successes); T17's
+  does **not** — `meridian tui` hangs forever on Onboarding's "Generating your identity…" step, because
+  `run_worker` never executes an `Effect` and no `Preflight`/`Screen::Main` navigation exists to reach any
+  other screen live. Per the task-tracking skill's own §7 ("a build phase isn't done until its acceptance
+  demo runs"), this means **Phase 4 is still open**. `/plan-phase` was re-invoked against this specific
+  gap (not a new phase — see reasoning below) and broke it into **10 more tasks, 4.29–4.38**, fully
+  dependency-ordered, in [Phase 4's README](./phase-4/README.md#tasks-todo) — including a **third gap**
+  found only during this planning pass (no live inbound-message receive path exists anywhere in the
+  crate's event model; see 4.35). An `architect` consult (folded into the task files) already settled the
+  one architecturally significant sub-question (where live session state lives once screens stop each
+  holding isolated copies — an `App`-owned, moved-not-cloned `LiveSession`, no new ADR needed).
+  **The envelope-v2 obligation was resolved, not dropped**: an architect call (recorded in [Phase 4's
+  README](./phase-4/README.md#envelope-v2-re-deferred--the-concrete-trigger)) determined full envelope-v2
+  doesn't block T08/T17 and stays out of this phase for the same "one coherent reviewable unit" reason
+  Phase 2 kept T09 out of Phase 2 — but a narrow, v1-scoped fix to `open_bytes`'s stale-session
+  short-circuit (which T08's own desync-recovery deliverable otherwise silently fails to accomplish)
+  landed inside **4.9**. The re-defer trigger is mechanical, not prose: [roadmap.md](../architecture/roadmap.md)'s
+  dependency table lists T07's deps as `03, 06, envelope-v2` — the same table `task-picker` reads every
+  `/pick-next-phase` run — so T07 (and T14, transitively) cannot be read as pickable again until an
+  envelope-v2 task/phase exists with status done. Phases 0–3 are **done**.
+- **NEXT:** `/next-task` for **4.29–4.38** — see [Phase 4's updated dependency order](./phase-4/README.md#dependency-order)
+  for wave/parallelism guidance (4.30 is the single highest-value task to land first: it's the exact fix
+  for the hang 4.28 reproduced). Only once **4.38** confirms the T17 demo genuinely passes does
+  `/start-review-phase` for Phase 5 become the correct next command — not before.
+
+**Why 4.29–4.38 extend Phase 4 rather than opening a new phase or a review phase**: the task-tracking
+skill's own phase-lifecycle rule is that a build phase isn't done until its acceptance demo runs, so
+Phase 4 was never actually finished — these are legitimately still Phase 4 build tasks, closing a gap
+Phase 4 itself created, not new scope. A review phase (`/start-review-phase`) was considered and rejected
+for this specific gap: review phases turn *discovered* findings into fix-tasks, but 4.28 already did the
+discovery and diagnosis work in full — routing that through a review-phase sweep would re-derive
+conclusions already on record, not add anything. Phase 5 remains the right venue for whatever *new*
+findings a full sweep of this phase's diff turns up once 4.38 actually closes it.
 
 ### Live carry-forwards (not owned by any open task)
 Everything else is owned by a Phase-4 task; these are the exceptions that would otherwise evaporate:
@@ -59,19 +72,6 @@ Everything else is owned by a Phase-4 task; these are the exceptions that would 
   every future build phase's task set.
 - **If `relay_rewrite.rs` ever flakes in CI**, widen its `SIDE_TIMEOUT`, **never** `ANSWER_TIMEOUT` —
   the test burns ~31 s real time with only ~4–5 s slack over the 30 s timeout it is exercising.
-- **T17's live navigation + worker wiring is a real, un-owned gap — no task in Phase 4's 28-task
-  breakdown was ever "wire the screens into a live session."** Every T17 screen (Onboarding, Unlock,
-  Contacts, Contact detail, Chat, Requests, Verify, Settings, Help, Palette, Diagnostics) is fully
-  built and unit/snapshot-tested in isolation, but `App::new()` always starts on Onboarding (no
-  `Preflight` step, no `Screen::Main`), and — the more fundamental gap —
-  `apps/tui/src/lib.rs::run_worker` is still task 4.11's inert stub: it never executes an `Effect`
-  against `meridian-core`, so a real `meridian tui` session hangs indefinitely on Onboarding's
-  "Generating your identity…" step (confirmed empirically by 4.28; `Ctrl-Q` still restores the
-  terminal cleanly from that stuck state). The T17 acceptance demo does **not** run end to end today.
-  Full writeup: [tui-client.md §10](../architecture/tui-client.md#10-current-implementation-status-as-of-task-428).
-  A future build phase needs a dedicated "Preflight/Main navigation + real `run_worker` effect
-  execution" task before this demo can pass; `/plan-phase` must schedule one rather than assume T17 is
-  fully closed because its screens are.
 - **A human must confirm branch protection on `main` actually requires `ci.yml` to pass before
   merge** (`docs/operations/docker-image.md` §1) — no tool available to an agent session can read
   GitHub's branch-protection/ruleset config. 3.12 landed the pre-merge docker build gate itself but
@@ -239,7 +239,8 @@ blocking, `meridian-mitm-sim`) is a hard prerequisite for T17's mandatory verifi
 the [phase README](./phase-4/README.md#resolving-the-t17t08-overlap) for why they aren't split.
 Envelope v2 (T07's blocker) is deliberately **not** in this phase — see
 [the re-deferral](./phase-4/README.md#envelope-v2-re-deferred--the-concrete-trigger) — except for a narrow v1-scoped fix
-inside 4.9. 28 tasks, [full DAG here](./phase-4/README.md#dependency-order).
+inside 4.9. 38 tasks (28 originally planned + 10 added post-4.28 to close the T17 gap it found —
+see [Phase 4's own status note](./phase-4/README.md) for why), [full DAG here](./phase-4/README.md#dependency-order).
 
 **ADR track — blocks all T17 code, not T08**
 - [x] **4.1** ADR 0020 — TUI packaging — [file](./phase-4/4.1-adr-tui-packaging.md)
@@ -276,8 +277,22 @@ inside 4.9. 28 tasks, [full DAG here](./phase-4/README.md#dependency-order).
 - [x] **4.26** Terminal-constraint degradation — [file](./phase-4/4.26-terminal-constraint-degradation.md)
 - [x] **4.27** At-rest audit harness — [file](./phase-4/4.27-at-rest-audit-harness.md)
 
-**Phase exit gate**
+**Phase exit gate (first attempt — found the T17 gap below)**
 - [x] **4.28** Docs sync + phase acceptance-demo wiring — [file](./phase-4/4.28-docs-sync-acceptance-demo.md)
+
+**T17 gap closure — added post-4.28** (real `run_worker` execution, a live inbound-message receive path
+found missing during this planning pass, `Preflight`/`Screen::Main` navigation, and a second, planned-to-
+succeed exit-gate attempt) — see [Phase 4's own task list](./phase-4/README.md#tasks-todo) for full detail
+- [ ] **4.29** `Effect::LoadSession` + `LiveSession` assembly — [file](./phase-4/4.29-load-session-live-session.md)
+- [ ] **4.30** Real `run_worker`: account lifecycle — [file](./phase-4/4.30-run-worker-account-lifecycle.md)
+- [ ] **4.31** Real `run_worker`: contacts & contact-detail persistence — [file](./phase-4/4.31-run-worker-contacts-persistence.md)
+- [ ] **4.32** Real `run_worker`: trust & request-queue persistence — [file](./phase-4/4.32-run-worker-trust-request-persistence.md)
+- [ ] **4.33** Real `run_worker`: outbound chat — [file](./phase-4/4.33-run-worker-outbound-chat.md)
+- [ ] **4.34** Real `run_worker`: settings & diagnostics — [file](./phase-4/4.34-run-worker-settings-diagnostics.md)
+- [ ] **4.35** Inbound delivery stream — [file](./phase-4/4.35-inbound-delivery-stream.md)
+- [ ] **4.36** `Screen::Main` + live navigation — [file](./phase-4/4.36-screen-main-live-navigation.md)
+- [ ] **4.37** Preflight routing — [file](./phase-4/4.37-preflight-routing.md)
+- [ ] **4.38** T17 acceptance-demo closure (phase re-exit gate) — [file](./phase-4/4.38-t17-acceptance-demo-closure.md)
 
 ---
 
