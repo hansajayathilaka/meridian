@@ -1,5 +1,6 @@
 //! The sealed local JSON store — `contacts.json`, `history/<peer-pubkey-hex>.jsonl`,
-//! `outbox.json` — plus the deliberately-unsealed `state.json` (task 4.15, ADR 0021,
+//! `outbox.json` — plus the deliberately-unsealed `state.json` (task 4.15,
+//! [ADR 0021](../../../../docs/adr/0021-client-local-store-config-formats.md),
 //! [tui-client.md §5](../../../../docs/architecture/tui-client.md#5-local-store--configuration)).
 //!
 //! ## Layout

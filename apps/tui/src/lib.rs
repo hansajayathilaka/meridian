@@ -1,6 +1,7 @@
 //! `meridian-tui` — the interactive terminal client (feature T17).
 //!
-//! Owns all ratatui/crossterm code in the workspace (ADR 0020). Depends on `meridian-core` only,
+//! Owns all ratatui/crossterm code in the workspace
+//! ([ADR 0020](../../../docs/adr/0020-tui-packaging.md)). Depends on `meridian-core` only,
 //! never on `meridian-cli` — `meridian-cli` depends on this crate, launching it via a thin
 //! `meridian tui` subcommand (task 4.12). No protocol logic lands here: this crate orchestrates
 //! `meridian-core` exactly like the CLI does, and is never more capable than the headless CLI, only

@@ -1,4 +1,5 @@
-//! `$MERIDIAN_HOME/tui/config.toml` loader (task 4.14, ADR 0021 condition 3).
+//! `$MERIDIAN_HOME/tui/config.toml` loader (task 4.14,
+//! [ADR 0021](../../../docs/adr/0021-client-local-store-config-formats.md) condition 3).
 //!
 //! `config.toml` is the one file in the client-local store family that is human-authored and
 //! **never rewritten wholesale by the app** (tui-client.md §5) — UI-driven setting changes either

@@ -3,7 +3,7 @@
 
 # Phase 4 — Verification & Trust + Terminal TUI Client
 
-**Kind:** build · **Status:** planning · **Reviews phase(s):** n/a (build phase; Phase 5 will review it)
+**Kind:** build · **Status:** in progress (27/28 tasks done; 4.28 itself closes out the phase) · **Reviews phase(s):** n/a (build phase; Phase 5 will review it)
 
 ## Goal
 Ship **Feature 08 — Verification & Contact Trust** and **Feature 17 — Terminal TUI Client** together,
@@ -195,7 +195,7 @@ start it day 1)
 - [x] **4.27** At-rest audit harness — [file](./4.27-at-rest-audit-harness.md)
 
 **Phase exit gate**
-- [ ] **4.28** Docs sync + phase acceptance-demo wiring — [file](./4.28-docs-sync-acceptance-demo.md)
+- [x] **4.28** Docs sync + phase acceptance-demo wiring — [file](./4.28-docs-sync-acceptance-demo.md)
 
 ### Dependency order
 ```
@@ -231,12 +231,42 @@ petname API (4.6); everything downstream in T17 (4.20–4.27) serializes behind 
 there. 4.24 and 4.13 are the most freely schedulable — use them to fill slack.
 
 ## Exit criteria
-- All Phase 4 tasks `[x]`, tree green (`just build`, `cargo clippy --workspace --all-targets -D
-  warnings` clean), docs synced.
-- T08's acceptance demo runs: `meridian-mitm-sim` matrix — 0 silent successes against `verified`, 0
-  successes against `pinned` without the exact `verification-ux.md` warning shown.
-- T17's acceptance demo runs: onboarding → verified chat → restart-persists → key-change blocks, all
-  from `meridian tui` alone, at 80×24, with the at-rest audit and panic-restores-terminal test green.
-- The envelope-v2 obligation above is either discharged this phase or re-deferred with a concrete,
-  recorded trigger — not silently dropped again.
-- Then: `/start-review-phase` for Phase 5.
+
+**Assessed honestly by task 4.28** (the phase's own exit-gate task) — see its own file for the full
+diff and [tui-client.md §10](../../architecture/tui-client.md#10-current-implementation-status-as-of-task-428)
+for the complete writeup of the one criterion below that does **not** hold today.
+
+- [x] All Phase 4 tasks `[x]` in the tracker except 4.28 itself, which is `[~]` pending this review
+  (4.1–4.27 all done; see [dependency order](#dependency-order)).
+- [x] Tree green: `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings`
+  clean (re-run fresh by 4.28, not assumed from prior tasks' own gates). Docs synced: `bash
+  tools/check-docs.sh` clean (2301 relative links checked, 0 broken); the screen-flow diagram
+  re-validated syntactically via `mermaid-cli` (not available as a bare `mmdc` in this environment,
+  same as every earlier task's own check — fetched on demand via `npx` for this one-time validation
+  pass, and reconciled against the real screen stack while at it).
+- [x] **T08's acceptance demo runs, confirmed end to end by 4.28**: `bash harnesses/mitm-sim/run.sh`
+  exits 0 — 0 silent successes against `verified`, 0 successes against `pinned` without the exact
+  `verification-ux.md` warning shown, across every cell including the T08 trust-state matrix (task
+  4.10). The literal `meridian-mitm-sim --attack substitute-key --against <state>` invocation in
+  [08-verification-trust.md](../../architecture/features/08-verification-trust.md)'s "Working output"
+  is illustrative shorthand for this harness (there is no standalone `meridian-mitm-sim` binary with
+  those flags — see task [4.10](./4.10-mitm-sim-trust-matrix.md)'s own Status section, which already
+  recorded this); the harness itself is what actually ships and actually runs.
+- [ ] **T17's acceptance demo does NOT run end to end today — confirmed empirically by 4.28, not
+  assumed.** `meridian tui` reaches Onboarding, but hangs indefinitely on "Generating your identity…"
+  once the org hint is submitted, because `apps/tui/src/lib.rs::run_worker` (unchanged since task
+  4.11's own placeholder scope) never executes an `Effect` against `meridian-core` — every screen past
+  that point (contacts, chat, verify, restart, key-change block) is fully built and unit/snapshot-
+  tested in isolation but has no live route from a real session. `Ctrl-Q` does restore the terminal
+  cleanly from the stuck state, and the at-rest audit / panic-restores-terminal tests are green in
+  isolation — but the demo as a whole, driven "from `meridian tui` alone," does not complete. Full
+  writeup, and exactly what's missing (a Preflight/Main navigation task plus real `run_worker` effect
+  execution — never scoped to any of this phase's 28 tasks):
+  [tui-client.md §10](../../architecture/tui-client.md#10-current-implementation-status-as-of-task-428).
+  Carried forward as an un-owned obligation in
+  [docs/tasks/README.md](../README.md#live-carry-forwards-not-owned-by-any-open-task) for a future
+  build phase to schedule.
+- [x] The envelope-v2 obligation above was re-deferred with a concrete, mechanical trigger (see
+  [above](#envelope-v2-re-deferred--the-concrete-trigger)) — not silently dropped.
+- Then: `/start-review-phase` for Phase 5, which inherits the T17 live-navigation/worker-wiring gap as
+  a known, documented finding rather than a surprise.

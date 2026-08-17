@@ -27,7 +27,7 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   ADR dependency and starts immediately. The two tracks converge at **4.19** (contact list, the first
   T17 screen needing T08's trust module), after which T17's remaining screens (4.20–4.27) and the
   phase exit gate (4.28) serialize. **The envelope-v2 obligation was resolved, not dropped**: an
-  architect call (recorded in [Phase 4's README](./phase-4/README.md#envelope-v2-re-deferred))
+  architect call (recorded in [Phase 4's README](./phase-4/README.md#envelope-v2-re-deferred--the-concrete-trigger))
   determined full envelope-v2 doesn't block T08/T17 and stays out of this phase for the same
   "one coherent reviewable unit" reason Phase 2 kept T09 out of Phase 2 — but a narrow, v1-scoped fix
   to `open_bytes`'s stale-session short-circuit (which T08's own desync-recovery deliverable
@@ -44,7 +44,7 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 Everything else is owned by a Phase-4 task; these are the exceptions that would otherwise evaporate:
 - **Envelope v2 is now a standing, mechanically-checked dependency gate**, not prose. See
   [roadmap.md](../architecture/roadmap.md) (T07's deps row + the note beneath the table) and
-  [Phase 4's README](./phase-4/README.md#envelope-v2-re-deferred). It must still carry the
+  [Phase 4's README](./phase-4/README.md#envelope-v2-re-deferred--the-concrete-trigger). It must still carry the
   replay-dedup obligation from Phase 2 (2.13 bounds a replay's harm to one failed decrypt; full dedup
   via envelope v2's `eid` per [ADR 0016](../adr/0016-envelope-deniability.md) C7) into whatever build
   phase implements it.
@@ -59,6 +59,19 @@ Everything else is owned by a Phase-4 task; these are the exceptions that would 
   every future build phase's task set.
 - **If `relay_rewrite.rs` ever flakes in CI**, widen its `SIDE_TIMEOUT`, **never** `ANSWER_TIMEOUT` —
   the test burns ~31 s real time with only ~4–5 s slack over the 30 s timeout it is exercising.
+- **T17's live navigation + worker wiring is a real, un-owned gap — no task in Phase 4's 28-task
+  breakdown was ever "wire the screens into a live session."** Every T17 screen (Onboarding, Unlock,
+  Contacts, Contact detail, Chat, Requests, Verify, Settings, Help, Palette, Diagnostics) is fully
+  built and unit/snapshot-tested in isolation, but `App::new()` always starts on Onboarding (no
+  `Preflight` step, no `Screen::Main`), and — the more fundamental gap —
+  `apps/tui/src/lib.rs::run_worker` is still task 4.11's inert stub: it never executes an `Effect`
+  against `meridian-core`, so a real `meridian tui` session hangs indefinitely on Onboarding's
+  "Generating your identity…" step (confirmed empirically by 4.28; `Ctrl-Q` still restores the
+  terminal cleanly from that stuck state). The T17 acceptance demo does **not** run end to end today.
+  Full writeup: [tui-client.md §10](../architecture/tui-client.md#10-current-implementation-status-as-of-task-428).
+  A future build phase needs a dedicated "Preflight/Main navigation + real `run_worker` effect
+  execution" task before this demo can pass; `/plan-phase` must schedule one rather than assume T17 is
+  fully closed because its screens are.
 - **A human must confirm branch protection on `main` actually requires `ci.yml` to pass before
   merge** (`docs/operations/docker-image.md` §1) — no tool available to an agent session can read
   GitHub's branch-protection/ruleset config. 3.12 landed the pre-merge docker build gate itself but
@@ -225,7 +238,7 @@ core trust module (safety-number compare, TOFU→pinned→verified states, un-so
 blocking, `meridian-mitm-sim`) is a hard prerequisite for T17's mandatory verification screens — see
 the [phase README](./phase-4/README.md#resolving-the-t17t08-overlap) for why they aren't split.
 Envelope v2 (T07's blocker) is deliberately **not** in this phase — see
-[the re-deferral](./phase-4/README.md#envelope-v2-re-deferred) — except for a narrow v1-scoped fix
+[the re-deferral](./phase-4/README.md#envelope-v2-re-deferred--the-concrete-trigger) — except for a narrow v1-scoped fix
 inside 4.9. 28 tasks, [full DAG here](./phase-4/README.md#dependency-order).
 
 **ADR track — blocks all T17 code, not T08**
@@ -264,7 +277,7 @@ inside 4.9. 28 tasks, [full DAG here](./phase-4/README.md#dependency-order).
 - [x] **4.27** At-rest audit harness — [file](./phase-4/4.27-at-rest-audit-harness.md)
 
 **Phase exit gate**
-- [ ] **4.28** Docs sync + phase acceptance-demo wiring — [file](./phase-4/4.28-docs-sync-acceptance-demo.md)
+- [x] **4.28** Docs sync + phase acceptance-demo wiring — [file](./phase-4/4.28-docs-sync-acceptance-demo.md)
 
 ---
 
