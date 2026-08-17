@@ -1,10 +1,11 @@
-//! The real per-[`Effect`] execution this crate's worker task runs (task 4.30) — the network/
-//! store/crypto half of the account-lifecycle sub-steps `crate::screens::onboarding`/
-//! `crate::screens::unlock` only ever *describe*. [`dispatch`] is the single entry point
-//! `crate::run_worker`'s event loop calls for every [`Effect`] it receives; internally it fans out
-//! to one function per effect group (`handle_generate_account`/`handle_register`/
-//! `handle_publish_bundle`/`handle_unlock` below), so later gap-closure tasks (4.31–4.34) extend the
-//! same `match` with their own groups rather than inlining everything into one growing function.
+//! The real per-[`Effect`] execution this crate's worker task runs (task 4.30, extended by task
+//! 4.29) — the network/store/crypto half of the account-lifecycle sub-steps
+//! `crate::screens::onboarding`/`crate::screens::unlock` only ever *describe*. [`dispatch`] is the
+//! single entry point `crate::run_worker`'s event loop calls for every [`Effect`] it receives;
+//! internally it fans out to one function per effect group (`handle_generate_account`/
+//! `handle_register`/`handle_publish_bundle`/`handle_unlock`/`handle_load_session` below), so later
+//! gap-closure tasks (4.31–4.34) extend the same `match` with their own groups rather than inlining
+//! everything into one growing function.
 //!
 //! Every [`Effect`] variant this module does not yet own (contacts/trust/settings/chat/…) falls
 //! through `dispatch`'s final arm, which preserves this crate's original task-4.11 placeholder
@@ -18,16 +19,20 @@
 
 use std::path::PathBuf;
 
-use meridian_core::account::{self, AccountDescriptor};
+use meridian_core::account::{self, AccountDescriptor, StoreKind};
+use meridian_core::chat::ChatState as CoreChatState;
 use meridian_core::identity::{
     generate_account, FileSecretStore, KeyHandle, MemorySecretStore, OsSecretStore, SecretStore,
 };
 use meridian_core::signaling::SignalingClient;
+use meridian_core::trust::TrustStore;
 
 use crate::app::{
-    Effect, GenerateAccountEffect, GenerateAccountRequest, GeneratedAccount, PublishBundleEffect,
-    PublishedBundle, RegisterRequest, StoreChoice, UnlockRequest, WorkerEvent,
+    Effect, GenerateAccountEffect, GenerateAccountRequest, GeneratedAccount, LoadSessionEffect,
+    LoadSessionOutcome, PublishBundleEffect, PublishedBundle, RegisterRequest, SessionOutcome,
+    StoreChoice, UnlockEffect, UnlockRequest, WorkerEvent,
 };
+use crate::session::LiveSession;
 
 /// The exact keychain "service" string `apps/cli/src/main.rs::OS_KEYSTORE_SERVICE` uses. Must stay
 /// identical between clients: an account minted with `--store os` by the CLI (or by this worker's
@@ -138,7 +143,8 @@ pub async fn dispatch(effect: Effect, session: &mut OnboardingSession) -> Worker
         Effect::GenerateAccount(e) => handle_generate_account(e).await,
         Effect::Register(request) => handle_register(request, session).await,
         Effect::PublishBundle(e) => handle_publish_bundle(e, session).await,
-        Effect::Unlock(request) => handle_unlock(request).await,
+        Effect::Unlock(effect) => handle_unlock(*effect).await,
+        Effect::LoadSession(effect) => handle_load_session(effect).await,
         // Not this task's scope (contacts/trust/settings/chat/diagnostics/… — see later
         // gap-closure tasks 4.31-4.34). Preserves task 4.11's original placeholder behavior so
         // screens whose real execution hasn't landed yet are unaffected by this change.
@@ -321,14 +327,163 @@ async fn handle_publish_bundle(
 }
 
 // ---------------------------------------------------------------------------
-// Unlock
+// Unlock (task 4.29: now also loads the real LiveSession, in the same round trip)
 // ---------------------------------------------------------------------------
 
-async fn handle_unlock(request: UnlockRequest) -> WorkerEvent {
+/// Unwraps a passphrase-protected keyfile and, on success, loads the real [`LiveSession`] behind it
+/// — `trust.bin`/`sessions.bin`/`contacts.json`, exactly like [`handle_load_session`]'s OS-keystore
+/// path, just against a [`FileSecretStore`] instead of an [`OsSecretStore`]. Both the passphrase
+/// verification *and* the session load happen in this one dispatch, never split across two effect
+/// round trips — see [`UnlockEffect`]'s own doc comment for why.
+async fn handle_unlock(effect: UnlockEffect) -> WorkerEvent {
+    let UnlockEffect { request, .. } = effect;
+    match run_unlock(&request) {
+        Ok(session) => WorkerEvent::Completed(Effect::Unlock(Box::new(UnlockEffect {
+            request,
+            outcome: SessionOutcome::ready(session),
+        }))),
+        Err(message) => WorkerEvent::Failed(
+            Effect::Unlock(Box::new(UnlockEffect {
+                request,
+                outcome: SessionOutcome::empty(),
+            })),
+            message,
+        ),
+    }
+}
+
+fn run_unlock(request: &UnlockRequest) -> Result<LiveSession, String> {
+    // Review fix (task 4.29, Finding 4): the symmetric guard to `run_load_session`'s own
+    // `StoreKind::File => Err(...)` arm below — checked first, and against the real on-disk
+    // `account.json`, not the caller-supplied keyfile, so an OS-keystore account is rejected with a
+    // clear, actionable message *before* `FileSecretStore::export_seed` ever runs against it. Without
+    // this guard, misusing `Effect::Unlock` on an OS-keystore account still fails closed today (an
+    // AEAD failure against the wrong/nonexistent keyfile, never a silent success or wrong-account
+    // leak), but with a confusing "corrupt trust.bin"-shaped error instead of a message that actually
+    // names the fix.
+    let descriptor = AccountDescriptor::load()?;
+    if descriptor.store != StoreKind::File {
+        return Err(
+            "this account is OS-keystore-backed — load it via Effect::LoadSession, not \
+             Effect::Unlock"
+                .to_string(),
+        );
+    }
     let fs = FileSecretStore::new(&request.keyfile, request.passphrase.clone());
-    match fs.export_seed() {
-        Ok(_seed) => WorkerEvent::Completed(Effect::Unlock(request)),
-        Err(e) => WorkerEvent::Failed(Effect::Unlock(request), e.to_string()),
+    // Verify the passphrase first, exactly as task 4.30 already did — a wrong passphrase must
+    // surface as *that*, not as a confusing "corrupt trust.bin" error from the loads below.
+    fs.export_seed().map_err(|e| e.to_string())?;
+    let handle = KeyHandle::from_label(&descriptor.label);
+    load_live_session(descriptor, &fs, &handle)
+}
+
+// ---------------------------------------------------------------------------
+// LoadSession (task 4.29): the OS-keystore / no-account-yet counterpart to Unlock
+// ---------------------------------------------------------------------------
+
+async fn handle_load_session(effect: LoadSessionEffect) -> WorkerEvent {
+    let LoadSessionEffect { request, .. } = effect;
+    match run_load_session() {
+        Ok(outcome) => WorkerEvent::Completed(Effect::LoadSession(LoadSessionEffect {
+            request,
+            outcome: Some(outcome),
+        })),
+        Err(message) => WorkerEvent::Failed(
+            Effect::LoadSession(LoadSessionEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// The real resolution behind [`Effect::LoadSession`] — see that effect's own request/outcome doc
+/// comments in `crate::app` for the full contract this implements.
+fn run_load_session() -> Result<LoadSessionOutcome, String> {
+    // Checked directly against the filesystem (never via `AccountDescriptor::load()`'s own error
+    // string, which conflates "not found" with "found but unparseable") so a genuinely corrupt
+    // `account.json` still fails closed as a hard error below, rather than being silently
+    // mistaken for the legitimate "never onboarded yet" case.
+    let account_json = account::config_dir()?.join("account.json");
+    if !account_json.exists() {
+        return Ok(LoadSessionOutcome::NoAccount);
+    }
+    let descriptor = AccountDescriptor::load()?;
+    match descriptor.store {
+        StoreKind::Os => {
+            init_os_keystore()?;
+            let service = descriptor
+                .service
+                .clone()
+                .unwrap_or_else(|| OS_KEYSTORE_SERVICE.to_string());
+            let os = OsSecretStore::new(&service);
+            let handle = KeyHandle::from_label(&descriptor.label);
+            let session = load_live_session(descriptor, &os, &handle)?;
+            Ok(LoadSessionOutcome::Loaded(Box::new(SessionOutcome::ready(
+                session,
+            ))))
+        }
+        // Never reached through ordinary navigation — a file-backed account routes through
+        // `Effect::Unlock` instead, which is the only path that ever has the live passphrase this
+        // store needs (see `UnlockEffect`'s own doc comment). Fails closed with a clear message
+        // rather than silently no-op'ing or, worse, prompting/guessing a passphrase here.
+        StoreKind::File => Err(
+            "this account is passphrase-protected — unlock it via Effect::Unlock, not \
+             Effect::LoadSession"
+                .to_string(),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared sealed-store loading — used by both `handle_unlock` and `handle_load_session`, which
+// differ only in how `store`/`handle` were obtained (a live passphrase vs. the OS keystore), never
+// in how the sealed state itself is opened.
+// ---------------------------------------------------------------------------
+
+/// Loads `trust.bin`/`sessions.bin`/`contacts.json` for an already-resolved `store`/`handle` pair
+/// into a real [`LiveSession`]. Every one of the three sealed/cached stores defaults (never errors)
+/// when its file is simply absent — the legitimate "nothing sealed here yet" case, exactly
+/// [`TrustStore::open_at_rest`]/`ChatState::open_at_rest`'s own callers already handle at
+/// `apps/core/src/account.rs`'s paths elsewhere in this crate (`crate::store::contacts::
+/// load_or_default_at`'s identical "`NotFound` -> default, anything else -> error" shape) — but a
+/// file that exists and fails to open (wrong key, corrupt bytes) is a hard error, never silently
+/// swallowed into a fresh/empty store: that would erase real TOFU pinned-key history / ratchet
+/// state, exactly the failure mode `TrustStore::open_at_rest`'s own doc comment calls out (ADR 0021
+/// condition 5b).
+fn load_live_session(
+    descriptor: AccountDescriptor,
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+) -> Result<LiveSession, String> {
+    let trust = load_trust(store, handle)?;
+    let chat = load_chat(store, handle)?;
+    let contacts =
+        crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
+    Ok(LiveSession {
+        account: descriptor,
+        trust,
+        chat,
+        contacts,
+    })
+}
+
+fn load_trust(store: &dyn SecretStore, handle: &KeyHandle) -> Result<TrustStore, String> {
+    let path = account::trust_path()?;
+    match std::fs::read(&path) {
+        Ok(bytes) => TrustStore::open_at_rest(store, handle, &bytes).map_err(|e| e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TrustStore::default()),
+        Err(e) => Err(format!("reading {}: {e}", path.display())),
+    }
+}
+
+fn load_chat(store: &dyn SecretStore, handle: &KeyHandle) -> Result<CoreChatState, String> {
+    let path = account::sessions_path()?;
+    match std::fs::read(&path) {
+        Ok(bytes) => CoreChatState::open_at_rest(store, handle, &bytes).map_err(|e| e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CoreChatState::default()),
+        Err(e) => Err(format!("reading {}: {e}", path.display())),
     }
 }
 
@@ -384,5 +539,226 @@ fn open_store_for_bulk_signing(
                 .map_err(|e| e.to_string())?;
             Ok(Box::new(mem))
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for the shared sealed-store loading logic (task 4.29).
+//
+// `load_trust`/`load_chat`/`load_live_session`/`run_load_session` are private to this module, so
+// their own defaulting/fail-closed contracts are proven here directly, against a `MemorySecretStore`
+// (no real keystore access, no scrypt cost) rather than through `dispatch`'s public surface — the
+// `StoreChoice::Os`-shaped end-to-end path is deliberately not exercised anywhere in this crate's
+// test suite (see `apps/tui/tests/run_worker_account.rs`'s own module doc: "needs a real platform
+// credential store ... which a headless CI runner does not have"); this module's own `MemorySecretStore`
+// stands in for exactly the part of that path (`load_live_session` and everything it calls) that is
+// actually shared with the `OsSecretStore`-backed branch — the only thing genuinely untestable
+// headlessly is the `keyring`-backed `OsSecretStore::new`/`init_os_keystore` glue itself, which this
+// module's own `run_load_session` keeps to a thin, single, easily-audited branch (see that function's
+// body) precisely so the untestable surface stays that small.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use meridian_core::identity::generate_account;
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        prev_home: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(dir: &Path) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_home = std::env::var("MERIDIAN_HOME").ok();
+            // SAFETY: serialized by ENV_LOCK, the only place in this test module touching this var.
+            unsafe {
+                std::env::set_var("MERIDIAN_HOME", dir);
+            }
+            Self {
+                _lock: lock,
+                prev_home,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: see `EnvGuard::set`.
+            unsafe {
+                match &self.prev_home {
+                    Some(v) => std::env::set_var("MERIDIAN_HOME", v),
+                    None => std::env::remove_var("MERIDIAN_HOME"),
+                }
+            }
+        }
+    }
+
+    fn store_and_handle() -> (MemorySecretStore, KeyHandle) {
+        let store = MemorySecretStore::new();
+        let account = generate_account(&store, "example.org").expect("generate_account");
+        (store, account.handle().clone())
+    }
+
+    fn dummy_descriptor() -> AccountDescriptor {
+        AccountDescriptor {
+            v: 1,
+            pubkey: "a".repeat(64),
+            hint: "example.org".to_string(),
+            store: StoreKind::Os,
+            keyfile: None,
+            service: Some(OS_KEYSTORE_SERVICE.to_string()),
+            label: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn load_trust_defaults_to_empty_when_trust_bin_is_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(tmp.path());
+        let (store, handle) = store_and_handle();
+
+        let trust = load_trust(&store, &handle).expect("no trust.bin yet -> default, not error");
+        assert_eq!(trust.contacts().count(), 0);
+    }
+
+    #[test]
+    fn load_trust_fails_closed_on_corrupt_bytes_never_silently_reinitializes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(tmp.path());
+        let (store, handle) = store_and_handle();
+
+        let path = account::trust_path().expect("trust_path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not a real sealed trust store").unwrap();
+
+        let err = load_trust(&store, &handle).expect_err("corrupt trust.bin must be a hard error");
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn load_trust_fails_closed_under_the_wrong_key() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(tmp.path());
+        let (store, handle) = store_and_handle();
+        let mut trust = TrustStore::default();
+        trust.observe([7u8; 32], "peer.example", 1_760_000_000);
+        let sealed = trust.seal_at_rest(&store, &handle).expect("seal trust.bin");
+        let path = account::trust_path().expect("trust_path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+
+        // A different account's store/handle must never open it.
+        let (wrong_store, wrong_handle) = store_and_handle();
+        let err = load_trust(&wrong_store, &wrong_handle)
+            .expect_err("trust.bin sealed under a different key must fail closed");
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn load_chat_defaults_to_empty_when_sessions_bin_is_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(tmp.path());
+        let (store, handle) = store_and_handle();
+
+        let chat = load_chat(&store, &handle).expect("no sessions.bin yet -> default, not error");
+        assert!(!chat.has_session(&[0u8; 32]));
+    }
+
+    #[test]
+    fn load_chat_fails_closed_on_corrupt_bytes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(tmp.path());
+        let (store, handle) = store_and_handle();
+
+        let path = account::sessions_path().expect("sessions_path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not a real sealed chat state").unwrap();
+
+        match load_chat(&store, &handle) {
+            Err(err) => assert!(!err.is_empty()),
+            Ok(_) => panic!("corrupt sessions.bin must be a hard error, not a silent default"),
+        }
+    }
+
+    #[test]
+    fn load_live_session_round_trips_real_sealed_trust_and_contacts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(tmp.path());
+        let (store, handle) = store_and_handle();
+
+        let mut trust = TrustStore::default();
+        trust.observe([9u8; 32], "peer.example", 1_760_000_000);
+        let trust_sealed = trust.seal_at_rest(&store, &handle).expect("seal trust.bin");
+        let trust_path = account::trust_path().expect("trust_path");
+        std::fs::create_dir_all(trust_path.parent().unwrap()).unwrap();
+        std::fs::write(&trust_path, trust_sealed).unwrap();
+
+        let doc = crate::store::contacts::ContactsDocument {
+            v: crate::store::contacts::CURRENT_VERSION,
+            contacts: Vec::new(),
+        };
+        crate::store::contacts::save(&doc, &store, &handle).expect("save contacts.json");
+
+        let session =
+            load_live_session(dummy_descriptor(), &store, &handle).expect("load_live_session");
+        assert_eq!(session.trust.contacts().count(), 1);
+        assert!(session.trust.contact(&[9u8; 32]).is_some());
+        assert!(!session.chat.has_session(&[0u8; 32]));
+        assert!(session.contacts.contacts.is_empty());
+    }
+
+    #[test]
+    fn run_load_session_returns_no_account_when_account_json_is_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(tmp.path());
+
+        match run_load_session().expect("a pristine MERIDIAN_HOME is not an error") {
+            LoadSessionOutcome::NoAccount => {}
+            other => panic!("expected NoAccount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_load_session_fails_closed_for_a_file_backed_account_never_touching_the_os_keystore() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(tmp.path());
+        let keyfile = tmp.path().join("account.key");
+        let fs = FileSecretStore::new(&keyfile, "does-not-matter");
+        let account = generate_account(&fs, "example.org").expect("generate_account");
+        AccountDescriptor::new_file(&account, &keyfile)
+            .save()
+            .expect("save account.json");
+
+        let err = run_load_session()
+            .expect_err("a file-backed account.json must never load through LoadSession");
+        assert!(err.contains("Unlock"));
+    }
+
+    /// Review fix (task 4.29, Finding 4): the symmetric guard on `run_unlock`, mirroring the test
+    /// immediately above (`run_load_session_fails_closed_for_a_file_backed_account_never_touching_
+    /// the_os_keystore`) exactly, just for the opposite direction — an OS-keystore `account.json`
+    /// must never unlock through `Effect::Unlock`, and the failure must name the actual fix
+    /// (`Effect::LoadSession`), not surface as a confusing keyfile/AEAD error.
+    #[test]
+    fn run_unlock_fails_closed_for_an_os_keystore_account_never_touching_the_keyfile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(tmp.path());
+        dummy_descriptor().save().expect("save account.json");
+
+        // A keyfile path that doesn't even exist on disk — proves the guard fires before any
+        // `FileSecretStore` operation is attempted against it.
+        let request = UnlockRequest {
+            keyfile: tmp.path().join("nonexistent.key"),
+            passphrase: "does-not-matter".to_string(),
+        };
+        let err = run_unlock(&request)
+            .expect_err("an OS-keystore account.json must never unlock through Effect::Unlock");
+        assert!(err.contains("LoadSession"));
     }
 }

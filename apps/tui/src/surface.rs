@@ -207,37 +207,46 @@ impl fmt::Display for KeyBinding {
 /// [`crate::app::Screen`] split (`docs/architecture/tui-client.md §4`): either dispatch a fixed
 /// effect for the worker to run, or push a freshly built [`ExtensionPane`] onto the screen stack.
 ///
-/// `PushPane` carries a *factory*, not a pane instance: a pane holds its own live state (e.g. a
-/// transfer list's in-progress items), so each trigger of the command must build a fresh one rather
-/// than share/reuse a single instance across invocations.
+/// **Both variants carry a *factory*, not a value** — this is load-bearing, not merely a stylistic
+/// match with `PushPane`. A single registered [`PaletteCommand`] is triggered every time its
+/// keybinding fires or it is selected from the palette (`App::dispatch_palette_action`'s own doc
+/// comment: repeated firing is ordinary, expected use, not a bug to guard against once). `PushPane`
+/// already had to be a factory for exactly this reason (a pane holds its own live, per-invocation
+/// state). `Effect` review fix (task 4.29, Finding 1): it was previously a `Box<Effect>` *value*,
+/// which forced [`Effect`] (and everything it can carry, including
+/// [`crate::app::SessionOutcome`]/[`crate::app::UnlockEffect`]/[`crate::app::LoadSessionEffect`]) to
+/// implement `Clone` purely so `Screen::Help`/`Screen::Palette`'s registry-snapshot `.clone()` had
+/// something to clone through — with no type-level guard against a *populated*, live-session-carrying
+/// `Effect` ever being registered here (only convention). A factory closes that gap completely:
+/// `Effect` (and `SessionOutcome`) no longer need `Clone` at all (see `SessionOutcome`'s own doc for
+/// the type-level consequence — its panic-on-populated `Clone` impl is gone, not merely narrowed),
+/// and every registered command naturally produces a *fresh* `Effect` on each trigger, which is the
+/// only shape that was ever actually correct for a request-only effect anyway.
 pub enum PaletteAction {
-    /// Dispatch this effect for the (future) worker to execute.
-    ///
-    /// Boxed (task 4.19 review fix): once [`crate::app::AddedContact`] grew a real
-    /// `Vec<meridian_core::trust::PinnedKey>` (Finding 1 — the effect-outcome payload must carry
-    /// back a contact's *actual* trust state/history, not an assumed-fresh shape), [`Effect`] grew
-    /// large enough that `PaletteAction`'s size gap against `PushPane`'s thin `Arc` tripped
-    /// `clippy::large_enum_variant` — the same reason `crate::app::AppEvent::Worker` is boxed.
-    Effect(Box<Effect>),
+    /// Build and dispatch a fresh [`Effect`] for the (future) worker to execute, one new value per
+    /// trigger — see this type's own doc comment for why a factory, not a stored value.
+    Effect(Arc<dyn Fn() -> Effect + Send + Sync>),
     /// Push a freshly constructed extension pane onto the screen stack
     /// (`Screen::Extension(pane())`).
     PushPane(Arc<dyn Fn() -> Box<dyn ExtensionPane> + Send + Sync>),
 }
 
 impl Clone for PaletteAction {
+    /// Cheap in both arms now — an `Arc::clone` of a factory, never a deep clone of a live `Effect`
+    /// (or the [`crate::app::SessionOutcome`] one might carry) — see this type's own doc comment.
     fn clone(&self) -> Self {
         match self {
-            PaletteAction::Effect(effect) => PaletteAction::Effect(effect.clone()),
+            PaletteAction::Effect(factory) => PaletteAction::Effect(Arc::clone(factory)),
             PaletteAction::PushPane(factory) => PaletteAction::PushPane(Arc::clone(factory)),
         }
     }
 }
 
 impl fmt::Debug for PaletteAction {
-    /// Hand-rolled: `PushPane`'s `Arc<dyn Fn() -> ...>` has no `Debug` impl to derive.
+    /// Hand-rolled: neither `Arc<dyn Fn() -> ...>` variant has a `Debug` impl to derive.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PaletteAction::Effect(effect) => f.debug_tuple("Effect").field(effect).finish(),
+            PaletteAction::Effect(_) => write!(f, "Effect(<fn>)"),
             PaletteAction::PushPane(_) => write!(f, "PushPane(<fn>)"),
         }
     }
@@ -477,7 +486,7 @@ mod tests {
             name: "Test",
             description: "a test command",
             keybinding: Some(KeyBinding::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
-            action: PaletteAction::Effect(Box::new(Effect::FetchBundle)),
+            action: PaletteAction::Effect(Arc::new(|| Effect::FetchBundle)),
         });
         assert!(registry.get("test.cmd").is_some());
         assert_eq!(registry.iter().count(), 1);
@@ -498,7 +507,7 @@ mod tests {
                 name: "Test",
                 description: "a test command",
                 keybinding: None,
-                action: PaletteAction::Effect(Box::new(Effect::FetchBundle)),
+                action: PaletteAction::Effect(Arc::new(|| Effect::FetchBundle)),
             },
         );
         assert!(registry.renderers().supports("mrd.exotic/1"));

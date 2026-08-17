@@ -210,7 +210,7 @@ closure (4.38) mirroring 4.28's own role. Full planning rationale (including the
 the `run_worker` split was chosen, why `LiveSession` is a dedicated task, and why 4.28 itself was never
 reopened) lives in each task file's own text plus the architect consult recorded in
 [tui-client.md §4](../../architecture/tui-client.md) once folded in by 4.38.
-- [ ] **4.29** `Effect::LoadSession` + `LiveSession` assembly — [file](./4.29-load-session-live-session.md)
+- [x] **4.29** `Effect::LoadSession` + `LiveSession` assembly — [file](./4.29-load-session-live-session.md)
 - [x] **4.30** Real `run_worker`: account lifecycle — [file](./4.30-run-worker-account-lifecycle.md)
 - [ ] **4.31** Real `run_worker`: contacts & contact-detail persistence — [file](./4.31-run-worker-contacts-persistence.md)
 - [ ] **4.32** Real `run_worker`: trust & request-queue persistence — [file](./4.32-run-worker-trust-request-persistence.md)

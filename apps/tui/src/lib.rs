@@ -36,6 +36,7 @@ pub mod app;
 pub mod config;
 pub mod config_write;
 pub mod screens;
+pub mod session;
 pub mod statusbar;
 pub mod store;
 pub mod surface;
@@ -45,6 +46,7 @@ pub mod worker;
 
 pub use app::{App, AppEvent, Effect, Screen, WorkerEvent};
 pub use config::{load as load_config, load_from as load_config_from, TuiConfig};
+pub use session::LiveSession;
 pub use terminal::{spawn_signal_watch, CrosstermOps, TerminalGuard, TerminalOps};
 pub use theme::RenderCtx;
 

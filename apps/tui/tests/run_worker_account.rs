@@ -36,7 +36,8 @@ use meridian_rendezvous::{serve, AppState, Config, MemoryStore, Store};
 
 use meridian_tui::app::{
     Effect, GenerateAccountEffect, GenerateAccountRequest, PublishBundleEffect,
-    PublishBundleRequest, RegisterRequest, StoreChoice, UnlockRequest, WorkerEvent,
+    PublishBundleRequest, RegisterRequest, SessionOutcome, StoreChoice, UnlockEffect,
+    UnlockRequest, WorkerEvent,
 };
 use meridian_tui::worker::{dispatch, OnboardingSession};
 
@@ -457,18 +458,19 @@ fn publish_bundle_retry_after_a_transient_failure_reuses_the_cached_connection()
         label: generated.label.clone(),
         account_pub: generated.account_pub,
     });
-    // Dispatched twice below (the failed attempt, then its retry) — same effect both times, exactly
-    // how `crate::screens::onboarding`'s `Failed::retry` re-dispatches on Enter/`r`.
-    let publish_effect = Effect::PublishBundle(PublishBundleEffect {
-        request: PublishBundleRequest {
-            server: server.clone(),
-            store: StoreChoice::File { passphrase },
-            label: generated.label.clone(),
-            account_pub: generated.account_pub,
-            otk_count: 5,
-        },
-        outcome: None,
-    });
+    // Dispatched twice below (the failed attempt, then its retry) — same request both times, exactly
+    // how `crate::screens::onboarding`'s `Failed::retry` re-dispatches on Enter/`r`. Kept as the
+    // request struct (not a whole `Effect`) so it can be cloned for the second dispatch: `Effect`
+    // itself deliberately does not implement `Clone` (see its own doc comment in `crate::app`) — a
+    // real retry re-dispatches a freshly built `Effect` from the same request data, never clones a
+    // live `Effect` value, exactly what this rewrites the test to do.
+    let publish_request = PublishBundleRequest {
+        server: server.clone(),
+        store: StoreChoice::File { passphrase },
+        label: generated.label.clone(),
+        account_pub: generated.account_pub,
+        otk_count: 5,
+    };
 
     // Same runtime for the whole sequence — see the identical note on
     // `register_then_publish_bundle_reuses_one_connection` above for why.
@@ -481,7 +483,11 @@ fn publish_bundle_retry_after_a_transient_failure_reuses_the_cached_connection()
         // First PublishBundle attempt: the server's store fails this one `put_bundle` call. Must
         // surface the real backend error, never the masking "no active registration session"
         // message — that would mean the connection was already gone before this call even ran.
-        match dispatch(publish_effect.clone(), &mut session).await {
+        let first_attempt = Effect::PublishBundle(PublishBundleEffect {
+            request: publish_request.clone(),
+            outcome: None,
+        });
+        match dispatch(first_attempt, &mut session).await {
             WorkerEvent::Failed(
                 Effect::PublishBundle(PublishBundleEffect { outcome: None, .. }),
                 message,
@@ -494,9 +500,13 @@ fn publish_bundle_retry_after_a_transient_failure_reuses_the_cached_connection()
             other => panic!("expected a failed PublishBundle, got {other:?}"),
         }
 
-        // Retry: dispatching the identical effect again must reuse the same still-cached connection
-        // and succeed.
-        match dispatch(publish_effect, &mut session).await {
+        // Retry: dispatching the identical request again (as a freshly built `Effect`) must reuse the
+        // same still-cached connection and succeed.
+        let retry = Effect::PublishBundle(PublishBundleEffect {
+            request: publish_request,
+            outcome: None,
+        });
+        match dispatch(retry, &mut session).await {
             WorkerEvent::Completed(Effect::PublishBundle(PublishBundleEffect {
                 outcome: Some(published),
                 ..
@@ -521,19 +531,40 @@ fn publish_bundle_retry_after_a_transient_failure_reuses_the_cached_connection()
 // ---------------------------------------------------------------------------
 
 #[test]
-fn unlock_with_the_correct_passphrase_succeeds() {
+fn unlock_with_the_correct_passphrase_succeeds_and_loads_a_real_live_session() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
     let keyfile = tmp.path().join("returning-user.key");
     let fs = FileSecretStore::new(&keyfile, "the-right-passphrase");
-    generate_account(&fs, "org-a.test").expect("seed a returning-user keyfile");
+    let acct = generate_account(&fs, "org-a.test").expect("seed a returning-user keyfile");
+    account::AccountDescriptor::new_file(&acct, &keyfile)
+        .save()
+        .expect("save account.json for the returning user");
 
     let mut session = OnboardingSession::default();
-    let effect = Effect::Unlock(UnlockRequest {
-        keyfile,
-        passphrase: "the-right-passphrase".to_string(),
-    });
+    let effect = Effect::Unlock(Box::new(UnlockEffect {
+        request: UnlockRequest {
+            keyfile,
+            passphrase: "the-right-passphrase".to_string(),
+        },
+        outcome: SessionOutcome::empty(),
+    }));
     match block_on(dispatch(effect, &mut session)) {
-        WorkerEvent::Completed(Effect::Unlock(_)) => {}
+        WorkerEvent::Completed(Effect::Unlock(effect)) => {
+            let UnlockEffect { outcome, .. } = *effect;
+            let live = outcome
+                .into_option()
+                .expect("a completed Unlock must carry a real LiveSession");
+            assert_eq!(
+                live.account.pubkey,
+                hex::encode(acct.public_key().as_bytes())
+            );
+            // Nothing was ever sealed for this brand-new returning-user account, so every store
+            // defaults — never an error — exactly `LiveSession::empty`'s own shape.
+            assert_eq!(live.trust.contacts().count(), 0);
+            assert!(!live.chat.has_session(&[0u8; 32]));
+            assert!(live.contacts.contacts.is_empty());
+        }
         other => panic!("expected a completed Unlock, got {other:?}"),
     }
 }
@@ -541,19 +572,28 @@ fn unlock_with_the_correct_passphrase_succeeds() {
 #[test]
 fn unlock_with_the_wrong_passphrase_fails_without_leaking_it() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
     let keyfile = tmp.path().join("returning-user.key");
     let fs = FileSecretStore::new(&keyfile, "the-right-passphrase");
-    generate_account(&fs, "org-a.test").expect("seed a returning-user keyfile");
+    let acct = generate_account(&fs, "org-a.test").expect("seed a returning-user keyfile");
+    account::AccountDescriptor::new_file(&acct, &keyfile)
+        .save()
+        .expect("save account.json for the returning user");
 
     let mut session = OnboardingSession::default();
-    let effect = Effect::Unlock(UnlockRequest {
-        keyfile,
-        passphrase: "totally-wrong-guess".to_string(),
-    });
+    let effect = Effect::Unlock(Box::new(UnlockEffect {
+        request: UnlockRequest {
+            keyfile,
+            passphrase: "totally-wrong-guess".to_string(),
+        },
+        outcome: SessionOutcome::empty(),
+    }));
     match block_on(dispatch(effect, &mut session)) {
-        WorkerEvent::Failed(Effect::Unlock(_), message) => {
+        WorkerEvent::Failed(Effect::Unlock(effect), message) => {
+            let UnlockEffect { outcome, .. } = *effect;
             assert!(!message.contains("totally-wrong-guess"));
             assert!(!message.contains("the-right-passphrase"));
+            assert!(outcome.into_option().is_none());
         }
         other => panic!("expected a failed Unlock, got {other:?}"),
     }
@@ -597,10 +637,13 @@ fn effect_debug_never_leaks_a_passphrase() {
             },
             outcome: None,
         }),
-        Effect::Unlock(UnlockRequest {
-            keyfile: PathBuf::from("/tmp/x.key"),
-            passphrase: secret.to_string(),
-        }),
+        Effect::Unlock(Box::new(UnlockEffect {
+            request: UnlockRequest {
+                keyfile: PathBuf::from("/tmp/x.key"),
+                passphrase: secret.to_string(),
+            },
+            outcome: SessionOutcome::empty(),
+        })),
     ];
     for effect in &effects {
         let dump = format!("{effect:?}");
