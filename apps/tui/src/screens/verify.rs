@@ -112,6 +112,9 @@ use ratatui::Frame;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
 use meridian_core::crypto::{display_groups, safety_number};
 use meridian_core::identity::render_terminal;
 use meridian_core::trust::{SendGate, TrustStore};
@@ -121,6 +124,7 @@ use crate::app::{
     MarkVerifiedRequest, SetUserBlockedEffect, SetUserBlockedRequest, WorkerEvent,
 };
 use crate::screens::contacts::{short_pubkey, trust_glyph_and_label};
+use crate::theme::{color_or_none, RenderCtx};
 
 // ---------------------------------------------------------------------------
 // State
@@ -152,6 +156,12 @@ pub struct VerifyState {
     /// A transient, non-persisted status line — mirrors `ChatState::notice`'s identical contract.
     pub notice: Option<String>,
     pub mode: VerifyMode,
+    /// How many rows the security banner has been scrolled down by — task 4.26's carry-forward fix
+    /// from 4.22's review (see [`render_body`]'s own doc comment). Only meaningful (and only ever
+    /// reachable via a key) when the banner's own wrapped height exceeds the physical terminal height
+    /// even after the number/QR pane has already been given up entirely; `0` (the ordinary case)
+    /// means "top of the banner", matching every other screen's un-scrolled default.
+    pub banner_scroll: u16,
 }
 
 /// The screen's own sub-mode — mirrors `crate::screens::requests::RequestsMode`'s confirm-then-act
@@ -202,6 +212,7 @@ impl VerifyState {
             safety_number,
             notice: None,
             mode: VerifyMode::View,
+            banner_scroll: 0,
         }
     }
 
@@ -263,7 +274,37 @@ pub fn handle_key(state: &mut VerifyState, key: KeyEvent) -> (Vec<Effect>, bool)
     }
 }
 
+/// Task 4.26's carry-forward fix from 4.22's review: `Up`/`Down`/`PageUp`/`PageDown` scroll the
+/// security banner when — at an extreme post-launch resize — it needs more rows than the physical
+/// terminal offers even with the number/QR pane given up entirely (see [`render_body`]'s own doc
+/// comment). Only intercepted from [`VerifyMode::View`]/[`VerifyMode::Error`] — **deliberately never**
+/// from [`VerifyMode::Confirm`], so this cannot weaken the "every key other than y/Y cancels back to
+/// View" property `handle_confirm_key`'s own doc names as security-relevant and
+/// `tests/screens_verify.rs`'s exhaustive keyspace sweep pins byte-for-byte; a scrolled banner during a
+/// `Confirm` prompt still cancels on any non-`y`/`Y` key exactly as before, it just isn't scrollable
+/// mid-prompt (an accepted, minor UX gap at an already-extreme terminal size, not a security-relevant
+/// one — the confirm prompt's own text is short and always at the *end* of the banner, so scrolling to
+/// it before pressing `v`/`b`/`a` is sufficient).
+fn banner_scroll_delta(code: KeyCode) -> Option<i32> {
+    match code {
+        KeyCode::Down => Some(1),
+        KeyCode::Up => Some(-1),
+        KeyCode::PageDown => Some(10),
+        KeyCode::PageUp => Some(-10),
+        _ => None,
+    }
+}
+
+fn apply_banner_scroll(state: &mut VerifyState, delta: i32) {
+    let next = i32::from(state.banner_scroll).saturating_add(delta).max(0);
+    state.banner_scroll = u16::try_from(next).unwrap_or(u16::MAX);
+}
+
 fn handle_view_key(state: &mut VerifyState, key: KeyEvent) -> (Vec<Effect>, bool) {
+    if let Some(delta) = banner_scroll_delta(key.code) {
+        apply_banner_scroll(state, delta);
+        return (Vec::new(), false);
+    }
     match key.code {
         KeyCode::Esc => return (Vec::new(), true),
         KeyCode::Char('v') if is_plain_char(key.modifiers) => {
@@ -303,6 +344,10 @@ fn handle_confirm_key(state: &mut VerifyState, action: VerifyAction, key: KeyEve
 }
 
 fn handle_error_key(state: &mut VerifyState, key: KeyEvent) {
+    if let Some(delta) = banner_scroll_delta(key.code) {
+        apply_banner_scroll(state, delta);
+        return;
+    }
     if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
         state.mode = VerifyMode::View;
     }
@@ -431,10 +476,16 @@ pub fn handle_worker(state: &mut VerifyState, event: WorkerEvent) -> Vec<Effect>
 // Render
 // ---------------------------------------------------------------------------
 
-/// Pure view function — see the module doc.
+/// Pure view function — degradation-unaware default (unicode on, color on) for any call site without
+/// a [`RenderCtx`] handy. See [`render_with_ctx`] and `crate::theme`'s own module doc.
 pub fn render(state: &VerifyState, frame: &mut Frame<'_>) {
+    render_with_ctx(state, frame, &RenderCtx::default());
+}
+
+/// Pure view function — see the module doc and `crate::theme`'s own "retrofit scope" section.
+pub fn render_with_ctx(state: &VerifyState, frame: &mut Frame<'_>, ctx: &RenderCtx) {
     let area = frame.area();
-    let (glyph, label) = trust_glyph_and_label(state.trust.trust_state(&state.peer_pubkey));
+    let (glyph, label) = trust_glyph_and_label(state.trust.trust_state(&state.peer_pubkey), ctx);
     let title = format!(
         "Meridian — Verify · {}  {glyph} {label}",
         state.peer_label()
@@ -448,17 +499,20 @@ pub fn render(state: &VerifyState, frame: &mut Frame<'_>) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
-    render_body(state, frame, rows[0]);
+    let overflowing = render_body(state, frame, rows[0], ctx);
 
     let footer = Paragraph::new(Line::from(Span::styled(
-        footer_hint(state),
+        footer_hint(state, overflowing),
         Style::default().add_modifier(Modifier::DIM),
     )));
     frame.render_widget(footer, rows[1]);
 }
 
-fn render_body(state: &VerifyState, frame: &mut Frame<'_>, area: Rect) {
-    let banner = banner_lines(state);
+/// Renders the banner + number/QR pane. Returns whether the banner is in the extreme "even the whole
+/// physical terminal isn't tall enough for it" overflow case — see the doc below and
+/// [`footer_hint`]'s `banner_overflowing` parameter, which uses this to surface the scroll keys.
+fn render_body(state: &VerifyState, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx) -> bool {
+    let banner = banner_lines(state, ctx);
     // **Security-relevant sizing, not merely cosmetic.** The banner carries this screen's
     // un-softenable canonical wording (verification-ux.md hard prohibition #3: "no burying the
     // block behind an easily-missed banner"). `banner.len()` is the *logical* line count — one of
@@ -477,11 +531,31 @@ fn render_body(state: &VerifyState, frame: &mut Frame<'_>, area: Rect) {
     // fit. The un-truncated `blocked_reason`/`warn_reason` text takes priority: it is
     // security-critical and not re-derivable once clipped, whereas the number/QR pane is a pure,
     // cheap-to-recompute display of already-known data. So the banner always gets exactly the
-    // height `wrapped_height` says it needs (clamped only to the *physical* area height, so the
-    // layout itself never over-allocates), and the number/QR pane gets whatever is left —
+    // height `wrapped_height` says it needs, and the number/QR pane gets whatever is left —
     // shrinking toward zero, and disappearing first, if the terminal is too short for both.
-    let banner_height = wrapped_height(&banner, area.width).min(area.height);
+    //
+    // **Task 4.26's carry-forward fix (from 4.22's review).** The clamp above only protects against
+    // the banner *stealing* the number/QR pane's space — it does nothing for the more extreme case
+    // where the banner's own wrapped height exceeds the *entire* physical terminal, e.g. a mid-session
+    // resize to a handful of rows. Before this fix, `wrapped_height(...).min(area.height)` still
+    // silently truncated the `Paragraph` to whatever fit, tail of the canonical wording clipped with
+    // no way to read the rest. Now: when the banner alone needs more rows than `area` has, it gets the
+    // *entire* area (the number/QR pane disappears completely — cheap, re-derivable display data, not
+    // security-critical) and renders scrollable via [`VerifyState::banner_scroll`]
+    // (`Up`/`Down`/`PageUp`/`PageDown` — see [`banner_scroll_delta`]), so the full canonical text is
+    // always reachable, never silently dropped, no matter how short the terminal gets.
+    let full_banner_height = wrapped_height(&banner, area.width);
+    if area.height > 0 && full_banner_height > area.height {
+        let max_scroll = full_banner_height.saturating_sub(area.height);
+        let scroll = state.banner_scroll.min(max_scroll);
+        let paragraph = Paragraph::new(banner)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
+        frame.render_widget(paragraph, area);
+        return true;
+    }
 
+    let banner_height = full_banner_height.min(area.height);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(banner_height), Constraint::Min(0)])
@@ -490,15 +564,27 @@ fn render_body(state: &VerifyState, frame: &mut Frame<'_>, area: Rect) {
     if banner_height > 0 {
         frame.render_widget(Paragraph::new(banner).wrap(Wrap { trim: false }), rows[0]);
     }
-    render_number_and_qr(state, frame, rows[1]);
+    render_number_and_qr(state, frame, rows[1], ctx);
+    false
 }
 
 /// The number of terminal rows `lines` will actually occupy once word-wrapped (`Wrap{trim: false}`)
 /// at `width` columns — a conservative, greedy word-wrap approximation of `ratatui`'s own wrapper
 /// (good enough to size a [`Constraint::Length`] region without under-allocating; see
 /// [`render_body`]'s doc comment for why under-allocating here is a security-relevant defect, not
-/// just a cosmetic one). A word longer than `width` still counts as (at least) one row, matching
-/// `Wrap{trim: false}`'s own "never silently drop content" behavior.
+/// just a cosmetic one). A word longer than `width` — reachable from wire-observed,
+/// attacker-influenced text (e.g. a space-free `Contact::hint` flowing through
+/// `blocked_reason`/`warn_reason`, see `apps/core/src/trust.rs`) — is broken across
+/// `ceil(word_width / width)` rows, not one, matching `ratatui`'s real `WordWrapper`
+/// (`line_composer_long_word` in its own `reflow.rs` test suite: a word that doesn't fit the
+/// remaining space of the current row always starts a fresh row, and one wider than a whole fresh
+/// row is then split grapheme-by-grapheme into `width`-cell-wide chunks). `word_width` itself is a
+/// terminal display-cell width (see [`word_display_width`]), not a `char` count — double-width
+/// characters (CJK, fullwidth forms, many emoji) occupy 2 cells per 1 `char`, and a `char`-count
+/// measurement was a second, independent undercount this function once had alongside the row-count
+/// one. Undercounting either one — the bugs this function once had — silently clips the tail of the
+/// un-softenable Blocked/Warn banner text off-screen or under-allocates its render region entirely;
+/// see [`wrapped_row_count`].
 fn wrapped_height(lines: &[Line<'static>], width: u16) -> u16 {
     if width == 0 {
         return lines.len() as u16;
@@ -519,33 +605,84 @@ fn wrapped_height(lines: &[Line<'static>], width: u16) -> u16 {
 }
 
 fn wrapped_row_count(text: &str, width: usize) -> usize {
+    // Guard against division by zero below — `wrapped_height` already special-cases `width == 0`
+    // before ever calling this function, but this keeps the helper itself panic-free for any direct
+    // caller (e.g. a unit test) too.
+    let width = width.max(1);
     let mut rows = 0usize;
     let mut current_width = 0usize;
     let mut row_started = false;
     for word in text.split(' ') {
-        let word_width = word.chars().count();
-        if !row_started {
+        let word_width = word_display_width(word);
+        // (a) The word fits on the current row (with a separating space, unless the row is empty) —
+        // append it in place, no new row.
+        if row_started {
+            let needed = current_width + 1 + word_width;
+            if needed <= width {
+                current_width = needed;
+                continue;
+            }
+        }
+        // The word does not fit on the current row (or there is no current row yet): it always
+        // starts a fresh row, mirroring ratatui's real `WordWrapper` (see this function's caller,
+        // `wrapped_height`, for the citation).
+        if word_width <= width {
+            // (b) It fits within a whole fresh row on its own.
             rows += 1;
             current_width = word_width;
-            row_started = true;
-            continue;
-        }
-        let needed = current_width + 1 + word_width;
-        if needed <= width {
-            current_width = needed;
         } else {
-            rows += 1;
-            current_width = word_width;
+            // (c) It exceeds `width` even alone — ratatui splits it grapheme-by-grapheme (see
+            // `word_display_width`) into `width`-cell-wide chunks, `ceil(word_width / width)` rows
+            // in total (not one — the bug this function once had). The position on the last of
+            // those rows is the remainder, so a
+            // following word that fits after it is still accounted for correctly (`width` itself,
+            // not `0`, when the word divides evenly — otherwise a phantom empty trailing row would
+            // look like it has room for nothing, which is conservative but not accurate).
+            rows += word_width.div_ceil(width);
+            let remainder = word_width % width;
+            current_width = if remainder == 0 { width } else { remainder };
         }
+        row_started = true;
     }
     rows.max(1)
+}
+
+/// The terminal display-cell width of `word`, matching `ratatui`'s real `WordWrapper` (which
+/// measures via `StyledGrapheme::symbol.cell_width()`) rather than a Unicode scalar (`char`) count.
+/// A naive `word.chars().count()` undercounts any double-width character (CJK ideographs, fullwidth
+/// forms, many emoji) by up to 2x — reachable from wire-observed, attacker-influenced text (e.g. a
+/// space-free `Contact::hint`, unrestricted in charset, flowing through `blocked_reason`/
+/// `warn_reason`; see `apps/core/src/trust.rs`), so this must be exact, not approximate.
+///
+/// Iterates by extended grapheme cluster (`unicode-segmentation`), not by `char`, so combining
+/// characters and ZWJ sequences (e.g. a family emoji built from several joined codepoints) are
+/// measured as the single visual unit `ratatui`'s own per-grapheme rendering treats them as, rather
+/// than summing each constituent codepoint's width independently. Each grapheme's width comes from
+/// `unicode-width`'s `UnicodeWidthStr::width` — the same crate `ratatui-core` itself depends on for
+/// `cell_width()` — so this stays consistent with `ratatui`'s actual layout decisions, not a
+/// second, potentially-diverging measurement.
+fn word_display_width(word: &str) -> usize {
+    word.graphemes(true).map(UnicodeWidthStr::width).sum()
 }
 
 /// **The KeyChangeBlocked / KeyChangeWarning modals, plus this screen's own confirm/error prompts.**
 /// Renders whatever [`SendGate::Blocked`]/[`SendGate::Warn`]'s carried reason string actually is —
 /// verbatim, never re-derived — see the module doc. Empty (nothing rendered) when the gate is
 /// [`SendGate::Ok`] and no sub-mode is active.
-fn banner_lines(state: &VerifyState) -> Vec<Line<'static>> {
+fn banner_lines(state: &VerifyState, ctx: &RenderCtx) -> Vec<Line<'static>> {
+    let red = |base: Style| match color_or_none(Color::Red, ctx) {
+        Some(color) => base.fg(color),
+        None => base,
+    };
+    let yellow = |base: Style| match color_or_none(Color::Yellow, ctx) {
+        Some(color) => base.fg(color),
+        None => base,
+    };
+    let cyan = |base: Style| match color_or_none(Color::Cyan, ctx) {
+        Some(color) => base.fg(color),
+        None => base,
+    };
+
     let mut lines = Vec::new();
     match state.gate() {
         SendGate::Blocked(reason) => {
@@ -563,25 +700,17 @@ fn banner_lines(state: &VerifyState) -> Vec<Line<'static>> {
             };
             lines.push(Line::from(Span::styled(
                 header,
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                red(Style::default().add_modifier(Modifier::BOLD)),
             )));
-            lines.push(Line::from(Span::styled(
-                reason,
-                Style::default().fg(Color::Red),
-            )));
+            lines.push(Line::from(Span::styled(reason, red(Style::default()))));
             lines.push(Line::from(""));
         }
         SendGate::Warn(reason) => {
             lines.push(Line::from(Span::styled(
                 "KEY CHANGE WARNING",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                yellow(Style::default().add_modifier(Modifier::BOLD)),
             )));
-            lines.push(Line::from(Span::styled(
-                reason,
-                Style::default().fg(Color::Yellow),
-            )));
+            lines.push(Line::from(Span::styled(reason, yellow(Style::default()))));
             lines.push(Line::from(""));
         }
         SendGate::Ok => {}
@@ -592,9 +721,7 @@ fn banner_lines(state: &VerifyState) -> Vec<Line<'static>> {
             lines.push(Line::from(Span::styled(
                 "Did both sides see the identical safety number/QR, compared out-of-band? Only \
                  confirm if they genuinely matched. (y/n)",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                cyan(Style::default().add_modifier(Modifier::BOLD)),
             )));
         }
         VerifyMode::Confirm(VerifyAction::Block) => {
@@ -605,7 +732,7 @@ fn banner_lines(state: &VerifyState) -> Vec<Line<'static>> {
             };
             lines.push(Line::from(Span::styled(
                 format!("{verb} this contact? (y/n)"),
-                Style::default().fg(Color::Red),
+                red(Style::default()),
             )));
         }
         VerifyMode::Confirm(VerifyAction::Acknowledge) => {
@@ -613,13 +740,13 @@ fn banner_lines(state: &VerifyState) -> Vec<Line<'static>> {
                 "acknowledge without verifying? this re-pins the new key but does not confirm it \
                  is genuinely theirs — verify instead if anything you're about to send is \
                  sensitive. (y/n)",
-                Style::default().fg(Color::Yellow),
+                yellow(Style::default()),
             )));
         }
         VerifyMode::Error(message) => {
             lines.push(Line::from(Span::styled(
                 message.clone(),
-                Style::default().fg(Color::Red),
+                red(Style::default()),
             )));
             lines.push(Line::from("Press Enter or Esc to continue."));
         }
@@ -630,7 +757,7 @@ fn banner_lines(state: &VerifyState) -> Vec<Line<'static>> {
 /// The side-by-side safety-number + QR display this task's own name comes from — via 4.5's already-
 /// reviewed primitives, `meridian_core::crypto::{safety_number, display_groups}` and
 /// `meridian_core::identity::render_terminal` (see the module doc).
-fn render_number_and_qr(state: &VerifyState, frame: &mut Frame<'_>, area: Rect) {
+fn render_number_and_qr(state: &VerifyState, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
@@ -649,10 +776,11 @@ fn render_number_and_qr(state: &VerifyState, frame: &mut Frame<'_>, area: Rect) 
     ];
     if let Some(notice) = &state.notice {
         number_lines.push(Line::from(""));
-        number_lines.push(Line::from(Span::styled(
-            notice.clone(),
-            Style::default().fg(Color::Red),
-        )));
+        let mut style = Style::default();
+        if let Some(color) = color_or_none(Color::Red, ctx) {
+            style = style.fg(color);
+        }
+        number_lines.push(Line::from(Span::styled(notice.clone(), style)));
     }
     frame.render_widget(
         Paragraph::new(number_lines).wrap(Wrap { trim: false }),
@@ -666,8 +794,10 @@ fn render_number_and_qr(state: &VerifyState, frame: &mut Frame<'_>, area: Rect) 
     frame.render_widget(Paragraph::new(qr_lines), cols[1]);
 }
 
-fn footer_hint(state: &VerifyState) -> String {
-    match &state.mode {
+/// `banner_overflowing` is [`render_body`]'s own return value: `true` only in the extreme case where
+/// the banner needed the whole physical terminal and is now scrollable — see [`banner_scroll_delta`].
+fn footer_hint(state: &VerifyState, banner_overflowing: bool) -> String {
+    let base = match &state.mode {
         VerifyMode::View => match state.gate() {
             SendGate::Blocked(_) => "v verify · b block · Esc back".to_string(),
             SendGate::Warn(_) => {
@@ -685,5 +815,155 @@ fn footer_hint(state: &VerifyState) -> String {
             "y confirm acknowledge (does not verify) · n/Esc cancel".to_string()
         }
         VerifyMode::Error(_) => "Enter/Esc continue".to_string(),
+    };
+    if banner_overflowing && !matches!(state.mode, VerifyMode::Confirm(_)) {
+        format!("{base} · Up/Down/PgUp/PgDn scroll banner (too short to show it all)")
+    } else {
+        base
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // wrapped_row_count — pure, no I/O. Security-review regression: this helper once treated any
+    // single word longer than `width` as occupying exactly one row, undercounting the space
+    // `render_body` reserves for the un-softenable Blocked/Warn banner text — see this function's
+    // own doc comment and `render_body`'s for why undercounting here is a security-relevant defect,
+    // not merely cosmetic. `text`/`hint` reaching this function is wire-observed and
+    // attacker-influenced (`Contact::hint`, bounded to 253 bytes but never required to contain a
+    // space — see `apps/core/src/trust.rs`), so these tests exercise exactly that shape: a long,
+    // space-free token, not just the short fixed labels the screen-level tests use.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn short_text_that_fits_on_one_row_counts_as_one_row() {
+        assert_eq!(wrapped_row_count("hello world", 40), 1);
+    }
+
+    #[test]
+    fn empty_text_counts_as_one_row_never_zero() {
+        assert_eq!(wrapped_row_count("", 40), 1);
+    }
+
+    #[test]
+    fn ordinary_word_wrap_matches_a_simple_greedy_count() {
+        // "aaaa bbbb cccc dddd" at width 9: "aaaa bbbb" (9 chars) fits row 1, "cccc dddd" (9 chars)
+        // fits row 2 — two rows, no word individually exceeds the width.
+        assert_eq!(wrapped_row_count("aaaa bbbb cccc dddd", 9), 2);
+    }
+
+    #[test]
+    fn a_single_space_free_word_longer_than_width_spans_ceil_len_over_width_rows() {
+        // The core fix this test pins: a lone 100-char space-free token (a hostile `Contact::hint`
+        // with no spaces at all) at width 10 must occupy `ceil(100 / 10) = 10` rows, not 1.
+        let hostile = "a".repeat(100);
+        assert_eq!(wrapped_row_count(&hostile, 10), 10);
+        // Not-evenly-divisible case: ceil(101 / 10) = 11.
+        let hostile = "a".repeat(101);
+        assert_eq!(wrapped_row_count(&hostile, 10), 11);
+    }
+
+    #[test]
+    fn a_long_word_embedded_in_ordinary_surrounding_text_still_spans_every_row_it_needs() {
+        // Mirrors the real shape of `blocked_reason`/`warn_reason`: ordinary words, then one hostile
+        // long space-free token (the interpolated `label`), then more ordinary words. Every row the
+        // long word itself needs must be counted, and the words after it must still be reachable
+        // (not silently absorbed into an undercounted row).
+        let hostile = "b".repeat(37); // ceil(37 / 10) = 4 rows on its own at width 10.
+        let text = format!("The safety number for {hostile} has changed.");
+        // "The safety" (10 chars incl. space... exact wrapping isn't the point here) plus the 4 rows
+        // the long word needs plus at least one more row for the trailing words — comfortably more
+        // than the old, buggy "1 row per over-long word" behavior would ever produce.
+        let rows = wrapped_row_count(&text, 10);
+        assert!(
+            rows > 4,
+            "expected at least 1 (leading words) + 4 (the long word's own rows), got {rows}"
+        );
+    }
+
+    #[test]
+    fn wrapped_height_of_a_hostile_long_hint_reason_is_never_undercounted_relative_to_a_direct_row_count(
+    ) {
+        // `wrapped_height` (this function's only caller) must sum exactly what `wrapped_row_count`
+        // reports per line — this pins that composition against a realistic canonical-reason-shaped
+        // string carrying a long, space-free hint.
+        let hostile_label = "x".repeat(80);
+        let reason = format!(
+            "The safety number for {hostile_label} has changed. This can happen if they \
+             reinstalled or switched devices — but it can also mean someone is intercepting your \
+             messages. Sends to {hostile_label} are blocked until you verify the new safety \
+             number with them through a channel you trust. Verify the new safety number to \
+             resume, or leave this contact blocked — there is no way to send without doing one of \
+             those."
+        );
+        let lines = vec![Line::from(reason.clone())];
+        let width = 40u16;
+        let height = wrapped_height(&lines, width);
+        let direct = wrapped_row_count(&reason, width as usize);
+        assert_eq!(height as usize, direct);
+        // Sanity: the hostile label alone forces several rows at this width — if this were 1 (the
+        // old bug), the rest of this test file's screen-level regressions wouldn't be exercising
+        // anything real.
+        assert!(height as usize >= 80usize.div_ceil(width as usize));
+    }
+
+    // -----------------------------------------------------------------------
+    // word_display_width / wrapped_row_count with double-width characters — residual security-review
+    // regression: `word_width` was once measured as `word.chars().count()` (a Unicode scalar count),
+    // undercounting any double-width character (CJK ideographs, fullwidth forms, many emoji) by up to
+    // 2x even after the row-count math itself (`ceil(word_width / width)`) was already correct. See
+    // this module's doc comment on `word_display_width` and `apps/tui/tests/degradation.rs`'s
+    // `verify_screen_ordinary_terminal_with_a_wide_hostile_hint_never_garbles_or_silently_drops_the_banner`
+    // for the screen-level regression this closes.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn word_display_width_counts_ascii_as_one_cell_per_char() {
+        assert_eq!(word_display_width("hello"), 5);
+    }
+
+    #[test]
+    fn word_display_width_counts_double_width_cjk_as_two_cells_per_char() {
+        // "中" (U+4E2D) is a single Unicode scalar value but renders as 2 terminal cells — the exact
+        // gap a `chars().count()` measurement missed.
+        let word = "\u{4e2d}".repeat(10);
+        assert_eq!(word_display_width(&word), 20);
+        assert_ne!(
+            word_display_width(&word),
+            word.chars().count(),
+            "sanity: this case must actually diverge from a naive char count, or it isn't exercising \
+             the bug"
+        );
+    }
+
+    #[test]
+    fn word_display_width_treats_a_zwj_emoji_sequence_as_one_grapheme_not_summed_per_codepoint() {
+        // A ZWJ family emoji: several joined codepoints that render as a single glyph. Grapheme-cluster
+        // iteration must measure it once (as `unicode-width` reports for the whole cluster's own
+        // rendering), not once per constituent `char`.
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"; // man-ZWJ-woman-ZWJ-girl
+        let per_grapheme = word_display_width(family);
+        let naive_char_sum: usize = family
+            .chars()
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum();
+        assert!(
+            per_grapheme <= naive_char_sum,
+            "grapheme-cluster measurement must never exceed summing every constituent char's own \
+             width (got {per_grapheme} vs a naive per-char sum of {naive_char_sum})"
+        );
+    }
+
+    #[test]
+    fn a_single_space_free_double_width_word_spans_ceil_cell_width_over_render_width_rows() {
+        // 84 repeats of a double-width CJK character = 168 display cells (matching the reviewer's own
+        // 84-character reproduction) at width 40 must occupy `ceil(168 / 40) = 5` rows, not
+        // `ceil(84 / 40) = 3` (the char-count-based undercount) and not 1 (the still-older row-count
+        // bug).
+        let hostile = "\u{4e2d}".repeat(84);
+        assert_eq!(wrapped_row_count(&hostile, 40), 5);
     }
 }

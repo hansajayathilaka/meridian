@@ -43,6 +43,7 @@ use crate::app::{
 };
 use crate::screens::contacts::{short_pubkey, trust_glyph_and_label, ContactEntry};
 use crate::store::contacts::PolicyOverride;
+use crate::theme::{color_or_none, RenderCtx};
 
 // ---------------------------------------------------------------------------
 // State
@@ -307,8 +308,14 @@ pub fn handle_worker(state: &mut ContactDetailState, event: WorkerEvent) -> (Vec
 // Render
 // ---------------------------------------------------------------------------
 
-/// Pure view function — see the module doc.
+/// Pure view function — degradation-unaware default (unicode on, color on) for any call site without
+/// a [`RenderCtx`] handy. See [`render_with_ctx`] and `crate::theme`'s own module doc.
 pub fn render(state: &ContactDetailState, frame: &mut Frame<'_>) {
+    render_with_ctx(state, frame, &RenderCtx::default());
+}
+
+/// Pure view function — see the module doc and `crate::theme`'s own "retrofit scope" section.
+pub fn render_with_ctx(state: &ContactDetailState, frame: &mut Frame<'_>, ctx: &RenderCtx) {
     let area = frame.area();
     let title = format!("Meridian — Contact · {}", state.entry.display_label());
     let block = Block::default().borders(Borders::ALL).title(title);
@@ -320,7 +327,7 @@ pub fn render(state: &ContactDetailState, frame: &mut Frame<'_>) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
-    let lines = body_lines(state);
+    let lines = body_lines(state, ctx);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rows[0]);
 
     let footer = Paragraph::new(Line::from(Span::styled(
@@ -330,8 +337,16 @@ pub fn render(state: &ContactDetailState, frame: &mut Frame<'_>) {
     frame.render_widget(footer, rows[1]);
 }
 
-fn body_lines(state: &ContactDetailState) -> Vec<Line<'static>> {
-    let mut lines = detail_lines(&state.entry);
+fn red_style(ctx: &RenderCtx) -> Style {
+    let mut style = Style::default();
+    if let Some(color) = color_or_none(Color::Red, ctx) {
+        style = style.fg(color);
+    }
+    style
+}
+
+fn body_lines(state: &ContactDetailState, ctx: &RenderCtx) -> Vec<Line<'static>> {
+    let mut lines = detail_lines(&state.entry, ctx);
     match &state.mode {
         DetailMode::View | DetailMode::SavingPolicy(_) => {}
         DetailMode::EditPetname(edit) => {
@@ -347,7 +362,7 @@ fn body_lines(state: &ContactDetailState) -> Vec<Line<'static>> {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!("{verb} this contact? (y/n)"),
-                Style::default().fg(Color::Red),
+                red_style(ctx),
             )));
         }
         DetailMode::ConfirmDelete => {
@@ -360,7 +375,7 @@ fn body_lines(state: &ContactDetailState) -> Vec<Line<'static>> {
             lines.push(Line::from(Span::styled(
                 "remove from your local contact list only — trust and key history are kept and \
                  will reappear if added again. Continue? (y/n)",
-                Style::default().fg(Color::Red),
+                red_style(ctx),
             )));
         }
         DetailMode::SavingPetname(_) | DetailMode::SavingBlock(_) | DetailMode::SavingDelete => {
@@ -369,10 +384,7 @@ fn body_lines(state: &ContactDetailState) -> Vec<Line<'static>> {
         }
         DetailMode::Error(message) => {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                message.clone(),
-                Style::default().fg(Color::Red),
-            )));
+            lines.push(Line::from(Span::styled(message.clone(), red_style(ctx))));
             lines.push(Line::from("Press Enter or Esc to continue."));
         }
     }
@@ -381,8 +393,8 @@ fn body_lines(state: &ContactDetailState) -> Vec<Line<'static>> {
 
 /// The always-shown facts about this contact — trust-critical fields first, with the fingerprint
 /// directly beneath the petname/id (see the module doc's "Fingerprint alongside petname" section).
-fn detail_lines(entry: &ContactEntry) -> Vec<Line<'static>> {
-    let (glyph, label) = trust_glyph_and_label(entry.trust);
+fn detail_lines(entry: &ContactEntry, ctx: &RenderCtx) -> Vec<Line<'static>> {
+    let (glyph, label) = trust_glyph_and_label(entry.trust, ctx);
     let petname_line = match &entry.petname {
         Some(p) => format!("petname: {p}"),
         None => "petname: (none)".to_string(),
@@ -394,10 +406,7 @@ fn detail_lines(entry: &ContactEntry) -> Vec<Line<'static>> {
         Line::from(format!("trust: {glyph} {label}")),
     ];
     if entry.user_blocked {
-        lines.push(Line::from(Span::styled(
-            "locally blocked",
-            Style::default().fg(Color::Red),
-        )));
+        lines.push(Line::from(Span::styled("locally blocked", red_style(ctx))));
     }
     lines.push(Line::from(""));
     lines.push(Line::from("key history:"));

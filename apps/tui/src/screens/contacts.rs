@@ -85,6 +85,9 @@ use crate::app::{
     ImportContactQrRequest, WorkerEvent,
 };
 use crate::store::contacts::PolicyOverride;
+use crate::theme::{
+    color_or_none, contacts_pane_layout, glyph, ContactsPaneLayout, GlyphKind, RenderCtx,
+};
 
 // ---------------------------------------------------------------------------
 // ContactEntry — the join described in the module doc
@@ -163,27 +166,41 @@ pub fn short_pubkey(pubkey: &[u8; 32]) -> String {
 }
 
 /// The glyph + label for a [`TrustState`] — see the module doc's own section for the full mapping
-/// rationale. `pub` so `crate::screens::contact_detail` reuses the identical mapping rather than
-/// duplicating it.
-pub fn trust_glyph_and_label(state: TrustState) -> (char, &'static str) {
+/// rationale, and `crate::theme`'s own doc for the unicode/ASCII fallback [`GlyphKind`] provides.
+/// `pub` so `crate::screens::contact_detail`/`crate::screens::verify`/`crate::screens::chat` reuse the
+/// identical mapping rather than duplicating it — the full retrofit set named in `crate::theme`'s own
+/// "retrofit scope" doc section.
+pub fn trust_glyph_and_label(state: TrustState, ctx: &RenderCtx) -> (&'static str, &'static str) {
     match state {
-        TrustState::New => ('○', "new"),
-        TrustState::Pinned => ('●', "pinned"),
-        TrustState::Verified => ('●', "verified"),
-        TrustState::PinnedKeyChanged => ('▲', "key changed — ack needed"),
-        TrustState::Blocked => ('✕', "blocked — key changed"),
+        TrustState::New => (glyph(GlyphKind::TrustNew, ctx), "new"),
+        TrustState::Pinned => (glyph(GlyphKind::TrustPinnedOrVerified, ctx), "pinned"),
+        TrustState::Verified => (glyph(GlyphKind::TrustPinnedOrVerified, ctx), "verified"),
+        TrustState::PinnedKeyChanged => (
+            glyph(GlyphKind::TrustKeyChanged, ctx),
+            "key changed — ack needed",
+        ),
+        TrustState::Blocked => (glyph(GlyphKind::TrustBlocked, ctx), "blocked — key changed"),
     }
 }
 
-fn trust_style(state: TrustState) -> Style {
-    match state {
-        TrustState::New => Style::default().fg(Color::DarkGray),
-        TrustState::Pinned => Style::default().fg(Color::Yellow),
-        TrustState::Verified => Style::default().fg(Color::Green),
-        TrustState::PinnedKeyChanged => Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-        TrustState::Blocked => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+fn trust_style(state: TrustState, ctx: &RenderCtx) -> Style {
+    let base = match state {
+        TrustState::New => Style::default(),
+        TrustState::Pinned => Style::default(),
+        TrustState::Verified => Style::default(),
+        TrustState::PinnedKeyChanged => Style::default().add_modifier(Modifier::BOLD),
+        TrustState::Blocked => Style::default().add_modifier(Modifier::BOLD),
+    };
+    let color = match state {
+        TrustState::New => Color::DarkGray,
+        TrustState::Pinned => Color::Yellow,
+        TrustState::Verified => Color::Green,
+        TrustState::PinnedKeyChanged => Color::Yellow,
+        TrustState::Blocked => Color::Red,
+    };
+    match color_or_none(color, ctx) {
+        Some(color) => base.fg(color),
+        None => base,
     }
 }
 
@@ -739,8 +756,16 @@ pub fn apply_update(state: &mut ContactsState, entry: ContactEntry, deleted: boo
 // Render
 // ---------------------------------------------------------------------------
 
-/// Pure view function — see the module doc.
+/// Pure view function — degradation-unaware default (unicode on, color on) for any call site without
+/// a [`RenderCtx`] handy. See [`render_with_ctx`] and `crate::theme`'s own module doc.
 pub fn render(state: &ContactsState, frame: &mut Frame<'_>) {
+    render_with_ctx(state, frame, &RenderCtx::default());
+}
+
+/// Pure view function — see the module doc and `crate::theme`'s own "retrofit scope" section. Also
+/// applies the narrow-width contacts-collapse mechanism (task 4.26 deliverable 4,
+/// [`crate::theme::contacts_pane_layout`]) to this screen's own row formatting — see [`render_list`].
+pub fn render_with_ctx(state: &ContactsState, frame: &mut Frame<'_>, ctx: &RenderCtx) {
     let area = frame.area();
     let block = Block::default()
         .borders(Borders::ALL)
@@ -754,15 +779,15 @@ pub fn render(state: &ContactsState, frame: &mut Frame<'_>) {
         .split(inner);
 
     if let Some(add) = &state.add {
-        render_add_contact(add, frame, rows[0]);
+        render_add_contact(add, frame, rows[0], ctx);
     } else {
-        render_list(state, frame, rows[0]);
+        render_list(state, frame, rows[0], ctx);
     }
 
     let footer_text = state
         .notice
         .clone()
-        .unwrap_or_else(|| footer_hint(state).to_string());
+        .unwrap_or_else(|| footer_hint(state, ctx));
     let footer = Paragraph::new(Line::from(Span::styled(
         footer_text,
         Style::default().add_modifier(Modifier::DIM),
@@ -770,7 +795,7 @@ pub fn render(state: &ContactsState, frame: &mut Frame<'_>) {
     frame.render_widget(footer, rows[1]);
 }
 
-fn render_list(state: &ContactsState, frame: &mut Frame<'_>, area: Rect) {
+fn render_list(state: &ContactsState, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -799,18 +824,30 @@ fn render_list(state: &ContactsState, frame: &mut Frame<'_>, area: Rect) {
         return;
     }
 
+    // Task 4.26 deliverable 4: below-80-columns this screen renders its own rows in a denser,
+    // unpadded format instead of the fixed-width columns it uses when there's room — see
+    // `crate::theme::contacts_pane_layout`'s own doc for why this is the mechanism, not the
+    // combined-layout integration itself (no such screen exists yet to collapse *within*).
+    let layout_mode = contacts_pane_layout(rows[1].width);
     let lines: Vec<Line<'static>> = filtered
         .iter()
         .enumerate()
-        .map(|(i, entry)| contact_row_line(entry, i == state.selected))
+        .map(|(i, entry)| contact_row_line(entry, i == state.selected, layout_mode, ctx))
         .collect();
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rows[1]);
 }
 
 /// One contacts-list row: selection marker, trust glyph, label, trust label, and — per tui-
-/// client.md §6 rule 2 — the truncated pubkey fingerprint, always alongside the label.
-fn contact_row_line(entry: &ContactEntry, selected: bool) -> Line<'static> {
-    let (glyph, label) = trust_glyph_and_label(entry.trust);
+/// client.md §6 rule 2 — the truncated pubkey fingerprint, always alongside the label. `layout`
+/// decides only the *formatting* (padded columns vs. dense/unpadded) — glyph + label + fingerprint are
+/// always present in both, never dropped at a narrow width.
+fn contact_row_line(
+    entry: &ContactEntry,
+    selected: bool,
+    layout: ContactsPaneLayout,
+    ctx: &RenderCtx,
+) -> Line<'static> {
+    let (glyph, label) = trust_glyph_and_label(entry.trust, ctx);
     let name = entry.display_label();
     let short = short_pubkey(&entry.pubkey);
     let blocked = if entry.user_blocked {
@@ -819,23 +856,30 @@ fn contact_row_line(entry: &ContactEntry, selected: bool) -> Line<'static> {
         ""
     };
     let marker = if selected { "> " } else { "  " };
-    let text = format!("{marker}{glyph} {name:<20} {label:<24} {short}{blocked}");
+    let text = match layout {
+        ContactsPaneLayout::SideBySide => {
+            format!("{marker}{glyph} {name:<20} {label:<24} {short}{blocked}")
+        }
+        ContactsPaneLayout::Overlay => {
+            format!("{marker}{glyph} {name} - {label} - {short}{blocked}")
+        }
+    };
     let style = if selected {
         Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
     } else {
-        trust_style(entry.trust)
+        trust_style(entry.trust, ctx)
     };
     Line::from(Span::styled(text, style))
 }
 
-fn render_add_contact(add: &AddContactState, frame: &mut Frame<'_>, area: Rect) {
-    let lines = add_contact_lines(add);
+fn render_add_contact(add: &AddContactState, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx) {
+    let lines = add_contact_lines(add, ctx);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn add_contact_lines(add: &AddContactState) -> Vec<Line<'static>> {
+fn add_contact_lines(add: &AddContactState, ctx: &RenderCtx) -> Vec<Line<'static>> {
     match add {
-        AddContactState::EnterId(e) => enter_id_lines(e),
+        AddContactState::EnterId(e) => enter_id_lines(e, ctx),
         AddContactState::ImportingQr(i) => vec![
             Line::from(format!("Importing QR from {}…", i.qr_path)),
             Line::from(""),
@@ -860,7 +904,7 @@ fn add_contact_lines(add: &AddContactState) -> Vec<Line<'static>> {
     }
 }
 
-fn enter_id_lines(e: &EnterId) -> Vec<Line<'static>> {
+fn enter_id_lines(e: &EnterId, ctx: &RenderCtx) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from("Add a contact"),
         Line::from(""),
@@ -878,10 +922,11 @@ fn enter_id_lines(e: &EnterId) -> Vec<Line<'static>> {
     ];
     if let Some(err) = &e.error {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            err.clone(),
-            Style::default().fg(Color::Red),
-        )));
+        let mut style = Style::default();
+        if let Some(color) = color_or_none(Color::Red, ctx) {
+            style = style.fg(color);
+        }
+        lines.push(Line::from(Span::styled(err.clone(), style)));
     }
     lines
 }
@@ -907,7 +952,7 @@ fn focus_style(focused: bool) -> Style {
     }
 }
 
-fn footer_hint(state: &ContactsState) -> String {
+fn footer_hint(state: &ContactsState, ctx: &RenderCtx) -> String {
     if let Some(add) = &state.add {
         match add {
             AddContactState::EnterId(e) if e.focus == EnterIdFocus::Id => {
@@ -927,6 +972,7 @@ fn footer_hint(state: &ContactsState) -> String {
     } else if state.filtering {
         "type to filter · Enter/Esc done".to_string()
     } else {
-        "↑↓/jk move · Enter open · n add · r requests · v verify · / filter".to_string()
+        let arrows = glyph(GlyphKind::ScrollHint, ctx);
+        format!("{arrows}/jk move · Enter open · n add · r requests · v verify · / filter")
     }
 }

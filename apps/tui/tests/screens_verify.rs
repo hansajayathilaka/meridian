@@ -104,6 +104,7 @@ fn state_from_cheap(peer: [u8; 32], trust: TrustStore) -> VerifyState {
         safety_number: String::new(),
         notice: None,
         mode: VerifyMode::View,
+        banner_scroll: 0,
     }
 }
 

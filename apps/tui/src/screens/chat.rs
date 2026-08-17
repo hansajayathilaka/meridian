@@ -117,6 +117,7 @@ use crate::store::history::{
     Direction as MsgDirection, HistoryEntry, MessageState, CURRENT_VERSION,
 };
 use crate::surface::{MessageRenderer, MessageRendererRegistry};
+use crate::theme::{color_or_none, glyph, GlyphKind, RenderCtx};
 
 // ---------------------------------------------------------------------------
 // State
@@ -310,7 +311,18 @@ pub fn send_error_copy(error: &str) -> String {
 /// This is a 1:1 conversation screen, so the header (see [`render`] below) already names the peer
 /// once; per-line real names are not required for a two-party transcript the way they would be for
 /// a group chat.
-pub struct ChatMessageRenderer;
+///
+/// **Carries a [`RenderCtx`] snapshot (task 4.26), not a signature change to
+/// [`crate::surface::MessageRenderer::render`].** That trait's signature is a stable, third-party-
+/// shaped extension contract (`crate::surface`'s own module doc: "review changes here as if third
+/// parties will implement against them") — widening it just for this one screen's degradation inputs
+/// would ripple into every current and future `MessageRenderer` impl. Instead this struct is built
+/// fresh with the resolved `ctx` on every render call (exactly like [`transcript_registry`] already
+/// does for the registry itself — see that function's own doc), so `render`'s fixed
+/// `&self`/`&HistoryEntry` signature never needs to change.
+pub struct ChatMessageRenderer {
+    ctx: RenderCtx,
+}
 
 impl MessageRenderer for ChatMessageRenderer {
     fn stream_type(&self) -> &'static str {
@@ -322,15 +334,19 @@ impl MessageRenderer for ChatMessageRenderer {
             MsgDirection::Out => "you",
             MsgDirection::In => "them",
         };
-        let marker = state_marker(entry.state);
-        let style = if entry.state == MessageState::Failed {
-            Style::default().fg(Color::Red)
+        let marker = state_marker(entry.state, &self.ctx);
+        let mut style = Style::default();
+        let color = if entry.state == MessageState::Failed {
+            Some(Color::Red)
         } else {
             match entry.dir {
-                MsgDirection::Out => Style::default(),
-                MsgDirection::In => Style::default().fg(Color::Cyan),
+                MsgDirection::Out => None,
+                MsgDirection::In => Some(Color::Cyan),
             }
         };
+        if let Some(color) = color.and_then(|c| color_or_none(c, &self.ctx)) {
+            style = style.fg(color);
+        }
         vec![Line::from(Span::styled(
             format!("{who:>4}  {}{marker}", entry.body),
             style,
@@ -338,22 +354,26 @@ impl MessageRenderer for ChatMessageRenderer {
     }
 }
 
-fn state_marker(state: MessageState) -> &'static str {
+/// Delivery-state marker — glyph-only for the terminal states (never color alone: `Failed`'s `✗`/`x`
+/// is a distinct glyph from `Sent`/`Delivered`'s `✓`/`v`/`vv`, not merely a different color on the same
+/// mark), plus the two plain-English in-flight labels that were already ASCII. See `crate::theme`'s
+/// own doc for the unicode/ASCII fallback [`GlyphKind`] provides.
+fn state_marker(state: MessageState, ctx: &RenderCtx) -> std::borrow::Cow<'static, str> {
     match state {
-        MessageState::Composing => " …",
-        MessageState::Pending => " (pending)",
-        MessageState::Sent => " ✓",
-        MessageState::Delivered => " ✓✓",
-        MessageState::Failed => " ✗",
-        MessageState::Received => "",
+        MessageState::Composing => " …".into(),
+        MessageState::Pending => " (pending)".into(),
+        MessageState::Sent => format!(" {}", glyph(GlyphKind::DeliverySent, ctx)).into(),
+        MessageState::Delivered => format!(" {}", glyph(GlyphKind::DeliveryDelivered, ctx)).into(),
+        MessageState::Failed => format!(" {}", glyph(GlyphKind::DeliveryFailed, ctx)).into(),
+        MessageState::Received => "".into(),
     }
 }
 
 /// Builds a registry containing only [`ChatMessageRenderer`] — see the module doc for why this is
 /// constructed fresh on every render call rather than stored in [`ChatState`].
-fn transcript_registry() -> MessageRendererRegistry {
+fn transcript_registry(ctx: &RenderCtx) -> MessageRendererRegistry {
     let mut registry = MessageRendererRegistry::new();
-    registry.register(Arc::new(ChatMessageRenderer));
+    registry.register(Arc::new(ChatMessageRenderer { ctx: *ctx }));
     registry
 }
 
@@ -708,10 +728,16 @@ fn fail_send(state: &mut ChatState, error: String) -> Vec<Effect> {
 // Render
 // ---------------------------------------------------------------------------
 
-/// Pure view function — see the module doc.
+/// Pure view function — degradation-unaware default (unicode on, color on) for any call site without
+/// a [`RenderCtx`] handy. See [`render_with_ctx`] and `crate::theme`'s own module doc.
 pub fn render(state: &ChatState, frame: &mut Frame<'_>) {
+    render_with_ctx(state, frame, &RenderCtx::default());
+}
+
+/// Pure view function — see the module doc and `crate::theme`'s own "retrofit scope" section.
+pub fn render_with_ctx(state: &ChatState, frame: &mut Frame<'_>, ctx: &RenderCtx) {
     let area = frame.area();
-    let (glyph, label) = trust_glyph_and_label(state.trust.trust_state(&state.peer_pubkey));
+    let (glyph, label) = trust_glyph_and_label(state.trust.trust_state(&state.peer_pubkey), ctx);
     let title = format!("Meridian — Chat · {}  {glyph} {label}", state.peer_label());
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
@@ -726,18 +752,18 @@ pub fn render(state: &ChatState, frame: &mut Frame<'_>) {
         ])
         .split(inner);
 
-    render_transcript(state, frame, rows[0]);
-    render_composer(state, frame, rows[1]);
+    render_transcript(state, frame, rows[0], ctx);
+    render_composer(state, frame, rows[1], ctx);
 
     let footer = Paragraph::new(Line::from(Span::styled(
-        footer_hint(state),
+        footer_hint(state, ctx),
         Style::default().add_modifier(Modifier::DIM),
     )));
     frame.render_widget(footer, rows[2]);
 }
 
-fn render_transcript(state: &ChatState, frame: &mut Frame<'_>, area: Rect) {
-    let lines = transcript_lines(state);
+fn render_transcript(state: &ChatState, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx) {
+    let lines = transcript_lines(state, ctx);
     let total = lines.len() as u16;
     let max_scroll = total.saturating_sub(area.height);
     let scroll_from_bottom = u16::try_from(state.scroll_from_bottom).unwrap_or(u16::MAX);
@@ -748,7 +774,7 @@ fn render_transcript(state: &ChatState, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn transcript_lines(state: &ChatState) -> Vec<Line<'static>> {
+fn transcript_lines(state: &ChatState, ctx: &RenderCtx) -> Vec<Line<'static>> {
     if state.entries.is_empty() {
         return vec![Line::from(Span::styled(
             "(no messages yet)",
@@ -756,7 +782,7 @@ fn transcript_lines(state: &ChatState) -> Vec<Line<'static>> {
         ))];
     }
 
-    let registry = transcript_registry();
+    let registry = transcript_registry(ctx);
     let divider_index = state
         .entries
         .len()
@@ -764,9 +790,13 @@ fn transcript_lines(state: &ChatState) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (i, entry) in state.entries.iter().enumerate() {
         if state.unread_count > 0 && i == divider_index {
+            let mut style = Style::default();
+            if let Some(color) = color_or_none(Color::Yellow, ctx) {
+                style = style.fg(color);
+            }
             lines.push(Line::from(Span::styled(
-                "── unread ──",
-                Style::default().fg(Color::Yellow),
+                glyph(GlyphKind::UnreadDivider, ctx),
+                style,
             )));
         }
         lines.extend(registry.render(entry));
@@ -776,37 +806,41 @@ fn transcript_lines(state: &ChatState) -> Vec<Line<'static>> {
                 .get(&entry.mid)
                 .cloned()
                 .unwrap_or_else(|| "not delivered — press r to retry".to_string());
-            lines.push(Line::from(Span::styled(
-                format!("      {copy}"),
-                Style::default().fg(Color::Red),
-            )));
+            let mut style = Style::default();
+            if let Some(color) = color_or_none(Color::Red, ctx) {
+                style = style.fg(color);
+            }
+            lines.push(Line::from(Span::styled(format!("      {copy}"), style)));
         }
     }
     lines
 }
 
-fn render_composer(state: &ChatState, frame: &mut Frame<'_>, area: Rect) {
+fn render_composer(state: &ChatState, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx) {
     let gate = state.gate();
+    let red = |base: Style| match color_or_none(Color::Red, ctx) {
+        Some(color) => base.fg(color),
+        None => base,
+    };
+    let yellow = |base: Style| match color_or_none(Color::Yellow, ctx) {
+        Some(color) => base.fg(color),
+        None => base,
+    };
     let lines: Vec<Line<'static>> = if let SendGate::Blocked(reason) = &gate {
         // tui-client.md §6 rule 1: a hard-stop banner replaces the composer while sends are
         // blocked — live, recomputed every render, never a stale snapshot from the last `Enter`.
         vec![
             Line::from(Span::styled(
                 "SENDS BLOCKED",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                red(Style::default().add_modifier(Modifier::BOLD)),
             )),
-            Line::from(Span::styled(
-                reason.clone(),
-                Style::default().fg(Color::Red),
-            )),
+            Line::from(Span::styled(reason.clone(), red(Style::default()))),
         ]
     } else if let ComposerMode::AwaitingAck { reason, .. } = &state.mode {
         vec![
             Line::from(Span::styled(
                 reason.clone(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                yellow(Style::default().add_modifier(Modifier::BOLD)),
             )),
             Line::from("type y to acknowledge and send, anything else cancels:"),
             Line::from(format!("> {}", state.composer)),
@@ -816,7 +850,7 @@ fn render_composer(state: &ChatState, frame: &mut Frame<'_>, area: Rect) {
         if let Some(notice) = &state.notice {
             lines.push(Line::from(Span::styled(
                 notice.clone(),
-                Style::default().fg(Color::Red),
+                red(Style::default()),
             )));
         }
         lines.push(Line::from(format!("> {}", state.composer)));
@@ -825,18 +859,20 @@ fn render_composer(state: &ChatState, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn footer_hint(state: &ChatState) -> String {
+fn footer_hint(state: &ChatState, ctx: &RenderCtx) -> String {
     if matches!(state.gate(), SendGate::Blocked(_)) {
         return "Esc back (sends blocked — see banner above)".to_string();
     }
+    let recall = glyph(GlyphKind::RecallUp, ctx);
     match (&state.mode, state.focus) {
         (ComposerMode::AwaitingAck { .. }, _) => {
             "type y to acknowledge and send · anything else/Esc cancels".to_string()
         }
         (ComposerMode::Normal, ChatFocus::Composer) => {
-            "Enter send · Alt+Enter/^J newline · ^U clear · ^W delete word · ↑ recall · Tab scroll \
-             · Esc back"
-                .to_string()
+            format!(
+                "Enter send · Alt+Enter/^J newline · ^U clear · ^W delete word · {recall} \
+                 recall · Tab scroll · Esc back"
+            )
         }
         (ComposerMode::Normal, ChatFocus::Transcript) => {
             "PgUp/PgDn/^U/^D/jk scroll · Home/End/g/G top/bottom · u unread · r retry failed · Tab \

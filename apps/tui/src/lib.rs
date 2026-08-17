@@ -39,10 +39,12 @@ pub mod statusbar;
 pub mod store;
 pub mod surface;
 pub mod terminal;
+pub mod theme;
 
 pub use app::{App, AppEvent, Effect, Screen, WorkerEvent};
 pub use config::{load as load_config, load_from as load_config_from, TuiConfig};
 pub use terminal::{spawn_signal_watch, CrosstermOps, TerminalGuard, TerminalOps};
+pub use theme::RenderCtx;
 
 use std::io;
 use std::sync::Arc;
@@ -68,6 +70,13 @@ pub fn terminal_size() -> io::Result<(u16, u16)> {
 /// subcommand (task 4.12); not itself invoked by any test in this crate, since it requires a real
 /// terminal.
 pub async fn run() -> io::Result<()> {
+    // Task 4.26: load the real `config.toml` (if any) so `ui.unicode`/`ui.theme` are a first-class,
+    // actually-live degradation path for a real session, not just a testable-in-isolation mechanism —
+    // see `crate::theme`'s own module doc. Mirrors `crate::config`'s own "fail closed on a malformed
+    // file, default on a missing one" contract: a config that fails to load is a hard error here too,
+    // never a silent fallback to defaults that would mask a typo the user needs to see.
+    let config = load_config(&[]).map_err(io::Error::other)?;
+
     let ops: Arc<dyn TerminalOps> = Arc::new(CrosstermOps);
     let guard = TerminalGuard::install(Arc::clone(&ops))?;
     let (signal_ops, signal_restored) = guard.restore_handle();
@@ -76,7 +85,7 @@ pub async fn run() -> io::Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let mut app = App::new_with_config(config);
 
     // crossterm events arrive on a dedicated OS thread (crossterm::event::read is blocking) and
     // are forwarded as AppEvents.

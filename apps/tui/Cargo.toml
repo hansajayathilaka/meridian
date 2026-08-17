@@ -48,6 +48,16 @@ figment = { version = "0.10.19", features = ["toml", "env"] }
 # (`cargo tree -p meridian-tui -i toml_edit`), so adding it as a direct dependency here doesn't add
 # a second copy at a different version.
 toml_edit = "0.22.27"
+# `screens/verify.rs`'s `wrapped_row_count` (task 4.26 review fix): measures word width in actual
+# terminal display cells, matching ratatui's own `WordWrapper` (which measures via
+# `StyledGrapheme::symbol.cell_width()`, backed by these same two crates), not Unicode scalar
+# (`char`) count — a `char`-count measurement undercounts any double-width character (CJK
+# ideographs, fullwidth forms, many emoji) by up to 2x. Pinned to the exact versions already
+# resolved via ratatui's own dependency tree (`cargo tree -p meridian-tui -i unicode-width` /
+# `-i unicode-segmentation`), so adding them as direct dependencies here doesn't add a second copy
+# at a different version — same precedent as `toml_edit` above.
+unicode-width = "0.2.2"
+unicode-segmentation = "1.13.3"
 
 [dev-dependencies]
 # Self-dependency with test-support enabled, so tests/terminal_guard.rs (a separate crate linking

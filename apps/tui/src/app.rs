@@ -34,6 +34,7 @@ use crate::screens::verify::{self, VerifyState};
 use crate::store::contacts::PolicyOverride;
 use crate::store::history::HistoryEntry;
 use crate::surface::{ExtensionPane, PaletteAction, PaletteCommand, SurfaceRegistry};
+use crate::theme::RenderCtx;
 
 /// Events the runtime feeds into [`App::update`]. Produced by crossterm input, the worker-response
 /// channel, or the 250ms tick — see the event-loop diagram in tui-client.md §4.
@@ -932,6 +933,14 @@ pub struct App {
     /// [`Screen::Help`]/[`Screen::Palette`]'s own construction (a snapshot taken at push time, not a
     /// live reference — see those screens' module docs).
     surface: SurfaceRegistry,
+    /// The `[ui]` degradation inputs (task 4.26) — [`crate::theme::RenderCtx::from_env`] reads real
+    /// `NO_COLOR` fresh on every [`App::render`] call, merged with whatever `config` this `App` was
+    /// constructed with. Defaults to [`crate::config::TuiConfig::default`] (matching every screen's
+    /// pre-existing hardcoded behavior) until a caller uses [`App::new_with_config`] — the same
+    /// "Preflight-shaped gap" [`Screen::Unlock`]/[`Screen::Contacts`]/[`Screen::Chat`] already flag
+    /// for their own not-yet-live inputs; [`crate::run`] is the one real caller that loads an actual
+    /// `config.toml` and passes it through.
+    config: crate::config::TuiConfig,
 }
 
 impl Default for App {
@@ -947,13 +956,24 @@ impl App {
     /// unbuilt) — so every run starts a new user from the top of the onboarding flow. `Screen::
     /// Unlock` itself exists and is fully wired (task 4.17); only the decision to construct and
     /// push it here is missing.
+    ///
+    /// Resolves [`crate::theme::RenderCtx`] against [`crate::config::TuiConfig::default`] — see
+    /// [`App::new_with_config`] for the real-config counterpart.
     pub fn new() -> Self {
+        Self::new_with_config(crate::config::TuiConfig::default())
+    }
+
+    /// Same as [`App::new`], but resolves [`crate::theme::RenderCtx`] (task 4.26) against a real,
+    /// already-loaded `config.toml` instead of [`crate::config::TuiConfig::default`] — see
+    /// [`App::config`]'s own doc comment.
+    pub fn new_with_config(config: crate::config::TuiConfig) -> Self {
         let mut surface = SurfaceRegistry::new();
         register_builtin_commands(&mut surface);
         Self {
             screens: vec![Screen::Onboarding(Box::default())],
             should_quit: false,
             surface,
+            config,
         }
     }
 
@@ -1357,15 +1377,25 @@ impl App {
 
     /// The one and only view function. Pure — no I/O, no `.await` — so it can run against a real
     /// terminal or `ratatui::backend::TestBackend` identically.
+    ///
+    /// **Task 4.26's one env read, and only here.** [`RenderCtx::from_env`] resolves `NO_COLOR` fresh
+    /// on every call — this is this crate's one true "natural boundary" (`crate::theme`'s own module
+    /// doc), never a scattered `std::env::var` call inside a screen's own nested render logic. Only
+    /// the four screens that render a trust/delivery-state glyph
+    /// ([`crate::screens::contacts`]/[`crate::screens::contact_detail`]/[`crate::screens::verify`]/
+    /// [`crate::screens::chat`] — see `crate::theme`'s own "retrofit scope" doc section) receive it via
+    /// their `render_with_ctx` entry point; every other screen keeps its pre-existing `render(state,
+    /// frame)` call, documented there as out of this pass's scope.
     pub fn render(&self, frame: &mut Frame<'_>) {
+        let ctx = RenderCtx::from_env(&self.config);
         match self.current_screen() {
             Screen::Onboarding(state) => onboarding::render(state, frame),
             Screen::Unlock(state) => unlock::render(state, frame),
-            Screen::Contacts(state) => contacts::render(state, frame),
-            Screen::ContactDetail(state) => contact_detail::render(state, frame),
-            Screen::Chat(state) => chat::render(state, frame),
+            Screen::Contacts(state) => contacts::render_with_ctx(state, frame, &ctx),
+            Screen::ContactDetail(state) => contact_detail::render_with_ctx(state, frame, &ctx),
+            Screen::Chat(state) => chat::render_with_ctx(state, frame, &ctx),
             Screen::Requests(state) => requests::render(state, frame),
-            Screen::Verify(state) => verify::render(state, frame),
+            Screen::Verify(state) => verify::render_with_ctx(state, frame, &ctx),
             Screen::Settings(state) => settings::render(state, frame),
             Screen::Help(state) => help::render(state, frame),
             Screen::Palette(state) => palette::render(state, frame),
