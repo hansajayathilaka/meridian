@@ -64,3 +64,10 @@ unicode-segmentation = "1.13.3"
 # the normal, non-`cfg(test)` build of this lib) can reach terminal::test_support::RecordingOps.
 meridian-tui = { path = ".", features = ["test-support"] }
 tempfile = { workspace = true }
+# tests/at_rest_audit.rs (task 4.27 review fixup): `trust.bin`/`sessions.bin` are CBOR
+# (`ciborium`) pre-seal, not JSON — decoding the raw sealed bytes directly as the real pre-seal
+# CBOR type (and asserting that decode fails) is what actually falsifies "sealing was skipped" for
+# those two files, unlike a JSON-parseability check. Same pin as every other CBOR user in the
+# workspace (`apps/core`, `apps/crypto`, `apps/proto`); dev-only — never a normal-build dependency
+# of this crate.
+ciborium = { workspace = true }

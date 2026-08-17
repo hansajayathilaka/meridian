@@ -192,7 +192,7 @@ start it day 1)
 - [x] **4.24** Settings screen — [file](./4.24-settings-screen.md)
 - [x] **4.25** Help overlay + command palette + diagnostics — [file](./4.25-help-palette-diagnostics.md)
 - [x] **4.26** Terminal-constraint degradation — [file](./4.26-terminal-constraint-degradation.md)
-- [ ] **4.27** At-rest audit harness — [file](./4.27-at-rest-audit-harness.md)
+- [x] **4.27** At-rest audit harness — [file](./4.27-at-rest-audit-harness.md)
 
 **Phase exit gate**
 - [ ] **4.28** Docs sync + phase acceptance-demo wiring — [file](./4.28-docs-sync-acceptance-demo.md)
