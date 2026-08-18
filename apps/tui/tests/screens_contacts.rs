@@ -115,11 +115,31 @@ fn enter_with_no_contacts_does_nothing() {
     assert!(matches!(action, ContactsAction::None));
 }
 
+/// Task 4.36: `Enter` now opens `Screen::Chat`, repointed from the old task-4.19 stand-in that
+/// opened Contact detail — see `ContactsAction::OpenChat`'s own doc comment.
 #[test]
-fn enter_on_a_contact_opens_detail_with_a_full_clone_of_the_entry() {
+fn enter_on_a_contact_opens_chat_with_a_full_clone_of_the_entry() {
     let e = entry(1, Some("alice"), TrustState::Verified);
     let mut state = ContactsState::new(vec![e.clone()]);
     let (effects, action) = contacts::handle_key(&mut state, key(KeyCode::Enter));
+    assert!(effects.is_empty());
+    match action {
+        ContactsAction::OpenChat(opened) => {
+            assert_eq!(opened.pubkey, e.pubkey);
+            assert_eq!(opened.petname, e.petname);
+            assert_eq!(opened.trust, e.trust);
+        }
+        other => panic!("expected OpenChat, got {other:?}"),
+    }
+}
+
+/// Task 4.36: `i` ("info") is `Screen::ContactDetail`'s own new dedicated key, now that `Enter`
+/// opens `Screen::Chat` instead.
+#[test]
+fn i_on_a_contact_opens_detail_with_a_full_clone_of_the_entry() {
+    let e = entry(1, Some("alice"), TrustState::Verified);
+    let mut state = ContactsState::new(vec![e.clone()]);
+    let (effects, action) = contacts::handle_key(&mut state, char_key('i'));
     assert!(effects.is_empty());
     match action {
         ContactsAction::OpenDetail(opened) => {
@@ -166,14 +186,14 @@ fn filter_matches_petname_hint_or_id_case_insensitively() {
     state = type_str(state, "ali");
     assert_eq!(state.filter, "ali");
 
-    // Only "Alice" matches — confirmed by pressing Enter (opens detail) and checking which entry
+    // Only "Alice" matches — confirmed by pressing Enter (opens chat) and checking which entry
     // came back, since the filtered *view* isn't itself a public field.
     contacts::handle_key(&mut state, key(KeyCode::Enter)); // closes the filter box
     assert!(!state.filtering);
     let (_, action) = contacts::handle_key(&mut state, key(KeyCode::Enter));
     match action {
-        ContactsAction::OpenDetail(opened) => assert_eq!(opened.petname.as_deref(), Some("Alice")),
-        other => panic!("expected OpenDetail, got {other:?}"),
+        ContactsAction::OpenChat(opened) => assert_eq!(opened.petname.as_deref(), Some("Alice")),
+        other => panic!("expected OpenChat, got {other:?}"),
     }
 }
 
@@ -188,15 +208,29 @@ fn esc_while_filtering_never_destroys_the_typed_filter_text() {
     assert_eq!(state.filter, "ali", "Esc must not clear the filter text");
 }
 
+/// Task 4.36: `v` now routes to a real `Screen::Verify` (replacing task 4.19's own "not implemented
+/// yet" stand-in notice) — see `ContactsAction::OpenVerify`'s own doc comment.
 #[test]
-fn v_sets_a_not_yet_implemented_notice_and_any_other_key_clears_it() {
-    let mut state = ContactsState::new(vec![entry(1, Some("alice"), TrustState::Pinned)]);
-    contacts::handle_key(&mut state, char_key('v'));
-    assert!(state.notice.is_some());
-    assert!(state.notice.as_ref().unwrap().contains("not implemented"));
+fn v_on_a_contact_opens_verify_with_a_full_clone_of_the_entry() {
+    let e = entry(1, Some("alice"), TrustState::Pinned);
+    let mut state = ContactsState::new(vec![e.clone()]);
+    let (effects, action) = contacts::handle_key(&mut state, char_key('v'));
+    assert!(effects.is_empty());
+    match action {
+        ContactsAction::OpenVerify(opened) => {
+            assert_eq!(opened.pubkey, e.pubkey);
+            assert_eq!(opened.petname, e.petname);
+        }
+        other => panic!("expected OpenVerify, got {other:?}"),
+    }
+}
 
-    contacts::handle_key(&mut state, key(KeyCode::Down));
-    assert!(state.notice.is_none(), "a non-v key must clear the notice");
+#[test]
+fn v_with_no_contacts_does_nothing() {
+    let mut state = ContactsState::new(Vec::new());
+    let (effects, action) = contacts::handle_key(&mut state, char_key('v'));
+    assert!(effects.is_empty());
+    assert!(matches!(action, ContactsAction::None));
 }
 
 // ---------------------------------------------------------------------------

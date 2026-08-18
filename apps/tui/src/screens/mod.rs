@@ -10,6 +10,7 @@ pub mod contact_detail;
 pub mod contacts;
 pub mod diagnostics;
 pub mod help;
+pub mod main;
 pub mod onboarding;
 pub mod palette;
 pub mod requests;
