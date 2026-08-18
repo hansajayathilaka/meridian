@@ -3,13 +3,13 @@
 
 # Phase 4 — Verification & Trust + Terminal TUI Client
 
-**Kind:** build · **Status:** in progress — 37/38 tasks done (4.1–4.37), but per the task-tracking
+**Kind:** build · **Status:** in progress — 38/41 tasks done (4.1–4.38), but per the task-tracking
 skill's own §7 ("a build phase isn't done until its acceptance demo runs"), the phase is **still not
 closed**: task 4.28 found T17's acceptance demo did not run end to end; 4.29–4.37 closed that specific
-gap, but 4.38 — the re-exit-gate attempt — found the demo *still* doesn't pass, for two reasons (one
-already flagged by 4.37, one newly discovered live by 4.38 itself). A follow-up task (working number
-4.39) is needed before this phase can exit · **Reviews phase(s):** n/a (build phase; Phase 5 will review
-it, once it's actually closeable)
+gap, but 4.38 — the second exit-gate attempt — found the demo *still* doesn't pass, for two reasons (one
+already flagged by 4.37, one newly discovered live by 4.38 itself). Two fix tasks (4.39, 4.40) and a
+third exit-gate attempt (4.41) were planned via `/plan-phase` to close them · **Reviews phase(s):** n/a
+(build phase; Phase 5 will review it, once it's actually closeable)
 
 ## Goal
 Ship **Feature 08 — Verification & Contact Trust** and **Feature 17 — Terminal TUI Client** together,
@@ -225,7 +225,15 @@ reopened) lives in each task file's own text plus the architect consult recorded
 - [x] **4.38** T17 acceptance-demo closure (phase re-exit gate) — [file](./4.38-t17-acceptance-demo-closure.md)
   — **done in the sense 4.28 was done**: its own verification/doc-reconciliation scope is fully
   executed and honestly written up; the demo it verified still does **not** pass (see Exit criteria
-  below) — a new task (4.39) is needed next, not a reopening of this one.
+  below) — 4.39/4.40/4.41 are needed next, not a reopening of this one.
+
+**Second gap-closure wave (planned by `/plan-phase` against 4.38's own findings)** — fixes both defects
+4.38 found live, then a third, hopefully-final exit-gate attempt.
+- [ ] **4.39** Prekey bundle republish + vault persistence on session start (fix for 4.38's Defect A —
+  no first-contact message can ever be decrypted, for any account type) — [file](./4.39-prekey-bundle-republish.md)
+- [ ] **4.40** Thread the live-session secret store through file-backed contacts/trust/send handlers (fix
+  for 4.38's Defect B — file-backed accounts fail closed post-`Screen::Main`) — [file](./4.40-file-backed-live-session-store.md)
+- [ ] **4.41** T17 acceptance-demo closure, third exit-gate attempt (needs both 4.39 and 4.40) — [file](./4.41-t17-acceptance-demo-closure-attempt-3.md)
 
 ### Dependency order
 ```
@@ -261,6 +269,14 @@ everything ──► 4.28
 4.20      ──► 4.33 (run_worker: outbound chat)    │  match statement — must land as sequential
 4.24,4.25 ──► 4.34 (run_worker: settings/diag)   ─┘  commits (any order among themselves)
 4.29–4.37 (all of them) ──► 4.38 (re-exit gate)
+
+-- Second gap-closure wave (added post-4.38, planned via /plan-phase) --
+4.29,4.35,4.37 ──► 4.39 (bundle republish — Defect A fix)
+4.29,4.31,4.32,4.33,4.35,4.37 ──► 4.40 (file-backed store cache — Defect B fix;
+                                          logically independent of 4.39, land after it
+                                          to avoid a simultaneous diff on worker.rs's
+                                          session-threading machinery)
+4.39,4.40 ──► 4.41 (third exit-gate attempt)
 ```
 **Parallel tracks.** Track ADR (4.1, 4.2) — no code. Track T08 (4.3→4.10) — the phase's longest
 sequential chain, zero dependency on the ADRs or on any T17 task. Track T17-infra (4.13 independent;
@@ -278,6 +294,18 @@ task to land first** even though it has no hard dependency on anything in this s
 for the specific hang 4.28 reproduced ("Generating your identity…"), so it turns a completely stuck
 onboarding into a runnable (if not yet fully navigable) session soonest.
 
+**Second gap-closure wave (4.39–4.41), planned against 4.38's own findings.** 4.39 and 4.40 fix two
+genuinely independent defects (different code paths, no shared blocking dependency, confirmed during
+planning) — develop in parallel if convenient, but land sequentially since both touch
+`apps/tui/src/worker.rs`'s session-threading machinery (`OnboardingSession` or its successor): 4.39 first,
+since it's the more fundamental blocker (blocks first-contact receiving for *every* account type, not just
+file-backed) and has no open design question, so it can start immediately; 4.40 second, since it carries
+a load-bearing architect + security-reviewer consult before any code lands (extending in-memory key
+residency for the full session lifetime is a real security-posture question, not a mechanical
+thread-through) and should rebase onto 4.39's landed diff rather than the reverse. 4.41 is a hard join on
+both — there's no partial-credit path, since either defect alone independently blocks a different point
+in the demo script.
+
 ## Exit criteria
 
 **Assessed honestly by task 4.28** (the phase's first exit-gate attempt) — see its own file for the full
@@ -287,7 +315,11 @@ meant to be the **second, planned-to-succeed** exit-gate attempt, once 4.29–4.
 found — **it wasn't**: 4.38 re-ran the demo live and found it still doesn't pass, for two reasons (one
 already flagged by 4.37, one newly discovered by 4.38's own live re-run and its new regression test).
 See [tui-client.md §11](../../architecture/tui-client.md#11-current-implementation-status-as-of-task-438--the-phases-second-exit-gate-attempt)
-and [4.38's own Status section](./4.38-t17-acceptance-demo-closure.md) for the full writeup.
+and [4.38's own Status section](./4.38-t17-acceptance-demo-closure.md) for the full writeup. `/plan-phase`
+was re-invoked against these two specific findings and broke them into
+[4.39](./4.39-prekey-bundle-republish.md) (Defect A fix), [4.40](./4.40-file-backed-live-session-store.md)
+(Defect B fix), and [4.41](./4.41-t17-acceptance-demo-closure-attempt-3.md) (a third, hopefully-final
+exit-gate attempt) — see the [dependency order](#dependency-order) above for how they relate.
 
 - [x] All 28 originally-planned Phase 4 tasks (4.1–4.28) are `[x]` in the tracker (see
   [dependency order](#dependency-order)). **Not sufficient for phase closure** — see the next item.
@@ -329,6 +361,8 @@ and [4.38's own Status section](./4.38-t17-acceptance-demo-closure.md) for the f
 - [x] The envelope-v2 obligation above was re-deferred with a concrete, mechanical trigger (see
   [above](#envelope-v2-re-deferred--the-concrete-trigger)) — not silently dropped.
 - Then: **not yet** `/start-review-phase` for Phase 5 — the task-tracking skill's own §7 still applies
-  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. A follow-up task
-  (working number: 4.39) needs to close the two defects above before this phase can exit; see
-  [docs/tasks/README.md](../README.md)'s carry-forward section.
+  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. Tasks
+  [4.39](./4.39-prekey-bundle-republish.md), [4.40](./4.40-file-backed-live-session-store.md), and
+  [4.41](./4.41-t17-acceptance-demo-closure-attempt-3.md) need to close the two defects above and confirm
+  the demo genuinely passes before this phase can exit; see [docs/tasks/README.md](../README.md)'s
+  carry-forward section.

@@ -16,7 +16,7 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 4 (T08 + T17) is 37/38 tasks done (4.1–4.37), but still NOT closed.** T08's track
+- **NOW:** **Phase 4 (T08 + T17) is 38/41 tasks done (4.1–4.38), but still NOT closed.** T08's track
   (4.3→4.10) is fully done and its acceptance demo genuinely passes. T17's track needed a second
   gap-closure wave (4.29–4.37) after task **4.28** (the phase's first exit-gate attempt) found
   `meridian tui` hanging forever on Onboarding's "Generating your identity…" step. That wave genuinely
@@ -42,24 +42,30 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   [Phase 4's README](./phase-4/README.md#exit-criteria), and
   [4.38's own Status section](./phase-4/4.38-t17-acceptance-demo-closure.md). Per 4.38's own explicit
   scope ("verification + doc reconciliation only — report a genuine defect, never patch around it"),
-  **neither defect was fixed** — both need a new task.
-- **NEXT:** A follow-up task (working number **4.39**) needs to close both defects 4.38 found before
-  Phase 4's exit criteria can honestly be met — `/plan-phase` (or a manual `/new-task`) should scope it
-  against [4.38's own Status section](./phase-4/4.38-t17-acceptance-demo-closure.md) and
-  [tui-client.md §11](../architecture/tui-client.md#11-current-implementation-status-as-of-task-438--the-phases-second-exit-gate-attempt)
-  before assuming either fix is small. Only once that lands and a **third** exit-gate attempt confirms
-  the T17 demo genuinely passes does `/start-review-phase` for Phase 5 become the correct next command —
-  not before.
+  **neither defect was fixed** — `/plan-phase` was re-invoked against these two findings and broke them
+  into three tasks: [4.39](./phase-4/4.39-prekey-bundle-republish.md) (Defect A fix — bundle republish +
+  vault persistence, wired into `run_worker`'s existing one-shot `inbound_handoff` branch, per 4.35's own
+  already-approved deferral of this exact gap), [4.40](./phase-4/4.40-file-backed-live-session-store.md)
+  (Defect B fix — threading a session-scoped, already-unwrapped secret-store cache through the twelve
+  `run_worker` handlers that currently re-derive from disk per dispatch; gated on an in-task architect +
+  security-reviewer consult before any code lands, since this genuinely extends decrypted key material's
+  in-memory residency to the whole session lifetime), and
+  [4.41](./phase-4/4.41-t17-acceptance-demo-closure-attempt-3.md) (a third exit-gate attempt, hard-joined
+  on both 4.39 and 4.40, holding to the same two-independent-runs discipline 4.28/4.38 both used).
+- **NEXT:** `/next-task` for **4.39 → 4.40 → 4.41**, in that order (4.39 and 4.40 are logically
+  independent — different code paths, no shared blocking dependency — but land sequentially since both
+  touch `apps/tui/src/worker.rs`'s session-threading machinery; 4.39 first since it's the more fundamental
+  blocker and has no open design question). Only once 4.41 confirms the T17 demo genuinely passes does
+  `/start-review-phase` for Phase 5 become the correct next command — not before.
 
-**Why 4.29–4.38 extended Phase 4 rather than opening a new phase or a review phase** (and why 4.39 will
-too, for the same reason): the task-tracking skill's own phase-lifecycle rule is that a build phase
-isn't done until its acceptance demo runs, so Phase 4 was never actually finished — these are
-legitimately still Phase 4 build tasks, closing gaps Phase 4 itself created, not new scope. A review
-phase (`/start-review-phase`) was considered and rejected for this specific gap, twice now: review
-phases turn *discovered* findings into fix-tasks, but 4.28 and 4.38 already did the discovery and
-diagnosis work in full each time — routing that through a review-phase sweep would re-derive conclusions
-already on record, not add anything. Phase 5 remains the right venue for whatever *new* findings a full
-sweep of this phase's diff turns up once a future task actually closes it.
+**Why 4.29–4.41 extended Phase 4 rather than opening a new phase or a review phase**: the task-tracking
+skill's own phase-lifecycle rule is that a build phase isn't done until its acceptance demo runs, so
+Phase 4 was never actually finished — these are legitimately still Phase 4 build tasks, closing gaps
+Phase 4 itself created, not new scope. A review phase (`/start-review-phase`) was considered and rejected
+for this specific gap, twice now: review phases turn *discovered* findings into fix-tasks, but 4.28 and
+4.38 already did the discovery and diagnosis work in full each time — routing that through a review-phase
+sweep would re-derive conclusions already on record, not add anything. Phase 5 remains the right venue
+for whatever *new* findings a full sweep of this phase's diff turns up once 4.41 actually closes it.
 
 ### Live carry-forwards (not owned by any open task)
 Everything else is owned by a Phase-4 task; these are the exceptions that would otherwise evaporate:
@@ -301,6 +307,9 @@ succeed exit-gate attempt) — see [Phase 4's own task list](./phase-4/README.md
 - [x] **4.36** `Screen::Main` + live navigation — [file](./phase-4/4.36-screen-main-live-navigation.md)
 - [x] **4.37** Preflight routing — [file](./phase-4/4.37-preflight-routing.md)
 - [x] **4.38** T17 acceptance-demo closure (phase re-exit gate) — [file](./phase-4/4.38-t17-acceptance-demo-closure.md)
+- [ ] **4.39** Prekey bundle republish + vault persistence on session start (fix for 4.38's Defect A) — [file](./phase-4/4.39-prekey-bundle-republish.md)
+- [ ] **4.40** Thread the live-session secret store through file-backed contacts/trust/send handlers (fix for 4.38's Defect B) — [file](./phase-4/4.40-file-backed-live-session-store.md)
+- [ ] **4.41** T17 acceptance-demo closure, third exit-gate attempt — [file](./phase-4/4.41-t17-acceptance-demo-closure-attempt-3.md)
 
 ---
 
