@@ -57,18 +57,12 @@
 //! - stdout is captured but a line doesn't parse as the expected JSON shape → an explicit
 //!   line-numbered parse-error message, never a silently-dropped row.
 //!
-//! ## Same worker-stub precedent as every other `Effect` in this crate
-//! `crate::run_worker` is still today's unconditional-success, no-op-payload stub (task 4.11's own
-//! precedent — see that function's doc comment): it echoes `Effect::RunDoctor` straight back as
-//! `WorkerEvent::Completed` with `outcome` still `None`. [`handle_worker`] below only acts on a
-//! `Completed` carrying a real `Some(DoctorReport)`, mirroring
-//! `crate::screens::onboarding::handle_worker`'s identical `outcome: Some(..)` guard — so pressing `r`
-//! against today's stub leaves the screen in [`DiagnosticsStatus::Running`] forever, exactly the same
-//! "not built by this task" gap every other `Effect` in this crate already has (see, e.g.,
-//! `crate::app::Effect`'s own doc comment), not a new one this screen introduces. [`run_doctor_binary`]
-//! is the real, callable implementation a future worker executing this effect should call — present
-//! and independently tested, not yet wired into `run_worker`, the identical "real, callable, not yet
-//! wired" shape `crate::config_write::write_setting_at` already established for task 4.24.
+//! ## Wired into `crate::worker` as of task 4.34
+//! `crate::worker::dispatch` executes `Effect::RunDoctor` for real: it calls [`run_doctor_binary`]
+//! and reports `WorkerEvent::Completed` with `outcome: Some(DoctorReport)` on success, or
+//! `WorkerEvent::Failed` on any of the honest failure paths above. [`handle_worker`] below only acts
+//! on a `Completed` carrying a real `Some(DoctorReport)`, mirroring
+//! `crate::screens::onboarding::handle_worker`'s identical `outcome: Some(..)` guard.
 //!
 //! ## No live connection state plumbed in
 //! `crate::app::App` holds no live `Transport`/session handle anywhere yet — see

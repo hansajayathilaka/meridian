@@ -35,10 +35,10 @@ use crate::app::{
     GenerateAccountRequest, GeneratedAccount, ImportContactQrEffect, ImportContactQrRequest,
     LoadSessionEffect, LoadSessionOutcome, MarkVerifiedEffect, MarkVerifiedRequest,
     PersistHistoryEffect, PersistHistoryRequest, PublishBundleEffect, PublishedBundle,
-    RegisterRequest, RejectRequestEffect, RejectRequestRequest, SendMessageEffect,
-    SendMessageRequest, SentMessage, SessionOutcome, SetPetnameEffect, SetPetnameRequest,
-    SetPolicyOverrideEffect, SetPolicyOverrideRequest, SetUserBlockedEffect, SetUserBlockedRequest,
-    StoreChoice, UnlockEffect, UnlockRequest, WorkerEvent,
+    RegisterRequest, RejectRequestEffect, RejectRequestRequest, RunDoctorEffect, SaveSettingEffect,
+    SendMessageEffect, SendMessageRequest, SentMessage, SessionOutcome, SetPetnameEffect,
+    SetPetnameRequest, SetPolicyOverrideEffect, SetPolicyOverrideRequest, SetUserBlockedEffect,
+    SetUserBlockedRequest, StoreChoice, UnlockEffect, UnlockRequest, WorkerEvent,
 };
 use crate::session::LiveSession;
 use crate::store::contacts::{ContactRecord, ContactsDocument, PinnedKeyRecord, TrustLabel};
@@ -169,9 +169,17 @@ pub async fn dispatch(effect: Effect, session: &mut OnboardingSession) -> Worker
         // Task 4.33: outbound chat (the send half of the T17 demo's "both sides chat" step).
         Effect::SendMessage(effect) => handle_send_message(effect).await,
         Effect::PersistHistory(effect) => handle_persist_history(effect).await,
-        // Not this task's scope (settings/diagnostics/… — see later gap-closure task 4.34, and
-        // 4.35 for the receive path). Preserves task 4.11's original placeholder behavior so
-        // screens whose real execution hasn't landed yet are unaffected by this change.
+        // Task 4.34: settings write-back / diagnostics — both already-built, already-reviewed
+        // functions (`crate::config_write::write_setting_at` from task 4.24,
+        // `crate::screens::diagnostics::run_doctor_binary` from task 4.25); this task is purely
+        // wiring, not new logic.
+        Effect::SaveSetting(effect) => handle_save_setting(effect).await,
+        Effect::RunDoctor(effect) => handle_run_doctor(effect).await,
+        // Effect::FetchBundle is the only variant still falling through here: a placeholder no task
+        // has claimed yet (see `crate::app::Effect::FetchBundle`'s own doc comment). Task 4.35's
+        // inbound-delivery work is a separate `AppEvent::Inbound` push path, not a `dispatch` arm, so
+        // it does not touch or reduce this catch-all. Preserves task 4.11's original placeholder
+        // behavior so any future unhandled variant is unaffected by this change.
         other => WorkerEvent::Completed(other),
     }
 }
@@ -1412,6 +1420,65 @@ fn save_chat(
         .seal_at_rest(store, handle)
         .map_err(|e| format!("sealing session store: {e}"))?;
     std::fs::write(&path, sealed).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+// ---------------------------------------------------------------------------
+// Settings write-back / diagnostics (task 4.34)
+//
+// Both handlers below are pure wiring onto already-built, already-reviewed functions — see this
+// task's own file. Neither derives a `SecretStore`/`KeyHandle` via `open_account_store` the way
+// every contacts/chat handler above does: both `SaveSettingRequest`/`RunDoctorRequest` carry every
+// input their underlying function needs directly (`config_path`/`value`; `binary`), exactly like
+// `UnlockRequest::keyfile` — see those requests' own doc comments in `crate::app`.
+// ---------------------------------------------------------------------------
+
+// --- SaveSetting -----------------------------------------------------------------------------
+
+async fn handle_save_setting(effect: SaveSettingEffect) -> WorkerEvent {
+    let SaveSettingEffect { request, .. } = effect;
+    match crate::config_write::write_setting_at(&request.config_path, &request.value) {
+        Ok(()) => WorkerEvent::Completed(Effect::SaveSetting(SaveSettingEffect {
+            request,
+            outcome: Some(()),
+        })),
+        // `ConfigWriteError` (`NoFile`/`Malformed`/`NotATable`/`Io`) is surfaced verbatim via its
+        // own `Display` impl — every one of those variants is already an honest, named refusal
+        // (see `crate::config_write`'s own module doc), never a silent no-op; this handler adds no
+        // softening on top.
+        Err(e) => WorkerEvent::Failed(
+            Effect::SaveSetting(SaveSettingEffect {
+                request,
+                outcome: None,
+            }),
+            e.to_string(),
+        ),
+    }
+}
+
+// --- RunDoctor ---------------------------------------------------------------------------------
+
+/// **Not this crate's protocol logic** — mirrors `crate::screens::diagnostics`'s own module doc:
+/// invokes the already-built `meridian doctor --json` binary as a subprocess and treats its
+/// captured stdout as opaque data (`run_doctor_binary` already parses it internally via
+/// `parse_doctor_json`, so this handler has nothing left to do beyond propagating that one
+/// `Result` faithfully). A missing binary on `PATH`, a non-zero exit, or an unparseable line are
+/// each an honest, named `Err(String)` already — see that function's own doc comment for exactly
+/// which message each produces — never a silent no-op or a fabricated empty report.
+async fn handle_run_doctor(effect: RunDoctorEffect) -> WorkerEvent {
+    let RunDoctorEffect { request, .. } = effect;
+    match crate::screens::diagnostics::run_doctor_binary(&request.binary) {
+        Ok(report) => WorkerEvent::Completed(Effect::RunDoctor(RunDoctorEffect {
+            request,
+            outcome: Some(report),
+        })),
+        Err(message) => WorkerEvent::Failed(
+            Effect::RunDoctor(RunDoctorEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
