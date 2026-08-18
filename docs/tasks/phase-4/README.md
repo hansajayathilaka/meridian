@@ -229,7 +229,7 @@ reopened) lives in each task file's own text plus the architect consult recorded
 
 **Second gap-closure wave (planned by `/plan-phase` against 4.38's own findings)** — fixes both defects
 4.38 found live, then a third, hopefully-final exit-gate attempt.
-- [ ] **4.39** Prekey bundle republish + vault persistence on session start (fix for 4.38's Defect A —
+- [~] **4.39** Prekey bundle republish + vault persistence on session start (fix for 4.38's Defect A —
   no first-contact message can ever be decrypted, for any account type) — [file](./4.39-prekey-bundle-republish.md)
 - [ ] **4.40** Thread the live-session secret store through file-backed contacts/trust/send handlers (fix
   for 4.38's Defect B — file-backed accounts fail closed post-`Screen::Main`) — [file](./4.40-file-backed-live-session-store.md)
