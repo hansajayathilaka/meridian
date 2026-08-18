@@ -217,7 +217,7 @@ reopened) lives in each task file's own text plus the architect consult recorded
 - [x] **4.33** Real `run_worker`: outbound chat — [file](./4.33-run-worker-outbound-chat.md)
 - [x] **4.34** Real `run_worker`: settings & diagnostics — [file](./4.34-run-worker-settings-diagnostics.md)
 - [x] **4.35** Inbound delivery stream — [file](./4.35-inbound-delivery-stream.md)
-- [ ] **4.36** `Screen::Main` + live navigation — [file](./4.36-screen-main-live-navigation.md)
+- [~] **4.36** `Screen::Main` + live navigation — [file](./4.36-screen-main-live-navigation.md)
 - [ ] **4.37** Preflight routing — [file](./4.37-preflight-routing.md)
 - [ ] **4.38** T17 acceptance-demo closure (phase re-exit gate) — [file](./4.38-t17-acceptance-demo-closure.md)
 
