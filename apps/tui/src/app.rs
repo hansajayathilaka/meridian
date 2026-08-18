@@ -1056,19 +1056,16 @@ pub enum Screen {
     /// A form over `config.toml`'s fields — see [`crate::screens::settings`]. Boxed for the same
     /// `clippy::large_enum_variant` reason as the other large variants above.
     ///
-    /// **"Reached from the command palette" (tui-client.md §2), still not wired — a deliberate,
-    /// documented scope boundary of task 4.25, not an oversight.** Task 4.25 wires
-    /// `PaletteRegistry::find_binding` into [`App::handle_key`] (see that method's own doc comment)
-    /// and gives the palette ([`Screen::Palette`]) a real, generic dispatch path
-    /// (`App::dispatch_palette_action`) for any *registered* command — but registering a working
-    /// "open Settings" command would need a real, already-loaded [`crate::config::TuiConfig`]/
-    /// `config_path` to construct a [`SettingsState`] from, and `App` has no live config anywhere
-    /// yet (the same `Preflight`-shaped gap [`Screen::Unlock`]/[`Screen::Contacts`]/[`Screen::Chat`]
-    /// all flag in their own doc comments — task 4.25 is a discoverability task, not the task that
-    /// threads a real config into `App`). This variant exists fully wired
-    /// (`handle_key`/`handle_worker`/`render` all dispatch to it below) and independently reachable
-    /// via [`App::push_screen`], exactly like [`Screen::Verify`] before its own navigation task; only
-    /// the palette-registration step is left for whichever future task gives `App` that real config.
+    /// **"Reached from the command palette" (tui-client.md §2) — wired by task 4.36.** Task 4.25
+    /// wired `PaletteRegistry::find_binding` into [`App::handle_key`] (see that method's own doc
+    /// comment) and gave the palette ([`Screen::Palette`]) a real, generic dispatch path
+    /// (`App::dispatch_palette_action`) for any *registered* command, but deliberately left the
+    /// "open Settings" command unregistered — it needed a real, already-loaded
+    /// [`crate::config::TuiConfig`]/`config_path` to construct a [`SettingsState`] from, and `App`
+    /// had no live config anywhere yet. Task 4.36 registers `nav.settings` in
+    /// `App::register_builtin_commands` now that [`Screen::Main`]'s live `LiveSession` carries that
+    /// config. This variant also remains independently reachable via [`App::push_screen`], exactly
+    /// like [`Screen::Verify`].
     Settings(Box<SettingsState>),
     /// The generated help overlay (task 4.25) — `F1`, built from a snapshot of
     /// [`App`]'s registered [`crate::surface::PaletteRegistry`] taken at push time. See

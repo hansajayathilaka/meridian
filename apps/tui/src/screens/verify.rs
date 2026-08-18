@@ -92,17 +92,15 @@
 //! `contact_detail.rs` already uses (closing this gap would mean redesigning that shared pattern,
 //! out of scope here).
 //!
-//! ## `own_pubkey`, and why this screen is not yet reachable from `crate::screens::contacts`
+//! ## `own_pubkey`, and how this screen became reachable from `crate::screens::contacts` (task 4.36)
 //! [`VerifyState::new`] takes `own_pubkey`/`peer_pubkey`/`peer_hint`/an already-loaded `TrustStore`
 //! directly — the same "constructed with what it needs, unit-tested in isolation, wired into real
 //! navigation by a later task" shape `crate::screens::chat::ChatState`/
-//! `crate::screens::requests::RequestsState` already established for tasks 4.20/4.21.
-//! `crate::app::Screen::Verify`'s own doc comment explains exactly why `crate::screens::contacts`'s
-//! `v` key still shows its task-4.19-authored "not implemented yet" stand-in rather than pushing
-//! this screen: `ContactsState` has no `own_pubkey` field and no live `TrustStore` handle to build a
-//! [`VerifyState`] from (it works off `ContactEntry`, a display-only join — see that module's own
-//! doc). Wiring `^V` for real is exactly the kind of "future task that gives `App` a real, loaded
-//! `TrustStore`" every other screen in this crate has been waiting on since task 4.19.
+//! `crate::screens::requests::RequestsState` already established for tasks 4.20/4.21. `Screen::Main`
+//! (task 4.36) is that later task: it holds `own_pubkey` and a live `TrustStore` from `LiveSession`,
+//! reclaims the `TrustStore` back out on return exactly as `Screen::Chat` does, and `v` in
+//! `crate::screens::contacts` now pushes this screen for real, replacing the task-4.19-authored "not
+//! implemented yet" stand-in.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};

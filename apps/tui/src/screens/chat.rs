@@ -84,12 +84,13 @@
 //! reference with no change to [`ChatMessageRenderer`] itself or its `mrd.chat/1` contract.
 //!
 //! ## What this screen does *not* do
-//! No navigation wiring: `crate::screens::contacts`' own module doc already anticipates this
-//! screen's existence and explicitly defers repointing its `Enter` key (and giving `ContactDetail`
-//! its own key) to "a future task" — see [`crate::app::Screen::Chat`]'s doc comment for why that
-//! stays deferred here too, keeping this diff scoped to this module plus the `Effect`/`Screen`
-//! plumbing it needs. `entries` starts pre-loaded (mirrors `ContactsState::new`'s "already loaded...
-//! out of this task's scope" contract) from task 4.15's history store.
+//! `entries` starts pre-loaded (mirrors `ContactsState::new`'s "already loaded... out of this
+//! task's scope" contract) from task 4.15's history store.
+//!
+//! ## Navigation wiring (task 4.36)
+//! `crate::screens::contacts`'s `Enter` key opens this screen directly; `ContactDetail` got its own
+//! dedicated key (`i`) instead — see [`crate::app::Screen::Chat`]'s doc comment and
+//! `crate::screens::contacts`'s own module doc for the resolved key layout.
 //!
 //! ## Receive-path wiring (task 4.35)
 //! [`handle_inbound_message`] is `crate::app::App::handle_inbound`'s one call into this module for a
