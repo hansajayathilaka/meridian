@@ -490,3 +490,82 @@ was that future task. Closing it needs at least:
 Tracked as follow-up in [docs/tasks/phase-4/README.md](../tasks/phase-4/README.md)'s exit criteria
 and [docs/tasks/README.md](../tasks/README.md)'s carry-forward section, mirroring how this phase
 already carries forward 4.22's Verify-screen-height note into 4.26.
+
+---
+
+## 11. Current implementation status (as of task 4.38 — the phase's second exit-gate attempt)
+
+Section 10 above is frozen as task 4.28's own historical record (several other task files link to it
+by that exact anchor); this section is the follow-up, written after tasks 4.29–4.37 closed both gaps
+4.28 found — and after actually re-running the demo, live, a second time, exactly as 4.28 did.
+
+**Both of 4.28's own gaps are now closed for real.** `Preflight` (4.37) genuinely routes an existing
+account to `Unlock`/straight to `Screen::Main`; `Screen::Main` (4.36) is real, live navigation, not a
+placeholder; `run_worker`/`worker::dispatch` (4.30–4.34) genuinely executes every effect it used to
+echo back inertly — `GenerateAccount`, `Register`, `PublishBundle`, `Unlock`, `LoadSession`,
+`AddContact`, `ImportContactQr`, `SetPetname`, `SetUserBlocked`, `SetPolicyOverride`, `DeleteContact`,
+`AcceptRequest`, `RejectRequest`, `MarkVerified`, `AcknowledgeKeyChange`, `SendMessage`,
+`PersistHistory`, `SaveSetting`, `RunDoctor` — against real `meridian-core` calls and real sealed-store
+files. A persistent inbound-delivery loop (4.35) really does forward decrypted content to `App` live.
+Onboarding on a fresh `$MERIDIAN_HOME`, through registration and bundle publish, genuinely completes
+end to end — confirmed twice, independently, exactly as 4.28's own bar required (once by 4.38 itself,
+live via a PTY-driven `meridian tui` process; the second, independent confirmation is the reviewer/
+test-engineer sign-off that follows 4.38, per that task's own scope).
+
+**The T17 acceptance demo still does not pass end to end — for two reasons, one already flagged, one
+newly discovered by this same re-run.**
+
+**1. The already-flagged file-backed-account gap (task 4.37's own Status section) is real, and now
+reproduced live**, not just reasoned about. `worker.rs::open_account_store` — the helper `AddContact`/
+`SetPetname`/`SetUserBlocked`/`SetPolicyOverride`/`DeleteContact`/`AcceptRequest`/`RejectRequest`/
+`MarkVerified`/`AcknowledgeKeyChange`/`SendMessage`/`PersistHistory` all call — re-derives a fresh
+`SecretStore` per dispatch, and fails closed for a passphrase-keyfile account (no cached, already-
+unwrapped store to reuse). Confirmed by literally driving `meridian tui` under a PTY: a file-backed
+account onboards, registers, publishes a bundle, and reaches a live, connected `Screen::Main` —
+genuinely further than 4.28's own hang — but pressing `n` to add a contact then fails with exactly the
+message that function's own code names: *"Could not add this contact. this account is passphrase-
+protected — this action from a live TUI session isn't supported yet for file-backed accounts (no
+cached, already-unlocked store to reuse); use the CLI instead."* `Ctrl-Q` still restores the terminal
+cleanly from that error dialog.
+
+**2. A previously-undiscovered defect, found by this task's own new two-process regression test
+(`apps/tui/tests/live_session_e2e.rs`), blocks first-contact receiving for *every* account type,
+including OS-keystore.** `apps/cli/src/main.rs::cmd_register` (the exact call sequence
+`worker::handle_publish_bundle` mirrors) has always had a latent version of this same gap:
+`SignalingClient::publish_bundle`'s own doc comment is explicit that it "[r]eturns the generated bundle
+*and its secret scalars* for the caller to persist" — but `cmd_register` never persists them, and
+neither does `worker::handle_publish_bundle`. In the CLI this is harmless: `apps/cli/src/chat.rs::run`
+(the CLI's actual "start chatting" entry point) unconditionally republishes its **own** fresh bundle —
+`client.publish_bundle(...)` immediately followed by `state.vault.set_bundle(...)` and `save_state(...)`
+— every single time it runs, before it is ever capable of receiving anything, so the `cmd_register`-time
+bundle is never actually relied on for a real receive. **`meridian-tui` has no equivalent step
+anywhere.** `Effect::PublishBundle` is dispatched exactly once, from `screens/onboarding.rs`, at
+account-creation time, and never again — not from `Screen::Main`'s construction, not from
+`inbound_handoff`/`run_inbound_loop`'s spawn (4.35), not on a later `Unlock`/`LoadSession`. So the one
+bundle a T17-onboarded account ever publishes is the vault-less one, and it is the **only** bundle a
+peer can ever X3DH-initiate against. When they do, `ChatState::open_inbound` cannot resolve the OTK/SPK
+secret scalar for that bundle (`PrekeyVault` never had them) and fails closed with
+`ChatError::UnknownPrekey` ("no matching prekey secret for incoming session") —
+`process_inbound_delivery` drops it silently (an `eprintln!` only, no user-visible signal on either
+side). Reproduced live, twice: once via `apps/tui/tests/live_session_e2e.rs` (two real, separate OS
+processes, a real in-process rendezvous server, real `worker::dispatch`/`run_inbound_loop` — the
+responder's own inbound loop logs exactly this rejection the moment the initiator's message arrives),
+and independently confirmed to be root-caused correctly by tracing `apps/cli/src/chat.rs::run`'s own
+working design as the counter-example. **This is more fundamental than finding 1**: it blocks the
+demo's "peer sees a message request" step even for an OS-keystore account that has no file-backed
+gap to hit at all (not independently re-confirmed via a live `meridian tui` PTY session for the
+OS-keystore case specifically — this sandbox has no working platform Secret Service even after
+installing `gnome-keyring`, the same headless-environment limitation `tests/load_session.rs`'s own
+module doc already names — but the defect lives entirely in `worker.rs`/`meridian-core`, not in any
+screen, so there is no reason to expect an OS-keystore account to behave differently).
+
+**Verdict: the T17 acceptance demo does not run end to end today.** Not a regression from 4.28 (this
+phase is a great deal further along — a live session now exists, reaches a connected `Screen::Main`,
+and the onboarding/registration/publish path is solid) but two distinct, real defects still block it:
+one already flagged and now reproduced live (4.37's file-backed gap), one newly found by this task's
+own live re-run and its new regression test (no live bundle republish/vault persistence for any account
+type). Neither is fixed here, per this task's own explicit scope — see
+[docs/tasks/phase-4/4.38-t17-acceptance-demo-closure.md](../tasks/phase-4/4.38-t17-acceptance-demo-closure.md)'s
+own Status section for the full evidentiary writeup, and
+[docs/tasks/README.md](../tasks/README.md)'s carry-forward section for where this now stands in the
+tracker.

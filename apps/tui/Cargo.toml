@@ -72,6 +72,15 @@ keyring = "4.1.4"
 # dependency (the only QR image format either client's demo produces).
 image = { workspace = true, features = ["png"] }
 
+# Task 4.38's own two-process regression test: `harness = false` so the file owns a plain `fn
+# main()` (see that file's own module doc, "## `harness = false`") instead of libtest's generated
+# one, letting it re-invoke `std::env::current_exe()` as a real child process per simulated peer —
+# the standard, idiomatic way a Rust test binary spawns itself with a distinct env per role.
+[[test]]
+name = "live_session_e2e"
+path = "tests/live_session_e2e.rs"
+harness = false
+
 [dev-dependencies]
 # Self-dependency with test-support enabled, so tests/terminal_guard.rs (a separate crate linking
 # the normal, non-`cfg(test)` build of this lib) can reach terminal::test_support::RecordingOps.
