@@ -72,20 +72,20 @@
 //! runner reports — the two child invocations it spawns are ordinary subprocesses from their
 //! perspective, never separately discovered or double-counted.
 //!
-//! ## Known-failing, gated, not `#[ignore]`d
-//! This test genuinely, reproducibly fails today (task 4.38's second finding: no code path in
-//! `meridian-tui` republishes a prekey bundle with vault-persisted secrets, so `ChatError::UnknownPrekey`
-//! blocks all first-contact decryption — see `docs/tasks/phase-4/4.38-t17-acceptance-demo-closure.md`
-//! and `tui-client.md` §11). Per task 4.38's own explicit scope, that defect is not fixed here; it's a
-//! follow-up task (working number 4.39). Because this file uses `harness = false` (a plain `fn main()`,
-//! not libtest's `#[test]` machinery), the usual repo convention for a known-failing test —
-//! `#[ignore = "reason"]`, e.g. `tests/load_session.rs`'s OS-keystore test — doesn't apply directly: an
-//! `#[ignore]` attribute has no effect on a function that isn't `#[test]`-annotated in a `harness =
-//! false` binary. The orchestrator branch is instead gated behind an opt-in `LIVE_E2E_RUN=1` env var,
-//! defaulting to a clean skip (exit 0, printed reason) so this doesn't hard-block CI on an already-
-//! tracked, not-yet-fixed defect — the same intent as `#[ignore]`, adapted to this file's harness. Once
-//! 4.39 lands the real fix, flipping this gate to always-on (removing the `RUN_ENV` check) should be
-//! part of that task's own Deliverables, so this regression test resumes running by default.
+//! ## Formerly known-failing; the gate is now removed (task 4.39)
+//! This test used to reproducibly fail (task 4.38's second finding: no code path in `meridian-tui`
+//! republished a prekey bundle with vault-persisted secrets, so `ChatError::UnknownPrekey` blocked all
+//! first-contact decryption — see `docs/tasks/phase-4/4.38-t17-acceptance-demo-closure.md` and
+//! `tui-client.md` §11). Task 4.39 closed that defect (`worker::republish_bundle`, called once per
+//! session right before `run_inbound_loop` is spawned — see that function's own module doc in
+//! `apps/tui/src/worker.rs`). Since this test drives `worker::dispatch`/`run_inbound_loop` directly
+//! rather than through `crate::run_worker`'s own event loop (see this module doc's own "why
+//! `worker::dispatch`/`run_inbound_loop` directly" section above), each peer below calls
+//! `worker::republish_bundle` itself, once, immediately before starting its own persistent inbound
+//! loop — mirroring exactly what `run_worker`'s wiring now does, not a different sequence invented
+//! here. The opt-in `LIVE_E2E_RUN` gate this file used to need (`harness = false` means `#[ignore]`
+//! does not apply — see the removed section this replaced) is gone: this test now runs unconditionally
+//! under plain `cargo test -p meridian-tui --test live_session_e2e`.
 //!
 //! ## Simplifications, stated plainly
 //! - Petname is the generic `"peer"`, not the demo script's cosmetic `"bob"` — which of the two roles
@@ -122,15 +122,12 @@ use meridian_tui::app::{
 };
 use meridian_tui::statusbar::ConnectionState;
 use meridian_tui::store::history::{self, Direction as HistDirection, HistoryEntry, MessageState};
-use meridian_tui::worker::{dispatch, run_inbound_loop, OnboardingSession};
+use meridian_tui::worker::{dispatch, republish_bundle, run_inbound_loop, OnboardingSession};
 
 const ROLE_ENV: &str = "LIVE_E2E_ROLE";
 const TAG_ENV: &str = "LIVE_E2E_TAG";
 const SERVER_ENV: &str = "LIVE_E2E_SERVER";
 const SHARED_ENV: &str = "LIVE_E2E_SHARED";
-/// Opt-in gate for the orchestrator branch — see the module doc's "Known-failing, gated, not
-/// `#[ignore]`d" section for why this exists instead of the usual `#[ignore = "..."]`.
-const RUN_ENV: &str = "LIVE_E2E_RUN";
 
 const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
 const FILE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -148,21 +145,6 @@ fn main() {
                     std::process::exit(1);
                 }
             }
-        }
-        _ if env::var(RUN_ENV).ok().as_deref() != Some("1") => {
-            println!(
-                "[live_session_e2e] SKIPPED (set {RUN_ENV}=1 to run): this test reproduces a \
-                 genuine, already-tracked defect (task 4.38's finding — no code path in \
-                 meridian-tui republishes a prekey bundle with vault-persisted secrets, so \
-                 ChatError::UnknownPrekey blocks all first-contact decryption; see \
-                 docs/tasks/phase-4/4.38-t17-acceptance-demo-closure.md and tui-client.md §11) \
-                 fixed by a follow-up task (working number 4.39, not yet landed). Gated behind \
-                 an opt-in env var rather than #[ignore] because this file uses `harness = \
-                 false` (see the module doc), so run `LIVE_E2E_RUN=1 cargo test -p meridian-tui \
-                 --test live_session_e2e -- --nocapture` to reproduce, or once 4.39 lands, flip \
-                 this gate to always-on as part of that task's own Deliverables."
-            );
-            std::process::exit(0);
         }
         _ => match run_orchestrator() {
             Ok(()) => {
@@ -405,6 +387,7 @@ async fn run_peer() -> Result<(), String> {
             &shared,
             &server,
             &other_id,
+            generated.account_pub,
             other_pub,
             &other_hint,
             &service,
@@ -481,6 +464,7 @@ async fn run_initiator(
     shared: &Path,
     server: &str,
     other_id: &str,
+    own_pub: [u8; 32],
     other_pub: [u8; 32],
     other_hint: &str,
     service: &str,
@@ -552,8 +536,21 @@ async fn run_initiator(
     )
     .await?;
 
+    // Task 4.39: republish a fresh, vault-persisted bundle before starting the persistent inbound
+    // loop — mirrors exactly what `crate::run_worker`'s own `inbound_handoff` wiring now does
+    // (`worker::republish_bundle`, once per session, immediately before `run_inbound_loop` is
+    // spawned); this file drives `dispatch`/`run_inbound_loop` directly rather than through
+    // `run_worker`'s event loop (see the module doc), so it has to make that same call itself.
+    // Connects as *this* account (`own_pub`), never `other_pub` — a bundle is only ever republished
+    // for the account that owns it.
+    println!("[peer {tag}] republishing prekey bundle (vault-persisted)…");
+    let os = OsSecretStore::new(service);
+    republish_bundle(&os, handle, own_pub, server)
+        .await
+        .map_err(|e| format!("republishing bundle: {e}"))?;
+
     println!("[peer {tag}] waiting for the reply…");
-    let mut rx = spawn_inbound(other_pub, server, service, handle);
+    let mut rx = spawn_inbound(own_pub, server, service, handle);
     let reply = wait_for_inbound(&mut rx, INBOUND_TIMEOUT)
         .await
         .ok_or("timed out waiting for the responder's reply")?;
@@ -597,6 +594,16 @@ async fn run_responder(
     handle: &KeyHandle,
 ) -> Result<(), String> {
     let mut session = OnboardingSession::default();
+
+    // Task 4.39: same republish-before-listening step as `run_initiator` above — see that call
+    // site's own comment. The responder is the role that actually needs this in this scenario (it
+    // is the one receiving the initiator's first-contact intro), but every real session republishes
+    // unconditionally, regardless of role — see `worker::republish_bundle`'s own doc comment.
+    println!("[peer {tag}] republishing prekey bundle (vault-persisted)…");
+    let os = OsSecretStore::new(service);
+    republish_bundle(&os, handle, own_pub, server)
+        .await
+        .map_err(|e| format!("republishing bundle: {e}"))?;
 
     println!("[peer {tag}] starting the persistent inbound loop…");
     let mut rx = spawn_inbound(own_pub, server, service, handle);

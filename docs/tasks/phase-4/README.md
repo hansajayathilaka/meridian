@@ -341,23 +341,28 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   assumed.** 4.29–4.37 genuinely closed 4.28's own hang (`Preflight`/`Screen::Main` live navigation and
   a real `run_worker` now exist; onboarding, registration, and bundle publish all genuinely complete,
   reaching a live, connected `Screen::Main` — confirmed live via a PTY-driven `meridian tui` run). Two
-  distinct defects still block the rest of the demo, both found/reconfirmed by 4.38's own live re-run:
-  **(1)** the already-flagged file-backed-account gap (4.37's own Status section:
+  distinct defects still blocked the rest of the demo, both found/reconfirmed by 4.38's own live re-run:
+  **(1) Defect B, still open** — the already-flagged file-backed-account gap (4.37's own Status section:
   `worker.rs::open_account_store` fails closed for a passphrase-keyfile account) — reproduced live for
   the first time: a file-backed account reaches `Screen::Main` and then fails, with the exact predicted
-  message, the moment it tries to add a contact; **(2)** a **newly-discovered** defect, found by 4.38's
-  own new two-process regression test (`apps/tui/tests/live_session_e2e.rs`): no code path in
-  `meridian-tui` ever republishes a prekey bundle with its secret scalars persisted into
-  `sessions.bin`'s `PrekeyVault` (`Effect::PublishBundle` fires exactly once, at onboarding, mirroring
-  `apps/cli/src/main.rs::cmd_register`'s own latent version of the same gap — but unlike the CLI, which
-  covers for it via `apps/cli/src/chat.rs::run`'s own unconditional republish-before-listening, nothing
-  in `meridian-tui` ever republishes at all) — so a peer's first-contact message can never be decrypted
-  (`ChatError::UnknownPrekey`, silently dropped), for **any** account type, OS-keystore included. Full
-  writeup: [tui-client.md §11](../../architecture/tui-client.md#11-current-implementation-status-as-of-task-438--the-phases-second-exit-gate-attempt)
+  message, the moment it tries to add a contact; tracked by [4.40](./4.40-file-backed-live-session-store.md),
+  not yet started. **(2) Defect A, closed by [4.39](./4.39-prekey-bundle-republish.md)** — a
+  **newly-discovered** defect, found by 4.38's own new two-process regression test
+  (`apps/tui/tests/live_session_e2e.rs`): no code path in `meridian-tui` ever republished a prekey bundle
+  with its secret scalars persisted into `sessions.bin`'s `PrekeyVault` (`Effect::PublishBundle` fired
+  exactly once, at onboarding, mirroring `apps/cli/src/main.rs::cmd_register`'s own latent version of the
+  same gap — but unlike the CLI, which covers for it via `apps/cli/src/chat.rs::run`'s own unconditional
+  republish-before-listening, nothing in `meridian-tui` republished at all) — so a peer's first-contact
+  message could never be decrypted (`ChatError::UnknownPrekey`, silently dropped), for **any** account
+  type, OS-keystore included. 4.39 closed this via `worker::republish_bundle`, wired into
+  `run_worker`'s `inbound_handoff` branch (once per session, before `run_inbound_loop` is spawned) — see
+  that task's own Status section and `tui-client.md §11`'s update. Full original writeup:
+  [tui-client.md §11](../../architecture/tui-client.md#11-current-implementation-status-as-of-task-438--the-phases-second-exit-gate-attempt)
   and [4.38's own Status section](./4.38-t17-acceptance-demo-closure.md). **Neither defect was fixed by
-  4.38** — its own scope is verification only, per this project's "report, don't patch around it" rule
-  for a genuine finding. Both need a new task (not a reopened 4.37, per this project's numbering
-  convention) before this checkbox can honestly flip.
+  4.38 itself** — its own scope was verification only, per this project's "report, don't patch around it"
+  rule for a genuine finding. This checkbox stays `[ ]` until *both* defects are closed and the demo is
+  re-confirmed end to end — that re-confirmation is [4.41](./4.41-t17-acceptance-demo-closure-attempt-3.md)'s
+  own job, not this task's.
 - [x] The envelope-v2 obligation above was re-deferred with a concrete, mechanical trigger (see
   [above](#envelope-v2-re-deferred--the-concrete-trigger)) — not silently dropped.
 - Then: **not yet** `/start-review-phase` for Phase 5 — the task-tracking skill's own §7 still applies

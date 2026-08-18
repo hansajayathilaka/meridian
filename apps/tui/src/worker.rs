@@ -27,7 +27,7 @@ use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{
     generate_account, FileSecretStore, KeyHandle, MemorySecretStore, OsSecretStore, SecretStore,
 };
-use meridian_core::signaling::SignalingClient;
+use meridian_core::signaling::{SignalingClient, DEFAULT_OTK_COUNT};
 use meridian_core::trust::{Contact, PinnedKey, TrustState, TrustStore};
 
 use crate::app::{
@@ -1599,6 +1599,103 @@ pub fn inbound_handoff(event: &WorkerEvent) -> Option<InboundHandoff> {
         }
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Prekey bundle republish + vault persistence (task 4.39, closing task 4.38's Defect A)
+// ---------------------------------------------------------------------------
+
+/// Republishes a fresh prekey bundle for this session and persists its secret scalars into
+/// `sessions.bin`'s `PrekeyVault` — mirroring `apps/cli/src/chat.rs::run`'s exact connect ->
+/// `publish_bundle` -> `state.vault.set_bundle(...)` -> save sequence, not a new one. Closes task
+/// 4.38's Defect A: `crate::screens::onboarding`'s own `handle_publish_bundle` publishes a bundle
+/// but never records the matching secrets anywhere a later `ChatState::open_inbound` could find
+/// them, so — until now — no `meridian-tui` session ever had a code path that made a peer's
+/// first-contact message decryptable at all; every genuine first envelope hit
+/// `ChatError::UnknownPrekey` and was silently dropped (`worker::process_inbound_delivery`'s own
+/// catch-all).
+///
+/// **Call site, deliberately separate from [`inbound_handoff`].** `crate::run_worker` calls this
+/// once, immediately before `tokio::spawn(run_inbound_loop(..))`, guarded by the same one-shot
+/// `inbound_started` flag that already ensures `run_inbound_loop` itself only spawns once per
+/// session — so this also runs exactly once per session. It is its own async function, never
+/// folded into [`inbound_handoff`], because that function is synchronous and documented as "never
+/// a new round trip" (task 4.35) — widening its contract to cover a network round trip would break
+/// that invariant for every other caller of `inbound_handoff` (today, only `crate::run_worker`,
+/// but the doc comment's promise is about the function's own contract, not just its one caller).
+///
+/// Takes `store`/`handle`/`account_pub`/`server` by reference/value directly (the same shape
+/// [`InboundHandoff`] carries) rather than an `&InboundHandoff`, so `crate::run_worker` can borrow
+/// `handoff.store`/`handoff.handle` for this call and *then* still move the whole `handoff` into
+/// `run_inbound_loop` right after — see that call site's own comment.
+///
+/// **Failure UX (`TODO: confirm` — no design doc this task read specifies visible-status vs.
+/// log-only for a failed republish):** logged to stderr and otherwise swallowed by the caller,
+/// which spawns `run_inbound_loop` regardless of the `Result` this returns. A transient failure
+/// here (e.g. a momentary network hiccup right at session start) must not block the persistent
+/// receive loop from starting at all — the loop still serves already-established sessions and
+/// ordinary replies just fine without a fresh bundle; only a *new* first-contact peer is affected,
+/// and onboarding's own bundle (unpersisted secrets aside) is still live on the server in this
+/// failure case, not absent. This task's own file explicitly rules out inventing a new screen or
+/// `Effect` to surface this more richly, so a swallowed, logged failure is the considered choice
+/// here, not an oversight.
+pub async fn republish_bundle(
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+    account_pub: [u8; 32],
+    server: &str,
+) -> Result<(), String> {
+    let mut client = SignalingClient::connect(server, store, handle, account_pub, None, 1)
+        .await
+        .map_err(|e| format!("connecting to {server}: {e}"))?;
+
+    let generated = client
+        .publish_bundle(store, handle, DEFAULT_OTK_COUNT)
+        .await
+        .map_err(|e| format!("publishing bundle: {e}"));
+    // Best-effort graceful close either way — mirrors `handle_publish_bundle`'s own
+    // `let _ = client.close().await` on its success path; this one-shot connection is never reused
+    // across calls (unlike `OnboardingSession`'s cached `Register` -> `PublishBundle` connection),
+    // so there is nothing to keep open regardless of outcome.
+    let generated = match generated {
+        Ok(g) => g,
+        Err(e) => {
+            let _ = client.close().await;
+            return Err(e);
+        }
+    };
+
+    let otks: Vec<([u8; 32], [u8; 32])> = generated
+        .bundle
+        .otks
+        .iter()
+        .zip(generated.otk_secrets.iter())
+        .map(|(p, s)| (*p, **s))
+        .collect();
+
+    // Task 4.35: hold `chat_state_lock` for the whole load-mutate-save `sessions.bin` sequence,
+    // same as every other handler in this module that touches it — `run_inbound_loop`'s own task
+    // may be racing this exact file (it is not spawned until *after* this call returns, per
+    // `crate::run_worker`'s own ordering, but a defensive same-lock discipline here costs nothing
+    // and keeps this function correct even if a future caller ever changes that ordering).
+    let result = {
+        let _chat_guard = chat_state_lock().lock().await;
+        match load_chat(store, handle) {
+            Ok(mut chat) => {
+                chat.vault.set_bundle(
+                    generated.bundle.spk,
+                    *generated.spk_secret,
+                    otks,
+                    now_unix(),
+                );
+                save_chat(&chat, store, handle)
+            }
+            Err(e) => Err(e),
+        }
+    };
+
+    let _ = client.close().await;
+    result
 }
 
 /// The persistent inbound-delivery loop itself (task 4.35) — see this section's own module doc for
