@@ -22,6 +22,12 @@
 //!    "both account types are covered by construction" claim this task's own file makes about
 //!    `inbound_handoff`, checked directly for the file-backed branch too (never re-deriving one
 //!    `SecretStore`/`KeyHandle` shape for `Os` and a different one for `File`).
+//! 4. [`republish_bundle_fails_cleanly_without_panicking_on_an_unreachable_server`] — the
+//!    log-only-and-still-listen failure UX `crate::run_worker`'s own doc comment commits to (a failed
+//!    republish must never block `run_inbound_loop` from starting): proves `republish_bundle` itself
+//!    returns a plain `Err(String)` — never panics, never blocks — when the connect step fails, which
+//!    is the one property `run_worker`'s `if let Err(e) = ... { eprintln!(...) }` (no early return)
+//!    actually depends on.
 //!
 //! ## Why (1) and (2) use an OS-keystore (mocked) account, not a file-backed one
 //! `republish_bundle` mirrors `apps/cli/src/chat.rs::run`'s own `publish_bundle(store, handle,
@@ -455,4 +461,51 @@ fn inbound_handoff_also_produces_a_working_handoff_for_a_file_backed_account() {
         handoff.handle.label(),
         hex::encode(account.public_key().as_bytes())
     );
+}
+
+// ---------------------------------------------------------------------------
+// (4) a failed republish returns a clean Err, never panics — the property `run_worker`'s
+//     log-only-and-still-listen wiring (no early return around the call) actually depends on.
+// ---------------------------------------------------------------------------
+
+/// `run_worker` (`apps/tui/src/lib.rs`) wraps its `republish_bundle` call in
+/// `if let Err(e) = ... { eprintln!(...) }` with no early return, so `run_inbound_loop` always spawns
+/// regardless of outcome — that wiring is a structural fact of `lib.rs`, not something an integration
+/// test against a private function can re-exercise. What *is* this crate's own responsibility to
+/// prove is the property that wiring relies on: `republish_bundle` itself fails cleanly (a plain
+/// `Err(String)`, no panic) rather than hanging or aborting when its first step — connecting — fails.
+#[test]
+fn republish_bundle_fails_cleanly_without_panicking_on_an_unreachable_server() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+
+    let mut session = OnboardingSession::default();
+    let (generated, handoff) = block_on(async {
+        // No real server is spawned here — `onboard_os_account` needs one to register against, so
+        // reuse the same real server as the other tests, then hand `republish_bundle` a deliberately
+        // unreachable address instead (mirrors test 3's own `"ws://127.0.0.1:1"` unreachable-address
+        // trick) rather than tearing the server down mid-test.
+        let server = spawn_server();
+        let generated = onboard_os_account(&server, &mut session, "self-org.test").await;
+        let outcome = dispatch(load_session_effect(), &mut session).await;
+        let handoff = inbound_handoff(&outcome)
+            .expect("a successful OS-keystore LoadSession must produce an inbound handoff");
+        (generated, handoff)
+    });
+    let _ = generated;
+
+    let result = block_on(republish_bundle(
+        handoff.store.as_ref(),
+        &handoff.handle,
+        handoff.account_pub,
+        "ws://127.0.0.1:1",
+    ));
+
+    match result {
+        Err(e) => assert!(
+            e.contains("connecting to"),
+            "expected a connect-stage error message, got {e:?}"
+        ),
+        Ok(()) => panic!("republish_bundle must not succeed against an unreachable server"),
+    }
 }

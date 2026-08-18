@@ -52,10 +52,12 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   in-memory residency to the whole session lifetime), and
   [4.41](./phase-4/4.41-t17-acceptance-demo-closure-attempt-3.md) (a third exit-gate attempt, hard-joined
   on both 4.39 and 4.40, holding to the same two-independent-runs discipline 4.28/4.38 both used).
-- **NEXT:** `/next-task` for **4.39 → 4.40 → 4.41**, in that order (4.39 and 4.40 are logically
-  independent — different code paths, no shared blocking dependency — but land sequentially since both
-  touch `apps/tui/src/worker.rs`'s session-threading machinery; 4.39 first since it's the more fundamental
-  blocker and has no open design question). Only once 4.41 confirms the T17 demo genuinely passes does
+- **NEXT:** **4.39 is done** (reviewed, closed — see [its own Status
+  section](./phase-4/4.39-prekey-bundle-republish.md#status)): Defect A (no prekey republish, ever) is
+  closed. `/next-task` continues with **4.40 → 4.41**. 4.40 is logically independent of 4.39 — different
+  code paths, no shared blocking dependency — it landed after rather than before only to avoid a
+  simultaneous diff on `apps/tui/src/worker.rs`'s session-threading machinery, which is now moot since
+  4.39 already landed there. Only once 4.41 confirms the T17 demo genuinely passes does
   `/start-review-phase` for Phase 5 become the correct next command — not before.
 
 **Why 4.29–4.41 extended Phase 4 rather than opening a new phase or a review phase**: the task-tracking
@@ -307,7 +309,7 @@ succeed exit-gate attempt) — see [Phase 4's own task list](./phase-4/README.md
 - [x] **4.36** `Screen::Main` + live navigation — [file](./phase-4/4.36-screen-main-live-navigation.md)
 - [x] **4.37** Preflight routing — [file](./phase-4/4.37-preflight-routing.md)
 - [x] **4.38** T17 acceptance-demo closure (phase re-exit gate) — [file](./phase-4/4.38-t17-acceptance-demo-closure.md)
-- [~] **4.39** Prekey bundle republish + vault persistence on session start (fix for 4.38's Defect A) — [file](./phase-4/4.39-prekey-bundle-republish.md)
+- [x] **4.39** Prekey bundle republish + vault persistence on session start (fix for 4.38's Defect A) — [file](./phase-4/4.39-prekey-bundle-republish.md)
 - [ ] **4.40** Thread the live-session secret store through file-backed contacts/trust/send handlers (fix for 4.38's Defect B) — [file](./phase-4/4.40-file-backed-live-session-store.md)
 - [ ] **4.41** T17 acceptance-demo closure, third exit-gate attempt — [file](./phase-4/4.41-t17-acceptance-demo-closure-attempt-3.md)
 
