@@ -342,11 +342,15 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   a real `run_worker` now exist; onboarding, registration, and bundle publish all genuinely complete,
   reaching a live, connected `Screen::Main` — confirmed live via a PTY-driven `meridian tui` run). Two
   distinct defects still blocked the rest of the demo, both found/reconfirmed by 4.38's own live re-run:
-  **(1) Defect B, still open** — the already-flagged file-backed-account gap (4.37's own Status section:
-  `worker.rs::open_account_store` fails closed for a passphrase-keyfile account) — reproduced live for
-  the first time: a file-backed account reaches `Screen::Main` and then fails, with the exact predicted
-  message, the moment it tries to add a contact; tracked by [4.40](./4.40-file-backed-live-session-store.md),
-  not yet started. **(2) Defect A, closed by [4.39](./4.39-prekey-bundle-republish.md)** — a
+  **(1) Defect B, closed by [4.40](./4.40-file-backed-live-session-store.md)** — the already-flagged
+  file-backed-account gap (4.37's own Status section: `worker.rs::open_account_store` fails closed for a
+  passphrase-keyfile account) — reproduced live for the first time by 4.38: a file-backed account
+  reaches `Screen::Main` and then fails, with the exact predicted message, the moment it tries to add a
+  contact. 4.40 closed this via a new, `StoreKind::File`-only `OnboardingSession::live_store` cache —
+  populated once by `handle_unlock`'s success path, consulted by `open_account_store`'s `StoreKind::File`
+  branch on every later contacts/trust/chat dispatch instead of failing closed — see that task's own
+  Status section for the architect + security-reviewer consult that cleared the design and the exact
+  shape landed. **(2) Defect A, closed by [4.39](./4.39-prekey-bundle-republish.md)** — a
   **newly-discovered** defect, found by 4.38's own new two-process regression test
   (`apps/tui/tests/live_session_e2e.rs`): no code path in `meridian-tui` ever republished a prekey bundle
   with its secret scalars persisted into `sessions.bin`'s `PrekeyVault` (`Effect::PublishBundle` fired

@@ -92,6 +92,40 @@ const OS_KEYSTORE_SERVICE: &str = "meridian";
 #[derive(Default)]
 pub struct OnboardingSession {
     pending: Option<PendingConnection>,
+    /// **Task 4.40** (closing task 4.38's Defect B): the already-unwrapped `SecretStore`/`KeyHandle`
+    /// pair for a **file-backed** account's live session, populated exactly once — by
+    /// [`handle_unlock`]'s own success path — and read thereafter by every contacts/trust/chat
+    /// handler's [`open_account_store`] call. See that function's own doc comment for the full
+    /// design and the `inbound_handoff`/`run_inbound_loop` (task 4.35) security precedent this
+    /// generalizes; see this task's own Status section (`docs/tasks/phase-4/
+    /// 4.40-file-backed-live-session-store.md`) for the architect + security-reviewer consult that
+    /// cleared extending this process's key-material residency to the whole session lifetime.
+    ///
+    /// **Deliberately a distinct field from `pending`** (binding modification 1 of that consult):
+    /// `pending`'s own invalidation is retry-driven (a fresh `Register` overwrites it; a *successful*
+    /// `PublishBundle` removes it — see [`PendingConnection`]'s own doc comment), while this field is
+    /// populate-once-and-keep-forever for the rest of the process's life. Folding the two together
+    /// would blur two genuinely different lifecycles into one shared invalidation rule that fits
+    /// neither.
+    ///
+    /// **`StoreKind::File`-only** (binding modification 3): the OS-keystore path never reads or
+    /// writes this field — see [`open_account_store`]'s own doc comment for why (already cheap to
+    /// re-derive per dispatch, so there is no residency cost worth caching away there).
+    ///
+    /// **Single-writer discipline** (binding modification 2): only [`handle_unlock`]'s success path
+    /// ever calls [`OnboardingSession::set_live_store`]; every other handler in this module only
+    /// ever reads it, via [`OnboardingSession::live_store`].
+    ///
+    /// **Known duplication, named on purpose, not fixed here** (binding modification 5): once this
+    /// is populated, a live file-backed session holds *two* independent `FileSecretStore` instances
+    /// resident in this one process — this one, and a second, separately-constructed one inside
+    /// [`run_inbound_loop`]'s own [`InboundHandoff`] (built by [`inbound_handoff`], from the very
+    /// same `UnlockRequest`, task 4.35). Not a new exposure class (same process, same trust
+    /// boundary — see this task's Status section), but a future reader should not assume there is
+    /// only one copy of the passphrase-derived key material resident. `TODO: confirm`: unifying the
+    /// two (e.g. behind one shared `Arc<dyn SecretStore>`) is a larger refactor than this task's own
+    /// scope — left for a future task to decide, not implemented here.
+    live_store: Option<(Box<dyn SecretStore>, KeyHandle)>,
 }
 
 struct PendingConnection {
@@ -101,6 +135,40 @@ struct PendingConnection {
     /// [`handle_publish_bundle`] does not pay a second, redundant scrypt unwrap for the same
     /// passphrase keyfile — see [`open_store_for_bulk_signing`]'s own doc comment.
     store: Box<dyn SecretStore>,
+}
+
+impl std::fmt::Debug for OnboardingSession {
+    /// Hand-rolled, same reason and same shape as [`crate::session::LiveSession`]'s own `Debug`
+    /// impl: both `pending`'s [`PendingConnection::store`] and this struct's own `live_store` hold
+    /// live, passphrase-derived key material behind `Box<dyn SecretStore>`, which has no `Debug`
+    /// supertrait to derive through at all — `#[derive(Debug)]` on this struct would not compile
+    /// (a compile-time guarantee that a naive derive can never leak the store's contents, not just
+    /// discipline). This hand-rolled impl exists only so the struct can be `{:?}`-formatted at all
+    /// (e.g. in a future diagnostic log line) without ever reaching into either store field for
+    /// real — both are shown as a fixed, static redaction marker, never the store's own state.
+    /// [`worker::tests::onboarding_session_debug_never_leaks_the_live_store`] (task 4.40, binding
+    /// modification 6) pins this down with a real assertion, mirroring `LiveSession`'s own
+    /// `debug_never_leaks_chat_session_internals` test exactly.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnboardingSession")
+            .field(
+                "pending",
+                &self.pending.as_ref().map(|p| {
+                    format!(
+                        "PendingConnection {{ account_pub: {}, store: <redacted> }}",
+                        hex::encode(p.account_pub)
+                    )
+                }),
+            )
+            .field(
+                "live_store",
+                &self
+                    .live_store
+                    .as_ref()
+                    .map(|_| "<redacted: file-backed live-session SecretStore/KeyHandle>"),
+            )
+            .finish()
+    }
 }
 
 impl OnboardingSession {
@@ -115,6 +183,29 @@ impl OnboardingSession {
             client,
             store,
         });
+    }
+
+    /// **Task 4.40, binding modification 2 (single-writer discipline):** the *only* place in this
+    /// module that ever populates [`OnboardingSession::live_store`] — called exactly once, from
+    /// [`handle_unlock`]'s own success path, for a `StoreKind::File` account only (guaranteed by
+    /// [`run_unlock`]'s own guard, which rejects an OS-keystore `account.json` before this is ever
+    /// reached). Every other handler in this module only ever reads the cache back via
+    /// [`OnboardingSession::live_store`] — never writes it.
+    fn set_live_store(&mut self, store: Box<dyn SecretStore>, handle: KeyHandle) {
+        self.live_store = Some((store, handle));
+    }
+
+    /// **Task 4.40, binding modification 4:** borrows (never consumes) the cached file-backed
+    /// store/handle populated at `Unlock` time, if any — the read half every contacts/trust/chat
+    /// handler's [`open_account_store`] call goes through. `None` when no file-backed account has
+    /// ever successfully unlocked in this session yet (e.g. an OS-keystore session, which never
+    /// populates this field at all, or a stray dispatch that somehow raced ahead of a successful
+    /// `Unlock` — should not happen through ordinary navigation, since `Screen::Main` is
+    /// unreachable without one, but this accessor does not assume that invariant holds elsewhere).
+    fn live_store(&self) -> Option<(&dyn SecretStore, &KeyHandle)> {
+        self.live_store
+            .as_ref()
+            .map(|(store, handle)| (store.as_ref(), handle))
     }
 
     /// Borrows (never consumes) the cached client + store for `account_pub`, so a fallible operation
@@ -154,23 +245,30 @@ pub async fn dispatch(effect: Effect, session: &mut OnboardingSession) -> Worker
         Effect::GenerateAccount(e) => handle_generate_account(e).await,
         Effect::Register(request) => handle_register(request, session).await,
         Effect::PublishBundle(e) => handle_publish_bundle(e, session).await,
-        Effect::Unlock(effect) => handle_unlock(*effect).await,
+        Effect::Unlock(effect) => handle_unlock(*effect, session).await,
         Effect::LoadSession(effect) => handle_load_session(effect).await,
-        // Task 4.31: contacts / contact-detail persistence.
-        Effect::AddContact(effect) => handle_add_contact(effect).await,
+        // Task 4.31: contacts / contact-detail persistence. Each of these (task 4.40) now also
+        // reads `session`'s file-backed live-store cache via `open_account_store` — see
+        // `OnboardingSession::live_store`'s own doc comment. `session: &mut OnboardingSession` is
+        // implicitly reborrowed as `&OnboardingSession` here (a standard coercion at a function-call
+        // argument site): none of these twelve handlers ever need to *write* the cache, only
+        // `handle_unlock` above does.
+        Effect::AddContact(effect) => handle_add_contact(effect, session).await,
         Effect::ImportContactQr(effect) => handle_import_contact_qr(effect).await,
-        Effect::SetPetname(effect) => handle_set_petname(effect).await,
-        Effect::SetUserBlocked(effect) => handle_set_user_blocked(effect).await,
-        Effect::SetPolicyOverride(effect) => handle_set_policy_override(effect).await,
-        Effect::DeleteContact(effect) => handle_delete_contact(effect).await,
+        Effect::SetPetname(effect) => handle_set_petname(effect, session).await,
+        Effect::SetUserBlocked(effect) => handle_set_user_blocked(effect, session).await,
+        Effect::SetPolicyOverride(effect) => handle_set_policy_override(effect, session).await,
+        Effect::DeleteContact(effect) => handle_delete_contact(effect, session).await,
         // Task 4.32: message-request-queue / verify-screen trust persistence.
-        Effect::AcceptRequest(effect) => handle_accept_request(effect).await,
-        Effect::RejectRequest(effect) => handle_reject_request(effect).await,
-        Effect::MarkVerified(effect) => handle_mark_verified(effect).await,
-        Effect::AcknowledgeKeyChange(effect) => handle_acknowledge_key_change(effect).await,
+        Effect::AcceptRequest(effect) => handle_accept_request(effect, session).await,
+        Effect::RejectRequest(effect) => handle_reject_request(effect, session).await,
+        Effect::MarkVerified(effect) => handle_mark_verified(effect, session).await,
+        Effect::AcknowledgeKeyChange(effect) => {
+            handle_acknowledge_key_change(effect, session).await
+        }
         // Task 4.33: outbound chat (the send half of the T17 demo's "both sides chat" step).
-        Effect::SendMessage(effect) => handle_send_message(effect).await,
-        Effect::PersistHistory(effect) => handle_persist_history(effect).await,
+        Effect::SendMessage(effect) => handle_send_message(effect, session).await,
+        Effect::PersistHistory(effect) => handle_persist_history(effect, session).await,
         // Task 4.34: settings write-back / diagnostics — both already-built, already-reviewed
         // functions (`crate::config_write::write_setting_at` from task 4.24,
         // `crate::screens::diagnostics::run_doctor_binary` from task 4.25); this task is purely
@@ -399,13 +497,22 @@ async fn handle_publish_bundle(
 /// path, just against a [`FileSecretStore`] instead of an [`OsSecretStore`]. Both the passphrase
 /// verification *and* the session load happen in this one dispatch, never split across two effect
 /// round trips — see [`UnlockEffect`]'s own doc comment for why.
-async fn handle_unlock(effect: UnlockEffect) -> WorkerEvent {
+///
+/// **Task 4.40 (binding modification 2 — single-writer discipline):** on success, this is the one
+/// and only place in this module that ever calls [`OnboardingSession::set_live_store`], caching the
+/// exact `FileSecretStore`/`KeyHandle` pair [`run_unlock`] just built and verified so every
+/// contacts/trust/chat handler's later [`open_account_store`] call can borrow it back instead of
+/// failing closed — see that function's own doc comment for the full design.
+async fn handle_unlock(effect: UnlockEffect, session: &mut OnboardingSession) -> WorkerEvent {
     let UnlockEffect { request, .. } = effect;
     match run_unlock(&request) {
-        Ok(session) => WorkerEvent::Completed(Effect::Unlock(Box::new(UnlockEffect {
-            request,
-            outcome: SessionOutcome::ready(session),
-        }))),
+        Ok((live_session, store, handle)) => {
+            session.set_live_store(store, handle);
+            WorkerEvent::Completed(Effect::Unlock(Box::new(UnlockEffect {
+                request,
+                outcome: SessionOutcome::ready(live_session),
+            })))
+        }
         Err(message) => WorkerEvent::Failed(
             Effect::Unlock(Box::new(UnlockEffect {
                 request,
@@ -416,7 +523,13 @@ async fn handle_unlock(effect: UnlockEffect) -> WorkerEvent {
     }
 }
 
-fn run_unlock(request: &UnlockRequest) -> Result<LiveSession, String> {
+/// Returns the loaded [`LiveSession`] alongside the already-unwrapped `store`/`handle` pair that
+/// loaded it — task 4.40 widened this return shape (previously just `Result<LiveSession, String>`)
+/// so [`handle_unlock`] can cache that exact pair on [`OnboardingSession`] without paying a second,
+/// redundant passphrase unwrap to reconstruct it.
+fn run_unlock(
+    request: &UnlockRequest,
+) -> Result<(LiveSession, Box<dyn SecretStore>, KeyHandle), String> {
     // Review fix (task 4.29, Finding 4): the symmetric guard to `run_load_session`'s own
     // `StoreKind::File => Err(...)` arm below — checked first, and against the real on-disk
     // `account.json`, not the caller-supplied keyfile, so an OS-keystore account is rejected with a
@@ -424,7 +537,8 @@ fn run_unlock(request: &UnlockRequest) -> Result<LiveSession, String> {
     // this guard, misusing `Effect::Unlock` on an OS-keystore account still fails closed today (an
     // AEAD failure against the wrong/nonexistent keyfile, never a silent success or wrong-account
     // leak), but with a confusing "corrupt trust.bin"-shaped error instead of a message that actually
-    // names the fix.
+    // names the fix. It also guarantees (task 4.40) that `OnboardingSession::set_live_store` is only
+    // ever reached for a genuinely `StoreKind::File` account.
     let descriptor = AccountDescriptor::load()?;
     if descriptor.store != StoreKind::File {
         return Err(
@@ -438,7 +552,8 @@ fn run_unlock(request: &UnlockRequest) -> Result<LiveSession, String> {
     // surface as *that*, not as a confusing "corrupt trust.bin" error from the loads below.
     fs.export_seed().map_err(|e| e.to_string())?;
     let handle = KeyHandle::from_label(&descriptor.label);
-    load_live_session(descriptor, &fs, &handle)
+    let live_session = load_live_session(descriptor, &fs, &handle)?;
+    Ok((live_session, Box::new(fs), handle))
 }
 
 // ---------------------------------------------------------------------------
@@ -512,29 +627,68 @@ fn run_load_session() -> Result<LoadSessionOutcome, String> {
 // calls, unlike `OnboardingSession`).
 // ---------------------------------------------------------------------------
 
-/// Resolves the `SecretStore`/`KeyHandle` pair every handler below needs, fresh from the real,
+/// Either a freshly-constructed, owned `SecretStore` (the `StoreKind::Os` branch — nothing to
+/// borrow from, since it is rebuilt fresh on every call) or a borrow into
+/// [`OnboardingSession::live_store`] (the `StoreKind::File` branch — task 4.40). [`open_account_store`]
+/// returns one of these rather than a bare `(Box<dyn SecretStore>, KeyHandle)` precisely so the
+/// file-backed branch can hand back **borrowed** data (binding modification 4 of this task's own
+/// consult) instead of forcing every caller to either move the cached store out of `session` (which
+/// would leave a *later* dispatch with nothing cached at all) or pay a fresh, redundant unwrap just
+/// to hand back an owned copy.
+enum AccountStore<'a> {
+    Owned(Box<dyn SecretStore>, KeyHandle),
+    Cached(&'a dyn SecretStore, &'a KeyHandle),
+}
+
+impl AccountStore<'_> {
+    /// The one thing every call site actually wants: a borrowed `(&dyn SecretStore, &KeyHandle)`
+    /// pair, regardless of which branch produced it.
+    fn parts(&self) -> (&dyn SecretStore, &KeyHandle) {
+        match self {
+            AccountStore::Owned(store, handle) => (store.as_ref(), handle),
+            AccountStore::Cached(store, handle) => (*store, *handle),
+        }
+    }
+}
+
+/// Resolves the `SecretStore`/`KeyHandle` pair every handler below needs, from the real,
 /// already-onboarded `account.json` — never from a request field (none of
 /// [`AddContactRequest`]/[`SetPetnameRequest`]/[`SetUserBlockedRequest`]/
 /// [`SetPolicyOverrideRequest`]/[`DeleteContactRequest`]/[`SendMessageRequest`]/
-/// [`PersistHistoryRequest`] carries one; see `crate::app`'s own doc comments on each).
+/// [`PersistHistoryRequest`] carries one; see `crate::app`'s own doc comments on each), plus
+/// `session`'s own file-backed live-store cache (task 4.40).
 ///
-/// **`StoreKind::Os` only, today.** Mirrors [`run_load_session`]'s own `StoreKind::Os` branch
-/// exactly (`init_os_keystore` -> `OsSecretStore::new(service)` -> `KeyHandle::from_label`) — the
-/// OS keystore needs no additional secret from this call site, so a fresh [`OsSecretStore`] can be
-/// (re-)constructed on every single effect dispatch with no state carried between them, exactly
-/// this task's own "single, complete disk round-trip" scope.
+/// **`StoreKind::Os`.** Mirrors [`run_load_session`]'s own `StoreKind::Os` branch exactly
+/// (`init_os_keystore` -> `OsSecretStore::new(service)` -> `KeyHandle::from_label`) — the OS
+/// keystore needs no additional secret from this call site, so a fresh [`OsSecretStore`] is
+/// (re-)constructed on every single effect dispatch with no state carried between them: cheap (no
+/// KDF, no passphrase to hold onto), so — per this task's own binding modification 3 — there is no
+/// residency cost worth caching away here, and this branch stays byte-for-byte unchanged from
+/// before task 4.40.
 ///
-/// **`StoreKind::File` fails closed here**, with a message naming the real gap rather than
-/// attempting (and failing more confusingly) a `FileSecretStore` operation with no passphrase:
-/// unlike [`run_unlock`], none of this module's six contacts-group requests carry one, and unlike
-/// [`OnboardingSession`], `crate::app::App` has no `Option<LiveSession>` field yet to have cached
-/// an already-unwrapped store in from a prior `Effect::Unlock` — [`crate::session::LiveSession`]'s
-/// own module doc names this exact "known gap" (`App` discarding the `LiveSession` a successful
-/// file-backed `Effect::Unlock` already builds) and defers wiring it to a later task (4.36/4.37).
-/// `TODO: confirm`: once that wiring lands, this function (or its caller) is the natural place to
-/// thread the already-unlocked store through instead of re-deriving one per effect for the
-/// file-backed case — not invented here, since no design doc this task read specifies it.
-fn open_account_store() -> Result<(Box<dyn SecretStore>, KeyHandle), String> {
+/// **`StoreKind::File`.** Task 4.40, closing the gap this function's own doc comment used to name
+/// as an open `TODO: confirm` (first flagged by task 4.37's own review, reproduced live end to end
+/// by task 4.38's Defect B): borrows the already-unwrapped store/handle
+/// [`handle_unlock`]'s success path cached on `session.live_store` the moment this account's
+/// passphrase was last verified, rather than re-deriving one (which this branch has no passphrase
+/// in scope to do — none of this module's contacts/trust/chat requests carry one; see the doc
+/// comments this paragraph opened with). Fails closed, with a message naming the real gap, only
+/// when nothing is cached yet — an OS-keystore session (which never populates this field at all) or
+/// a dispatch that somehow reached a contacts/trust/chat effect before any successful `Unlock` in
+/// this process (should not happen through ordinary navigation, since `Screen::Main` is
+/// unreachable without one).
+///
+/// **Security rationale for resident, already-unwrapped key material for the rest of the process's
+/// life:** not a new residency extension — task 4.40's own architect + security-reviewer consult
+/// (this task's own Status section, `docs/tasks/phase-4/4.40-file-backed-live-session-store.md`)
+/// found this pattern was already shipped and already accepted: [`run_inbound_loop`]'s own
+/// [`InboundHandoff`] (built by [`inbound_handoff`], task 4.35) already constructs an independent,
+/// passphrase-holding `FileSecretStore` for every file-backed account that reaches `Screen::Main`
+/// and keeps it resident, unconditionally, for the rest of the process's life. This cache is a
+/// second, narrower, better-scoped occurrence of that same pattern — not a wholly new exposure
+/// class (see `OnboardingSession::live_store`'s own doc comment for the resulting, deliberately
+/// named two-copies duplication).
+fn open_account_store(session: &OnboardingSession) -> Result<AccountStore<'_>, String> {
     let descriptor = AccountDescriptor::load()?;
     match descriptor.store {
         StoreKind::Os => {
@@ -544,14 +698,19 @@ fn open_account_store() -> Result<(Box<dyn SecretStore>, KeyHandle), String> {
                 .clone()
                 .unwrap_or_else(|| OS_KEYSTORE_SERVICE.to_string());
             let handle = KeyHandle::from_label(&descriptor.label);
-            Ok((Box::new(OsSecretStore::new(&service)), handle))
+            Ok(AccountStore::Owned(
+                Box::new(OsSecretStore::new(&service)),
+                handle,
+            ))
         }
-        StoreKind::File => Err(
-            "this account is passphrase-protected — this action from a live TUI session isn't \
-             supported yet for file-backed accounts (no cached, already-unlocked store to reuse); \
-             use the CLI instead"
-                .to_string(),
-        ),
+        StoreKind::File => session
+            .live_store()
+            .map(|(store, handle)| AccountStore::Cached(store, handle))
+            .ok_or_else(|| {
+                "this account is passphrase-protected and has not been unlocked in this session \
+                 yet — send Effect::Unlock first"
+                    .to_string()
+            }),
     }
 }
 
@@ -662,9 +821,9 @@ fn upsert_contact_record(doc: &mut ContactsDocument, id: &str, contact: &Contact
 
 // --- AddContact --------------------------------------------------------------------------------
 
-async fn handle_add_contact(effect: AddContactEffect) -> WorkerEvent {
+async fn handle_add_contact(effect: AddContactEffect, session: &OnboardingSession) -> WorkerEvent {
     let AddContactEffect { request, .. } = effect;
-    match run_add_contact(&request) {
+    match run_add_contact(&request, session) {
         Ok(added) => WorkerEvent::Completed(Effect::AddContact(AddContactEffect {
             request,
             outcome: Some(added),
@@ -685,11 +844,15 @@ async fn handle_add_contact(effect: AddContactEffect) -> WorkerEvent {
 /// `crate::app`). [`AddedContact`] is built from the real post-mutation [`Contact`] read back via
 /// `TrustStore::contact`, never an assumed fresh-TOFU shape — the task 4.19 Finding 1 fix
 /// [`AddedContact`]'s own doc comment requires.
-fn run_add_contact(request: &AddContactRequest) -> Result<AddedContact, String> {
-    let (store, handle) = open_account_store()?;
+fn run_add_contact(
+    request: &AddContactRequest,
+    session: &OnboardingSession,
+) -> Result<AddedContact, String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
     let now = now_unix();
 
-    let mut trust = load_trust(store.as_ref(), &handle)?;
+    let mut trust = load_trust(store, handle)?;
     trust.observe(request.pubkey, &request.hint, now);
     if let Some(petname) = request.petname.clone() {
         trust
@@ -700,12 +863,12 @@ fn run_add_contact(request: &AddContactRequest) -> Result<AddedContact, String> 
         .contact(&request.pubkey)
         .cloned()
         .expect("just observed above — always present");
-    save_trust(&trust, store.as_ref(), &handle)?;
+    save_trust(&trust, store, handle)?;
 
-    let mut doc = crate::store::contacts::load_or_default(store.as_ref(), &handle)
-        .map_err(|e| e.to_string())?;
+    let mut doc =
+        crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
     upsert_contact_record(&mut doc, &request.id, &contact, now);
-    crate::store::contacts::save(&doc, store.as_ref(), &handle).map_err(|e| e.to_string())?;
+    crate::store::contacts::save(&doc, store, handle).map_err(|e| e.to_string())?;
 
     Ok(AddedContact {
         pubkey: request.pubkey,
@@ -752,9 +915,9 @@ fn run_import_contact_qr(request: &ImportContactQrRequest) -> Result<String, Str
 
 // --- SetPetname ----------------------------------------------------------------------------------
 
-async fn handle_set_petname(effect: SetPetnameEffect) -> WorkerEvent {
+async fn handle_set_petname(effect: SetPetnameEffect, session: &OnboardingSession) -> WorkerEvent {
     let SetPetnameEffect { request, .. } = effect;
-    match run_set_petname(&request) {
+    match run_set_petname(&request, session) {
         Ok(()) => WorkerEvent::Completed(Effect::SetPetname(SetPetnameEffect {
             request,
             outcome: Some(()),
@@ -772,10 +935,11 @@ async fn handle_set_petname(effect: SetPetnameEffect) -> WorkerEvent {
 /// Mirrors `apps/cli/src/contact.rs::cmd_rename`'s write path: `TrustStore::set_petname`, then the
 /// matching `contacts.json` `ContactRecord.petname` — both writes, per [`SetPetnameEffect`]'s own
 /// doc comment in `crate::app`, unlike [`SetUserBlockedEffect`] (`trust.bin` only).
-fn run_set_petname(request: &SetPetnameRequest) -> Result<(), String> {
-    let (store, handle) = open_account_store()?;
+fn run_set_petname(request: &SetPetnameRequest, session: &OnboardingSession) -> Result<(), String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
 
-    let mut trust = load_trust(store.as_ref(), &handle)?;
+    let mut trust = load_trust(store, handle)?;
     trust
         .set_petname(&request.pubkey, request.petname.clone())
         .map_err(|e| e.to_string())?;
@@ -784,23 +948,26 @@ fn run_set_petname(request: &SetPetnameRequest) -> Result<(), String> {
         .expect("set_petname succeeded — contact exists")
         .petname
         .clone();
-    save_trust(&trust, store.as_ref(), &handle)?;
+    save_trust(&trust, store, handle)?;
 
-    let mut doc = crate::store::contacts::load_or_default(store.as_ref(), &handle)
-        .map_err(|e| e.to_string())?;
+    let mut doc =
+        crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
     let pubkey_hex = hex::encode(request.pubkey);
     if let Some(record) = doc.contacts.iter_mut().find(|c| c.pubkey == pubkey_hex) {
         record.petname = petname;
-        crate::store::contacts::save(&doc, store.as_ref(), &handle).map_err(|e| e.to_string())?;
+        crate::store::contacts::save(&doc, store, handle).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
 // --- SetUserBlocked --------------------------------------------------------------------------------
 
-async fn handle_set_user_blocked(effect: SetUserBlockedEffect) -> WorkerEvent {
+async fn handle_set_user_blocked(
+    effect: SetUserBlockedEffect,
+    session: &OnboardingSession,
+) -> WorkerEvent {
     let SetUserBlockedEffect { request, .. } = effect;
-    match run_set_user_blocked(&request) {
+    match run_set_user_blocked(&request, session) {
         Ok(()) => WorkerEvent::Completed(Effect::SetUserBlocked(SetUserBlockedEffect {
             request,
             outcome: Some(()),
@@ -819,20 +986,27 @@ async fn handle_set_user_blocked(effect: SetUserBlockedEffect) -> WorkerEvent {
 /// — deliberately never mirrored into `contacts.json` (see [`SetUserBlockedEffect`]'s own doc
 /// comment in `crate::app`: that document's `TrustLabel` enum has no field for a user-initiated
 /// block).
-fn run_set_user_blocked(request: &SetUserBlockedRequest) -> Result<(), String> {
-    let (store, handle) = open_account_store()?;
-    let mut trust = load_trust(store.as_ref(), &handle)?;
+fn run_set_user_blocked(
+    request: &SetUserBlockedRequest,
+    session: &OnboardingSession,
+) -> Result<(), String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
+    let mut trust = load_trust(store, handle)?;
     trust
         .set_user_blocked(&request.pubkey, request.blocked)
         .map_err(|e| e.to_string())?;
-    save_trust(&trust, store.as_ref(), &handle)
+    save_trust(&trust, store, handle)
 }
 
 // --- SetPolicyOverride -----------------------------------------------------------------------------
 
-async fn handle_set_policy_override(effect: SetPolicyOverrideEffect) -> WorkerEvent {
+async fn handle_set_policy_override(
+    effect: SetPolicyOverrideEffect,
+    session: &OnboardingSession,
+) -> WorkerEvent {
     let SetPolicyOverrideEffect { request, .. } = effect;
-    match run_set_policy_override(&request) {
+    match run_set_policy_override(&request, session) {
         Ok(()) => WorkerEvent::Completed(Effect::SetPolicyOverride(SetPolicyOverrideEffect {
             request,
             outcome: Some(()),
@@ -849,10 +1023,14 @@ async fn handle_set_policy_override(effect: SetPolicyOverrideEffect) -> WorkerEv
 
 /// Writes only `contacts.json`'s `ContactRecord.policy_override` — `TrustStore` has no concept of
 /// relay policy at all, per [`SetPolicyOverrideEffect`]'s own doc comment in `crate::app`.
-fn run_set_policy_override(request: &SetPolicyOverrideRequest) -> Result<(), String> {
-    let (store, handle) = open_account_store()?;
-    let mut doc = crate::store::contacts::load_or_default(store.as_ref(), &handle)
-        .map_err(|e| e.to_string())?;
+fn run_set_policy_override(
+    request: &SetPolicyOverrideRequest,
+    session: &OnboardingSession,
+) -> Result<(), String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
+    let mut doc =
+        crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
     let pubkey_hex = hex::encode(request.pubkey);
     let record = doc
         .contacts
@@ -860,14 +1038,17 @@ fn run_set_policy_override(request: &SetPolicyOverrideRequest) -> Result<(), Str
         .find(|c| c.pubkey == pubkey_hex)
         .ok_or_else(|| "no contact recorded for this pubkey — add it first".to_string())?;
     record.policy_override = request.policy_override;
-    crate::store::contacts::save(&doc, store.as_ref(), &handle).map_err(|e| e.to_string())
+    crate::store::contacts::save(&doc, store, handle).map_err(|e| e.to_string())
 }
 
 // --- DeleteContact ---------------------------------------------------------------------------------
 
-async fn handle_delete_contact(effect: DeleteContactEffect) -> WorkerEvent {
+async fn handle_delete_contact(
+    effect: DeleteContactEffect,
+    session: &OnboardingSession,
+) -> WorkerEvent {
     let DeleteContactEffect { request, .. } = effect;
-    match run_delete_contact(&request) {
+    match run_delete_contact(&request, session) {
         Ok(()) => WorkerEvent::Completed(Effect::DeleteContact(DeleteContactEffect {
             request,
             outcome: Some(()),
@@ -887,13 +1068,17 @@ async fn handle_delete_contact(effect: DeleteContactEffect) -> WorkerEvent {
 /// judgment call: no core primitive exists to forget TOFU pinned-key history, by design). Deleting
 /// an already-absent row is a no-op, not an error — idempotent, matching "delete" being a
 /// lower-stakes, purely-local list-membership action.
-fn run_delete_contact(request: &DeleteContactRequest) -> Result<(), String> {
-    let (store, handle) = open_account_store()?;
-    let mut doc = crate::store::contacts::load_or_default(store.as_ref(), &handle)
-        .map_err(|e| e.to_string())?;
+fn run_delete_contact(
+    request: &DeleteContactRequest,
+    session: &OnboardingSession,
+) -> Result<(), String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
+    let mut doc =
+        crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
     let pubkey_hex = hex::encode(request.pubkey);
     doc.contacts.retain(|c| c.pubkey != pubkey_hex);
-    crate::store::contacts::save(&doc, store.as_ref(), &handle).map_err(|e| e.to_string())
+    crate::store::contacts::save(&doc, store, handle).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -916,9 +1101,12 @@ fn run_delete_contact(request: &DeleteContactRequest) -> Result<(), String> {
 
 // --- AcceptRequest -------------------------------------------------------------------------------
 
-async fn handle_accept_request(effect: AcceptRequestEffect) -> WorkerEvent {
+async fn handle_accept_request(
+    effect: AcceptRequestEffect,
+    session: &OnboardingSession,
+) -> WorkerEvent {
     let AcceptRequestEffect { request, .. } = effect;
-    match run_accept_request(&request).await {
+    match run_accept_request(&request, session).await {
         Ok(()) => WorkerEvent::Completed(Effect::AcceptRequest(AcceptRequestEffect {
             request,
             outcome: Some(()),
@@ -975,29 +1163,36 @@ async fn handle_accept_request(effect: AcceptRequestEffect) -> WorkerEvent {
 /// same as [`run_reject_request`]/[`run_send_message`] — see that function's own doc comment for why
 /// (`sessions.bin` is a single serialized document covering every peer's session, and the persistent
 /// inbound receive loop touches the same file concurrently on its own tokio task).
-async fn run_accept_request(request: &AcceptRequestRequest) -> Result<(), String> {
-    let (store, handle) = open_account_store()?;
+async fn run_accept_request(
+    request: &AcceptRequestRequest,
+    session: &OnboardingSession,
+) -> Result<(), String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
     let _chat_guard = chat_state_lock().lock().await;
 
-    let mut chat = load_chat(store.as_ref(), &handle)?;
+    let mut chat = load_chat(store, handle)?;
     let accepted = chat.accept_request(&request.sender_ik).is_some();
     let has_session = chat.has_session(&request.sender_ik);
-    save_chat(&chat, store.as_ref(), &handle)?;
+    save_chat(&chat, store, handle)?;
 
-    let mut trust = load_trust(store.as_ref(), &handle)?;
+    let mut trust = load_trust(store, handle)?;
     let pin_still_owed = has_session && trust.contact(&request.sender_ik).is_none();
     if accepted || pin_still_owed {
         trust.observe(request.sender_ik, "", now_unix());
-        save_trust(&trust, store.as_ref(), &handle)?;
+        save_trust(&trust, store, handle)?;
     }
     Ok(())
 }
 
 // --- RejectRequest -------------------------------------------------------------------------------
 
-async fn handle_reject_request(effect: RejectRequestEffect) -> WorkerEvent {
+async fn handle_reject_request(
+    effect: RejectRequestEffect,
+    session: &OnboardingSession,
+) -> WorkerEvent {
     let RejectRequestEffect { request, .. } = effect;
-    match run_reject_request(&request).await {
+    match run_reject_request(&request, session).await {
         Ok(()) => WorkerEvent::Completed(Effect::RejectRequest(RejectRequestEffect {
             request,
             outcome: Some(()),
@@ -1024,19 +1219,26 @@ async fn handle_reject_request(effect: RejectRequestEffect) -> WorkerEvent {
 ///
 /// **Task 4.35:** holds [`chat_state_lock`] for the whole load-mutate-save sequence — see
 /// [`run_accept_request`]'s own doc comment for why.
-async fn run_reject_request(request: &RejectRequestRequest) -> Result<(), String> {
-    let (store, handle) = open_account_store()?;
+async fn run_reject_request(
+    request: &RejectRequestRequest,
+    session: &OnboardingSession,
+) -> Result<(), String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
     let _chat_guard = chat_state_lock().lock().await;
-    let mut chat = load_chat(store.as_ref(), &handle)?;
+    let mut chat = load_chat(store, handle)?;
     chat.reject_request(&request.sender_ik);
-    save_chat(&chat, store.as_ref(), &handle)
+    save_chat(&chat, store, handle)
 }
 
 // --- MarkVerified --------------------------------------------------------------------------------
 
-async fn handle_mark_verified(effect: MarkVerifiedEffect) -> WorkerEvent {
+async fn handle_mark_verified(
+    effect: MarkVerifiedEffect,
+    session: &OnboardingSession,
+) -> WorkerEvent {
     let MarkVerifiedEffect { request, .. } = effect;
-    match run_mark_verified(&request) {
+    match run_mark_verified(&request, session) {
         Ok(()) => WorkerEvent::Completed(Effect::MarkVerified(MarkVerifiedEffect {
             request,
             outcome: Some(()),
@@ -1057,20 +1259,27 @@ async fn handle_mark_verified(effect: MarkVerifiedEffect) -> WorkerEvent {
 /// screen dispatched this effect). Faithfully propagates [`TrustError::UnknownContact`] (e.g. a
 /// concurrently-deleted contact) as a real [`WorkerEvent::Failed`], never swallowed into a silent
 /// success.
-fn run_mark_verified(request: &MarkVerifiedRequest) -> Result<(), String> {
-    let (store, handle) = open_account_store()?;
-    let mut trust = load_trust(store.as_ref(), &handle)?;
+fn run_mark_verified(
+    request: &MarkVerifiedRequest,
+    session: &OnboardingSession,
+) -> Result<(), String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
+    let mut trust = load_trust(store, handle)?;
     trust
         .mark_verified(&request.pubkey)
         .map_err(|e| e.to_string())?;
-    save_trust(&trust, store.as_ref(), &handle)
+    save_trust(&trust, store, handle)
 }
 
 // --- AcknowledgeKeyChange -------------------------------------------------------------------------
 
-async fn handle_acknowledge_key_change(effect: AcknowledgeKeyChangeEffect) -> WorkerEvent {
+async fn handle_acknowledge_key_change(
+    effect: AcknowledgeKeyChangeEffect,
+    session: &OnboardingSession,
+) -> WorkerEvent {
     let AcknowledgeKeyChangeEffect { request, .. } = effect;
-    match run_acknowledge_key_change(&request) {
+    match run_acknowledge_key_change(&request, session) {
         Ok(()) => {
             WorkerEvent::Completed(Effect::AcknowledgeKeyChange(AcknowledgeKeyChangeEffect {
                 request,
@@ -1109,14 +1318,18 @@ async fn handle_acknowledge_key_change(effect: AcknowledgeKeyChangeEffect) -> Wo
 /// already-covered "no mutation at all" case (a contact that is not `PinnedKeyChanged` and not under
 /// escalation, e.g. already `Verified`/`Pinned`) still takes no save at all: `trust.bin` stays
 /// byte-for-byte untouched, never even resealed-and-rewritten-identically.
-fn run_acknowledge_key_change(request: &AcknowledgeKeyChangeRequest) -> Result<(), String> {
-    let (store, handle) = open_account_store()?;
-    let mut trust = load_trust(store.as_ref(), &handle)?;
+fn run_acknowledge_key_change(
+    request: &AcknowledgeKeyChangeRequest,
+    session: &OnboardingSession,
+) -> Result<(), String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
+    let mut trust = load_trust(store, handle)?;
     let state_before = trust.contact(&request.pubkey).map(|c| c.state);
     let result = trust.acknowledge_key_change(&request.pubkey);
     let state_after = trust.contact(&request.pubkey).map(|c| c.state);
     if state_before != state_after {
-        save_trust(&trust, store.as_ref(), &handle)?;
+        save_trust(&trust, store, handle)?;
     }
     result.map_err(|e| e.to_string())
 }
@@ -1144,9 +1357,12 @@ fn run_acknowledge_key_change(request: &AcknowledgeKeyChangeRequest) -> Result<(
 // un-softenable key-change UI exists to prevent).
 // ---------------------------------------------------------------------------
 
-async fn handle_send_message(effect: SendMessageEffect) -> WorkerEvent {
+async fn handle_send_message(
+    effect: SendMessageEffect,
+    session: &OnboardingSession,
+) -> WorkerEvent {
     let SendMessageEffect { request, .. } = effect;
-    match run_send_message(&request).await {
+    match run_send_message(&request, session).await {
         Ok(sent) => WorkerEvent::Completed(Effect::SendMessage(SendMessageEffect {
             request,
             outcome: Some(sent),
@@ -1227,8 +1443,12 @@ fn resolve_server(descriptor: &AccountDescriptor) -> Result<String, String> {
 /// whole call is the simplest way to make that impossible without restructuring this already-
 /// reviewed function's control flow; a future task can narrow it if outbound-send/inbound-receive
 /// contention ever becomes a real throughput problem.
-async fn run_send_message(request: &SendMessageRequest) -> Result<SentMessage, String> {
-    let (store, handle) = open_account_store()?;
+async fn run_send_message(
+    request: &SendMessageRequest,
+    session: &OnboardingSession,
+) -> Result<SentMessage, String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
     let _chat_guard = chat_state_lock().lock().await;
     let descriptor = AccountDescriptor::load()?;
     let account_pub = account_pub_bytes(&descriptor)?;
@@ -1237,12 +1457,11 @@ async fn run_send_message(request: &SendMessageRequest) -> Result<SentMessage, S
         meridian_core::identity::to_id_string(&request.peer_pubkey, &request.peer_hint)
             .unwrap_or_else(|_| hex::encode(request.peer_pubkey));
 
-    let mut chat = load_chat(store.as_ref(), &handle)?;
+    let mut chat = load_chat(store, handle)?;
 
-    let mut client =
-        SignalingClient::connect(&server, store.as_ref(), &handle, account_pub, None, 1)
-            .await
-            .map_err(|e| format!("connecting to {server}: {e}"))?;
+    let mut client = SignalingClient::connect(&server, store, handle, account_pub, None, 1)
+        .await
+        .map_err(|e| format!("connecting to {server}: {e}"))?;
 
     // Role decided by key order (mirrors `apps/cli/src/chat.rs::run` exactly), so two peers who
     // both reach out establish exactly one X3DH session rather than racing two. A non-initiator
@@ -1261,23 +1480,23 @@ async fn run_send_message(request: &SendMessageRequest) -> Result<SentMessage, S
         )
         .await?;
         chat.start_initiator_session(
-            store.as_ref(),
-            &handle,
+            store,
+            handle,
             &account_pub,
             &request.peer_pubkey,
             &peer_bundle.spk,
             peer_bundle.otks.first().copied(),
         )
         .map_err(|e| format!("establishing session: {e}"))?;
-        save_chat(&chat, store.as_ref(), &handle)?;
+        save_chat(&chat, store, handle)?;
     }
 
     let mut id = [0u8; 16];
     getrandom::fill(&mut id).map_err(|e| e.to_string())?;
     let blob = chat
         .seal_outbound(
-            store.as_ref(),
-            &handle,
+            store,
+            handle,
             &account_pub,
             &request.peer_pubkey,
             &ChatContent::Text {
@@ -1286,7 +1505,7 @@ async fn run_send_message(request: &SendMessageRequest) -> Result<SentMessage, S
             },
         )
         .map_err(|e| format!("sealing message: {e}"))?;
-    save_chat(&chat, store.as_ref(), &handle)?;
+    save_chat(&chat, store, handle)?;
 
     let delivered = route_tolerant(
         &mut client,
@@ -1423,9 +1642,12 @@ async fn route_tolerant(
 // PersistHistory (task 4.33)
 // ---------------------------------------------------------------------------
 
-async fn handle_persist_history(effect: PersistHistoryEffect) -> WorkerEvent {
+async fn handle_persist_history(
+    effect: PersistHistoryEffect,
+    session: &OnboardingSession,
+) -> WorkerEvent {
     let PersistHistoryEffect { request, .. } = effect;
-    match run_persist_history(&request) {
+    match run_persist_history(&request, session) {
         Ok(()) => WorkerEvent::Completed(Effect::PersistHistory(PersistHistoryEffect {
             request,
             outcome: Some(()),
@@ -1446,10 +1668,14 @@ async fn handle_persist_history(effect: PersistHistoryEffect) -> WorkerEvent {
 /// in `crate::app`). The screen already deduped by `mid` before dispatching this effect
 /// (`crate::screens::chat::insert_deduped`), so this appends unconditionally rather than
 /// re-deriving that decision here.
-fn run_persist_history(request: &PersistHistoryRequest) -> Result<(), String> {
-    let (store, handle) = open_account_store()?;
+fn run_persist_history(
+    request: &PersistHistoryRequest,
+    session: &OnboardingSession,
+) -> Result<(), String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
     let peer_pubkey_hex = hex::encode(request.peer_pubkey);
-    crate::store::history::append(&peer_pubkey_hex, &request.entry, store.as_ref(), &handle)
+    crate::store::history::append(&peer_pubkey_hex, &request.entry, store, handle)
         .map_err(|e| e.to_string())
 }
 
@@ -2119,6 +2345,160 @@ mod tests {
         }
     }
 
+    fn dummy_file_descriptor(keyfile: &Path) -> AccountDescriptor {
+        AccountDescriptor {
+            v: 1,
+            pubkey: "b".repeat(64),
+            hint: "example.org".to_string(),
+            store: StoreKind::File,
+            keyfile: Some(keyfile.to_path_buf()),
+            service: None,
+            label: "b".repeat(64),
+            server: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Task 4.40 — `OnboardingSession::live_store` (binding modifications 6 and 7)
+    // -----------------------------------------------------------------------------------------
+
+    /// Binding modification 6: the host struct (`OnboardingSession`), not just `Box<dyn
+    /// SecretStore>` itself, must never leak the cached store's real contents through `Debug` —
+    /// mirrors `crate::session::LiveSession`'s own `debug_never_leaks_chat_session_internals` test
+    /// exactly, just against the field this task added.
+    #[test]
+    fn onboarding_session_debug_never_leaks_the_live_store() {
+        let store: Box<dyn SecretStore> = Box::new(MemorySecretStore::new());
+        let handle = KeyHandle::from_label("deadbeef");
+        let mut session = OnboardingSession::default();
+        session.set_live_store(store, handle);
+
+        let dump = format!("{session:?}");
+        assert!(dump.contains("redacted"), "dump: {dump}");
+        // Never shows any real `SecretStore` implementor's name/state — only the fixed marker.
+        assert!(!dump.contains("MemorySecretStore"));
+        assert!(!dump.contains("FileSecretStore"));
+    }
+
+    /// A `SecretStore` double whose sole job is proving *how many times it was constructed* — the
+    /// correct proxy (see this test's own doc comment below) for "no second scrypt/age-decrypt",
+    /// binding modification 7's own required negative assertion. Delegates every real trait method
+    /// to a wrapped [`MemorySecretStore`] so a session built around this double can still do real,
+    /// successful sealed-store round trips (`load_trust`/`save_trust`/…) — this is not a stub that
+    /// merely compiles, it is a store the twelve handlers can genuinely operate against.
+    struct CountingStore {
+        inner: MemorySecretStore,
+    }
+
+    impl CountingStore {
+        /// Increments `constructions` once, here, at construction time — mirroring exactly where a
+        /// real `FileSecretStore`'s own one-time passphrase-verification cost
+        /// (`FileSecretStore::export_seed`, called once by [`run_unlock`]) is actually paid in
+        /// production. `use_key`/`derive_key` are deliberately **not** instrumented: real sealed-
+        /// store operations (`seal_at_rest`/`open_at_rest`) call those on *every* dispatch
+        /// regardless of caching — that is expected, unavoidable work, not the regression this test
+        /// exists to catch. Counting constructions is the one observable that actually
+        /// distinguishes "the same cached store object is reused across dispatches" (this task's
+        /// fix) from "a fresh store was silently rebuilt — and its passphrase silently
+        /// re-verified — on every dispatch" (the regression this test rules out).
+        ///
+        /// Takes an already-seeded `inner` (rather than building an empty one) so the twelve
+        /// handlers this test drives against it can do real, successful sealed-store round trips —
+        /// `derive_key`/`use_key` both fail closed against a label with nothing stored under it.
+        fn new(
+            inner: MemorySecretStore,
+            constructions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ) -> Self {
+            constructions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Self { inner }
+        }
+    }
+
+    impl SecretStore for CountingStore {
+        fn store(
+            &self,
+            label: &str,
+            secret: &[u8],
+        ) -> std::result::Result<KeyHandle, meridian_core::identity::StoreError> {
+            self.inner.store(label, secret)
+        }
+
+        fn use_key(
+            &self,
+            h: &KeyHandle,
+            op: meridian_core::identity::SignOrDh,
+            input: &[u8],
+        ) -> std::result::Result<Vec<u8>, meridian_core::identity::StoreError> {
+            self.inner.use_key(h, op, input)
+        }
+
+        fn nonextractable(&self) -> bool {
+            self.inner.nonextractable()
+        }
+
+        fn derive_key(
+            &self,
+            h: &KeyHandle,
+            info: &[u8],
+        ) -> std::result::Result<[u8; 32], meridian_core::identity::StoreError> {
+            self.inner.derive_key(h, info)
+        }
+    }
+
+    /// Binding modification 7: proves a **second, later dispatch reuses the cache** — a real
+    /// negative assertion (an instrumented, construction-counting `SecretStore` double), not just
+    /// "the operation succeeded twice." Populates `session.live_store` directly (bypassing a real
+    /// `Effect::Unlock` round trip, which always constructs its own genuine `FileSecretStore` and
+    /// therefore could never observe this) and drives two *different* handler dispatches
+    /// (`run_add_contact` then `run_set_petname`) against the same `session` — both must succeed,
+    /// and [`CountingStore::new`] must never have run a second time.
+    #[test]
+    fn open_account_store_reuses_the_cached_file_backed_store_never_rebuilding_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(tmp.path());
+        let keyfile = tmp.path().join("account.key");
+        let seeded = MemorySecretStore::new();
+        let account = generate_account(&seeded, "example.org").expect("generate_account");
+        dummy_file_descriptor(&keyfile)
+            .save()
+            .expect("save account.json");
+
+        let constructions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = account.handle().clone();
+        let mut session = OnboardingSession::default();
+        session.set_live_store(Box::new(CountingStore::new(seeded, &constructions)), handle);
+        assert_eq!(
+            constructions.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "constructed exactly once, simulating handle_unlock's own single populate-time build"
+        );
+
+        let add_request = AddContactRequest {
+            id: "peer".to_string(),
+            pubkey: [9u8; 32],
+            hint: "peer.example".to_string(),
+            petname: None,
+        };
+        run_add_contact(&add_request, &session).expect("run_add_contact against the cached store");
+        assert_eq!(
+            constructions.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first later dispatch must reuse the cache, never rebuild the store"
+        );
+
+        let petname_request = SetPetnameRequest {
+            pubkey: [9u8; 32],
+            petname: Some("bff".to_string()),
+        };
+        run_set_petname(&petname_request, &session)
+            .expect("run_set_petname against the same cached store");
+        assert_eq!(
+            constructions.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a second, later dispatch of a *different* handler must still reuse the same cache"
+        );
+    }
+
     #[test]
     fn load_trust_defaults_to_empty_when_trust_bin_is_absent() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2259,8 +2639,14 @@ mod tests {
             keyfile: tmp.path().join("nonexistent.key"),
             passphrase: "does-not-matter".to_string(),
         };
-        let err = run_unlock(&request)
-            .expect_err("an OS-keystore account.json must never unlock through Effect::Unlock");
-        assert!(err.contains("LoadSession"));
+        // `run_unlock`'s `Ok` type widened (task 4.40) to `(LiveSession, Box<dyn SecretStore>,
+        // KeyHandle)`, which — deliberately, `Box<dyn SecretStore>` has no `Debug` supertrait at
+        // all (see `OnboardingSession`'s own hand-rolled `Debug` impl for why) — no longer
+        // implements `Debug` itself, so `Result::expect_err` (which requires `T: Debug`) no longer
+        // compiles here. A plain `match` proves the same thing without that bound.
+        match run_unlock(&request) {
+            Err(err) => assert!(err.contains("LoadSession")),
+            Ok(_) => panic!("an OS-keystore account.json must never unlock through Effect::Unlock"),
+        }
     }
 }
