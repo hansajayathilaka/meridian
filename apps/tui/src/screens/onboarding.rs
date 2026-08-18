@@ -181,12 +181,21 @@ pub struct PublishingBundle {
 }
 
 /// Terminal state: onboarding is done. `Enter` (see [`handle_key`]'s `Success` arm for the exact
-/// key set) signals "finished" back up to `App`, which swaps `Screen::Onboarding` for
-/// `Screen::Placeholder` (the `Screen::Main` stand-in).
+/// key set) signals "finished" back up to `App`, which (task 4.37) builds and dispatches whichever
+/// effect the freshly onboarded account's own store needs to reach a real `Screen::Main` —
+/// `Effect::LoadSession` for [`StoreChoice::Os`] (nothing sealed on disk yet to read — see
+/// `crate::session::LiveSession::empty`'s own doc comment), `Effect::Unlock` for
+/// [`StoreChoice::File`] (the single-round-trip unwrap `Screen::Unlock` itself uses, reusing the
+/// passphrase already typed at `ChooseStore` rather than re-prompting for it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Success {
     pub id: String,
     pub otk_count: usize,
+    /// Carried forward from [`PublishingBundle::store`] (task 4.37) — the one piece of onboarding's
+    /// own state `App::handle_key`'s finished-arm needs but this struct didn't retain before: which
+    /// effect to dispatch on completion, and (for `StoreChoice::File`) the still-live passphrase to
+    /// dispatch it with, without re-prompting the user a second time.
+    pub store: StoreChoice,
 }
 
 /// Terminal state: the in-flight effect for `retry` failed. `Esc` returns to `back` (the last
@@ -542,6 +551,7 @@ pub fn handle_worker(state: &mut OnboardingState, event: WorkerEvent) -> Vec<Eff
                 *state = OnboardingState::Success(Success {
                     id: p.account.id.clone(),
                     otk_count: published.otk_count,
+                    store: p.store.clone(),
                 });
                 Vec::new()
             }

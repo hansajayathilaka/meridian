@@ -84,16 +84,34 @@
 //! reference with no change to [`ChatMessageRenderer`] itself or its `mrd.chat/1` contract.
 //!
 //! ## What this screen does *not* do
-//! No navigation wiring: `crate::screens::contacts`' own module doc already anticipates this
-//! screen's existence and explicitly defers repointing its `Enter` key (and giving `ContactDetail`
-//! its own key) to "a future task" — see [`crate::app::Screen::Chat`]'s doc comment for why that
-//! stays deferred here too, keeping this diff scoped to this module plus the `Effect`/`Screen`
-//! plumbing it needs. No receive-path wiring either: there is no `Effect`/`WorkerEvent` for an
-//! inbound message arriving live in this task — `entries` starts pre-loaded (mirrors
-//! `ContactsState::new`'s "already loaded... out of this task's scope" contract) from task 4.15's
-//! history store, and only ever grows here via a completed *outbound* send. The local
-//! dedup-by-`mid` guard ([`insert_deduped`]) is written generically (keyed purely on
-//! `HistoryEntry::mid`, not on direction) specifically so a future receive path reuses it unchanged.
+//! `entries` starts pre-loaded (mirrors `ContactsState::new`'s "already loaded... out of this
+//! task's scope" contract) from task 4.15's history store.
+//!
+//! ## Navigation wiring (task 4.36)
+//! `crate::screens::contacts`'s `Enter` key opens this screen directly; `ContactDetail` got its own
+//! dedicated key (`i`) instead — see [`crate::app::Screen::Chat`]'s doc comment and
+//! `crate::screens::contacts`'s own module doc for the resolved key layout.
+//!
+//! ## Receive-path wiring (task 4.35)
+//! [`handle_inbound_message`] is `crate::app::App::handle_inbound`'s one call into this module for a
+//! live [`crate::app::InboundEvent::Message`]: it reuses [`insert_deduped`] **unchanged** — exactly
+//! as this module's own doc used to anticipate before this task existed — so an inbound message and
+//! a racing outbound completion (`complete_send`) can never both land the same `mid` twice, no
+//! matter which one this screen sees first. [`apply_receipt`] is the same task's much smaller
+//! counterpart for a live [`crate::app::InboundEvent::Receipt`]: an in-memory-only `Sent` →
+//! `Delivered` transition (there is no disk-persistence effect for updating an already-written
+//! `HistoryEntry` in place — [`retry_last_failed`]'s own doc comment already made this exact
+//! "no history-mutation effect in this task's scope" judgment call for the outbound retry case; this
+//! is the same call, just for an inbound receipt).
+//!
+//! **The worker's own persistent receive loop (`crate::worker::run_inbound_loop`) auto-acknowledges
+//! every inbound `ChatContent::Text` with a `ChatContent::Receipt` before this screen ever sees the
+//! message** — never gated by [`SendGate`], since a receipt only acknowledges content already
+//! decrypted and seen (see that function's own doc comment for the full reasoning, mirroring
+//! `apps/cli/src/chat.rs::deliver_content`'s identical auto-ack). This screen's own send-gate wiring
+//! above is completely unaffected: [`dispatch_gated_send`] remains the *only* function in this
+//! module that ever constructs `Effect::SendMessage`, and the auto-ack path never runs through it or
+//! through this module at all — it is entirely the worker's, never this screen's.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -722,6 +740,50 @@ fn fail_send(state: &mut ChatState, error: String) -> Vec<Effect> {
     state.sending = None;
     state.notice = Some(send_error_copy(&error));
     Vec::new()
+}
+
+// ---------------------------------------------------------------------------
+// Live inbound events (task 4.35) — see the module doc's "Receive-path wiring" section
+// ---------------------------------------------------------------------------
+
+/// Applies a live inbound `mrd.chat/1` text message to this open conversation —
+/// `crate::app::App::handle_inbound`'s one call into this module for a
+/// [`crate::app::InboundEvent::Message`] whose peer matches this screen's own `peer_pubkey`.
+///
+/// Mirrors [`complete_send`]'s exact "only persist what was actually inserted" discipline, just for
+/// the inbound direction: [`insert_deduped`] (reused unchanged, keyed only on `mid`, never on
+/// direction — exactly as this module's own doc always intended) decides whether `entry` is new; a
+/// duplicate (e.g. a re-delivered envelope, or a mid that happens to already be present from a
+/// racing outbound completion) is silently discarded here, same as `complete_send`'s own repeat-
+/// report guard, and dispatches no further effect. `entry` must already be direction-`In` /
+/// state-`Received` — built by `crate::worker::run_inbound_loop`, never by this function.
+pub fn handle_inbound_message(state: &mut ChatState, entry: HistoryEntry) -> Vec<Effect> {
+    if !insert_deduped(&mut state.entries, entry.clone()) {
+        return Vec::new();
+    }
+    vec![Effect::PersistHistory(PersistHistoryEffect {
+        request: PersistHistoryRequest {
+            peer_pubkey: state.peer_pubkey,
+            entry,
+        },
+        outcome: None,
+    })]
+}
+
+/// Applies a live delivery receipt to this open conversation — marks the matching outbound `Sent`
+/// row `Delivered`, in memory only. See the module doc's "Receive-path wiring" section for why there
+/// is no disk-persistence effect for this (yet): a no-op if no entry with `dir == Out` and
+/// `mid == ack_mid` is currently loaded (e.g. the acknowledged send happened in an earlier session
+/// and its `Sent` row was never re-loaded as such) — never a panic, mirrors every other screen's
+/// tolerant `handle_worker`/`handle_inbound` shape in this crate.
+pub fn apply_receipt(state: &mut ChatState, ack_mid: &str) {
+    if let Some(entry) = state
+        .entries
+        .iter_mut()
+        .find(|e| e.dir == MsgDirection::Out && e.mid == ack_mid)
+    {
+        entry.state = MessageState::Delivered;
+    }
 }
 
 // ---------------------------------------------------------------------------

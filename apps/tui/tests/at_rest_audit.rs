@@ -101,13 +101,15 @@ use meridian_core::trust::{PinnedKey, TrustState, TrustStore};
 
 use meridian_tui::app::{
     AddContactEffect, AddContactRequest, AddedContact, Effect, GenerateAccountEffect,
-    GeneratedAccount, MarkVerifiedEffect, PersistHistoryEffect, PublishBundleEffect,
-    PublishedBundle, SendMessageEffect, SentMessage, SettingValue, WorkerEvent,
+    GeneratedAccount, LoadSessionEffect, LoadSessionOutcome, LoadSessionRequest,
+    MarkVerifiedEffect, PersistHistoryEffect, PublishBundleEffect, PublishedBundle,
+    SendMessageEffect, SentMessage, SessionOutcome, SettingValue, WorkerEvent,
 };
 use meridian_tui::config_write::write_setting_at;
 use meridian_tui::screens::chat::ChatState as TuiChatState;
 use meridian_tui::screens::contacts::ContactsState;
 use meridian_tui::screens::verify::VerifyState;
+use meridian_tui::session::LiveSession;
 use meridian_tui::store;
 use meridian_tui::store::contacts::{ContactRecord, ContactsDocument, PinnedKeyRecord, TrustLabel};
 use meridian_tui::store::history::{Direction as HistoryDirection, HistoryEntry, MessageState};
@@ -352,10 +354,34 @@ fn at_rest_audit_finds_no_plaintext_leaks() {
     );
     assert!(effects.is_empty());
 
-    // === Success -> Enter finishes onboarding (Screen::Onboarding -> Screen::Placeholder) ===
+    // === Success -> Enter finishes onboarding (task 4.37: Screen::Onboarding -> the
+    // Screen::Placeholder "loading" interim screen, dispatching Effect::LoadSession for this
+    // OS-keystore account rather than the pre-4.37 Screen::Placeholder-forever stand-in) =========
     let effects = press(&mut app, KeyCode::Enter);
-    assert!(effects.is_empty());
+    assert!(matches!(effects.as_slice(), [Effect::LoadSession(_)]));
     assert!(matches!(app.current_screen(), Screen::Placeholder));
+
+    // --- Harness-as-worker, faked (same "out of scope for this harness" group as
+    // Register/PublishBundle above): a real `Effect::LoadSession` execution needs a real OS
+    // keystore (`init_os_keystore`), unavailable headlessly — see
+    // `apps/tui/tests/load_session.rs`'s own module doc. Hands back the trivially-empty
+    // `LiveSession` a genuine first-ever load of this exact, freshly-onboarded account would
+    // produce (nothing sealed on disk for it yet — trust/contacts are populated for real,
+    // separately, a few steps below), landing on the real `Screen::Main` task 4.37 wires this
+    // account to. ---
+    let session_descriptor =
+        account::AccountDescriptor::new_os(&self_account, "meridian-tui-audit");
+    let effects = worker(
+        &mut app,
+        WorkerEvent::Completed(Effect::LoadSession(LoadSessionEffect {
+            request: LoadSessionRequest,
+            outcome: Some(LoadSessionOutcome::Loaded(Box::new(SessionOutcome::ready(
+                LiveSession::empty(session_descriptor),
+            )))),
+        })),
+    );
+    assert!(effects.is_empty());
+    assert!(matches!(app.current_screen(), Screen::Main(_)));
 
     // === Contacts: add a peer with a petname =============================================
     let peer_store = MemorySecretStore::new();

@@ -16,42 +16,50 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 4 (T08 + T17) is 28/28 originally-planned tasks done, but NOT closed.** T08's track
-  (4.3→4.10) and T17's screen-build track (4.11–4.27) are both fully complete and their own tests green.
-  Task **4.28** (the phase's first exit-gate attempt) ran both feature specs' acceptance demos for real
-  rather than assuming, and found: T08's genuinely passes (`meridian-mitm-sim`, 0 silent successes); T17's
-  does **not** — `meridian tui` hangs forever on Onboarding's "Generating your identity…" step, because
-  `run_worker` never executes an `Effect` and no `Preflight`/`Screen::Main` navigation exists to reach any
-  other screen live. Per the task-tracking skill's own §7 ("a build phase isn't done until its acceptance
-  demo runs"), this means **Phase 4 is still open**. `/plan-phase` was re-invoked against this specific
-  gap (not a new phase — see reasoning below) and broke it into **10 more tasks, 4.29–4.38**, fully
-  dependency-ordered, in [Phase 4's README](./phase-4/README.md#tasks-todo) — including a **third gap**
-  found only during this planning pass (no live inbound-message receive path exists anywhere in the
-  crate's event model; see 4.35). An `architect` consult (folded into the task files) already settled the
-  one architecturally significant sub-question (where live session state lives once screens stop each
-  holding isolated copies — an `App`-owned, moved-not-cloned `LiveSession`, no new ADR needed).
-  **The envelope-v2 obligation was resolved, not dropped**: an architect call (recorded in [Phase 4's
-  README](./phase-4/README.md#envelope-v2-re-deferred--the-concrete-trigger)) determined full envelope-v2
-  doesn't block T08/T17 and stays out of this phase for the same "one coherent reviewable unit" reason
-  Phase 2 kept T09 out of Phase 2 — but a narrow, v1-scoped fix to `open_bytes`'s stale-session
-  short-circuit (which T08's own desync-recovery deliverable otherwise silently fails to accomplish)
-  landed inside **4.9**. The re-defer trigger is mechanical, not prose: [roadmap.md](../architecture/roadmap.md)'s
-  dependency table lists T07's deps as `03, 06, envelope-v2` — the same table `task-picker` reads every
-  `/pick-next-phase` run — so T07 (and T14, transitively) cannot be read as pickable again until an
-  envelope-v2 task/phase exists with status done. Phases 0–3 are **done**.
-- **NEXT:** `/next-task` for **4.29–4.38** — see [Phase 4's updated dependency order](./phase-4/README.md#dependency-order)
-  for wave/parallelism guidance (4.30 is the single highest-value task to land first: it's the exact fix
-  for the hang 4.28 reproduced). Only once **4.38** confirms the T17 demo genuinely passes does
-  `/start-review-phase` for Phase 5 become the correct next command — not before.
+- **NOW:** **Phase 4 (T08 + T17) is 37/38 tasks done (4.1–4.37), but still NOT closed.** T08's track
+  (4.3→4.10) is fully done and its acceptance demo genuinely passes. T17's track needed a second
+  gap-closure wave (4.29–4.37) after task **4.28** (the phase's first exit-gate attempt) found
+  `meridian tui` hanging forever on Onboarding's "Generating your identity…" step. That wave genuinely
+  closed 4.28's own hang: `Preflight`/`Screen::Main` live navigation is real (4.36/4.37), `run_worker`
+  genuinely executes every effect it used to echo back inertly (4.30–4.34), and a persistent inbound-
+  delivery loop exists (4.35). **Task 4.38 — the phase's second exit-gate attempt — re-ran the demo live
+  and found it still does not pass**, for two reasons: **(1)** an already-flagged residual gap (4.37's
+  own Status section: `worker.rs::open_account_store` fails closed for a passphrase-keyfile account),
+  now reproduced live for the first time — a file-backed account reaches a genuinely live, connected
+  `Screen::Main` and then fails, with the exact predicted message, on its first contacts/trust/send
+  action; **(2)** a **newly-discovered** defect, found by 4.38's own new two-process regression test
+  (`apps/tui/tests/live_session_e2e.rs`, driving two real, separate OS processes through the real
+  `worker::dispatch`/`run_inbound_loop` over a real rendezvous server): no code path in `meridian-tui`
+  ever republishes a prekey bundle with its secret scalars persisted into `sessions.bin`'s
+  `PrekeyVault` — `Effect::PublishBundle` fires exactly once, at onboarding, mirroring a latent gap
+  `apps/cli/src/main.rs::cmd_register` has always had, but unlike the CLI (whose `chat.rs::run` always
+  republishes, vault-persisted, before it is ever capable of receiving), nothing in `meridian-tui` ever
+  republishes at all — so a peer's first-contact message can never be decrypted
+  (`ChatError::UnknownPrekey`, silently dropped), for **any** account type, OS-keystore included. This
+  second finding is the more fundamental of the two: it blocks receiving even where the first gap
+  doesn't apply. Full writeup:
+  [tui-client.md §11](../architecture/tui-client.md#11-current-implementation-status-as-of-task-438--the-phases-second-exit-gate-attempt),
+  [Phase 4's README](./phase-4/README.md#exit-criteria), and
+  [4.38's own Status section](./phase-4/4.38-t17-acceptance-demo-closure.md). Per 4.38's own explicit
+  scope ("verification + doc reconciliation only — report a genuine defect, never patch around it"),
+  **neither defect was fixed** — both need a new task.
+- **NEXT:** A follow-up task (working number **4.39**) needs to close both defects 4.38 found before
+  Phase 4's exit criteria can honestly be met — `/plan-phase` (or a manual `/new-task`) should scope it
+  against [4.38's own Status section](./phase-4/4.38-t17-acceptance-demo-closure.md) and
+  [tui-client.md §11](../architecture/tui-client.md#11-current-implementation-status-as-of-task-438--the-phases-second-exit-gate-attempt)
+  before assuming either fix is small. Only once that lands and a **third** exit-gate attempt confirms
+  the T17 demo genuinely passes does `/start-review-phase` for Phase 5 become the correct next command —
+  not before.
 
-**Why 4.29–4.38 extend Phase 4 rather than opening a new phase or a review phase**: the task-tracking
-skill's own phase-lifecycle rule is that a build phase isn't done until its acceptance demo runs, so
-Phase 4 was never actually finished — these are legitimately still Phase 4 build tasks, closing a gap
-Phase 4 itself created, not new scope. A review phase (`/start-review-phase`) was considered and rejected
-for this specific gap: review phases turn *discovered* findings into fix-tasks, but 4.28 already did the
-discovery and diagnosis work in full — routing that through a review-phase sweep would re-derive
-conclusions already on record, not add anything. Phase 5 remains the right venue for whatever *new*
-findings a full sweep of this phase's diff turns up once 4.38 actually closes it.
+**Why 4.29–4.38 extended Phase 4 rather than opening a new phase or a review phase** (and why 4.39 will
+too, for the same reason): the task-tracking skill's own phase-lifecycle rule is that a build phase
+isn't done until its acceptance demo runs, so Phase 4 was never actually finished — these are
+legitimately still Phase 4 build tasks, closing gaps Phase 4 itself created, not new scope. A review
+phase (`/start-review-phase`) was considered and rejected for this specific gap, twice now: review
+phases turn *discovered* findings into fix-tasks, but 4.28 and 4.38 already did the discovery and
+diagnosis work in full each time — routing that through a review-phase sweep would re-derive conclusions
+already on record, not add anything. Phase 5 remains the right venue for whatever *new* findings a full
+sweep of this phase's diff turns up once a future task actually closes it.
 
 ### Live carry-forwards (not owned by any open task)
 Everything else is owned by a Phase-4 task; these are the exceptions that would otherwise evaporate:
@@ -289,10 +297,10 @@ succeed exit-gate attempt) — see [Phase 4's own task list](./phase-4/README.md
 - [x] **4.32** Real `run_worker`: trust & request-queue persistence — [file](./phase-4/4.32-run-worker-trust-request-persistence.md)
 - [x] **4.33** Real `run_worker`: outbound chat — [file](./phase-4/4.33-run-worker-outbound-chat.md)
 - [x] **4.34** Real `run_worker`: settings & diagnostics — [file](./phase-4/4.34-run-worker-settings-diagnostics.md)
-- [ ] **4.35** Inbound delivery stream — [file](./phase-4/4.35-inbound-delivery-stream.md)
-- [ ] **4.36** `Screen::Main` + live navigation — [file](./phase-4/4.36-screen-main-live-navigation.md)
-- [ ] **4.37** Preflight routing — [file](./phase-4/4.37-preflight-routing.md)
-- [ ] **4.38** T17 acceptance-demo closure (phase re-exit gate) — [file](./phase-4/4.38-t17-acceptance-demo-closure.md)
+- [x] **4.35** Inbound delivery stream — [file](./phase-4/4.35-inbound-delivery-stream.md)
+- [x] **4.36** `Screen::Main` + live navigation — [file](./phase-4/4.36-screen-main-live-navigation.md)
+- [x] **4.37** Preflight routing — [file](./phase-4/4.37-preflight-routing.md)
+- [x] **4.38** T17 acceptance-demo closure (phase re-exit gate) — [file](./phase-4/4.38-t17-acceptance-demo-closure.md)
 
 ---
 

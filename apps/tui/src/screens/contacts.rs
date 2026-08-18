@@ -18,8 +18,9 @@
 //! state.
 //!
 //! **This screen's resolution:** [`ContactEntry`] is a *join* of both stores, assembled once
-//! wherever this screen's initial state is built (a future `Screen::Main`/`Preflight` step, out of
-//! this task's scope — the same "already loaded by a future step" relationship
+//! wherever this screen's initial state is built — task 4.36's `crate::screens::main::
+//! build_contact_entries` is exactly that "future `Screen::Main`/`Preflight` step" this doc used to
+//! flag as out of this task's own scope (the same "already loaded by a future step" relationship
 //! [`crate::screens::unlock::Entering::keyfile`]/`id` have to a future `Preflight`). It takes
 //! `pubkey`/`petname`/`trust`/`user_blocked`/`pinned_key_history` from
 //! `meridian_core::trust::TrustStore` (the crypto-relevant source of truth, always accurate for
@@ -217,8 +218,11 @@ pub struct ContactsState {
     pub selected: usize,
     pub filter: String,
     pub filtering: bool,
-    /// A transient status line (currently only the "Verify not implemented yet" stand-in — see the
-    /// crate doc's `v`/`Ctrl+V` handling below). Cleared on the next key that isn't `v` itself.
+    /// A transient status line. Reserved for a future error/notice use — task 4.36 removed this
+    /// module's one prior producer (the "Verify not implemented yet" stand-in, now that `v` opens a
+    /// real `Screen::Verify` instead — see [`ContactsAction::OpenVerify`]) and left the field in
+    /// place rather than deleting it, since [`footer_hint`]'s "notice wins over the ordinary hint
+    /// line" contract is still a reasonable one for whatever sets it next.
     pub notice: Option<String>,
     /// `Some` while the add-contact form (`n`) is open.
     pub add: Option<AddContactState>,
@@ -314,15 +318,27 @@ fn is_plain_char(modifiers: KeyModifiers) -> bool {
 pub enum ContactsAction {
     /// Nothing for `App` to do beyond dispatching the returned effects.
     None,
-    /// Push `Screen::ContactDetail` for this entry — see the module doc's note on `Enter` standing
-    /// in for the not-yet-built `Screen::Conversation` (`docs/architecture/diagrams/tui-screen-
-    /// flow.mermaid`'s `Contacts --> Conversation: Enter on a contact` transition) until task 4.20
-    /// lands a real chat screen: today, `Enter` is the only way to reach `Contact detail`, so it
-    /// opens that instead of a screen that doesn't exist yet. A future task repointing `Enter` at
-    /// `Conversation` should give `Contact detail` its own key at that point (tui-client.md's own
-    /// "Reached by ... Enter on a contact with the detail toggle" wording already anticipates a
-    /// dedicated toggle distinct from plain `Enter`).
+    /// Push `Screen::ContactDetail` for this entry (task 4.36's dedicated `i` "info/detail" key —
+    /// see [`handle_key`]'s own doc note on the exact key choice). Before task 4.36, `Enter` opened
+    /// this as a stand-in because `Screen::Chat` didn't exist yet
+    /// (`docs/architecture/diagrams/tui-screen-flow.mermaid`'s `Contacts --> Conversation: Enter on
+    /// a contact` transition); tui-client.md's own "Reached by ... Enter on a contact with the
+    /// detail toggle" wording already anticipated this dedicated toggle, distinct from `Enter`
+    /// (which now opens [`ContactsAction::OpenChat`] instead — see that variant's own doc comment).
     OpenDetail(ContactEntry),
+    /// Push `Screen::Chat` for this entry (task 4.36) — `Enter`, repointed from `OpenDetail` per
+    /// this module's own (now-resolved) doc note above and `crate::app::Screen::Chat`'s identical
+    /// one: "a future task repointing `Enter` at this screen [is] deliberately left to a future
+    /// navigation-integration task... giving `ContactDetail` its own dedicated key at that point."
+    /// `App` (via `crate::screens::main`, the only caller with a live `TrustStore`/history to build
+    /// a real `Screen::Chat` from) does the actual construction — this screen owns neither.
+    OpenChat(ContactEntry),
+    /// `v` in plain list-navigation mode: push the real `Screen::Verify` for this entry (task 4.36,
+    /// replacing task 4.19's own "Verify is not implemented yet" stand-in notice). Like
+    /// [`ContactsAction::OpenChat`], this screen has no live `TrustStore`/`own_pubkey` to build a
+    /// [`crate::screens::verify::VerifyState`] from — only `crate::screens::main` (which owns a
+    /// live `LiveSession`) can.
+    OpenVerify(ContactEntry),
     /// Plain list navigation's own `Esc`, with nothing local to cancel (no add-contact form open, not
     /// filtering) — `App` should pop this screen, same outcome as the generic catch-all Esc-pop
     /// handler every other non-owning screen gets.
@@ -331,9 +347,10 @@ pub enum ContactsAction {
     /// requests ..."): push `Screen::Requests` (task 4.21) — this screen owns no message-request
     /// data itself (unlike `AddContact`'s `ContactEntry`/`AddedContact` payloads, there is nothing
     /// for this action to carry), so `App` is what actually constructs
-    /// `crate::screens::requests::RequestsState` — see that variant's own doc comment for the
-    /// "empty until a future Preflight loads real data" caveat this shares with the crate's other
-    /// not-yet-fully-wired screens.
+    /// `crate::screens::requests::RequestsState`. Task 4.36: when this screen is embedded in
+    /// `crate::screens::main::MainState`, the caller now seeds this from a live
+    /// `meridian_core::chat::ChatState::pending_requests()` snapshot rather than always starting
+    /// empty — see `crate::app::App::requests_snapshot`'s own doc comment.
     OpenRequests,
 }
 
@@ -358,12 +375,6 @@ pub fn handle_key(state: &mut ContactsState, key: KeyEvent) -> (Vec<Effect>, Con
         return (effects, ContactsAction::None);
     }
 
-    // Any key other than `v` itself clears a stale "Verify not implemented" notice, so it doesn't
-    // linger past whatever the user does next.
-    if !matches!(key.code, KeyCode::Char('v')) {
-        state.notice = None;
-    }
-
     if state.filtering {
         match key.code {
             KeyCode::Esc | KeyCode::Enter => state.filtering = false,
@@ -385,7 +396,21 @@ pub fn handle_key(state: &mut ContactsState, key: KeyEvent) -> (Vec<Effect>, Con
         KeyCode::Down => move_selection(state, 1),
         KeyCode::Char('k') if is_plain_char(key.modifiers) => move_selection(state, -1),
         KeyCode::Char('j') if is_plain_char(key.modifiers) => move_selection(state, 1),
+        // Task 4.36: `Enter` opens `Screen::Chat` (the conversation) rather than `Screen::
+        // ContactDetail` — see `ContactsAction::OpenChat`'s own doc comment for the exact repoint
+        // this fulfills.
         KeyCode::Enter => {
+            if let Some(entry) = filtered_entries(state).get(state.selected) {
+                let entry = (*entry).clone();
+                return (Vec::new(), ContactsAction::OpenChat(entry));
+            }
+        }
+        // Task 4.36: `Contact detail`'s own dedicated key (tui-client.md's "Enter on a contact with
+        // the detail toggle" wording), now that `Enter` itself opens `Screen::Chat` instead. Not
+        // pinned to a specific chord by any design doc this task read — `i` ("info") is this task's
+        // own judgment call, flagged here for the reviewer (`TODO: confirm` a different binding if
+        // one is ever specified).
+        KeyCode::Char('i') if is_plain_char(key.modifiers) => {
             if let Some(entry) = filtered_entries(state).get(state.selected) {
                 let entry = (*entry).clone();
                 return (Vec::new(), ContactsAction::OpenDetail(entry));
@@ -398,14 +423,12 @@ pub fn handle_key(state: &mut ContactsState, key: KeyEvent) -> (Vec<Effect>, Con
             return (Vec::new(), ContactsAction::OpenRequests);
         }
         KeyCode::Char('/') => state.filtering = true,
+        // Task 4.36: routes to the real `Screen::Verify`, replacing task 4.19's own "not
+        // implemented yet" stand-in notice — see `ContactsAction::OpenVerify`'s own doc comment.
         KeyCode::Char('v') if is_plain_char(key.modifiers) => {
-            // The Verify screen (task 4.22) is out of this task's scope — see the module doc.
-            // This just makes the key reachable/routed with a documented "not yet implemented"
-            // notice, per this task's own `## Scope`.
-            if !filtered_entries(state).is_empty() {
-                state.notice = Some(
-                    "Verify is not implemented yet (task 4.22) — press v again to dismiss".into(),
-                );
+            if let Some(entry) = filtered_entries(state).get(state.selected) {
+                let entry = (*entry).clone();
+                return (Vec::new(), ContactsAction::OpenVerify(entry));
             }
         }
         KeyCode::Esc => return (Vec::new(), ContactsAction::Pop),
@@ -767,6 +790,14 @@ pub fn render(state: &ContactsState, frame: &mut Frame<'_>) {
 /// [`crate::theme::contacts_pane_layout`]) to this screen's own row formatting — see [`render_list`].
 pub fn render_with_ctx(state: &ContactsState, frame: &mut Frame<'_>, ctx: &RenderCtx) {
     let area = frame.area();
+    render_in(state, frame, area, ctx);
+}
+
+/// [`render_with_ctx`], but into an explicit `area` rather than the whole frame (task 4.36):
+/// `crate::screens::main` embeds this screen's list above its own status-bar row and needs a
+/// sub-`Rect` to render into, without changing [`render_with_ctx`]'s own full-frame signature (and
+/// therefore every existing call site/snapshot test that already depends on it).
+pub fn render_in(state: &ContactsState, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Meridian — Contacts");
@@ -973,6 +1004,8 @@ fn footer_hint(state: &ContactsState, ctx: &RenderCtx) -> String {
         "type to filter · Enter/Esc done".to_string()
     } else {
         let arrows = glyph(GlyphKind::ScrollHint, ctx);
-        format!("{arrows}/jk move · Enter open · n add · r requests · v verify · / filter")
+        format!(
+            "{arrows}/jk move · Enter chat · i detail · n add · r requests · v verify · / filter"
+        )
     }
 }

@@ -3,10 +3,13 @@
 
 # Phase 4 — Verification & Trust + Terminal TUI Client
 
-**Kind:** build · **Status:** in progress — 28/28 originally planned tasks done, but per the
-task-tracking skill's own §7 ("a build phase isn't done until its acceptance demo runs"), the phase is
-**not actually closed**: task 4.28 found T17's acceptance demo does not run end to end, and tasks
-4.29–4.38 (added post-4.28 to close that gap) are pending · **Reviews phase(s):** n/a (build phase; Phase 5 will review it)
+**Kind:** build · **Status:** in progress — 37/38 tasks done (4.1–4.37), but per the task-tracking
+skill's own §7 ("a build phase isn't done until its acceptance demo runs"), the phase is **still not
+closed**: task 4.28 found T17's acceptance demo did not run end to end; 4.29–4.37 closed that specific
+gap, but 4.38 — the re-exit-gate attempt — found the demo *still* doesn't pass, for two reasons (one
+already flagged by 4.37, one newly discovered live by 4.38 itself). A follow-up task (working number
+4.39) is needed before this phase can exit · **Reviews phase(s):** n/a (build phase; Phase 5 will review
+it, once it's actually closeable)
 
 ## Goal
 Ship **Feature 08 — Verification & Contact Trust** and **Feature 17 — Terminal TUI Client** together,
@@ -216,10 +219,13 @@ reopened) lives in each task file's own text plus the architect consult recorded
 - [x] **4.32** Real `run_worker`: trust & request-queue persistence — [file](./4.32-run-worker-trust-request-persistence.md)
 - [x] **4.33** Real `run_worker`: outbound chat — [file](./4.33-run-worker-outbound-chat.md)
 - [x] **4.34** Real `run_worker`: settings & diagnostics — [file](./4.34-run-worker-settings-diagnostics.md)
-- [ ] **4.35** Inbound delivery stream — [file](./4.35-inbound-delivery-stream.md)
-- [ ] **4.36** `Screen::Main` + live navigation — [file](./4.36-screen-main-live-navigation.md)
-- [ ] **4.37** Preflight routing — [file](./4.37-preflight-routing.md)
-- [ ] **4.38** T17 acceptance-demo closure (phase re-exit gate) — [file](./4.38-t17-acceptance-demo-closure.md)
+- [x] **4.35** Inbound delivery stream — [file](./4.35-inbound-delivery-stream.md)
+- [x] **4.36** `Screen::Main` + live navigation — [file](./4.36-screen-main-live-navigation.md)
+- [x] **4.37** Preflight routing — [file](./4.37-preflight-routing.md)
+- [x] **4.38** T17 acceptance-demo closure (phase re-exit gate) — [file](./4.38-t17-acceptance-demo-closure.md)
+  — **done in the sense 4.28 was done**: its own verification/doc-reconciliation scope is fully
+  executed and honestly written up; the demo it verified still does **not** pass (see Exit criteria
+  below) — a new task (4.39) is needed next, not a reopening of this one.
 
 ### Dependency order
 ```
@@ -276,8 +282,12 @@ onboarding into a runnable (if not yet fully navigable) session soonest.
 
 **Assessed honestly by task 4.28** (the phase's first exit-gate attempt) — see its own file for the full
 diff and [tui-client.md §10](../../architecture/tui-client.md#10-current-implementation-status-as-of-task-428)
-for the complete writeup of the one criterion below that does **not** hold today. Task 4.38 is the
-**second, planned-to-succeed** exit-gate attempt, once 4.29–4.37 close the gap 4.28 found.
+for the complete writeup of the one criterion below that did **not** hold at that point. Task 4.38 was
+meant to be the **second, planned-to-succeed** exit-gate attempt, once 4.29–4.37 closed the gap 4.28
+found — **it wasn't**: 4.38 re-ran the demo live and found it still doesn't pass, for two reasons (one
+already flagged by 4.37, one newly discovered by 4.38's own live re-run and its new regression test).
+See [tui-client.md §11](../../architecture/tui-client.md#11-current-implementation-status-as-of-task-438--the-phases-second-exit-gate-attempt)
+and [4.38's own Status section](./4.38-t17-acceptance-demo-closure.md) for the full writeup.
 
 - [x] All 28 originally-planned Phase 4 tasks (4.1–4.28) are `[x]` in the tracker (see
   [dependency order](#dependency-order)). **Not sufficient for phase closure** — see the next item.
@@ -295,21 +305,30 @@ for the complete writeup of the one criterion below that does **not** hold today
   is illustrative shorthand for this harness (there is no standalone `meridian-mitm-sim` binary with
   those flags — see task [4.10](./4.10-mitm-sim-trust-matrix.md)'s own Status section, which already
   recorded this); the harness itself is what actually ships and actually runs.
-- [ ] **T17's acceptance demo does NOT run end to end today — confirmed empirically by 4.28, not
-  assumed.** `meridian tui` reaches Onboarding, but hangs indefinitely on "Generating your identity…"
-  once the org hint is submitted, because `apps/tui/src/lib.rs::run_worker` (unchanged since task
-  4.11's own placeholder scope) never executes an `Effect` against `meridian-core` — every screen past
-  that point (contacts, chat, verify, restart, key-change block) is fully built and unit/snapshot-
-  tested in isolation but has no live route from a real session. `Ctrl-Q` does restore the terminal
-  cleanly from the stuck state, and the at-rest audit / panic-restores-terminal tests are green in
-  isolation — but the demo as a whole, driven "from `meridian tui` alone," does not complete. Full
-  writeup: [tui-client.md §10](../../architecture/tui-client.md#10-current-implementation-status-as-of-task-428).
-  **No longer un-owned**: tasks [4.29–4.38](#tasks-todo) close this gap (real `run_worker` execution,
-  a previously-unscoped third gap found during their own planning — no live inbound-message receive
-  path at all — plus the missing `Preflight`/`Screen::Main` navigation), with 4.38 re-running this exact
-  exit-gate check once they land. This checkbox flips only when 4.38 confirms the demo genuinely passes,
-  not when 4.29–4.37's code merges.
+- [ ] **T17's acceptance demo still does NOT run end to end — re-confirmed empirically by 4.38, not
+  assumed.** 4.29–4.37 genuinely closed 4.28's own hang (`Preflight`/`Screen::Main` live navigation and
+  a real `run_worker` now exist; onboarding, registration, and bundle publish all genuinely complete,
+  reaching a live, connected `Screen::Main` — confirmed live via a PTY-driven `meridian tui` run). Two
+  distinct defects still block the rest of the demo, both found/reconfirmed by 4.38's own live re-run:
+  **(1)** the already-flagged file-backed-account gap (4.37's own Status section:
+  `worker.rs::open_account_store` fails closed for a passphrase-keyfile account) — reproduced live for
+  the first time: a file-backed account reaches `Screen::Main` and then fails, with the exact predicted
+  message, the moment it tries to add a contact; **(2)** a **newly-discovered** defect, found by 4.38's
+  own new two-process regression test (`apps/tui/tests/live_session_e2e.rs`): no code path in
+  `meridian-tui` ever republishes a prekey bundle with its secret scalars persisted into
+  `sessions.bin`'s `PrekeyVault` (`Effect::PublishBundle` fires exactly once, at onboarding, mirroring
+  `apps/cli/src/main.rs::cmd_register`'s own latent version of the same gap — but unlike the CLI, which
+  covers for it via `apps/cli/src/chat.rs::run`'s own unconditional republish-before-listening, nothing
+  in `meridian-tui` ever republishes at all) — so a peer's first-contact message can never be decrypted
+  (`ChatError::UnknownPrekey`, silently dropped), for **any** account type, OS-keystore included. Full
+  writeup: [tui-client.md §11](../../architecture/tui-client.md#11-current-implementation-status-as-of-task-438--the-phases-second-exit-gate-attempt)
+  and [4.38's own Status section](./4.38-t17-acceptance-demo-closure.md). **Neither defect was fixed by
+  4.38** — its own scope is verification only, per this project's "report, don't patch around it" rule
+  for a genuine finding. Both need a new task (not a reopened 4.37, per this project's numbering
+  convention) before this checkbox can honestly flip.
 - [x] The envelope-v2 obligation above was re-deferred with a concrete, mechanical trigger (see
   [above](#envelope-v2-re-deferred--the-concrete-trigger)) — not silently dropped.
-- Then: `/start-review-phase` for Phase 5, which inherits the T17 live-navigation/worker-wiring gap as
-  a known, documented finding rather than a surprise.
+- Then: **not yet** `/start-review-phase` for Phase 5 — the task-tracking skill's own §7 still applies
+  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. A follow-up task
+  (working number: 4.39) needs to close the two defects above before this phase can exit; see
+  [docs/tasks/README.md](../README.md)'s carry-forward section.

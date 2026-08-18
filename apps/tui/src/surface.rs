@@ -36,7 +36,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
 use ratatui::Frame;
 
-use crate::app::{Effect, WorkerEvent};
+use crate::app::{Effect, Screen, WorkerEvent};
 use crate::store::history::HistoryEntry;
 
 // ---------------------------------------------------------------------------
@@ -229,25 +229,34 @@ pub enum PaletteAction {
     /// Push a freshly constructed extension pane onto the screen stack
     /// (`Screen::Extension(pane())`).
     PushPane(Arc<dyn Fn() -> Box<dyn ExtensionPane> + Send + Sync>),
+    /// Push a freshly constructed, **built-in, first-party** [`Screen`] directly (task 4.36) — for
+    /// core screens that predate this registry and are not, and should not become,
+    /// [`ExtensionPane`]s (e.g. `Screen::Settings`; see that variant's own doc comment on why task
+    /// 4.25 could register a *pane* but not yet a real "open Settings" command). `PushPane` remains
+    /// the mechanism for third-party feature panes per this module's own doc — this variant exists
+    /// only because `Screen` itself gains no new cases for third parties to reach through it.
+    PushScreen(Arc<dyn Fn() -> Screen + Send + Sync>),
 }
 
 impl Clone for PaletteAction {
-    /// Cheap in both arms now — an `Arc::clone` of a factory, never a deep clone of a live `Effect`
+    /// Cheap in every arm — an `Arc::clone` of a factory, never a deep clone of a live `Effect`
     /// (or the [`crate::app::SessionOutcome`] one might carry) — see this type's own doc comment.
     fn clone(&self) -> Self {
         match self {
             PaletteAction::Effect(factory) => PaletteAction::Effect(Arc::clone(factory)),
             PaletteAction::PushPane(factory) => PaletteAction::PushPane(Arc::clone(factory)),
+            PaletteAction::PushScreen(factory) => PaletteAction::PushScreen(Arc::clone(factory)),
         }
     }
 }
 
 impl fmt::Debug for PaletteAction {
-    /// Hand-rolled: neither `Arc<dyn Fn() -> ...>` variant has a `Debug` impl to derive.
+    /// Hand-rolled: no `Arc<dyn Fn() -> ...>` variant has a `Debug` impl to derive.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PaletteAction::Effect(_) => write!(f, "Effect(<fn>)"),
             PaletteAction::PushPane(_) => write!(f, "PushPane(<fn>)"),
+            PaletteAction::PushScreen(_) => write!(f, "PushScreen(<fn>)"),
         }
     }
 }
