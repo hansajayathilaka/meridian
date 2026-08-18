@@ -36,11 +36,10 @@
 //!   `config.toml` this crate's own schema would produce; defensive only.
 //! - [`ConfigWriteError::Io`] — any other filesystem failure (permissions, disk full, …).
 //!
-//! `crate::screens::settings` (the only intended caller, via a future worker executing
-//! [`crate::app::Effect::SaveSetting`] — see that variant's own doc for why this module doesn't wire
-//! itself into `run_worker` yet, mirroring every other `Effect` in this crate today) turns any of
-//! the above into an explicit "session-only, not saved" notice rather than silently discarding the
-//! outcome — see that module's own doc for the "never silent" property this exists to support.
+//! `crate::screens::settings` (the only intended caller, via `crate::worker::dispatch` executing
+//! [`crate::app::Effect::SaveSetting`] — wired as of task 4.34) turns any of the above into an
+//! explicit "session-only, not saved" notice rather than silently discarding the outcome — see that
+//! module's own doc for the "never silent" property this exists to support.
 
 use std::fs;
 use std::path::{Path, PathBuf};

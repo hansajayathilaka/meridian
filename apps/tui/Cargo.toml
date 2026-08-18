@@ -58,6 +58,19 @@ toml_edit = "0.22.27"
 # at a different version — same precedent as `toml_edit` above.
 unicode-width = "0.2.2"
 unicode-segmentation = "1.13.3"
+# `worker.rs` (task 4.30): `Effect::GenerateAccount`'s `StoreChoice::Os` branch mirrors
+# `apps/cli/src/main.rs::init_os_keystore` exactly — constructing a `keyring` v1 `Entry` registers
+# the real platform credential store into `keyring-core`, which `meridian_core::identity::
+# OsSecretStore` then uses. Same version pin as `apps/cli/Cargo.toml`'s own `keyring` dependency.
+keyring = "4.1.4"
+# `worker.rs` (task 4.31): `Effect::ImportContactQr`'s worker execution mirrors
+# `apps/cli/src/verify.rs::scan_and_compare`'s own `image::open(...).to_luma8()` call exactly, so
+# the `ImageBuffer<Luma<u8>, Vec<u8>>` type `meridian_core::identity::decode_luma` (re-exported
+# straight through from `meridian-identity`, not redefined) takes has to come from this crate
+# directly — `meridian-identity`/`meridian-core` don't re-export the `image` crate's own types.
+# Workspace-pinned version, PNG-only feature set — same as `apps/cli/Cargo.toml`'s own `image`
+# dependency (the only QR image format either client's demo produces).
+image = { workspace = true, features = ["png"] }
 
 [dev-dependencies]
 # Self-dependency with test-support enabled, so tests/terminal_guard.rs (a separate crate linking
@@ -71,3 +84,17 @@ tempfile = { workspace = true }
 # workspace (`apps/core`, `apps/crypto`, `apps/proto`); dev-only — never a normal-build dependency
 # of this crate.
 ciborium = { workspace = true }
+# tests/run_worker_account.rs (task 4.30): drives the real `meridian-rendezvous` server in-process
+# on an ephemeral port, mirroring `apps/cli/tests/rendezvous_demo.rs::spawn_server` exactly — dev-only,
+# never a normal-build dependency of this crate (same shape as that test's own `meridian-rendezvous`
+# dev-dependency in `apps/cli/Cargo.toml`).
+meridian-rendezvous = { path = "../rendezvous" }
+# `net` (TcpListener, for the in-process test server above) on top of this crate's own `tokio`
+# dependency's feature set.
+tokio = { workspace = true, features = ["net"] }
+# `tests/run_worker_account.rs`'s `CountingStore` wraps `meridian_rendezvous::store::Store` (an
+# `async_trait` trait) to count successful auths, proving `Register` -> `PublishBundle` reuses one
+# connection rather than opening a second — needs `PrekeyBundle` (`put_bundle`'s parameter type) and
+# `async_trait` itself to name the impl.
+meridian-proto = { path = "../proto" }
+async-trait = { workspace = true }

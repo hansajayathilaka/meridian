@@ -20,6 +20,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use meridian_core::trust::{PinnedKey, TrustState};
 
+use crate::session::LiveSession;
+
 use crate::screens::chat::{self, ChatState};
 use crate::screens::contact_detail::{self, ContactDetailState};
 use crate::screens::contacts::{self, ContactsState};
@@ -38,7 +40,11 @@ use crate::theme::RenderCtx;
 
 /// Events the runtime feeds into [`App::update`]. Produced by crossterm input, the worker-response
 /// channel, or the 250ms tick — see the event-loop diagram in tui-client.md §4.
-#[derive(Debug, Clone)]
+///
+/// **Does not derive `Clone`** (review fix, task 4.29 Finding 1): `Worker` wraps a [`WorkerEvent`],
+/// which no longer implements `Clone` (see that type's own doc comment) — nothing in this crate
+/// clones a whole `AppEvent` today; each event is consumed exactly once by `App::update`.
+#[derive(Debug)]
 pub enum AppEvent {
     /// Fired every 250ms so the UI can animate/expire things without new input.
     Tick,
@@ -171,18 +177,14 @@ pub struct PublishBundleEffect {
     pub outcome: Option<PublishedBundle>,
 }
 
-/// [`Effect::Unlock`]'s payload (task 4.17): unwrap a passphrase-protected keyfile —
+/// [`Effect::Unlock`]'s request half (task 4.17): unwrap a passphrase-protected keyfile —
 /// `meridian_core::store::FileSecretStore::new(keyfile, passphrase)` followed by an unwrap
 /// attempt (e.g. `export_seed`/`use_key`), mirroring `apps/cli/src/main.rs::load_store`'s
-/// `StoreKind::File` branch. Carries no separate outcome payload, same as [`RegisterRequest`]: a
-/// wrong passphrase surfaces as `meridian_core::store::StoreError::Unwrap` inside
-/// `WorkerEvent::Failed`'s message, and the mere fact of `WorkerEvent::Completed` arriving is the
-/// only signal [`crate::screens::unlock`] needs — there is no extra data to carry forward into
-/// `Screen::Main` from this pure-UI layer (the unlocked store itself is a worker-side concern).
+/// `StoreKind::File` branch.
 ///
 /// **`passphrase` is a live secret** — hand-rolled, unconditionally redacted [`fmt::Debug`], same
 /// discipline as [`StoreChoice::File`]'s, since this type sits directly inside [`Effect`], which
-/// `#[derive(Debug)]`s and is itself dumped by this crate's own `panic!("{other:?}")` test
+/// derives `Debug` and is itself dumped by this crate's own `panic!("{other:?}")` test
 /// fallbacks.
 #[derive(Clone, PartialEq, Eq)]
 pub struct UnlockRequest {
@@ -197,6 +199,135 @@ impl fmt::Debug for UnlockRequest {
             .field("passphrase", &"<redacted>")
             .finish()
     }
+}
+
+/// Wraps a [`LiveSession`] as it travels inside an [`Effect`]'s own outcome field
+/// ([`UnlockEffect::outcome`]/[`LoadSessionOutcome::Loaded`]) — task 4.29.
+///
+/// `LiveSession` deliberately implements neither `Clone` nor `PartialEq` (`TrustStore`/`ChatState`
+/// are move-only, never duplicated — see `crate::session`'s own module doc), and **this type does
+/// not implement `Clone` either** — deliberately, not an oversight. An earlier version of this type
+/// carried a hand-rolled `Clone` impl that panicked if ever called on a populated value, justified by
+/// the (then-true, but unenforced) claim that every `crate::surface::PaletteAction::Effect`
+/// registered anywhere in this crate was a static, request-only value. Review fix (task 4.29,
+/// Finding 1): that was a real, reproduced one-keypress crash waiting to happen — nothing in the type
+/// system stopped a future call site from registering a *populated* `SessionOutcome` as a
+/// `PaletteAction::Effect`, and `Screen::Help`/`Screen::Palette`'s own registry-snapshot `.clone()`
+/// (fired unconditionally by the global `F1`/`Ctrl+K` keys) would reach it. `PaletteAction::Effect`
+/// is now a *factory* (`Arc<dyn Fn() -> Effect + Send + Sync>` — see that type's own doc comment for
+/// the full reasoning), which never needs to clone a live `Effect` at all, so this type's `Clone` need
+/// is gone at the root rather than merely narrowed to "still panics, just less likely to be hit".
+pub struct SessionOutcome(Option<LiveSession>);
+
+impl SessionOutcome {
+    /// Not yet resolved (the shape every outgoing request effect starts in — mirrors every other
+    /// `outcome: None` construction site in this file).
+    pub fn empty() -> Self {
+        Self(None)
+    }
+
+    /// Resolved: a worker successfully loaded/unlocked a real [`LiveSession`].
+    pub fn ready(session: LiveSession) -> Self {
+        Self(Some(session))
+    }
+
+    /// Unwraps into the plain `Option<LiveSession>` shape every other consumer in this crate already
+    /// pattern-matches against `Effect`'s other `outcome: Option<T>` fields with.
+    pub fn into_option(self) -> Option<LiveSession> {
+        self.0
+    }
+
+    pub fn as_option(&self) -> Option<&LiveSession> {
+        self.0.as_ref()
+    }
+}
+
+impl fmt::Debug for SessionOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some(_) => write!(f, "SessionOutcome(Some(LiveSession))"),
+            None => write!(f, "SessionOutcome(None)"),
+        }
+    }
+}
+
+/// [`Effect::Unlock`]'s full payload (task 4.29 extension): the [`UnlockRequest`] going out, and
+/// (once a worker has executed it) the real, loaded [`LiveSession`] coming back for the file-backed
+/// path — see this task's own risk note: "a live passphrase must never cross more than one effect
+/// round-trip", which is exactly why the session comes back on *this* same effect rather than a
+/// second `Effect::LoadSession` dispatch. Same request/outcome shape as [`GenerateAccountEffect`],
+/// just with [`SessionOutcome`] standing in for a bare `Option<LiveSession>` (see that type's own doc
+/// for why).
+///
+/// **Does not derive `Clone`** (review fix, task 4.29 Finding 1): [`SessionOutcome`] no longer
+/// implements `Clone` — see that type's own doc comment for why — so this struct, which embeds one,
+/// cannot derive it either. Nothing needs it: [`crate::surface::PaletteAction::Effect`] is a factory
+/// now, never a stored value to clone.
+#[derive(Debug)]
+pub struct UnlockEffect {
+    pub request: UnlockRequest,
+    pub outcome: SessionOutcome,
+}
+
+/// [`Effect::LoadSession`]'s request half (task 4.29): resolve whatever `account.json` (if any) is
+/// on disk under `$MERIDIAN_HOME`, and — for an **OS-keystore-backed** account only — its associated
+/// `trust.bin`/`sessions.bin`/`contacts.json` into a real [`LiveSession`].
+///
+/// Carries no fields at all: every input a worker needs (`$MERIDIAN_HOME`'s layout,
+/// `account.json`'s own declared `StoreKind`) is read fresh from disk at dispatch time — there is
+/// nothing else a caller could usefully supply here that the worker doesn't already have to
+/// re-derive anyway (mirrors [`RunDoctorRequest::binary`]'s status as the *only* thing that
+/// genuinely can't be re-derived over on that effect; this one has no such field).
+///
+/// **A file-backed account's own load never goes through this effect** — that would mean either
+/// re-prompting for (or worse, re-threading) a passphrase outside [`Effect::Unlock`]'s own single
+/// round trip, exactly the risk that effect's own doc comment warns against. A worker that finds
+/// `account.json` declares a file-backed store here fails closed with a clear message instead of
+/// silently no-op'ing or guessing a passphrase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LoadSessionRequest;
+
+/// [`Effect::LoadSession`]'s outcome (task 4.29) — deliberately **not** a bare
+/// `Option<LiveSession>`-shaped `outcome` field the way most other effects in this file use, because
+/// "no `account.json` on disk at all" is a legitimate, non-error result this effect must be able to
+/// report distinctly from "a real account was found and loaded" — collapsing the two into the same
+/// shape would leave a caller unable to tell "nothing to load yet, route to onboarding" apart from
+/// "a session was loaded but happens to be freshly-empty" without inspecting the loaded
+/// [`AccountDescriptor`](meridian_core::account::AccountDescriptor) itself.
+///
+/// **Contract, precisely (task's own "no account.json" test case):** no `account.json` at all is
+/// [`LoadSessionOutcome::NoAccount`] — never a hard [`WorkerEvent::Failed`] (a pristine,
+/// never-onboarded `$MERIDIAN_HOME` is not an error) and never a fabricated [`LiveSession`] (there is
+/// no real [`AccountDescriptor`](meridian_core::account::AccountDescriptor) to put in one). A
+/// brand-new account that *has* an `account.json` (onboarding just finished) but nothing else yet
+/// sealed on disk loads through the ordinary [`LoadSessionOutcome::Loaded`] path and comes back
+/// looking exactly like [`LiveSession::empty`] would have built directly — same empty
+/// `TrustStore`/`ChatState`/contacts, just reached by a real (trivial) disk read here instead of a
+/// caller skipping the effect entirely, which is the "no disk read needed" shortcut this task's own
+/// risk note flags as available to whichever future task wires onboarding's own completion — this
+/// effect's own execution stays correct either way.
+///
+/// **Does not derive `Clone`** — same reason as [`UnlockEffect`]: [`LoadSessionOutcome::Loaded`]
+/// embeds a boxed [`SessionOutcome`], which no longer implements `Clone`.
+#[derive(Debug)]
+pub enum LoadSessionOutcome {
+    /// No `account.json` exists yet.
+    NoAccount,
+    /// A real account was found; its stores were opened (or defaulted). Boxed:
+    /// `clippy::large_enum_variant` flags the size gap against `NoAccount`'s zero-sized variant
+    /// otherwise — the same reason several `Screen`/`Effect` variants elsewhere in this file are
+    /// boxed.
+    Loaded(Box<SessionOutcome>),
+}
+
+/// [`Effect::LoadSession`]'s full payload — same request/outcome shape as [`GenerateAccountEffect`].
+///
+/// **Does not derive `Clone`** — same reason as [`UnlockEffect`]/[`LoadSessionOutcome`]: `outcome`
+/// transitively embeds a [`SessionOutcome`], which no longer implements `Clone`.
+#[derive(Debug)]
+pub struct LoadSessionEffect {
+    pub request: LoadSessionRequest,
+    pub outcome: Option<LoadSessionOutcome>,
 }
 
 /// Inputs for [`Effect::AddContact`] (task 4.19, `crate::screens::contacts`): TOFU-pin a peer's
@@ -707,14 +838,38 @@ pub struct RunDoctorEffect {
 /// `SetUserBlocked` is reused as-is for that screen's own block action — see
 /// [`MarkVerifiedEffect`]/[`AcknowledgeKeyChangeEffect`]; `SaveSetting` is the settings screen's
 /// (task 4.24) one new one — see [`SaveSettingEffect`]; `RunDoctor` is the diagnostics screen's (task
-/// 4.25) one new one — see [`RunDoctorEffect`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 4.25) one new one — see [`RunDoctorEffect`]; `LoadSession` is task 4.29's own new one — the
+/// OS-keystore/no-account-yet counterpart to `Unlock`'s now-extended file-backed path — see
+/// [`LoadSessionEffect`].
+///
+/// **Does not derive `PartialEq`/`Eq`** (unlike most of the payload structs above): `Unlock`/
+/// `LoadSession` carry a [`SessionOutcome`], and the [`crate::session::LiveSession`] it wraps
+/// deliberately implements neither (move-only — see that type's own module doc), so there is no
+/// meaningful, total equality to derive here any more. The handful of call sites that used to compare
+/// whole `Effect`/`Vec<Effect>` values now use `matches!` instead (see e.g.
+/// `crate::app::tests::find_binding_fires_a_registered_commands_effect_without_opening_the_palette`).
+///
+/// **Does not derive `Clone` either** (review fix, task 4.29 Finding 1): `Unlock`/`LoadSession`
+/// transitively embed a [`SessionOutcome`], which no longer implements `Clone` — see that type's own
+/// doc comment. Nothing needs `Effect: Clone` any more:
+/// [`crate::surface::PaletteAction::Effect`] is now a factory (`Arc<dyn Fn() -> Effect + Send +
+/// Sync>`) that builds a fresh `Effect` on every trigger rather than storing and cloning one, which is
+/// what made `Clone` load-bearing here in the first place — see that type's own doc comment for the
+/// full before/after reasoning. A call site that genuinely needs the same request twice (e.g. a
+/// same-effect retry) constructs it twice / clones the smaller request struct instead — see
+/// `apps/tui/tests/run_worker_account.rs`'s `publish_bundle_retry_after_a_transient_failure_reuses_
+/// the_cached_connection` for the pattern.
+#[derive(Debug)]
 pub enum Effect {
     SendMessage(SendMessageEffect),
     FetchBundle,
     PublishBundle(PublishBundleEffect),
     PersistHistory(PersistHistoryEffect),
-    Unlock(UnlockRequest),
+    /// Boxed: `clippy::large_enum_variant` flags the size gap against the smaller variants
+    /// otherwise, once [`UnlockEffect::outcome`] can carry a whole [`LiveSession`] — the same
+    /// `clippy::large_enum_variant` reason [`LoadSessionOutcome::Loaded`] is boxed too.
+    Unlock(Box<UnlockEffect>),
+    LoadSession(LoadSessionEffect),
     GenerateAccount(GenerateAccountEffect),
     Register(RegisterRequest),
     AddContact(AddContactEffect),
@@ -732,7 +887,12 @@ pub enum Effect {
 }
 
 /// The outcome of a worker task executing an [`Effect`], reported back as [`AppEvent::Worker`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **Does not derive `PartialEq`/`Eq`**, for the same reason [`Effect`] itself no longer does (see
+/// that type's own doc comment) — nothing in this crate compares whole `WorkerEvent` values today.
+/// **Does not derive `Clone`** either, for the same reason [`Effect`] no longer does (it wraps one
+/// directly) — nothing in this crate clones a whole `WorkerEvent` today.
+#[derive(Debug)]
 pub enum WorkerEvent {
     Completed(Effect),
     Failed(Effect, String),
@@ -1301,7 +1461,7 @@ impl App {
     /// title today.
     fn dispatch_palette_action(&mut self, action: PaletteAction) -> Vec<Effect> {
         match action {
-            PaletteAction::Effect(effect) => vec![*effect],
+            PaletteAction::Effect(factory) => vec![factory()],
             PaletteAction::PushPane(factory) => {
                 let pane = factory();
                 let already_open = matches!(
@@ -1323,6 +1483,17 @@ impl App {
             Some(Screen::Help(state)) => help::handle_worker(state, event),
             Some(Screen::Palette(state)) => palette::handle_worker(state, event),
             Some(Screen::Unlock(state)) => {
+                // **Known gap, flagged for 4.36/4.37 (task 4.29's own doc note, Finding 3):** this
+                // delegates the *whole* `WorkerEvent` to `unlock::handle_worker` without first
+                // reclaiming the `SessionOutcome`/`LiveSession` a successful file-backed
+                // `Effect::Unlock` now carries (see `crate::app::UnlockEffect`/
+                // `crate::session::LiveSession`) — so today a real, freshly-loaded `LiveSession` is
+                // built and then discarded unread on every successful unlock. Not a defect in *this*
+                // task (4.29's own scope explicitly excludes wiring `App` to hold
+                // `Option<LiveSession>` — see the task file's Scope/Out section), but whichever future
+                // task does that wiring must change *this arm itself* to extract the outcome before
+                // delegating, not just add navigation elsewhere — there is no other reclaim point on
+                // this path today.
                 let (effects, finished) = unlock::handle_worker(state, event);
                 if finished {
                     *self
@@ -1903,7 +2074,7 @@ mod tests {
                 KeyCode::Char('z'),
                 KeyModifiers::CONTROL,
             )),
-            action: PaletteAction::Effect(Box::new(Effect::FetchBundle)),
+            action: PaletteAction::Effect(Arc::new(|| Effect::FetchBundle)),
         });
 
         app.update(AppEvent::Key(key(
@@ -1933,14 +2104,17 @@ mod tests {
                 KeyCode::Char('p'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             )),
-            action: PaletteAction::Effect(Box::new(Effect::FetchBundle)),
+            action: PaletteAction::Effect(Arc::new(|| Effect::FetchBundle)),
         });
 
         let effects = app.update(AppEvent::Key(key(
             KeyCode::Char('p'),
             KeyModifiers::CONTROL | KeyModifiers::ALT,
         )));
-        assert_eq!(effects, vec![Effect::FetchBundle]);
+        assert!(
+            matches!(effects.as_slice(), [Effect::FetchBundle]),
+            "expected [Effect::FetchBundle], got {effects:?}"
+        );
         // No palette was opened — still on the root screen.
         assert!(matches!(app.current_screen(), Screen::Onboarding(_)));
         assert_eq!(app.screens.len(), 1);
@@ -1962,7 +2136,7 @@ mod tests {
                 KeyCode::Char('j'),
                 KeyModifiers::NONE,
             )),
-            action: PaletteAction::Effect(Box::new(Effect::FetchBundle)),
+            action: PaletteAction::Effect(Arc::new(|| Effect::FetchBundle)),
         });
         *app.screens.last_mut().unwrap() = Screen::Settings(Box::new(SettingsState::new(
             crate::config::TuiConfig::default(),
@@ -1970,7 +2144,10 @@ mod tests {
         )));
 
         let effects = app.update(AppEvent::Key(key(KeyCode::Char('j'), KeyModifiers::NONE)));
-        assert_eq!(effects, vec![Effect::FetchBundle]);
+        assert!(
+            matches!(effects.as_slice(), [Effect::FetchBundle]),
+            "expected [Effect::FetchBundle], got {effects:?}"
+        );
         match app.current_screen() {
             // Settings' own selection cursor did not move — it would have, absent the interception.
             Screen::Settings(state) => assert_eq!(state.selected, 0),

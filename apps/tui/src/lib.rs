@@ -36,14 +36,17 @@ pub mod app;
 pub mod config;
 pub mod config_write;
 pub mod screens;
+pub mod session;
 pub mod statusbar;
 pub mod store;
 pub mod surface;
 pub mod terminal;
 pub mod theme;
+pub mod worker;
 
 pub use app::{App, AppEvent, Effect, Screen, WorkerEvent};
 pub use config::{load as load_config, load_from as load_config_from, TuiConfig};
+pub use session::LiveSession;
 pub use terminal::{spawn_signal_watch, CrosstermOps, TerminalGuard, TerminalOps};
 pub use theme::RenderCtx;
 
@@ -148,15 +151,21 @@ fn translate_event(event: crossterm::event::Event) -> Option<AppEvent> {
     }
 }
 
-/// Executes [`Effect`]s and reports outcomes back as [`AppEvent::Worker`]. Effects have no real
-/// behavior yet (placeholder scope, task 4.11) — the network/store/crypto wiring for each lands with
-/// the tasks named on [`Effect`]'s doc comment.
+/// Executes [`Effect`]s and reports outcomes back as [`AppEvent::Worker`]. The account-lifecycle
+/// four (`GenerateAccount`/`Register`/`PublishBundle`/`Unlock`) run for real via
+/// [`worker::dispatch`] (task 4.30); every other `Effect` variant still falls through to
+/// [`worker::dispatch`]'s own placeholder-echo arm until its own task lands — see that function's
+/// doc comment. One [`worker::OnboardingSession`] lives for this task's whole lifetime, threaded
+/// through every dispatch, so a `Register` effect's live connection survives to be reused by the
+/// `PublishBundle` effect that follows it (never reconnecting between them — see
+/// [`worker::OnboardingSession`]'s doc comment).
 async fn run_worker(
     mut effects: mpsc::UnboundedReceiver<Effect>,
     replies: mpsc::UnboundedSender<AppEvent>,
 ) {
+    let mut session = worker::OnboardingSession::default();
     while let Some(effect) = effects.recv().await {
-        let outcome = WorkerEvent::Completed(effect);
+        let outcome = worker::dispatch(effect, &mut session).await;
         if replies.send(AppEvent::Worker(Box::new(outcome))).is_err() {
             break;
         }

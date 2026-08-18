@@ -37,7 +37,7 @@ use ratatui::Frame;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{Effect, UnlockRequest, WorkerEvent};
+use crate::app::{Effect, SessionOutcome, UnlockEffect, UnlockRequest, WorkerEvent};
 
 // ---------------------------------------------------------------------------
 // State
@@ -164,7 +164,13 @@ fn handle_entering(e: &mut Entering, key: KeyEvent) -> (Option<UnlockState>, Vec
                 attempts: e.attempts,
                 request: request.clone(),
             });
-            return (Some(next), vec![Effect::Unlock(request)]);
+            return (
+                Some(next),
+                vec![Effect::Unlock(Box::new(UnlockEffect {
+                    request,
+                    outcome: SessionOutcome::empty(),
+                }))],
+            );
         }
         _ => {}
     }

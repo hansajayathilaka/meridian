@@ -54,21 +54,23 @@ fn synthetic_registry() -> PaletteRegistry {
         name: "Alpha Command",
         description: "the first synthetic command, bound to Ctrl+A",
         keybinding: Some(KeyBinding::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
-        action: PaletteAction::Effect(Box::new(Effect::FetchBundle)),
+        action: PaletteAction::Effect(std::sync::Arc::new(|| Effect::FetchBundle)),
     });
     registry.register(PaletteCommand {
         id: "demo.beta",
         name: "Beta Command",
         description: "the second synthetic command, palette only, no binding",
         keybinding: None,
-        action: PaletteAction::Effect(Box::new(Effect::SendMessage(SendMessageEffect {
-            request: SendMessageRequest {
-                peer_pubkey: [0u8; 32],
-                peer_hint: String::new(),
-                body: String::new(),
-            },
-            outcome: None,
-        }))),
+        action: PaletteAction::Effect(std::sync::Arc::new(|| {
+            Effect::SendMessage(SendMessageEffect {
+                request: SendMessageRequest {
+                    peer_pubkey: [0u8; 32],
+                    peer_hint: String::new(),
+                    body: String::new(),
+                },
+                outcome: None,
+            })
+        })),
     });
     registry
 }
@@ -309,8 +311,8 @@ fn enter_on_the_selected_command_reports_run_with_its_action() {
         "the screen itself never dispatches — App does, via the outcome"
     );
     match outcome {
-        PaletteOutcome::Run(PaletteAction::Effect(effect)) => {
-            assert_eq!(*effect, Effect::FetchBundle);
+        PaletteOutcome::Run(PaletteAction::Effect(factory)) => {
+            assert!(matches!(factory(), Effect::FetchBundle));
         }
         other => panic!("expected Run(Effect(FetchBundle)), got {other:?}"),
     }

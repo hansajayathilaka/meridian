@@ -548,7 +548,7 @@ fn palette_command_violations(registry: &PaletteRegistry) -> Vec<&'static str> {
         .filter(|command| {
             matches!(
                 &command.action,
-                PaletteAction::Effect(effect) if matches!(**effect, Effect::SendMessage(_))
+                PaletteAction::Effect(factory) if matches!(factory(), Effect::SendMessage(_))
             )
         })
         .map(|command| command.id)
@@ -594,14 +594,16 @@ fn the_palette_command_checker_actually_catches_a_send_capable_command() {
         description: "a synthetic, never-actually-registered command standing in for a future \
                        ungated send path",
         keybinding: Some(KeyBinding::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
-        action: PaletteAction::Effect(Box::new(Effect::SendMessage(SendMessageEffect {
-            request: SendMessageRequest {
-                peer_pubkey: [0x31u8; 32],
-                peer_hint: "adversary.example".into(),
-                body: "attacker-controlled body, dispatched with no gate check".into(),
-            },
-            outcome: None,
-        }))),
+        action: PaletteAction::Effect(std::sync::Arc::new(|| {
+            Effect::SendMessage(SendMessageEffect {
+                request: SendMessageRequest {
+                    peer_pubkey: [0x31u8; 32],
+                    peer_hint: "adversary.example".into(),
+                    body: "attacker-controlled body, dispatched with no gate check".into(),
+                },
+                outcome: None,
+            })
+        })),
     });
 
     assert_eq!(

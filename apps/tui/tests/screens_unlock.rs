@@ -16,7 +16,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
-use meridian_tui::app::{Effect, UnlockRequest, WorkerEvent};
+use meridian_tui::app::{Effect, SessionOutcome, UnlockEffect, UnlockRequest, WorkerEvent};
 use meridian_tui::screens::unlock::{handle_key, handle_worker, render, Entering, UnlockState};
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -87,10 +87,15 @@ fn enter_with_a_passphrase_dispatches_unlock_effect_and_moves_to_unlocking() {
     assert!(!finished);
     assert_eq!(effects.len(), 1);
     match &effects[0] {
-        Effect::Unlock(UnlockRequest {
-            keyfile: kf,
-            passphrase,
-        }) => {
+        Effect::Unlock(effect) => {
+            let UnlockEffect {
+                request:
+                    UnlockRequest {
+                        keyfile: kf,
+                        passphrase,
+                    },
+                ..
+            } = effect.as_ref();
             assert_eq!(kf, &keyfile());
             assert_eq!(passphrase, "hunter2");
         }
@@ -133,10 +138,13 @@ fn worker_completed_signals_finished() {
     });
     let (effects, finished) = handle_worker(
         &mut state,
-        WorkerEvent::Completed(Effect::Unlock(UnlockRequest {
-            keyfile: keyfile(),
-            passphrase: "hunter2".into(),
-        })),
+        WorkerEvent::Completed(Effect::Unlock(Box::new(UnlockEffect {
+            request: UnlockRequest {
+                keyfile: keyfile(),
+                passphrase: "hunter2".into(),
+            },
+            outcome: SessionOutcome::empty(),
+        }))),
     );
     assert!(effects.is_empty());
     assert!(finished);
@@ -158,10 +166,13 @@ fn worker_failed_increments_attempts_and_returns_to_entering_with_no_lockout() {
     let (effects, finished) = handle_worker(
         &mut state,
         WorkerEvent::Failed(
-            Effect::Unlock(UnlockRequest {
-                keyfile: keyfile(),
-                passphrase: "wrong-one".into(),
-            }),
+            Effect::Unlock(Box::new(UnlockEffect {
+                request: UnlockRequest {
+                    keyfile: keyfile(),
+                    passphrase: "wrong-one".into(),
+                },
+                outcome: SessionOutcome::empty(),
+            })),
             "could not unwrap keyfile (wrong passphrase or corrupt data)".into(),
         ),
     );
@@ -195,10 +206,13 @@ fn worker_failed_increments_attempts_and_returns_to_entering_with_no_lockout() {
     let (_, finished) = handle_worker(
         &mut state,
         WorkerEvent::Failed(
-            Effect::Unlock(UnlockRequest {
-                keyfile: keyfile(),
-                passphrase: "correct-one".into(),
-            }),
+            Effect::Unlock(Box::new(UnlockEffect {
+                request: UnlockRequest {
+                    keyfile: keyfile(),
+                    passphrase: "correct-one".into(),
+                },
+                outcome: SessionOutcome::empty(),
+            })),
             "could not unwrap keyfile (wrong passphrase or corrupt data)".into(),
         ),
     );

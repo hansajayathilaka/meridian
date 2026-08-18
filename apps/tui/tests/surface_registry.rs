@@ -279,7 +279,7 @@ fn palette_command_registers_and_is_findable_by_binding() {
         name: "Ping",
         description: "a synthetic demo command",
         keybinding: Some(KeyBinding::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
-        action: PaletteAction::Effect(Box::new(Effect::FetchBundle)),
+        action: PaletteAction::Effect(Arc::new(|| Effect::FetchBundle)),
     });
 
     assert_eq!(registry.iter().count(), 1);
@@ -289,7 +289,7 @@ fn palette_command_registers_and_is_findable_by_binding() {
     assert_eq!(found.id, "demo.ping");
     assert!(matches!(
         &found.action,
-        PaletteAction::Effect(effect) if matches!(**effect, Effect::FetchBundle)
+        PaletteAction::Effect(factory) if matches!(factory(), Effect::FetchBundle)
     ));
 
     // An unrelated key never matches.
@@ -309,21 +309,23 @@ fn palette_command_registration_is_last_write_wins() {
         name: "First",
         description: "the first registration",
         keybinding: None,
-        action: PaletteAction::Effect(Box::new(Effect::FetchBundle)),
+        action: PaletteAction::Effect(Arc::new(|| Effect::FetchBundle)),
     });
     registry.register(PaletteCommand {
         id: "demo.collide",
         name: "Second",
         description: "the second registration",
         keybinding: None,
-        action: PaletteAction::Effect(Box::new(Effect::SendMessage(SendMessageEffect {
-            request: SendMessageRequest {
-                peer_pubkey: [0u8; 32],
-                peer_hint: String::new(),
-                body: String::new(),
-            },
-            outcome: None,
-        }))),
+        action: PaletteAction::Effect(Arc::new(|| {
+            Effect::SendMessage(SendMessageEffect {
+                request: SendMessageRequest {
+                    peer_pubkey: [0u8; 32],
+                    peer_hint: String::new(),
+                    body: String::new(),
+                },
+                outcome: None,
+            })
+        })),
     });
 
     assert_eq!(
@@ -335,7 +337,7 @@ fn palette_command_registration_is_last_write_wins() {
     assert_eq!(command.name, "Second");
     assert!(matches!(
         &command.action,
-        PaletteAction::Effect(effect) if matches!(**effect, Effect::SendMessage(_))
+        PaletteAction::Effect(factory) if matches!(factory(), Effect::SendMessage(_))
     ));
 }
 
@@ -350,7 +352,7 @@ fn surface_registry_bundles_renderers_and_commands_with_zero_cross_edits() {
             name: "Ping",
             description: "a synthetic demo command",
             keybinding: None,
-            action: PaletteAction::Effect(Box::new(Effect::FetchBundle)),
+            action: PaletteAction::Effect(Arc::new(|| Effect::FetchBundle)),
         },
     );
 
