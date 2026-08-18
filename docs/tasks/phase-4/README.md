@@ -219,7 +219,7 @@ reopened) lives in each task file's own text plus the architect consult recorded
 - [x] **4.35** Inbound delivery stream — [file](./4.35-inbound-delivery-stream.md)
 - [x] **4.36** `Screen::Main` + live navigation — [file](./4.36-screen-main-live-navigation.md)
 - [x] **4.37** Preflight routing — [file](./4.37-preflight-routing.md)
-- [ ] **4.38** T17 acceptance-demo closure (phase re-exit gate) — [file](./4.38-t17-acceptance-demo-closure.md)
+- [~] **4.38** T17 acceptance-demo closure (phase re-exit gate) — [file](./4.38-t17-acceptance-demo-closure.md)
 
 ### Dependency order
 ```
