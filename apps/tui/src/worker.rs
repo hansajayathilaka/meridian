@@ -1300,6 +1300,26 @@ async fn run_send_message(request: &SendMessageRequest) -> Result<SentMessage, S
     })
 }
 
+/// Sanitizes a routing hint before it is ever wrapped in `Some(..)` for
+/// `SignalingClient::fetch_bundle`/`route_with_hint`: an empty-but-present hint must never be
+/// forwarded as `Some(String::new())`. `meridian-rendezvous`'s own routing rule
+/// (`handle_route`/`handle_fetch`, `apps/rendezvous/src/ws.rs`) treats *any* `Some` hint that
+/// doesn't case-insensitively match its own domain as a foreign-server federation target — an
+/// empty string never matches a real domain, so passing it through verbatim misroutes as a
+/// federation attempt instead of a local delivery. A blank hint is exactly what
+/// `run_accept_request` pins for a first-contact sender (`TrustStore::observe`'s own
+/// "`MessageRequest` carries no advisory hint" contract), so this is not a hypothetical input —
+/// every call site that builds a routing hint (auto-ack in [`process_inbound_delivery`],
+/// [`fetch_with_retry`], [`route_tolerant`]) must run its hint through here so this class of bug
+/// cannot recur at a fourth call site either.
+fn sanitize_routing_hint(hint: &str) -> Option<String> {
+    if hint.is_empty() {
+        None
+    } else {
+        Some(hint.to_string())
+    }
+}
+
 /// Fetch + verify the peer's bundle, retrying while the peer has not published yet — mirrors
 /// `apps/cli/src/chat.rs::fetch_with_retry` exactly (same 40-attempt/250ms-backoff bound), minus
 /// its `eprintln!` progress lines: this worker's [`WorkerEvent`] has only `Completed`/`Failed`, no
@@ -1317,7 +1337,7 @@ async fn fetch_with_retry(
     let mut stale_hint = false;
     for _ in 0..40u32 {
         match client
-            .fetch_bundle(peer_ik, Some(peer_hint.to_string()), false)
+            .fetch_bundle(peer_ik, sanitize_routing_hint(peer_hint), false)
             .await
         {
             Ok(bundle) => return Ok(bundle),
@@ -1384,7 +1404,7 @@ async fn route_tolerant(
     use meridian_core::proto::error_codes::NOT_CONNECTED;
     use meridian_core::signaling::SignalError;
     match client
-        .route_with_hint(to, Some(hint.to_string()), blob)
+        .route_with_hint(to, sanitize_routing_hint(hint), blob)
         .await
     {
         Ok(delivered) => Ok(delivered),
@@ -1704,20 +1724,13 @@ async fn process_inbound_delivery(
                 &deliver.from,
                 &ChatContent::Receipt { ack: id },
             ) {
-                // Filters out an empty (but present) hint to `None` rather than passing it through
-                // as `Some(String::new())`: `meridian-rendezvous`'s own routing rule treats *any*
-                // `Some` hint that doesn't case-insensitively match its own domain as a foreign-
-                // server federation target (`handle_route`'s own `if let Some(hint) = &body.to_hint`
-                // branch) — an empty string never matches a real domain, so passing it through
-                // verbatim would misroute this ack as a federation attempt instead of a local
-                // delivery. A blank hint is exactly what `run_accept_request` (never any other
-                // caller) actually pins for a first-contact sender — `TrustStore::observe`'s own
-                // "`MessageRequest` carries no advisory hint" contract — so this is not a hypothetical
-                // input.
+                // Runs the looked-up hint through the same [`sanitize_routing_hint`] every other
+                // routing-hint call site uses — see that function's own doc comment for why an
+                // empty-but-present hint must never be forwarded verbatim.
                 let hint = load_trust(store, handle)
                     .ok()
                     .and_then(|t| t.contact(&deliver.from).map(|c| c.hint.clone()))
-                    .filter(|h| !h.is_empty());
+                    .and_then(|h| sanitize_routing_hint(&h));
                 let _ = client
                     .route_with_hint(deliver.from, hint, receipt_blob)
                     .await;

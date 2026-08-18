@@ -15,7 +15,20 @@
 //! 4. [`auto_ack_still_replies_even_though_trust_bin_marks_the_sender_blocked`] — (d), the
 //!    falsifiable version of "the auto-ack path is never gated by `SendGate`", mirroring
 //!    `run_worker_chat.rs`'s own `send_succeeds_even_though_trust_bin_marks_the_peer_blocked`.
+//!
+//! Plus a review-driven regression:
+//! 5. [`reply_to_a_message_request_accepted_contact_with_a_blank_hint_routes_locally`] — the
+//!    identical empty-hint-misroutes-as-federation bug (d)'s auto-ack fix closed, found the second
+//!    time on the ordinary outbound `Effect::SendMessage`/`route_tolerant` path
+//!    (`worker::sanitize_routing_hint` now centralizes the fix across every routing-hint call site).
+//!
+//! And, closing a review-flagged coverage gap:
+//! 6. [`reconnect_with_backoff_escalates_then_recovers_and_resumes_forwarding_inbound`] — the
+//!    reconnect-with-backoff logic itself (attempt counting, clamping, `AppEvent::ConnectionStatus`
+//!    emission, and resumed forwarding after a real reconnect), previously exercised only by
+//!    `statusbar.rs`'s pure rendering-primitive test, never by `run_inbound_loop` itself.
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -32,7 +45,7 @@ use meridian_rendezvous::{serve, AppState, Config, MemoryStore};
 
 use meridian_tui::app::{
     AcceptRequestEffect, AcceptRequestRequest, App, AppEvent, Effect, InboundEvent, Screen,
-    SetUserBlockedEffect, SetUserBlockedRequest,
+    SendMessageEffect, SendMessageRequest, SetUserBlockedEffect, SetUserBlockedRequest,
 };
 use meridian_tui::screens::chat::ChatState as TuiChatState;
 use meridian_tui::store::history::{Direction as MsgDirection, HistoryEntry, MessageState};
@@ -105,6 +118,105 @@ fn spawn_server() -> String {
     });
     let addr = rx.recv().unwrap();
     format!("ws://{addr}")
+}
+
+// ---------------------------------------------------------------------------
+// A killable, restartable-on-the-same-address in-process rendezvous server — used only by the
+// reconnect-with-backoff test below (deliverable 6); every other test in this file uses the
+// simpler, forever-running `spawn_server()` above.
+// ---------------------------------------------------------------------------
+
+/// Handle to a server spawned by [`try_spawn_server_at`]. `kill()` signals the server's dedicated
+/// OS thread to stop and drop its whole Tokio runtime — closing the listener *and* every accepted
+/// connection's socket (a real, unplanned-outage-style disconnect from a connected client's point
+/// of view, not a clean WS close) — so a later [`try_spawn_server_at`] call can rebind the identical
+/// address.
+struct KillableServer {
+    addr: SocketAddr,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl KillableServer {
+    async fn kill(mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        // A brief grace period for the server's OS thread to actually finish dropping its runtime
+        // (closing the listening socket) before a caller tries to rebind the same address — an
+        // `.await`, not a blocking sleep, so it never stalls this test's own async executor (in
+        // particular, the `run_inbound_loop` task under test, spawned onto the same runtime, keeps
+        // making progress the whole time).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Spawns a real, in-process `meridian-rendezvous` server on `bind_addr` (a fresh, empty
+/// `MemoryStore` every time — never carried over from a prior server on the same address), exactly
+/// like [`spawn_server`] except bindable to a caller-chosen fixed address and returning a
+/// [`KillableServer`] instead of running forever. Reports a bind failure back through the result
+/// rather than panicking inside the spawned thread, so [`spawn_server_restart`] can retry.
+fn try_spawn_server_at(bind_addr: SocketAddr) -> Result<(String, KillableServer), String> {
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel::<Result<SocketAddr, String>>();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let store = std::sync::Arc::new(MemoryStore::new());
+            let config = Config::default();
+            let state = AppState::new(config, store);
+            match tokio::net::TcpListener::bind(bind_addr).await {
+                Ok(listener) => {
+                    let actual = listener.local_addr().unwrap();
+                    let _ = addr_tx.send(Ok(actual));
+                    tokio::select! {
+                        _ = serve(state, listener) => {}
+                        _ = shutdown_rx => {}
+                    }
+                }
+                Err(e) => {
+                    let _ = addr_tx.send(Err(e.to_string()));
+                }
+            }
+        });
+        // `rt` drops here, at thread exit, forcibly ending every task it was still driving —
+        // including any live WebSocket connection — and closing their sockets.
+    });
+    let actual = addr_rx
+        .recv()
+        .map_err(|_| "server thread hung up before reporting a bind result".to_string())??;
+    Ok((
+        format!("ws://{actual}"),
+        KillableServer {
+            addr: actual,
+            shutdown: Some(shutdown_tx),
+        },
+    ))
+}
+
+fn spawn_server_at(addr: Option<SocketAddr>) -> (String, KillableServer) {
+    let bind_addr = addr.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap());
+    try_spawn_server_at(bind_addr)
+        .expect("bind must succeed for a fresh ephemeral/explicit address")
+}
+
+/// Rebinds `addr` for a fresh server, retrying briefly: a just-killed listener's port is not
+/// guaranteed to be immediately available for a new bind on every platform/kernel, even though
+/// [`KillableServer::kill`] already waits out the common case.
+async fn spawn_server_restart(addr: SocketAddr) -> (String, KillableServer) {
+    for attempt in 1..=20u32 {
+        match try_spawn_server_at(addr) {
+            Ok(pair) => return pair,
+            Err(e) if attempt < 20 => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = e;
+            }
+            Err(e) => panic!("could not rebind {addr} after {attempt} attempts: {e}"),
+        }
+    }
+    unreachable!("loop above always either returns or panics")
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +314,47 @@ async fn recv_inbound(
     }
 }
 
+/// Drains `rx` until the next [`AppEvent::ConnectionStatus`] arrives (skipping any interleaved
+/// [`AppEvent::Inbound`] pushes), or `timeout` elapses. `None` on timeout/closed channel.
+async fn recv_status(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    timeout: Duration,
+) -> Option<meridian_tui::statusbar::ConnectionState> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(AppEvent::ConnectionStatus(state))) => return Some(state),
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => return None,
+        }
+    }
+}
+
+/// Drains `rx`, skipping every [`AppEvent::ConnectionStatus::Reconnecting`]/[`AppEvent::Inbound`]
+/// push, until a [`ConnectionState::Connected`] status arrives or `timeout` elapses.
+async fn recv_connected(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    timeout: Duration,
+) -> bool {
+    use meridian_tui::statusbar::ConnectionState;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(AppEvent::ConnectionStatus(ConnectionState::Connected))) => return true,
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => return false,
+        }
+    }
+}
+
 fn spawn_inbound_loop(
     handle: KeyHandle,
     account_pub: [u8; 32],
@@ -223,6 +376,17 @@ fn spawn_inbound_loop(
 async fn dispatch_effect(effect: Effect) -> meridian_tui::app::WorkerEvent {
     let mut session = OnboardingSession::default();
     dispatch(effect, &mut session).await
+}
+
+/// Writes `$MERIDIAN_HOME/tui/config.toml` naming `server` — `worker::resolve_server`'s only source
+/// for the rendezvous URL an outbound `Effect::SendMessage` dispatch connects to. Mirrors
+/// `tests/run_worker_chat.rs::write_server_config` exactly (this file otherwise never dispatches an
+/// outbound send, so it never needed this helper before).
+fn write_server_config(home: &Path, server: &str) {
+    let path = home.join("tui").join("config.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).expect("create tui config dir");
+    std::fs::write(&path, format!("[account]\nserver = \"{server}\"\n"))
+        .expect("write config.toml");
 }
 
 /// Peer-side: fetch "us"'s bundle, X3DH-initiate, seal `body` as `ChatContent::Text`, and route it —
@@ -698,5 +862,170 @@ async fn auto_ack_still_replies_even_though_trust_bin_marks_the_sender_blocked()
     match content {
         ChatContent::Receipt { ack } => assert_eq!(ack, id),
         other => panic!("expected a Receipt acknowledging {id:?}, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Regression: an outbound reply to a message-request-accepted contact (blank hint) must route as
+// local delivery, never misroute as a federation attempt against domain "".
+// ---------------------------------------------------------------------------
+
+/// This task's own named demo scenario is "peer sends a message request -> we accept -> both sides
+/// chat." The reply half of that ("both sides chat") sends outbound through
+/// `worker::run_send_message`'s `route_tolerant`, fed directly from `SendMessageRequest.peer_hint`
+/// (`apps/tui/src/screens/chat.rs::dispatch_gated_send` sets this unconditionally from
+/// `state.peer_hint`, with no emptiness check of its own). A contact accepted via
+/// `Effect::AcceptRequest` is TOFU-pinned with a **blank** hint (`run_accept_request`'s own
+/// documented "`MessageRequest` carries no advisory hint" contract) — exactly the identical latent
+/// bug this task's own auto-ack path had (see
+/// `auto_ack_still_replies_even_though_trust_bin_marks_the_sender_blocked`'s own doc comment above),
+/// just on the ordinary outbound send path instead. Before `worker::sanitize_routing_hint` was
+/// applied at `route_tolerant`'s own call site, a blank hint was
+/// forwarded verbatim as `Some(String::new())`, which `meridian-rendezvous`'s `handle_route` treats
+/// as *any* non-matching hint being a foreign-domain federation attempt rather than local delivery —
+/// silently misrouting every reply to a message-request-originated contact in a real deployment.
+#[tokio::test]
+async fn reply_to_a_message_request_accepted_contact_with_a_blank_hint_routes_locally() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let server = spawn_server();
+    let (handle, us_pub) = setup_us_account();
+    publish_own_bundle(&server, &handle, us_pub).await;
+    write_server_config(tmp.path(), &server);
+
+    let (_rx, _peer_store, peer_account, _peer_chat, mut peer_client) =
+        establish_accepted_conversation(&server, &handle, us_pub).await;
+    let peer_pub = *peer_account.public_key().as_bytes();
+
+    // "us" replies with the exact blank hint `dispatch_gated_send` actually produces for a contact
+    // accepted this way — never a non-empty hint like every `send_request` call site in
+    // `tests/run_worker_chat.rs`.
+    let outcome = dispatch_effect(Effect::SendMessage(SendMessageEffect {
+        request: SendMessageRequest {
+            peer_pubkey: peer_pub,
+            peer_hint: String::new(),
+            body: "welcome, now both sides chat".to_string(),
+        },
+        outcome: None,
+    }))
+    .await;
+    let sent = match outcome {
+        meridian_tui::app::WorkerEvent::Completed(Effect::SendMessage(SendMessageEffect {
+            outcome: Some(sent),
+            ..
+        })) => sent,
+        other => panic!("expected a completed SendMessage, got {other:?}"),
+    };
+    assert!(
+        sent.delivered,
+        "the peer is connected right now: a blank hint must route as local delivery, not a \
+         federation attempt against domain \"\" (which would report delivered: false or fail \
+         closed outright)"
+    );
+
+    let deliver = tokio::time::timeout(Duration::from_secs(10), peer_client.next_deliver())
+        .await
+        .expect("timed out waiting for the reply to arrive at the peer")
+        .expect("next_deliver for the reply");
+    assert_eq!(deliver.from, us_pub);
+}
+
+// ---------------------------------------------------------------------------
+// (test-engineer follow-up) reconnect-with-backoff: attempt counting, clamping,
+// `AppEvent::ConnectionStatus` emission, and resumed inbound forwarding after a real reconnect.
+// ---------------------------------------------------------------------------
+
+/// `worker::run_inbound_loop`'s reconnect-with-backoff logic previously had no functional test —
+/// the only test touching `ConnectionState::Reconnecting` was `statusbar.rs`'s own pure rendering
+/// test, which never touches `run_inbound_loop` at all. This drives the real loop against a real,
+/// in-process server: connect, observe `Connected`, kill the server connection outright (drop the
+/// listener's whole Tokio runtime, not a clean WS close), observe escalating-then-clamped
+/// `Reconnecting { attempt, max }` statuses with `backoff_ms: vec![50, 100]` (`max == 2`), restart a
+/// fresh server bound to the *identical* address, observe `Connected` again, then confirm the loop
+/// still correctly forwards a subsequently delivered message.
+///
+/// **What this covers vs. what's still open** (see this task's own file's Status section for the
+/// authoritative version of this note): this is as close to "kill and restart on the same address"
+/// as this harness supports — the killed server's whole OS thread/Tokio runtime is dropped (a real
+/// severed-TCP-connection outage, not a graceful shutdown), and the replacement server rebinds the
+/// exact same `SocketAddr` (with a short retry loop for the rare case the port isn't immediately
+/// free again) rather than a different one, since `run_inbound_loop` is handed one fixed server URL
+/// for its whole call and has no way to be redirected mid-flight. Not covered: OS-level partial
+/// failures short of a full connection drop (e.g. a half-open TCP connection that never sends a
+/// FIN/RST), and backoff timing precision beyond "escalates, then clamps at `max`" — this test
+/// asserts ordering/values, not wall-clock delay accuracy.
+#[tokio::test]
+async fn reconnect_with_backoff_escalates_then_recovers_and_resumes_forwarding_inbound() {
+    use meridian_tui::statusbar::ConnectionState;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let (server, first_server) = spawn_server_at(None);
+    let (handle, us_pub) = setup_us_account();
+    publish_own_bundle(&server, &handle, us_pub).await;
+
+    let mut rx = spawn_inbound_loop(handle.clone(), us_pub, &server);
+
+    // Initial connect succeeds.
+    let initial = recv_status(&mut rx, Duration::from_secs(5))
+        .await
+        .expect("an initial ConnectionStatus must arrive");
+    assert_eq!(initial, ConnectionState::Connected);
+
+    // Sever the connection outright — a real outage, not a clean close.
+    let addr = first_server.addr;
+    first_server.kill().await;
+
+    // Escalating attempts, then clamped at `max` (backoff has 2 steps here).
+    let s1 = recv_status(&mut rx, Duration::from_secs(5))
+        .await
+        .expect("first Reconnecting status must arrive");
+    assert_eq!(s1, ConnectionState::Reconnecting { attempt: 1, max: 2 });
+
+    let s2 = recv_status(&mut rx, Duration::from_secs(5))
+        .await
+        .expect("second Reconnecting status must arrive");
+    assert_eq!(s2, ConnectionState::Reconnecting { attempt: 2, max: 2 });
+
+    let s3 = recv_status(&mut rx, Duration::from_secs(5))
+        .await
+        .expect("a third Reconnecting status must arrive, proving the loop never gives up");
+    assert_eq!(
+        s3,
+        ConnectionState::Reconnecting { attempt: 2, max: 2 },
+        "attempt must clamp at max rather than growing past it"
+    );
+
+    // Restart a fresh server on the identical address and confirm the loop actually reconnects.
+    let (restarted, _second_server) = spawn_server_restart(addr).await;
+    assert_eq!(
+        restarted, server,
+        "must rebind the identical address the loop is retrying"
+    );
+    publish_own_bundle(&restarted, &handle, us_pub).await;
+
+    assert!(
+        recv_connected(&mut rx, Duration::from_secs(10)).await,
+        "the loop must reconnect and report Connected once the server is back"
+    );
+
+    // And it still correctly forwards a subsequently delivered message.
+    let (peer_store, peer_account) = generate_peer();
+    let peer_pub = *peer_account.public_key().as_bytes();
+    let _peer = peer_send_first_contact(
+        &restarted,
+        &peer_store,
+        &peer_account,
+        us_pub,
+        "hello after reconnect",
+    )
+    .await;
+
+    let event = recv_inbound(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("a message request must still arrive over the reconnected loop");
+    match event {
+        InboundEvent::MessageRequest(entry) => assert_eq!(entry.sender_ik, peer_pub),
+        other => panic!("expected InboundEvent::MessageRequest, got {other:?}"),
     }
 }
