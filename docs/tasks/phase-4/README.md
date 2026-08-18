@@ -231,7 +231,7 @@ reopened) lives in each task file's own text plus the architect consult recorded
 4.38 found live, then a third, hopefully-final exit-gate attempt.
 - [x] **4.39** Prekey bundle republish + vault persistence on session start (fix for 4.38's Defect A —
   no first-contact message can ever be decrypted, for any account type) — [file](./4.39-prekey-bundle-republish.md)
-- [ ] **4.40** Thread the live-session secret store through file-backed contacts/trust/send handlers (fix
+- [~] **4.40** Thread the live-session secret store through file-backed contacts/trust/send handlers (fix
   for 4.38's Defect B — file-backed accounts fail closed post-`Screen::Main`) — [file](./4.40-file-backed-live-session-store.md)
 - [ ] **4.41** T17 acceptance-demo closure, third exit-gate attempt (needs both 4.39 and 4.40) — [file](./4.41-t17-acceptance-demo-closure-attempt-3.md)
 
