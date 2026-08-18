@@ -52,13 +52,17 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   in-memory residency to the whole session lifetime), and
   [4.41](./phase-4/4.41-t17-acceptance-demo-closure-attempt-3.md) (a third exit-gate attempt, hard-joined
   on both 4.39 and 4.40, holding to the same two-independent-runs discipline 4.28/4.38 both used).
-- **NEXT:** **4.39 is done** (reviewed, closed — see [its own Status
-  section](./phase-4/4.39-prekey-bundle-republish.md#status)): Defect A (no prekey republish, ever) is
-  closed. `/next-task` continues with **4.40 → 4.41**. 4.40 is logically independent of 4.39 — different
-  code paths, no shared blocking dependency — it landed after rather than before only to avoid a
-  simultaneous diff on `apps/tui/src/worker.rs`'s session-threading machinery, which is now moot since
-  4.39 already landed there. Only once 4.41 confirms the T17 demo genuinely passes does
-  `/start-review-phase` for Phase 5 become the correct next command — not before.
+- **NEXT:** **4.39 and 4.40 are both done** (reviewed, closed — see their own Status sections:
+  [4.39](./phase-4/4.39-prekey-bundle-republish.md#status),
+  [4.40](./phase-4/4.40-file-backed-live-session-store.md#status)). Both defects 4.38 found live are now
+  closed: Defect A (no prekey republish, ever) and Defect B (file-backed accounts failing closed
+  post-`Screen::Main`) — 4.40's fix landed behind a mandatory pre-code architect + security-reviewer
+  consult (GO WITH MODIFICATIONS, no new ADR needed) since it genuinely extends decrypted key-material
+  residency to the whole session lifetime, closing an asymmetry with an already-shipped, already-accepted
+  pattern (4.35's `inbound_handoff`/`run_inbound_loop`) rather than introducing a new exposure class.
+  `/next-task` continues with **4.41** — the third T17 exit-gate attempt, hard-joined on both defects now
+  being closed. Only once 4.41 confirms the T17 demo genuinely passes does `/start-review-phase` for
+  Phase 5 become the correct next command — not before.
 
 **Why 4.29–4.41 extended Phase 4 rather than opening a new phase or a review phase**: the task-tracking
 skill's own phase-lifecycle rule is that a build phase isn't done until its acceptance demo runs, so
@@ -310,7 +314,7 @@ succeed exit-gate attempt) — see [Phase 4's own task list](./phase-4/README.md
 - [x] **4.37** Preflight routing — [file](./phase-4/4.37-preflight-routing.md)
 - [x] **4.38** T17 acceptance-demo closure (phase re-exit gate) — [file](./phase-4/4.38-t17-acceptance-demo-closure.md)
 - [x] **4.39** Prekey bundle republish + vault persistence on session start (fix for 4.38's Defect A) — [file](./phase-4/4.39-prekey-bundle-republish.md)
-- [~] **4.40** Thread the live-session secret store through file-backed contacts/trust/send handlers (fix for 4.38's Defect B) — [file](./phase-4/4.40-file-backed-live-session-store.md)
+- [x] **4.40** Thread the live-session secret store through file-backed contacts/trust/send handlers (fix for 4.38's Defect B) — [file](./phase-4/4.40-file-backed-live-session-store.md)
 - [ ] **4.41** T17 acceptance-demo closure, third exit-gate attempt — [file](./phase-4/4.41-t17-acceptance-demo-closure-attempt-3.md)
 
 ---

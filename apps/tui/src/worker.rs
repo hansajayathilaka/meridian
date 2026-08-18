@@ -2381,8 +2381,12 @@ mod tests {
     }
 
     /// A `SecretStore` double whose sole job is proving *how many times it was constructed* — the
-    /// correct proxy (see this test's own doc comment below) for "no second scrypt/age-decrypt",
-    /// binding modification 7's own required negative assertion. Delegates every real trait method
+    /// correct proxy (see this test's own doc comment below) for "no second `FileSecretStore`
+    /// construction / no second `Effect::Unlock` passphrase round-trip" (not "no second scrypt/
+    /// age-decrypt" — that KDF cost is paid on every legitimate `use_key`/`derive_key` call
+    /// regardless of caching, per `use_key`'s own doc comment below; what this cache actually saves
+    /// is the round trip, not the per-call KDF work), binding modification 7's own required negative
+    /// assertion. Delegates every real trait method
     /// to a wrapped [`MemorySecretStore`] so a session built around this double can still do real,
     /// successful sealed-store round trips (`load_trust`/`save_trust`/…) — this is not a stub that
     /// merely compiles, it is a store the twelve handlers can genuinely operate against.
