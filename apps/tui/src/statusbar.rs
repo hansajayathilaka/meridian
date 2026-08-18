@@ -47,6 +47,17 @@ pub enum ConnectionState {
     Disconnected,
     Connecting,
     Connected,
+    /// The persistent connection dropped and is retrying with backoff (task 4.35,
+    /// `crate::worker::run_inbound_loop`) — tui-client.md §7's literal `● reconnecting (3/5)`
+    /// wording: `attempt` is the retry currently in flight (1-based), `max` is
+    /// `config.toml`'s `[network] reconnect_backoff_ms` step count (`crate::config::NetworkConfig`).
+    /// The loop keeps retrying past `attempt == max` (using the last configured backoff for every
+    /// further attempt — never gives up and goes silently deaf), so `attempt` is clamped to `max`
+    /// once reached rather than growing without bound.
+    Reconnecting {
+        attempt: u32,
+        max: u32,
+    },
 }
 
 /// Which path a session is using, if any — tui-client.md §2's `P2P direct` / relay wording.
@@ -79,11 +90,14 @@ impl Default for StatusBarInfo {
     }
 }
 
-fn connection_glyph_and_label(state: ConnectionState) -> (&'static str, &'static str) {
+fn connection_glyph_and_label(state: ConnectionState) -> (&'static str, String) {
     match state {
-        ConnectionState::Disconnected => ("o", "not connected"),
-        ConnectionState::Connecting => ("~", "connecting"),
-        ConnectionState::Connected => ("*", "connected"),
+        ConnectionState::Disconnected => ("o", "not connected".to_string()),
+        ConnectionState::Connecting => ("~", "connecting".to_string()),
+        ConnectionState::Connected => ("*", "connected".to_string()),
+        ConnectionState::Reconnecting { attempt, max } => {
+            ("~", format!("reconnecting ({attempt}/{max})"))
+        }
     }
 }
 
@@ -117,6 +131,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, info: &StatusBarInfo) {
         ConnectionState::Disconnected => Color::Red,
         ConnectionState::Connecting => Color::Yellow,
         ConnectionState::Connected => Color::Green,
+        ConnectionState::Reconnecting { .. } => Color::Yellow,
     };
     let line = Line::from(vec![
         Span::styled(format!("{glyph} {label}"), Style::default().fg(color)),
@@ -157,6 +172,7 @@ mod tests {
             ConnectionState::Disconnected,
             ConnectionState::Connecting,
             ConnectionState::Connected,
+            ConnectionState::Reconnecting { attempt: 1, max: 5 },
         ] {
             let info = StatusBarInfo {
                 connection,
@@ -166,6 +182,18 @@ mod tests {
             let text = render_to_text(&info);
             assert!(!text.trim().is_empty());
         }
+    }
+
+    #[test]
+    fn renders_reconnecting_with_the_canonical_n_of_m_wording() {
+        // tui-client.md §7's literal wording — status bar `● reconnecting (3/5)`.
+        let info = StatusBarInfo {
+            connection: ConnectionState::Reconnecting { attempt: 3, max: 5 },
+            transport: TransportPath::Unknown,
+            policy: NetworkPolicy::Inherit,
+        };
+        let text = render_to_text(&info);
+        assert!(text.contains("reconnecting (3/5)"));
     }
 
     #[test]

@@ -19,8 +19,10 @@
 
 use std::path::PathBuf;
 
+use tokio::sync::mpsc;
+
 use meridian_core::account::{self, AccountDescriptor, StoreKind};
-use meridian_core::chat::ChatState as CoreChatState;
+use meridian_core::chat::{ChatError, ChatState as CoreChatState};
 use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{
     generate_account, FileSecretStore, KeyHandle, MemorySecretStore, OsSecretStore, SecretStore,
@@ -910,7 +912,7 @@ fn run_delete_contact(request: &DeleteContactRequest) -> Result<(), String> {
 
 async fn handle_accept_request(effect: AcceptRequestEffect) -> WorkerEvent {
     let AcceptRequestEffect { request, .. } = effect;
-    match run_accept_request(&request) {
+    match run_accept_request(&request).await {
         Ok(()) => WorkerEvent::Completed(Effect::AcceptRequest(AcceptRequestEffect {
             request,
             outcome: Some(()),
@@ -962,8 +964,14 @@ async fn handle_accept_request(effect: AcceptRequestEffect) -> WorkerEvent {
 /// accepted (`chat.has_session(sender_ik) && trust.contact(sender_ik).is_none()`) — a fully-completed
 /// retry (both saves already succeeded once) has an existing `Contact` record and takes no action, and
 /// a phantom/never-accepted sender has no session and likewise takes no action, exactly as today.
-fn run_accept_request(request: &AcceptRequestRequest) -> Result<(), String> {
+///
+/// **Task 4.35:** holds [`chat_state_lock`] for the whole load-mutate-save `sessions.bin` sequence,
+/// same as [`run_reject_request`]/[`run_send_message`] — see that function's own doc comment for why
+/// (`sessions.bin` is a single serialized document covering every peer's session, and the persistent
+/// inbound receive loop touches the same file concurrently on its own tokio task).
+async fn run_accept_request(request: &AcceptRequestRequest) -> Result<(), String> {
     let (store, handle) = open_account_store()?;
+    let _chat_guard = chat_state_lock().lock().await;
 
     let mut chat = load_chat(store.as_ref(), &handle)?;
     let accepted = chat.accept_request(&request.sender_ik).is_some();
@@ -983,7 +991,7 @@ fn run_accept_request(request: &AcceptRequestRequest) -> Result<(), String> {
 
 async fn handle_reject_request(effect: RejectRequestEffect) -> WorkerEvent {
     let RejectRequestEffect { request, .. } = effect;
-    match run_reject_request(&request) {
+    match run_reject_request(&request).await {
         Ok(()) => WorkerEvent::Completed(Effect::RejectRequest(RejectRequestEffect {
             request,
             outcome: Some(()),
@@ -1007,8 +1015,12 @@ async fn handle_reject_request(effect: RejectRequestEffect) -> WorkerEvent {
 /// `sender_ik` as if it had never been contacted at all — the property this task's own tests
 /// (`reject_leaves_no_trace_*` below) pin via a real before/after comparison, not just a successful
 /// return.
-fn run_reject_request(request: &RejectRequestRequest) -> Result<(), String> {
+///
+/// **Task 4.35:** holds [`chat_state_lock`] for the whole load-mutate-save sequence — see
+/// [`run_accept_request`]'s own doc comment for why.
+async fn run_reject_request(request: &RejectRequestRequest) -> Result<(), String> {
     let (store, handle) = open_account_store()?;
+    let _chat_guard = chat_state_lock().lock().await;
     let mut chat = load_chat(store.as_ref(), &handle)?;
     chat.reject_request(&request.sender_ik);
     save_chat(&chat, store.as_ref(), &handle)
@@ -1199,8 +1211,19 @@ fn resolve_server(descriptor: &AccountDescriptor) -> Result<String, String> {
 /// network call, while this worker's window is only the in-memory, synchronous ratchet advance
 /// itself. A future reader comparing the two call sites should read this as the worker doing
 /// strictly better, not as the two behaving identically.
+///
+/// **Task 4.35:** holds [`chat_state_lock`] for this whole function, including its network calls —
+/// coarser than strictly necessary (only the disk load/mutate/save steps actually race with
+/// `run_inbound_loop`'s own concurrent `sessions.bin` access), but a deliberate, documented v1
+/// choice: this function only ever loads `chat` once at the top and mutates the same in-memory copy
+/// across both save points, so releasing the lock in between would still let the persistent receive
+/// loop's own save silently clobber whichever of the two writers finishes second. Holding it for the
+/// whole call is the simplest way to make that impossible without restructuring this already-
+/// reviewed function's control flow; a future task can narrow it if outbound-send/inbound-receive
+/// contention ever becomes a real throughput problem.
 async fn run_send_message(request: &SendMessageRequest) -> Result<SentMessage, String> {
     let (store, handle) = open_account_store()?;
+    let _chat_guard = chat_state_lock().lock().await;
     let descriptor = AccountDescriptor::load()?;
     let account_pub = account_pub_bytes(&descriptor)?;
     let server = resolve_server(&descriptor)?;
@@ -1420,6 +1443,323 @@ fn save_chat(
         .seal_at_rest(store, handle)
         .map_err(|e| format!("sealing session store: {e}"))?;
     std::fs::write(&path, sealed).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+// ---------------------------------------------------------------------------
+// Inbound delivery stream (task 4.35)
+//
+// The receive half of the T17 demo's "both sides chat" step — materially different from every
+// other `Effect` this module executes: it is not dispatched by a screen at all. `crate::run_worker`
+// spawns exactly one [`run_inbound_loop`] per session, immediately after a successful
+// `Effect::LoadSession`/`Effect::Unlock` (see [`inbound_handoff`]), and holds it open — one
+// persistent `SignalingClient`, never reconnected per message — for the rest of the process's life,
+// forwarding decoded content onto the same worker→App channel as `crate::app::AppEvent::Inbound`.
+//
+// **Auto-ack, never gated by `SendGate`.** Mirrors `apps/cli/src/chat.rs::deliver_content`'s own
+// auto-acknowledge exactly: a `ChatContent::Receipt` reply to an already-decrypted
+// `ChatContent::Text` only ever acknowledges content the local user has already seen — it sends no
+// new user-composed content, so withholding it behind `meridian_core::trust::TrustStore::can_send`
+// would protect nothing an attacker doesn't already have and would just break the protocol's own
+// liveness. [`process_inbound_delivery`] is the **only** place in this crate that ever constructs a
+// `ChatContent::Receipt` reply, and it has no `TrustStore` handle in scope anywhere below to have
+// gated it with even if it wanted to — the exemption is structural, not a bypassed check, and it is
+// scoped exactly to this one reply-to-already-decrypted-`Text` case (see `run_worker_chat.rs`'s own
+// "SendGate never consulted" precedent for the outbound side, and `tests/inbound_delivery.rs`'s own
+// falsifiable version of this exact claim for the inbound side).
+//
+// **Adversarial input, never trusted.** Every envelope this loop decrypts came off the wire from
+// whoever the rendezvous server claims routed it — `meridian_core::chat::ChatState::open_inbound`
+// already verifies the envelope's signature and session state before this function ever sees a
+// decoded `ChatContent`; anything that fails that (bad signature, sender mismatch, unknown prekey,
+// no session, a ratchet desync, a malformed/truncated blob) is dropped, logged, and never crashes
+// this loop or the app — mirrors `apps/cli/src/chat.rs::handle_inbound`'s own reject-loudly-never-
+// trust catch-all exactly. Automatic desync recovery (task 4.9's receiver-side re-handshake) is
+// deliberately **not** wired into this loop — out of this task's scope; a repeated desync from the
+// same peer is simply dropped here, same as any other rejection, until a future task decides this
+// loop should call `meridian_core::desync::attempt_recovery` too.
+// ---------------------------------------------------------------------------
+
+/// Serializes every load-mutate-save touch of `sessions.bin` across this worker task's two
+/// concurrent consumers: the ordinary effect-dispatch loop (`run_send_message`/`run_accept_request`/
+/// `run_reject_request`, all in this module) and [`run_inbound_loop`]'s own tokio task. Without this,
+/// a `sessions.bin` write from one side could silently clobber a concurrent write from the other —
+/// `sessions.bin` is a single serialized document covering every peer's session, not one file per
+/// peer, so even two writes touching *different* peers' sessions still race on the same underlying
+/// file. A plain `tokio::sync::Mutex` (never a blocking `std::sync::Mutex`, which `clippy::
+/// await_holding_lock` correctly flags — [`run_send_message`] holds this guard across real network
+/// `.await` points) behind a `OnceLock` so every call site in this module reaches the *same* lock
+/// without threading a parameter through every function signature that already exists (this task's
+/// own minimal-diff choice — see this module's own doc comment for why widening [`dispatch`]'s
+/// signature was avoided).
+fn chat_state_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// What [`crate::run_worker`] needs to spawn [`run_inbound_loop`] — see [`inbound_handoff`]'s own
+/// doc comment for exactly when and how this is built.
+pub struct InboundHandoff {
+    pub store: Box<dyn SecretStore>,
+    pub handle: KeyHandle,
+    pub account_pub: [u8; 32],
+    pub server: String,
+}
+
+/// Peeks (never consumes) a [`WorkerEvent`] fresh off [`dispatch`] and, only on a **successful**
+/// `Effect::LoadSession`/`Effect::Unlock` that actually produced a live session, independently
+/// re-derives the `SecretStore`/`KeyHandle`/`account_pub`/`server` [`crate::run_worker`] needs to
+/// spawn the one persistent inbound loop for this session — the architect-approved lifecycle task
+/// 4.35's own file names: "opened once at session-load time, held inside the worker task, never
+/// re-derived per effect."
+///
+/// **Never touches the [`crate::session::LiveSession`] the successful effect actually carries** —
+/// `crate::app::SessionOutcome` has no `Clone` (by design — see that type's own doc comment), and
+/// `crate::run_worker`'s loop still has to forward the *whole*, unread `WorkerEvent` on to `App`
+/// afterward exactly as task 4.29 left it (`crate::session`'s own "known gap" doc note: `App` does
+/// not yet reclaim a `LiveSession` from this event at all — that reclaim is 4.36/4.37's job, not this
+/// one's). Instead this re-derives its own, independent `SecretStore`: cheap for the OS-keystore
+/// branch (no KDF), and for the file-backed branch reads the still-in-scope
+/// `request.keyfile`/`request.passphrase` the very `WorkerEvent` being peeked already carries — never
+/// persisted anywhere, never sent anywhere else, never crossing more than this one already-completed
+/// round trip (this *is* that same round trip, just read a second time — [`UnlockRequest`]'s own "a
+/// live passphrase must never cross more than one effect round trip" invariant is about not starting
+/// a *new* round trip for it, which this does not).
+///
+/// Returns `None` (never a panic, never a fabricated handoff) for every other `WorkerEvent`, for a
+/// failed load/unlock, for an OS-keystore/file-backed account this process cannot re-derive a store
+/// for, or when [`resolve_server`] cannot resolve a rendezvous server yet (an account loaded/unlocked
+/// but never registered through this or any worker that persisted `account.json`'s `server` field —
+/// see that function's own doc comment). `TODO: confirm`: this last case means the persistent inbound
+/// loop silently never starts rather than surfacing an error anywhere the user can see — no design
+/// doc this task read specifies whether that should instead be a visible, named failure (e.g. a
+/// dedicated `WorkerEvent`); flagged, not resolved, here.
+pub fn inbound_handoff(event: &WorkerEvent) -> Option<InboundHandoff> {
+    match event {
+        WorkerEvent::Completed(Effect::LoadSession(LoadSessionEffect {
+            outcome: Some(LoadSessionOutcome::Loaded(boxed)),
+            ..
+        })) if boxed.as_option().is_some() => {
+            let descriptor = AccountDescriptor::load().ok()?;
+            if descriptor.store != StoreKind::Os {
+                return None;
+            }
+            init_os_keystore().ok()?;
+            let service = descriptor
+                .service
+                .clone()
+                .unwrap_or_else(|| OS_KEYSTORE_SERVICE.to_string());
+            let handle = KeyHandle::from_label(&descriptor.label);
+            let account_pub = account_pub_bytes(&descriptor).ok()?;
+            let server = resolve_server(&descriptor).ok()?;
+            Some(InboundHandoff {
+                store: Box::new(OsSecretStore::new(&service)),
+                handle,
+                account_pub,
+                server,
+            })
+        }
+        WorkerEvent::Completed(Effect::Unlock(boxed)) if boxed.outcome.as_option().is_some() => {
+            let descriptor = AccountDescriptor::load().ok()?;
+            let fs = FileSecretStore::new(&boxed.request.keyfile, boxed.request.passphrase.clone());
+            let handle = KeyHandle::from_label(&descriptor.label);
+            let account_pub = account_pub_bytes(&descriptor).ok()?;
+            let server = resolve_server(&descriptor).ok()?;
+            Some(InboundHandoff {
+                store: Box::new(fs),
+                handle,
+                account_pub,
+                server,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The persistent inbound-delivery loop itself (task 4.35) — see this section's own module doc for
+/// the full design. Reconnects with backoff (`backoff_ms`, `config.toml`'s
+/// `[network] reconnect_backoff_ms`) on any connection-level failure, surfacing
+/// `crate::app::AppEvent::ConnectionStatus` transitions along the way (tui-client.md §7's
+/// `● reconnecting (n/m)` contract) — the architect's own condition for approving this task: this
+/// loop must never go silently deaf for the rest of the session after its first drop. Returns only
+/// when `replies` itself fails to send (the app side hung up, e.g. `meridian tui` exited) — every
+/// other failure just reconnects, forever, at the last configured backoff step once `backoff_ms` is
+/// exhausted.
+pub async fn run_inbound_loop(
+    store: Box<dyn SecretStore>,
+    handle: KeyHandle,
+    account_pub: [u8; 32],
+    server: String,
+    backoff_ms: Vec<u64>,
+    replies: mpsc::UnboundedSender<crate::app::AppEvent>,
+) {
+    use crate::app::AppEvent;
+    use crate::statusbar::ConnectionState;
+
+    let backoff: Vec<u64> = if backoff_ms.is_empty() {
+        vec![500, 1000, 2000, 5000, 15000]
+    } else {
+        backoff_ms
+    };
+    let mut attempt: u32 = 0;
+
+    loop {
+        match SignalingClient::connect(&server, store.as_ref(), &handle, account_pub, None, 1).await
+        {
+            Ok(mut client) => {
+                attempt = 0;
+                if replies
+                    .send(AppEvent::ConnectionStatus(ConnectionState::Connected))
+                    .is_err()
+                {
+                    return;
+                }
+                // A connection-level failure (the socket dropped, the server went away, a framing
+                // error) simply ends this `while let`, falling through to the reconnect logic below
+                // — never crashes this loop, mirrors every other network call site in this module.
+                while let Ok(deliver) = client.next_deliver().await {
+                    if let Some(event) = process_inbound_delivery(
+                        store.as_ref(),
+                        &handle,
+                        &account_pub,
+                        &mut client,
+                        &deliver,
+                    )
+                    .await
+                    {
+                        if replies.send(AppEvent::Inbound(Box::new(event))).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            // Could not even connect this attempt — same reconnect handling as a mid-session drop.
+            Err(_e) => {}
+        }
+
+        let idx = (attempt as usize).min(backoff.len() - 1);
+        let delay_ms = backoff[idx];
+        attempt = attempt.saturating_add(1);
+        let shown_attempt = attempt.min(backoff.len() as u32);
+        if replies
+            .send(AppEvent::ConnectionStatus(ConnectionState::Reconnecting {
+                attempt: shown_attempt,
+                max: backoff.len() as u32,
+            }))
+            .is_err()
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+}
+
+/// Decrypts one delivered envelope and turns it into (at most) one [`crate::app::InboundEvent`] —
+/// [`run_inbound_loop`]'s own per-message body, factored out so it can be exercised directly by
+/// `tests/inbound_delivery.rs` without spinning up the whole reconnect loop. Always holds
+/// [`chat_state_lock`] for the whole load-open-save sequence (see that function's own doc comment),
+/// and always attempts [`save_chat`] before returning — a `sessions.bin` mutation
+/// (`open_inbound`/`open_inbound_gated` installing a session, consuming a one-time prekey, queuing a
+/// message request, advancing a ratchet chain) must survive even when the specific content is
+/// ultimately not forwarded to `App` (e.g. a `ChatError::RequestPending` re-send, or a `Receipt`).
+async fn process_inbound_delivery(
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+    account_pub: &[u8; 32],
+    client: &mut SignalingClient,
+    deliver: &meridian_core::proto::Deliver,
+) -> Option<crate::app::InboundEvent> {
+    use crate::app::InboundEvent;
+    use crate::store::history::{Direction as HistDirection, HistoryEntry, MessageState};
+
+    let _chat_guard = chat_state_lock().lock().await;
+
+    // A `sessions.bin` that fails to load (corrupt, wrong key) is a hard local problem, not
+    // something this envelope caused — drop this one delivery rather than crash the loop; the next
+    // successful delivery gets exactly the same chance. Mirrors every other handler's fail-closed
+    // `load_chat`/`load_trust` contract in this module.
+    let mut chat = match load_chat(store, handle) {
+        Ok(chat) => chat,
+        Err(e) => {
+            eprintln!("meridian tui: could not load sessions.bin for an inbound envelope: {e}");
+            return None;
+        }
+    };
+    chat.expire_previous_generation(now_unix());
+
+    let event = match chat.open_inbound(
+        store,
+        handle,
+        account_pub,
+        &deliver.from,
+        deliver.blob.as_bytes(),
+    ) {
+        Ok(ChatContent::Text { id, body }) => {
+            // Auto-ack (never gated by `SendGate` — see this section's own module doc). Best-effort:
+            // a failed seal or a failed route must not stop the message itself from being delivered
+            // to the user, so neither is treated as fatal to this whole delivery.
+            if let Ok(receipt_blob) = chat.seal_outbound(
+                store,
+                handle,
+                account_pub,
+                &deliver.from,
+                &ChatContent::Receipt { ack: id },
+            ) {
+                // Filters out an empty (but present) hint to `None` rather than passing it through
+                // as `Some(String::new())`: `meridian-rendezvous`'s own routing rule treats *any*
+                // `Some` hint that doesn't case-insensitively match its own domain as a foreign-
+                // server federation target (`handle_route`'s own `if let Some(hint) = &body.to_hint`
+                // branch) — an empty string never matches a real domain, so passing it through
+                // verbatim would misroute this ack as a federation attempt instead of a local
+                // delivery. A blank hint is exactly what `run_accept_request` (never any other
+                // caller) actually pins for a first-contact sender — `TrustStore::observe`'s own
+                // "`MessageRequest` carries no advisory hint" contract — so this is not a hypothetical
+                // input.
+                let hint = load_trust(store, handle)
+                    .ok()
+                    .and_then(|t| t.contact(&deliver.from).map(|c| c.hint.clone()))
+                    .filter(|h| !h.is_empty());
+                let _ = client
+                    .route_with_hint(deliver.from, hint, receipt_blob)
+                    .await;
+            }
+            Some(InboundEvent::Message {
+                peer_pubkey: deliver.from,
+                entry: HistoryEntry {
+                    v: crate::store::history::CURRENT_VERSION,
+                    mid: hex::encode(id),
+                    dir: HistDirection::In,
+                    ts: now_unix(),
+                    stream: "mrd.chat/1".to_string(),
+                    body,
+                    state: MessageState::Received,
+                },
+            })
+        }
+        Ok(ChatContent::Receipt { ack }) => Some(InboundEvent::Receipt {
+            peer_pubkey: deliver.from,
+            ack: hex::encode(ack),
+        }),
+        // First contact (task 2.10, §3.5) — gated, never auto-delivered. `open_inbound` already
+        // installed the pending request into `chat` itself; read it back to build the display copy.
+        Err(ChatError::MessageRequest) => chat.pending_request(&deliver.from).map(|req| {
+            InboundEvent::MessageRequest(crate::screens::requests::RequestEntry::from(req))
+        }),
+        // Everything else — `RequestPending`, `Desync`, `BadSignature`, `SenderMismatch`,
+        // `UnknownPrekey`, `NoSession`, a codec/crypto/store error — dropped, logged, never trusted.
+        // Mirrors `apps/cli/src/chat.rs::handle_inbound`'s own reject-loudly-never-trust catch-all
+        // exactly (this section's own module doc). Automatic desync recovery is deliberately not
+        // wired into this loop — out of this task's scope.
+        Err(e) => {
+            eprintln!("meridian tui: dropped an inbound envelope: {e}");
+            None
+        }
+    };
+
+    if let Err(e) = save_chat(&chat, store, handle) {
+        eprintln!("meridian tui: could not persist sessions.bin after an inbound envelope: {e}");
+    }
+
+    event
 }
 
 // ---------------------------------------------------------------------------

@@ -33,6 +33,7 @@ use crate::screens::requests::{self, RequestsState};
 use crate::screens::settings::{self, SettingsState};
 use crate::screens::unlock::{self, UnlockState};
 use crate::screens::verify::{self, VerifyState};
+use crate::statusbar::ConnectionState;
 use crate::store::contacts::PolicyOverride;
 use crate::store::history::HistoryEntry;
 use crate::surface::{ExtensionPane, PaletteAction, PaletteCommand, SurfaceRegistry};
@@ -62,6 +63,43 @@ pub enum AppEvent {
     /// `clippy::large_enum_variant` — the same reason `Screen::Onboarding`/`Screen::Unlock`/
     /// `Screen::Contacts`/`Screen::ContactDetail` are all boxed already.
     Worker(Box<WorkerEvent>),
+    /// A live push from the network (task 4.35) — **not** an answer to any `Effect` this crate ever
+    /// dispatched, which is exactly why this is its own `AppEvent` variant rather than being squeezed
+    /// into `WorkerEvent::Completed(Effect)`: nothing in `App::update` was waiting on it. Produced by
+    /// `crate::worker::run_inbound_loop`'s persistent receive connection, forwarded onto the same
+    /// worker→App channel every other `AppEvent` already flows through. Boxed for the same
+    /// `clippy::large_enum_variant` reason as [`Self::Worker`].
+    Inbound(Box<InboundEvent>),
+    /// The persistent inbound connection's own connect/reconnect state (task 4.35, tui-client.md §7's
+    /// `● reconnecting (n/m)` contract) — see [`crate::statusbar::ConnectionState`]. Routed into
+    /// [`App::connection_status`], not into any one screen: the connection is session-wide, not
+    /// per-conversation.
+    ConnectionStatus(ConnectionState),
+}
+
+/// Already-decrypted content pushed live off the wire (task 4.35) — the payload of
+/// [`AppEvent::Inbound`]. `crate::worker::run_inbound_loop` does all the crypto/session work
+/// (`meridian_core::chat::ChatState::open_inbound`, the auto-ack) before ever constructing one of
+/// these; `App::update` only ever routes already-decoded content, never touches ciphertext or a
+/// `SecretStore` itself (this crate's I/O-free `update` invariant, tui-client.md §4).
+#[derive(Debug, Clone)]
+pub enum InboundEvent {
+    /// A first-contact message request — mirrors `meridian_core::chat::ChatState::open_inbound`'s own
+    /// gate exactly (task 2.10, §3.5): never auto-delivered, never auto-accepted. Routed to an already
+    /// -open [`Screen::Requests`] directly, or queued in [`App`]'s own small pending-request buffer
+    /// (drained into a fresh [`Screen::Requests`] the next time one opens — see
+    /// [`App::handle_inbound`]) when no `Screen::Requests` is currently on the stack.
+    MessageRequest(crate::screens::requests::RequestEntry),
+    /// An ordinary `mrd.chat/1` text message from an already-accepted peer, already shaped as the
+    /// [`HistoryEntry`] [`crate::screens::chat::insert_deduped`] (reused unchanged, exactly as that
+    /// function's own doc comment anticipated) would dedup and append.
+    Message {
+        peer_pubkey: [u8; 32],
+        entry: HistoryEntry,
+    },
+    /// A delivery receipt for one of our own previously-sent messages — `ack` is the acknowledged
+    /// message's `mid` (hex), the same shape [`HistoryEntry::mid`] already uses.
+    Receipt { peer_pubkey: [u8; 32], ack: String },
 }
 
 /// Which secret store an onboarding user chose to protect their private key with. The choice
@@ -1101,6 +1139,19 @@ pub struct App {
     /// for their own not-yet-live inputs; [`crate::run`] is the one real caller that loads an actual
     /// `config.toml` and passes it through.
     config: crate::config::TuiConfig,
+    /// Inbound message requests observed live (task 4.35, [`AppEvent::Inbound`]) while no
+    /// `Screen::Requests` was on the stack to show them directly — drained into a fresh
+    /// [`Screen::Requests`] the next time one opens (`Ctrl+R`, or the Contacts screen's own `r`),
+    /// per this task's own deliverable ("surfaces on next `Ctrl-R`"). Deliberately App-level, not
+    /// screen-level: unlike every other queue in this crate, there is no live
+    /// `meridian_core::chat::ChatState` handle anywhere in `App` yet to snapshot
+    /// `pending_requests()` from on demand (the same gap `Screen::Requests`'s own doc comment
+    /// already names) — this buffer is this task's own, narrowly-scoped stand-in for that snapshot,
+    /// holding only what actually arrived live during this run, not the full persisted queue.
+    pending_inbound_requests: Vec<crate::screens::requests::RequestEntry>,
+    /// The persistent inbound connection's own state (task 4.35) — session-wide, so it lives on
+    /// `App` itself rather than inside any one `Screen`. See [`AppEvent::ConnectionStatus`].
+    connection: ConnectionState,
 }
 
 impl Default for App {
@@ -1134,6 +1185,8 @@ impl App {
             should_quit: false,
             surface,
             config,
+            pending_inbound_requests: Vec::new(),
+            connection: ConnectionState::Disconnected,
         }
     }
 
@@ -1161,6 +1214,21 @@ impl App {
             .expect("screens invariant: constructor pushes one, pop_screen never empties it")
     }
 
+    /// The persistent inbound connection's current state (task 4.35) — see
+    /// [`AppEvent::ConnectionStatus`]. `pub` so a (future) status-bar-carrying screen, or a test, can
+    /// read it without reaching into `App`'s private fields, mirroring [`App::commands`]'s own
+    /// read-only accessor shape.
+    pub fn connection_status(&self) -> ConnectionState {
+        self.connection
+    }
+
+    /// How many inbound message requests are queued (task 4.35) waiting for the next
+    /// `Screen::Requests` to open — see [`App::pending_inbound_requests`]'s own doc comment. `pub`
+    /// for the same reason as [`App::connection_status`].
+    pub fn pending_inbound_request_count(&self) -> usize {
+        self.pending_inbound_requests.len()
+    }
+
     /// Pushes a new screen on top of the stack (overlays render on top without unmounting what's
     /// beneath — tui-client.md §2).
     pub fn push_screen(&mut self, screen: Screen) {
@@ -1184,7 +1252,70 @@ impl App {
         match event {
             AppEvent::Key(key) => self.handle_key(key),
             AppEvent::Worker(worker_event) => self.handle_worker(*worker_event),
+            AppEvent::Inbound(inbound) => self.handle_inbound(*inbound),
+            AppEvent::ConnectionStatus(state) => {
+                self.connection = state;
+                Vec::new()
+            }
             AppEvent::Tick | AppEvent::Resize(_, _) | AppEvent::Paste(_) => Vec::new(),
+        }
+    }
+
+    /// Routes a live [`AppEvent::Inbound`] push (task 4.35) to whichever screen it's relevant to —
+    /// see this crate's module doc's runtime-structure diagram and the task's own "Scope" note this
+    /// mirrors exactly:
+    /// - [`InboundEvent::Message`]: an open [`Screen::Chat`] for that peer appends it live (deduped
+    ///   by `mid`, reusing [`chat::insert_deduped`] via [`chat::handle_inbound_message`] unchanged)
+    ///   and, only for what was actually inserted, dispatches [`Effect::PersistHistory`] so it
+    ///   survives a restart exactly like an outbound send already does
+    ///   ([`chat::complete_send`](chat)'s identical shape). **Persisted unconditionally, even when no
+    ///   matching `Screen::Chat` is open** — restart-persistent history (tui-client.md's whole point)
+    ///   cannot depend on which screen happens to be on top when a message arrives; only the
+    ///   *in-memory* dedup-and-append step is screen-gated.
+    /// - [`InboundEvent::MessageRequest`]: an open [`Screen::Requests`] gets it appended directly
+    ///   (deduped by `sender_ik`, so a resent first envelope for an already-queued sender never
+    ///   double-lists); otherwise it joins [`App::pending_inbound_requests`], drained into the next
+    ///   `Screen::Requests` that opens (`Ctrl+R`/Contacts' own `r`) — this task's own named
+    ///   deliverable.
+    /// - [`InboundEvent::Receipt`]: an open `Screen::Chat` for that peer updates the matching `Sent`
+    ///   row to `Delivered` in memory; otherwise dropped (out of this task's scope — see
+    ///   [`chat::apply_receipt`]'s own doc comment for why there is no disk-persistence effect for an
+    ///   in-place delivery-state update today).
+    fn handle_inbound(&mut self, event: InboundEvent) -> Vec<Effect> {
+        match event {
+            InboundEvent::Message { peer_pubkey, entry } => {
+                if let Some(Screen::Chat(state)) = self.screens.last_mut() {
+                    if state.peer_pubkey == peer_pubkey {
+                        return chat::handle_inbound_message(state, entry);
+                    }
+                }
+                vec![Effect::PersistHistory(PersistHistoryEffect {
+                    request: PersistHistoryRequest { peer_pubkey, entry },
+                    outcome: None,
+                })]
+            }
+            InboundEvent::MessageRequest(entry) => {
+                if let Some(Screen::Requests(state)) = self.screens.last_mut() {
+                    if !state.entries.iter().any(|e| e.sender_ik == entry.sender_ik) {
+                        state.entries.push(entry);
+                    }
+                } else if !self
+                    .pending_inbound_requests
+                    .iter()
+                    .any(|e| e.sender_ik == entry.sender_ik)
+                {
+                    self.pending_inbound_requests.push(entry);
+                }
+                Vec::new()
+            }
+            InboundEvent::Receipt { peer_pubkey, ack } => {
+                if let Some(Screen::Chat(state)) = self.screens.last_mut() {
+                    if state.peer_pubkey == peer_pubkey {
+                        chat::apply_receipt(state, &ack);
+                    }
+                }
+                Vec::new()
+            }
         }
     }
 
@@ -1199,11 +1330,19 @@ impl App {
         // section of the contacts pane") — same top-level, unconditional treatment as `Ctrl+Q`
         // above, mirrored here since pushing a screen is never destructive (unlike quitting) so
         // there is no reason to gate it behind whichever screen happens to be current. A no-op if
-        // `Screen::Requests` is already on top, so repeated `Ctrl+R` doesn't stack duplicates — see
-        // `Screen::Requests`'s own doc comment for why this pushes an empty queue today.
+        // `Screen::Requests` is already on top, so repeated `Ctrl+R` doesn't stack duplicates.
+        //
+        // **Task 4.35:** seeded from [`App::pending_inbound_requests`] — whatever arrived live while
+        // no `Screen::Requests` was open — rather than always starting empty. This crate still has no
+        // live `meridian_core::chat::ChatState` handle to snapshot the *full*, persisted
+        // `pending_requests()` from (that gap is unchanged — see `Screen::Requests`'s own doc
+        // comment), so a request that arrived in an *earlier* run (before this process started) is
+        // still not shown here; only what this task's own persistent receive loop actually observed
+        // during this run is.
         if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
             if !matches!(self.current_screen(), Screen::Requests(_)) {
-                self.push_screen(Screen::Requests(Box::new(RequestsState::new(Vec::new()))));
+                let entries = std::mem::take(&mut self.pending_inbound_requests);
+                self.push_screen(Screen::Requests(Box::new(RequestsState::new(entries))));
             }
             return Vec::new();
         }
@@ -1310,12 +1449,11 @@ impl App {
                     contacts::ContactsAction::Pop => {
                         self.pop_screen();
                     }
-                    // Same "empty until a future Preflight loads real data" caveat as the global
-                    // `Ctrl+R` handler above — see `Screen::Requests`'s own doc comment.
+                    // Same pending-inbound-requests seeding as the global `Ctrl+R` handler above —
+                    // see that handler's own doc comment (task 4.35).
                     contacts::ContactsAction::OpenRequests => {
-                        self.push_screen(Screen::Requests(Box::new(
-                            RequestsState::new(Vec::new()),
-                        )));
+                        let entries = std::mem::take(&mut self.pending_inbound_requests);
+                        self.push_screen(Screen::Requests(Box::new(RequestsState::new(entries))));
                     }
                     contacts::ContactsAction::None => {}
                 }

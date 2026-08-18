@@ -159,13 +159,41 @@ fn translate_event(event: crossterm::event::Event) -> Option<AppEvent> {
 /// through every dispatch, so a `Register` effect's live connection survives to be reused by the
 /// `PublishBundle` effect that follows it (never reconnecting between them — see
 /// [`worker::OnboardingSession`]'s doc comment).
+///
+/// **Task 4.35:** after every dispatched effect, [`worker::inbound_handoff`] peeks (never consumes)
+/// the resulting [`WorkerEvent`] for a *successful* `Effect::LoadSession`/`Effect::Unlock` — the
+/// first (and, per `inbound_started`, only) time that happens in a session, this spawns
+/// [`worker::run_inbound_loop`] as its own tokio task, handing it the config's
+/// `[network] reconnect_backoff_ms` and a clone of `replies` so its `AppEvent::Inbound`/
+/// `AppEvent::ConnectionStatus` pushes reach `App` exactly like every other worker-originated event.
+/// The persistent connection this spawns is deliberately never re-derived on a later effect — see
+/// that function's own doc comment for the architect-approved lifecycle this realizes.
 async fn run_worker(
     mut effects: mpsc::UnboundedReceiver<Effect>,
     replies: mpsc::UnboundedSender<AppEvent>,
 ) {
     let mut session = worker::OnboardingSession::default();
+    let mut inbound_started = false;
     while let Some(effect) = effects.recv().await {
         let outcome = worker::dispatch(effect, &mut session).await;
+
+        if !inbound_started {
+            if let Some(handoff) = worker::inbound_handoff(&outcome) {
+                inbound_started = true;
+                let backoff_ms = load_config(&[])
+                    .map(|c| c.network.reconnect_backoff_ms)
+                    .unwrap_or_default();
+                tokio::spawn(worker::run_inbound_loop(
+                    handoff.store,
+                    handoff.handle,
+                    handoff.account_pub,
+                    handoff.server,
+                    backoff_ms,
+                    replies.clone(),
+                ));
+            }
+        }
+
         if replies.send(AppEvent::Worker(Box::new(outcome))).is_err() {
             break;
         }
