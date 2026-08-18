@@ -250,7 +250,13 @@ fn run_generate_account(request: &GenerateAccountRequest) -> Result<GeneratedAcc
 /// `OS_KEYSTORE_SERVICE` explicitly as the thing to mirror for the OS-keystore branch, but is silent
 /// on an exact filename/location for the File-store branch; this is a considered default, not a
 /// documented one.
-fn default_keyfile_path() -> Result<PathBuf, String> {
+///
+/// `pub(crate)` (task 4.37, not a functional change): `crate::app::App::handle_key`'s
+/// Onboarding-finished arm needs this exact same path to build the `Effect::Unlock` a freshly
+/// onboarded file-backed account dispatches to reach `Screen::Main` — reusing this function rather
+/// than re-deriving the same `"account.key"` suffix a second time in `app.rs` is what keeps the two
+/// call sites from silently drifting apart.
+pub(crate) fn default_keyfile_path() -> Result<PathBuf, String> {
     Ok(account::config_dir()?.join("account.key"))
 }
 

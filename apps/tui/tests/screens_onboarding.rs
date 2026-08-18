@@ -374,6 +374,7 @@ fn success_enter_signals_finished() {
     let mut state = OnboardingState::Success(Success {
         id: account().id,
         otk_count: DEFAULT_OTK_COUNT,
+        store: StoreChoice::Os,
     });
     let (effects, finished) = handle_key(&mut state, key(KeyCode::Enter));
     assert!(effects.is_empty());
@@ -531,6 +532,7 @@ fn snapshot_success_terminal_state() {
     let state = OnboardingState::Success(Success {
         id: account().id,
         otk_count: 42,
+        store: StoreChoice::Os,
     });
     assert_renders_at_both_widths(&state, &["Registered", "42"]);
 }

@@ -32,7 +32,7 @@ use crate::screens::onboarding::{self, OnboardingState};
 use crate::screens::palette::{self, PaletteOutcome, PaletteState};
 use crate::screens::requests::{self, RequestEntry, RequestsState};
 use crate::screens::settings::{self, SettingsState};
-use crate::screens::unlock::{self, UnlockState};
+use crate::screens::unlock::{self, UnlockState, Unlocking};
 use crate::screens::verify::{self, VerifyState};
 use crate::statusbar::ConnectionState;
 use crate::store::contacts::PolicyOverride;
@@ -1205,12 +1205,15 @@ impl Default for App {
 }
 
 impl App {
-    /// A fresh app starts on [`Screen::Onboarding`] — this crate has no way (yet) to detect an
-    /// existing `account.json` and route to [`Screen::Unlock`] or straight to `Main` instead (the
-    /// `Preflight` step from `docs/architecture/diagrams/tui-screen-flow.mermaid`, still
-    /// unbuilt) — so every run starts a new user from the top of the onboarding flow. `Screen::
-    /// Unlock` itself exists and is fully wired (task 4.17); only the decision to construct and
-    /// push it here is missing.
+    /// A fresh app starts on [`Screen::Onboarding`] unconditionally — **deliberately, still, even
+    /// after task 4.37's `Preflight` routing landed.** This constructor performs no I/O (dozens of
+    /// existing tests across this crate construct an `App` this way with no `account.json` of their
+    /// own to check against — see this crate's own module doc's runtime-structure diagram: `update`/
+    /// `render` never perform I/O, and neither does this), so it cannot itself decide whether an
+    /// account already exists. [`App::new_with_route`] is the real `Preflight`-aware counterpart —
+    /// [`crate::run`] is the one real caller that uses it, having already loaded `account.json` (if
+    /// any) synchronously in its own setup phase and turned it into a
+    /// [`crate::preflight::InitialRoute`] via [`crate::preflight::preflight_route`].
     ///
     /// Resolves [`crate::theme::RenderCtx`] against [`crate::config::TuiConfig::default`] — see
     /// [`App::new_with_config`] for the real-config counterpart.
@@ -1220,7 +1223,9 @@ impl App {
 
     /// Same as [`App::new`], but resolves [`crate::theme::RenderCtx`] (task 4.26) against a real,
     /// already-loaded `config.toml` instead of [`crate::config::TuiConfig::default`] — see
-    /// [`App::config`]'s own doc comment.
+    /// [`App::config`]'s own doc comment. Still always starts on [`Screen::Onboarding`] — see
+    /// [`App::new`]'s own doc comment for why that stays true even after task 4.37, and
+    /// [`App::new_with_route`] for the constructor that doesn't.
     pub fn new_with_config(config: crate::config::TuiConfig) -> Self {
         // Task 4.36: needed to register a real "open Settings" command below. `default_config_path`
         // is pure (`$MERIDIAN_HOME`-relative path-joining, no disk I/O) — same discipline every
@@ -1238,6 +1243,32 @@ impl App {
             pending_inbound_requests: Vec::new(),
             connection: ConnectionState::Disconnected,
         }
+    }
+
+    /// The `Preflight`-aware constructor (task 4.37): same construction as [`App::new_with_config`],
+    /// but starts from a [`crate::preflight::InitialRoute`] decision instead of always
+    /// [`Screen::Onboarding`] — see [`crate::preflight`]'s own module doc for the full routing
+    /// design this implements (`docs/architecture/diagrams/tui-screen-flow.mermaid`'s `Preflight`
+    /// step). Returns the initial `Vec<Effect>` the route requires the runtime to dispatch
+    /// immediately alongside the constructed `App` (empty for `Onboarding`/`Unlock`; one
+    /// `Effect::LoadSession` for the OS-keystore route), mirroring the shape `App::update` itself
+    /// returns for every later event.
+    ///
+    /// [`App::new`]/[`App::new_with_config`] deliberately stay as they were (I/O-free,
+    /// unconditionally `Screen::Onboarding`) rather than being redefined in terms of this
+    /// constructor — the dozens of existing tests across this crate that build an `App` via those
+    /// two and expect `Screen::Onboarding` (with nothing to load a real `InitialRoute` from) keep
+    /// working unchanged. [`crate::run`] is the one real caller of this constructor.
+    pub fn new_with_route(
+        config: crate::config::TuiConfig,
+        route: crate::preflight::InitialRoute,
+    ) -> (Self, Vec<Effect>) {
+        let mut app = Self::new_with_config(config);
+        let (screen, effects) = route.into_screen_and_effects();
+        *app.screens
+            .last_mut()
+            .expect("screens invariant: constructor above pushes exactly one") = screen;
+        (app, effects)
     }
 
     /// Whether the runtime should stop the event loop and let the [`crate::terminal::TerminalGuard`]
@@ -1456,15 +1487,80 @@ impl App {
                 // sub-step, ChooseStore, and during an effect that's in flight, since there's
                 // nothing to cancel back to synchronously) — see
                 // `crate::screens::onboarding::handle_key`.
-                let (effects, finished) = onboarding::handle_key(state, key);
+                let (mut effects, finished) = onboarding::handle_key(state, key);
                 if finished {
-                    // Onboarding → Main on completion. `Screen::Main` doesn't exist yet (lands in
-                    // a later task, 4.19/4.20+); `Screen::Placeholder` stands in for it so that
-                    // future task only has to change the line below, not this flow.
+                    // Task 4.37: Onboarding → Main. Reaching a real `Screen::Main` needs a real
+                    // `LiveSession` (task 4.29), which a freshly onboarded account doesn't have in
+                    // hand yet — only `onboarding::handle_key`'s own `Success` arm ever returns
+                    // `finished = true` (see that function's doc comment), and `state` here is
+                    // still that same, untouched `Success` (`onboarding::handle_key`'s `Success`
+                    // arm reads `key.code` but never mutates `*state`), so it's safe to read
+                    // `Success::store` (task 4.37's own small addition, carried forward from
+                    // `PublishingBundle::store`) to decide which effect gets there:
+                    // - `StoreChoice::Os`: nothing is sealed on disk yet for this brand-new
+                    //   account, so `Effect::LoadSession` reads a trivially empty (but real)
+                    //   `LiveSession` straight back — see `crate::session::LiveSession::empty`'s
+                    //   own doc comment, which names this exact path. The interim screen is
+                    //   `Screen::Placeholder`, same "loading, briefly" role `Preflight`'s own
+                    //   OS-keystore route uses (`crate::preflight::InitialRoute::LoadSession`) —
+                    //   `App::handle_worker`'s new top-level `Effect::LoadSession` arm (below)
+                    //   swaps it for `Screen::Main` once the effect resolves, regardless of which
+                    //   of the two dispatched it.
+                    // - `StoreChoice::File`: `Effect::LoadSession` deliberately refuses file-backed
+                    //   accounts (`LoadSessionOutcome`'s own doc comment) — the single-round-trip
+                    //   unwrap `Screen::Unlock` itself uses (`Effect::Unlock`) is the right effect
+                    //   here too, reusing the passphrase already typed at `ChooseStore` rather than
+                    //   re-prompting for it a second time. The interim screen reuses
+                    //   `Screen::Unlock`'s own `Unlocking` sub-state (rather than inventing a new
+                    //   "loading" screen) so `App::handle_worker`'s `Screen::Unlock` arm — already
+                    //   updated by this same task to reclaim a `SessionOutcome` into `Screen::Main`
+                    //   — is the one and only place that logic lives.
+                    let OnboardingState::Success(success) = state.as_ref() else {
+                        // Defensive: unreachable per `onboarding::handle_key`'s own contract (see
+                        // above), but falls back to the pre-4.37 `Screen::Placeholder` stand-in
+                        // rather than panicking on an invariant this module doesn't itself own.
+                        *self
+                            .screens
+                            .last_mut()
+                            .expect("screens invariant: never empty") = Screen::Placeholder;
+                        return effects;
+                    };
+                    let (screen, initial_effects) = match &success.store {
+                        StoreChoice::Os => (
+                            Screen::Placeholder,
+                            vec![Effect::LoadSession(LoadSessionEffect {
+                                request: LoadSessionRequest,
+                                outcome: None,
+                            })],
+                        ),
+                        StoreChoice::File { passphrase } => {
+                            // Same fallback discipline as `crate::preflight::preflight_route`'s own
+                            // `keyfile` handling: `default_keyfile_path` only fails to resolve
+                            // `$MERIDIAN_HOME` at all, which `Effect::Unlock`'s own worker-side
+                            // execution would surface as an actionable error, not here.
+                            let keyfile = crate::worker::default_keyfile_path().unwrap_or_default();
+                            let request = UnlockRequest {
+                                keyfile,
+                                passphrase: passphrase.clone(),
+                            };
+                            let effect = Effect::Unlock(Box::new(UnlockEffect {
+                                request: request.clone(),
+                                outcome: SessionOutcome::empty(),
+                            }));
+                            let screen =
+                                Screen::Unlock(Box::new(UnlockState::Unlocking(Unlocking {
+                                    id: success.id.clone(),
+                                    attempts: 0,
+                                    request,
+                                })));
+                            (screen, vec![effect])
+                        }
+                    };
                     *self
                         .screens
                         .last_mut()
-                        .expect("screens invariant: never empty") = Screen::Placeholder;
+                        .expect("screens invariant: never empty") = screen;
+                    effects.extend(initial_effects);
                 }
                 effects
             }
@@ -1473,10 +1569,16 @@ impl App {
                 // including Esc (a no-op — `Unlock` has nothing beneath it either, and the mermaid
                 // diagram gives it no "back" transition, only retry-in-place or global quit via
                 // Ctrl+Q) — see `crate::screens::unlock::handle_key`.
+                //
+                // `finished` is always `false` here in practice — `unlock::handle_key` only ever
+                // signals completion from `handle_worker` (a submitted passphrase moves to
+                // `Unlocking` and dispatches `Effect::Unlock`; the *worker's* response is what
+                // decides success/failure, not this key handler) — see `App::handle_worker`'s own
+                // `Screen::Unlock` arm for the real `Screen::Main` transition (task 4.37). Kept
+                // here, unreachable, only for symmetry with the `Onboarding` arm above and in case a
+                // future change to `unlock::handle_key` ever does signal completion synchronously.
                 let (effects, finished) = unlock::handle_key(state, key);
                 if finished {
-                    // Unlock → Main on a passphrase accepted. Same `Screen::Placeholder` stand-in
-                    // as onboarding's completion, pending `Screen::Main` (4.19/4.20+).
                     *self
                         .screens
                         .last_mut()
@@ -1724,25 +1826,80 @@ impl App {
     }
 
     fn handle_worker(&mut self, event: WorkerEvent) -> Vec<Effect> {
+        // Task 4.37: `Effect::LoadSession` is handled here, ahead of any per-screen dispatch below
+        // — unlike every other effect in this file, no *screen* owns it the way Onboarding owns
+        // `GenerateAccount` or Unlock owns `Effect::Unlock`. It is dispatched from two different
+        // places that don't share a screen (`crate::preflight::InitialRoute::LoadSession`, at
+        // startup, before any screen has been interacted with; and `App::handle_key`'s
+        // Onboarding-finished arm, for a freshly onboarded OS-keystore account), and both leave
+        // `Screen::Placeholder` on top as the "loading, briefly" interim screen while it's in
+        // flight — so matching on the *event* first, regardless of what's on top of the stack, is
+        // the one dispatch point that covers both origins without duplicating this logic.
+        let event = match event {
+            WorkerEvent::Completed(Effect::LoadSession(effect)) => {
+                return self.apply_load_session_outcome(effect.outcome);
+            }
+            // A `LoadSession` failure at this point means something genuinely went wrong reading
+            // an OS-keystore account's own `trust.bin`/`sessions.bin`/`contacts.json` (corrupt
+            // data, an OS keystore that became unavailable between `Preflight`'s own synchronous
+            // check and this async read, …) — `docs/architecture/tui-client.md §7`'s own table has
+            // no row for this exact condition, and falling back to `Screen::Onboarding` here would
+            // be actively wrong (risking a second identity being generated over an account whose
+            // data merely failed to *load*, not one that doesn't exist). `TODO: confirm`: no design
+            // doc read for this task resolves what should happen instead (a dedicated error screen
+            // is new screen content, out of this task's own "routing, not screen content" scope —
+            // see the task file's own Scope note); left on `Screen::Placeholder`, visible via no
+            // more feedback than today's own pre-4.37 "stuck on Generating" gap, with `Ctrl+Q`
+            // still reachable to quit cleanly. Not silently absorbed: flagged here, and in this
+            // task's own Status write-up, for a follow-up to resolve deliberately rather than by
+            // omission.
+            WorkerEvent::Failed(Effect::LoadSession(_), _) => return Vec::new(),
+            other => other,
+        };
         match self.screens.last_mut() {
             Some(Screen::Onboarding(state)) => onboarding::handle_worker(state, event),
             Some(Screen::Extension(pane)) => pane.handle_worker(event),
             Some(Screen::Help(state)) => help::handle_worker(state, event),
             Some(Screen::Palette(state)) => palette::handle_worker(state, event),
-            Some(Screen::Unlock(state)) => {
-                // **Known gap, flagged for 4.36/4.37 (task 4.29's own doc note, Finding 3):** this
-                // delegates the *whole* `WorkerEvent` to `unlock::handle_worker` without first
-                // reclaiming the `SessionOutcome`/`LiveSession` a successful file-backed
-                // `Effect::Unlock` now carries (see `crate::app::UnlockEffect`/
-                // `crate::session::LiveSession`) — so today a real, freshly-loaded `LiveSession` is
-                // built and then discarded unread on every successful unlock. Not a defect in *this*
-                // task (4.29's own scope explicitly excludes wiring `App` to hold
-                // `Option<LiveSession>` — see the task file's Scope/Out section), but whichever future
-                // task does that wiring must change *this arm itself* to extract the outcome before
-                // delegating, not just add navigation elsewhere — there is no other reclaim point on
-                // this path today.
+            Some(Screen::Unlock(_)) => {
+                // Task 4.37 (resolves task 4.29's own doc note, Finding 3 — see
+                // `crate::session::LiveSession`'s module doc's "Known gap" paragraph for the
+                // pre-4.37 shape of this note): a successful `Effect::Unlock` now has its
+                // `SessionOutcome`/`LiveSession` reclaimed *before* falling through to
+                // `unlock::handle_worker`, which — for `Completed` — did nothing but signal
+                // "finished" with no further per-screen state to update; building `Screen::Main`
+                // directly here, rather than delegating and then swapping to a stand-in, is that
+                // reclaim point. `Failed`/irrelevant events still delegate to
+                // `unlock::handle_worker` unchanged (retry-in-place, attempt count, no lockout —
+                // `docs/architecture/tui-client.md §7`).
+                if let WorkerEvent::Completed(Effect::Unlock(effect)) = event {
+                    let UnlockEffect { outcome, .. } = *effect;
+                    let screen = match outcome.into_option() {
+                        Some(session) => Screen::Main(Box::new(MainState::from_session(session))),
+                        // Defensive: a real worker-produced `Effect::Unlock` always populates
+                        // `SessionOutcome::ready` on `Completed` (`worker::handle_unlock`'s own
+                        // doc comment) — never reachable there. Reachable only from a
+                        // hand-constructed test `WorkerEvent` (mirroring pre-4.37 tests that
+                        // exercised this arm with `SessionOutcome::empty()`) that simulates a
+                        // worker without actually running one; falls back to `Screen::Placeholder`
+                        // rather than building a `Screen::Main` from nothing.
+                        None => Screen::Placeholder,
+                    };
+                    *self
+                        .screens
+                        .last_mut()
+                        .expect("screens invariant: never empty") = screen;
+                    return Vec::new();
+                }
+                let Some(Screen::Unlock(state)) = self.screens.last_mut() else {
+                    return Vec::new();
+                };
                 let (effects, finished) = unlock::handle_worker(state, event);
                 if finished {
+                    // Unreachable today (see above — `Completed(Effect::Unlock(_))` is fully
+                    // handled above and is the only case `unlock::handle_worker` ever reports
+                    // `finished = true` for), kept only for symmetry/defense-in-depth against a
+                    // future change to that function's own contract.
                     *self
                         .screens
                         .last_mut()
@@ -1789,6 +1946,48 @@ impl App {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Applies a completed `Effect::LoadSession`'s outcome (task 4.37) — see
+    /// `App::handle_worker`'s own top-level `Effect::LoadSession` arm for why this isn't inlined
+    /// there (kept as its own method for the same "one clearly-bounded step" reason
+    /// `register_builtin_commands` is a free function rather than inlined into
+    /// `App::new_with_config`).
+    ///
+    /// Scoped to fire only while `Screen::Placeholder` is genuinely still on top — both current
+    /// dispatch sites leave it there as the "loading, briefly" interim screen while this effect is
+    /// in flight (see `handle_worker`'s own doc comment above). Today this guard is unreachable
+    /// (nothing else can be on top when this fires), but it's cheap insurance against a future
+    /// second dispatch site (e.g. a "reload session" command) firing while the user has since
+    /// navigated elsewhere — without it, a late completion would silently clobber whatever screen
+    /// they're actually on, discarding their navigation state.
+    fn apply_load_session_outcome(&mut self, outcome: Option<LoadSessionOutcome>) -> Vec<Effect> {
+        if !matches!(self.screens.last(), Some(Screen::Placeholder)) {
+            return Vec::new();
+        }
+        let screen = match outcome {
+            Some(LoadSessionOutcome::Loaded(boxed)) => match (*boxed).into_option() {
+                Some(session) => Screen::Main(Box::new(MainState::from_session(session))),
+                // Defensive: a real worker-produced `Loaded` always carries a populated
+                // `SessionOutcome::ready` (`worker::run_load_session`'s own doc comment) — never
+                // reachable there; only from a hand-constructed test event.
+                None => Screen::Placeholder,
+            },
+            // `NoAccount` should not be reachable here in a real run — this effect is only ever
+            // dispatched (`crate::preflight::InitialRoute::LoadSession`, or
+            // `App::handle_key`'s Onboarding-finished arm) after already confirming an
+            // OS-keystore `account.json` exists. Defensive: falls back to `Screen::Onboarding`
+            // rather than leaving the loading placeholder stuck forever if it somehow is (e.g. the
+            // file was deleted between that synchronous check and this async worker round trip) —
+            // a pristine, never-onboarded `$MERIDIAN_HOME` is exactly what `Screen::Onboarding` is
+            // for.
+            Some(LoadSessionOutcome::NoAccount) | None => Screen::Onboarding(Box::default()),
+        };
+        *self
+            .screens
+            .last_mut()
+            .expect("screens invariant: never empty") = screen;
+        Vec::new()
     }
 
     /// Reconciles a popped [`Screen::ContactDetail`]'s final state back into whichever
@@ -1926,6 +2125,77 @@ mod tests {
         assert!(!app.should_quit());
     }
 
+    /// Task 4.37: onboarding finishing for an **OS-keystore** account dispatches
+    /// `Effect::LoadSession` and lands on the `Screen::Placeholder` "loading" interim screen — the
+    /// same one `crate::preflight::InitialRoute::LoadSession` uses at startup — rather than the
+    /// pre-4.37 bare `Screen::Placeholder`-forever stand-in.
+    #[test]
+    fn onboarding_success_enter_for_an_os_keystore_account_dispatches_load_session() {
+        let mut app = App::new();
+        *app.screens.last_mut().unwrap() =
+            Screen::Onboarding(Box::new(OnboardingState::Success(onboarding::Success {
+                id: "mrd1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@chat.example".into(),
+                otk_count: 10,
+                store: StoreChoice::Os,
+            })));
+
+        let effects = app.update(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(effects[0], Effect::LoadSession(_)));
+        assert!(matches!(app.current_screen(), Screen::Placeholder));
+
+        // ... and once that effect resolves (task 4.29's own worker-built shape), `App` lands on a
+        // real `Screen::Main` — the same top-level `Effect::LoadSession` handling
+        // `crate::preflight::InitialRoute::LoadSession` also relies on.
+        let descriptor = meridian_core::account::AccountDescriptor {
+            v: 1,
+            pubkey: "d".repeat(64),
+            hint: "chat.example".to_string(),
+            store: meridian_core::account::StoreKind::Os,
+            keyfile: None,
+            service: Some("meridian".to_string()),
+            label: "d".repeat(64),
+            server: None,
+        };
+        let outcome = LoadSessionOutcome::Loaded(Box::new(SessionOutcome::ready(
+            LiveSession::empty(descriptor),
+        )));
+        app.update(AppEvent::Worker(Box::new(WorkerEvent::Completed(
+            Effect::LoadSession(LoadSessionEffect {
+                request: LoadSessionRequest,
+                outcome: Some(outcome),
+            }),
+        ))));
+        assert!(matches!(app.current_screen(), Screen::Main(_)));
+    }
+
+    /// Task 4.37: onboarding finishing for a **file-backed** account dispatches `Effect::Unlock`
+    /// (reusing the passphrase already typed at `ChooseStore`, never re-prompting) and lands on
+    /// `Screen::Unlock`'s own `Unlocking` sub-state — the same "please wait" screen a returning
+    /// user routed via `Preflight` sees, reused rather than duplicated.
+    #[test]
+    fn onboarding_success_enter_for_a_file_backed_account_dispatches_unlock() {
+        let mut app = App::new();
+        *app.screens.last_mut().unwrap() =
+            Screen::Onboarding(Box::new(OnboardingState::Success(onboarding::Success {
+                id: "mrd1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@chat.example".into(),
+                otk_count: 10,
+                store: StoreChoice::File {
+                    passphrase: "correct horse battery staple".into(),
+                },
+            })));
+
+        let effects = app.update(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(effects.len(), 1);
+        match &effects[0] {
+            Effect::Unlock(effect) => {
+                assert_eq!(effect.request.passphrase, "correct horse battery staple");
+            }
+            other => panic!("expected Effect::Unlock, got {other:?}"),
+        }
+        assert!(matches!(app.current_screen(), Screen::Unlock(_)));
+    }
+
     #[test]
     fn ctrl_q_sets_should_quit_and_emits_no_effects() {
         let mut app = App::new();
@@ -2035,12 +2305,15 @@ mod tests {
     }
 
     /// `Screen::Unlock` is fully dispatched at the `App` level (task 4.17): a submitted passphrase
-    /// dispatches `Effect::Unlock`, and a `WorkerEvent::Completed(Effect::Unlock(_))` swaps the
-    /// screen to `Screen::Placeholder` — the same completion mechanism `App::handle_key`'s
-    /// `Onboarding` arm uses, exercised here through `handle_worker` instead since Unlock signals
-    /// success directly from a worker event rather than via a confirmation keypress.
+    /// dispatches `Effect::Unlock`. **Defensive-fallback case (task 4.37):** the effect echoed back
+    /// here is the exact one `unlock::handle_key` itself built — `SessionOutcome::empty()` — which
+    /// is what this test object looks like before a real worker ever touches it; a real worker
+    /// (`worker::handle_unlock`) always populates `SessionOutcome::ready(..)` on `Completed`, so
+    /// this exercises `App::handle_worker`'s own defensive "no real outcome" fallback to
+    /// `Screen::Placeholder`, not the ordinary success path — see
+    /// `unlock_screen_completes_to_main_on_worker_success_with_a_real_session` below for that one.
     #[test]
-    fn unlock_screen_completes_to_placeholder_on_worker_success() {
+    fn unlock_screen_worker_completion_with_an_empty_outcome_falls_back_to_placeholder() {
         let mut app = App::new();
         *app.screens.last_mut().unwrap() = Screen::Unlock(Box::new(unlock_state()));
 
@@ -2054,6 +2327,39 @@ mod tests {
 
         app.update(AppEvent::Worker(Box::new(WorkerEvent::Completed(effect))));
         assert!(matches!(app.current_screen(), Screen::Placeholder));
+    }
+
+    /// The real success path (task 4.37): a `WorkerEvent::Completed(Effect::Unlock(_))` carrying a
+    /// real, populated `SessionOutcome` (exactly what `worker::handle_unlock` builds — see that
+    /// function's own doc comment) reclaims the `LiveSession` and lands on `Screen::Main`, built via
+    /// `MainState::from_session` — the reclaim point `crate::session::LiveSession`'s own module doc
+    /// flagged as missing before this task.
+    #[test]
+    fn unlock_screen_completes_to_main_on_worker_success_with_a_real_session() {
+        let mut app = App::new();
+        *app.screens.last_mut().unwrap() = Screen::Unlock(Box::new(unlock_state()));
+
+        let request = UnlockRequest {
+            keyfile: std::path::PathBuf::from("/home/user/.config/meridian/account.key"),
+            passphrase: "hunter2".into(),
+        };
+        let descriptor = meridian_core::account::AccountDescriptor {
+            v: 1,
+            pubkey: "c".repeat(64),
+            hint: "chat.example".to_string(),
+            store: meridian_core::account::StoreKind::File,
+            keyfile: Some(request.keyfile.clone()),
+            service: None,
+            label: "c".repeat(64),
+            server: None,
+        };
+        let effect = Effect::Unlock(Box::new(UnlockEffect {
+            request,
+            outcome: SessionOutcome::ready(LiveSession::empty(descriptor)),
+        }));
+
+        app.update(AppEvent::Worker(Box::new(WorkerEvent::Completed(effect))));
+        assert!(matches!(app.current_screen(), Screen::Main(_)));
     }
 
     /// `render` must work for `Screen::Unlock` too, against an in-memory backend — same property

@@ -35,6 +35,7 @@
 pub mod app;
 pub mod config;
 pub mod config_write;
+pub mod preflight;
 pub mod screens;
 pub mod session;
 pub mod statusbar;
@@ -81,6 +82,13 @@ pub async fn run() -> io::Result<()> {
     // never a silent fallback to defaults that would mask a typo the user needs to see.
     let config = load_config(&[]).map_err(io::Error::other)?;
 
+    // Task 4.37 (`Preflight`): the synchronous `account.json` check this crate's own setup phase
+    // already does I/O for — same "fail closed on a malformed file, default/absent on a missing
+    // one" precedent `load_config` above already established, applied to one more file, not a new
+    // pattern. `crate::preflight::preflight_route` is the pure decision this feeds.
+    let account = load_existing_account()?;
+    let route = preflight::preflight_route(account);
+
     let ops: Arc<dyn TerminalOps> = Arc::new(CrosstermOps);
     let guard = TerminalGuard::install(Arc::clone(&ops))?;
     let (signal_ops, signal_restored) = guard.restore_handle();
@@ -89,7 +97,7 @@ pub async fn run() -> io::Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new_with_config(config);
+    let (mut app, initial_effects) = App::new_with_route(config, route);
 
     // crossterm events arrive on a dedicated OS thread (crossterm::event::read is blocking) and
     // are forwarded as AppEvents.
@@ -100,6 +108,13 @@ pub async fn run() -> io::Result<()> {
     let (effect_tx, effect_rx) = mpsc::unbounded_channel::<Effect>();
     let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<AppEvent>();
     tokio::spawn(run_worker(effect_rx, worker_tx));
+
+    // Task 4.37: the `Preflight` route's own initial effect (if any — one `Effect::LoadSession`
+    // for the OS-keystore route, none for `Onboarding`/`Unlock`), dispatched before the event loop
+    // starts so it reaches the worker exactly like every later effect `App::update` returns.
+    for effect in initial_effects {
+        let _ = effect_tx.send(effect);
+    }
 
     let mut tick = tokio::time::interval(Duration::from_millis(250));
 
@@ -126,6 +141,23 @@ pub async fn run() -> io::Result<()> {
 
     drop(guard);
     Ok(())
+}
+
+/// The `Preflight` step's own synchronous I/O (task 4.37): whatever `account.json` (if any) is on
+/// disk under `$MERIDIAN_HOME`, loaded once, up front, exactly like `load_config` above already does
+/// for `config.toml`. Checked directly against the filesystem first (never via
+/// `AccountDescriptor::load()`'s own error string alone), mirroring `worker::run_load_session`'s
+/// identical discipline — so a genuinely corrupt `account.json` still fails closed as a hard error
+/// here (never silently mistaken for "never onboarded yet"), while a missing one cleanly means "no
+/// account yet" rather than an error.
+fn load_existing_account() -> io::Result<Option<meridian_core::account::AccountDescriptor>> {
+    let config_dir = meridian_core::account::config_dir().map_err(io::Error::other)?;
+    if !config_dir.join("account.json").exists() {
+        return Ok(None);
+    }
+    meridian_core::account::AccountDescriptor::load()
+        .map(Some)
+        .map_err(io::Error::other)
 }
 
 /// Reads crossterm events on a blocking OS thread (crossterm's `read` blocks, so it cannot run
