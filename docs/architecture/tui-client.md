@@ -85,7 +85,7 @@ exist yet in `App::handle_key`/`App::handle_worker` — see
 | **Main** | Contacts + conversation + composer + status bar | after unlock |
 | **Add contact** | Paste an `mrd1:` ID or import a QR image, assign a petname | `n` on the Contacts screen |
 | **Requests** | First-contact gate queue (§3.5): sender key, safety number, intro, accept/reject | `^R` (global), or `r` on the Contacts screen |
-| **Verify** | 60-digit safety number + QR, mark verified, block | `v` on a selected contact |
+| **Verify** | 60-digit safety number + QR, mark verified, block | `v` on a selected contact — including a contact created by **accepting a message request** (task 4.42): accepting synthesizes that sender's contacts row, so `Esc` back to Main lists them like any other contact and both `Enter` (chat) and `v` (verify) work unchanged |
 | **Contact detail** | Trust state, key history, per-contact relay policy, petname, block/delete | `Enter` on a contact with the detail toggle |
 | **Settings** | Server URL, relay policy, theme, timestamps, bell, retention | palette → *Settings* |
 | **Diagnostics** | `doctor` output, live connection/transport state, why a path was chosen | palette → *Diagnostics* |
@@ -590,3 +590,69 @@ file-backed account — only the OS-keystore path, and only the specific first-c
 section's finding 2 covered, is unblocked by 4.39 alone. A third, hopefully-final exit-gate re-attempt
 (4.41) is still needed once 4.40 also lands — see
 [docs/tasks/phase-4/README.md](../tasks/phase-4/README.md)'s exit criteria for where this now stands.
+
+**Update (task 4.43): the performance defect 4.39's own fix introduced for file-backed accounts is now
+closed.** The 4.39 note above stays as written (historical record, like §10 and the rest of §11); this
+adds what it did not yet know. 4.39 wired `worker::republish_bundle` to `InboundHandoff::store`, which
+for a file-backed account is a raw `FileSecretStore` — and `FileSecretStore::use_key`/`derive_key` each
+run a **full age/scrypt unwrap on every call**. A republish is `1 + DEFAULT_OTK_COUNT` = 101
+signatures, so every file-backed session start froze on "Unlocking" for ~3 minutes (4.39 recorded
+"> 90 s and climbing"; 4.41 measured 188.0 s/188.8 s live; 4.43 re-measured **194.5 s** from a completed
+`Effect::Unlock` to `run_inbound_loop`'s spawn, and **211.5 s** from the "Unlocking" screen to a
+rendered `Screen::Main` in a real PTY-driven `meridian tui`).
+
+`worker::inbound_handoff` now also builds an **unwrap-once** `MemorySecretStore`
+(`InboundHandoff::bulk_signing_store`) via the same `unwrap_keyfile_for_bulk_signing` helper
+`open_store_for_bulk_signing` uses for onboarding's own `PublishBundle` — one `export_seed` for the
+whole 101-signature burst instead of 101 of them (O(1) scrypt, not O(prekeys)). `run_worker` hands that
+store to `republish_bundle` and **drops it before spawning `run_inbound_loop`**, so raw-seed residency
+ends at republish completion rather than at process exit — which is why this change *reduces* key
+residency rather than extending it (the same seed was previously materialized 101 times across those
+~190 s). `InboundHandoff::store`, and therefore `run_inbound_loop`'s own behavior, is byte-for-byte
+unchanged, as is the OS-keystore branch. Same measurements after the fix: **1.92 s** completed-`Unlock`
+→ spawn, **3.6 s** "Unlocking" → `Screen::Main`. The republish deliberately remains *on* the critical
+path to `Screen::Main` (recorded decision, not an oversight — see 4.43's own Status section). Full
+writeup, methodology and machine conditions:
+[4.43's own Status section](../tasks/phase-4/4.43-file-backed-republish-performance.md).
+
+**Where the residual ~1.5-2 s actually goes — and what that means for the residency bound.** Measured
+separately after the fix, `republish_bundle` itself is **~0.052 s** of the ~1.45-1.92 s
+completed-`Unlock` → spawn window; **~97% of it is the single age/scrypt keyfile unwrap**
+`inbound_handoff` now performs once (~1.4-1.6 s at the shipped scrypt parameters). Two consequences,
+both worth stating precisely rather than rounding to "the republish takes ~2 s":
+
+- The `MemorySecretStore`'s raw-seed residency is **~50 ms**, not ~2 s — it is constructed *after* the
+  expensive unwrap and dropped at republish completion. The security rationale for this shape (residency
+  reduced, not extended) is therefore stronger than a "~2 s" reading of it suggests.
+- A file-backed session start will stay **~1.5-2 s regardless of the republish**, because that floor is
+  one unavoidable passphrase-KDF unwrap — that is what scrypt is for. Later work chasing residual
+  file-backed latency (e.g. the T17 exit-gate re-attempt) should not attribute it to this path; the only
+  ways down are KDF parameters or fewer unwraps per session, both separate decisions.
+
+**Update (task 4.42): Defect C — the responder side of a first contact was a dead end — is now
+closed.** Task 4.41's exit-gate attempt found that accepting a message request left the sender
+reachable from *no* screen at all: `Effect::AcceptRequest` wrote only `trust.bin`/`sessions.bin`, and
+§2's contacts list is driven by `contacts.json`, so the accepted sender never appeared in it — and
+could not be added by hand either, because a `MessageRequest` carries no routing hint, so the
+resulting `Contact` has `hint == ""` and `Contact::id_string()` genuinely fails (`validate_hint`
+rejects an empty hint). There was therefore no string the "add contact" form would have accepted; the
+gap was structural, not a missing button. Two changes close it, and no new ADR was needed
+(nothing here changes trust semantics — an accept still produces a TOFU pin and nothing more):
+
+- `worker::run_accept_request` now also upserts and saves that sender's sealed `contacts.json` row
+  (`id: ""`, `hint: ""`, `conv_handle: None`), on exactly the same `accepted || pin_still_owed` guard
+  as the pin, so a retry never fabricates a row for a sender with no session. **No hint-less `mrd1:`
+  id form was invented** — that would touch the wire-critical `meridian-identity` crate and
+  contradict [ADR 0001](../adr/0001-identity-scheme.md); the row renders through the existing
+  petname → hint → short-pubkey fallback, i.e. as the same fingerprint the Requests pane showed.
+- `App::apply_accepted_request` replays the same three mutations into the live `Screen::Main` beneath
+  the Requests screen (`trust.observe` with the **worker-supplied** timestamp, the contacts-row
+  update, and an in-memory `chat.accept_request`), so the sender is reachable immediately rather than
+  only after the next restart, `v` → Verify → mark-verified has a contact record to transition, and
+  an accepted request no longer re-appears on the next `^R`. A **rejected** one still can, within the
+  same session — that half is unchanged and deliberately out of 4.42's scope.
+
+Screen-level coverage for this lives in `apps/tui/tests/accept_to_chat.rs` (real key events through
+`App`, real `worker::dispatch` against a real sealed `$MERIDIAN_HOME`, plus a restart rebuilt from
+disk only) — the layer `live_session_e2e.rs` structurally cannot reach, which is why three exit-gate
+attempts passed while this was broken.

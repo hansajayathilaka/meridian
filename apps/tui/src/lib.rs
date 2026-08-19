@@ -203,14 +203,56 @@ fn translate_event(event: crossterm::event::Event) -> Option<AppEvent> {
 ///
 /// **Task 4.39:** immediately before that spawn — still inside the same `inbound_started`-guarded,
 /// once-per-session branch, so it too runs exactly once per session — this awaits
-/// [`worker::republish_bundle`] against `handoff.store`/`handoff.handle` (borrowed here; the same
-/// `handoff` is then moved into `run_inbound_loop` right after, per that struct's own doc comment on
-/// why `republish_bundle` takes its inputs by reference/value rather than `&InboundHandoff`), closing
-/// task 4.38's Defect A: without this, no `meridian-tui` session ever persisted a bundle's secret
-/// scalars into `sessions.bin`'s `PrekeyVault`, so a peer's first-contact message could never be
-/// decrypted. A failed republish is logged (by `worker::republish_bundle` itself) and otherwise never
-/// blocks `run_inbound_loop` from starting — see that function's own doc comment for the considered,
-/// `TODO: confirm`-flagged failure UX.
+/// [`worker::republish_bundle`] against the handoff's bulk-signing store and handle (destructured
+/// out of the `handoff` here; the remaining fields are then moved into `run_inbound_loop` right
+/// after, per that struct's own doc comment on why `republish_bundle` takes its inputs by
+/// reference/value rather than `&InboundHandoff`), closing task 4.38's Defect A: without this, no
+/// `meridian-tui` session ever persisted a bundle's secret scalars into `sessions.bin`'s
+/// `PrekeyVault`, so a peer's first-contact message could never be decrypted. A failed republish is
+/// logged (by `worker::republish_bundle` itself) and otherwise never blocks `run_inbound_loop` from
+/// starting — see that function's own doc comment for the considered, `TODO: confirm`-flagged
+/// failure UX.
+///
+/// **Task 4.43 (the store that call gets, and the ordering around it).** That republish is handed
+/// [`worker::InboundHandoff::bulk_signing_store`] — for a file-backed account, a `MemorySecretStore`
+/// unwrapped exactly once inside `worker::inbound_handoff` — not [`worker::InboundHandoff::store`],
+/// whose raw `FileSecretStore` re-ran a full age/scrypt unwrap on each of the 101 signatures and so
+/// froze a file-backed session start on "Unlocking" for ~190 s (measured live by task 4.41,
+/// re-measured at 194.5 s by 4.43 before its fix). The bulk store is then **dropped before**
+/// `run_inbound_loop` is spawned, which is what bounds raw-seed residency to the republish itself.
+///
+/// The republish is still awaited **before** `replies.send(AppEvent::Worker(..))` below — i.e. it
+/// remains on the critical path to `Screen::Main`, deliberately (task 4.43's own recorded decision,
+/// not an oversight). Now that it costs ~0.05 s rather than ~190 s, keeping it inline preserves a
+/// simple, useful invariant: by the time `App` renders `Screen::Main`, this session's prekey vault
+/// is already persisted and the inbound loop is already live, so there is no window in which the app
+/// looks ready while a first-contact envelope would still find no vault entry and no listener, and
+/// none in which a user-dispatched effect sits unserviced behind an unexplained multi-second stall
+/// on a screen that shows no progress at all. The "Unlocking…" screen is the honest place for that
+/// wait. Moving the send earlier would not change the `inbound_started` one-shot guard's meaning
+/// (it is a plain local `bool` set *before* the await, in a strictly sequential
+/// `while let Some(effect) = effects.recv().await` loop — no second handoff can be processed
+/// concurrently under either ordering, which is exactly what
+/// `tests/republish_bundle.rs::republish_only_fires_once_per_session_via_the_inbound_started_guard`
+/// pins), but it would trade a visible wait for an invisible one; if a later task wants it
+/// off the critical path it should land a visible status affordance with it.
+///
+/// Note what is and is not being traded here (task 4.43's measurement): the ~1.5-2 s a file-backed
+/// session start still costs is **not** this republish (~0.052 s of it) — ~97% is the single
+/// age/scrypt keyfile unwrap `worker::inbound_handoff` performs *before* this branch is reached.
+/// Moving the send earlier would therefore not make "Unlocking" meaningfully shorter.
+///
+/// **Residual (`TODO: confirm` — a follow-up task's scope, not 4.43's): the wait above is bounded
+/// only when the server answers.** `worker::republish_bundle`'s first act is
+/// `SignalingClient::connect`, which is a bare `connect_async(url).await` with **no timeout**
+/// (`apps/signaling/src/client.rs`), so against a black-holed or unroutable rendezvous server this
+/// inline await can hold "Unlocking" for the OS's whole SYN-retry budget (~130 s on Linux) with no
+/// progress indication at all. This is **not** a regression — task 4.39's wiring had the same shape
+/// — and it does not change the inline-vs-off-critical-path decision recorded above; but that
+/// decision's "it now costs ~0.05 s" premise describes the happy path only, and the unbounded tail
+/// should be read alongside it rather than discovered later. Candidate fixes (wrap the republish in
+/// `tokio::time::timeout`, or defer it off the critical path together with a visible status
+/// affordance) belong in their own task.
 async fn run_worker(
     mut effects: mpsc::UnboundedReceiver<Effect>,
     replies: mpsc::UnboundedSender<AppEvent>,
@@ -223,24 +265,48 @@ async fn run_worker(
         if !inbound_started {
             if let Some(handoff) = worker::inbound_handoff(&outcome) {
                 inbound_started = true;
+                // Destructured (task 4.43) rather than field-accessed, so `bulk_signing_store` is a
+                // local this function can drop at a precise point — see the `drop` below.
+                let worker::InboundHandoff {
+                    store,
+                    bulk_signing_store,
+                    handle,
+                    account_pub,
+                    server,
+                } = handoff;
                 if let Err(e) = worker::republish_bundle(
-                    handoff.store.as_ref(),
-                    &handoff.handle,
-                    handoff.account_pub,
-                    &handoff.server,
+                    bulk_signing_store.as_ref(),
+                    &handle,
+                    account_pub,
+                    &server,
                 )
                 .await
                 {
                     eprintln!("meridian tui: could not republish prekey bundle: {e}");
                 }
+                // Task 4.43, load-bearing and not merely tidy: for a file-backed account
+                // `bulk_signing_store` is the one object in this process holding the *raw* account
+                // seed (a `MemorySecretStore`'s `Zeroizing<Vec<u8>>`) rather than the passphrase.
+                // Dropping it here zeroizes it at republish completion — ~50 ms after
+                // `inbound_handoff` built it, per task 4.43's measurement (the republish is
+                // ~0.052 s; the ~1.5-2 s session start is dominated by the single scrypt unwrap
+                // that precedes this store's existence) — instead of at process exit, which is
+                // exactly why this task's shape *reduces* key residency rather than extending
+                // it — see
+                // `worker::InboundHandoff::bulk_signing_store`'s own doc comment. `run_inbound_loop`
+                // below is deliberately handed `store` (the per-delivery store), never this one:
+                // handing it the raw-seed store would turn a ~50 ms residency into a
+                // session-lifetime one, which is a different decision needing its own security
+                // sign-off.
+                drop(bulk_signing_store);
                 let backoff_ms = load_config(&[])
                     .map(|c| c.network.reconnect_backoff_ms)
                     .unwrap_or_default();
                 tokio::spawn(worker::run_inbound_loop(
-                    handoff.store,
-                    handoff.handle,
-                    handoff.account_pub,
-                    handoff.server,
+                    store,
+                    handle,
+                    account_pub,
+                    server,
                     backoff_ms,
                     replies.clone(),
                 ));

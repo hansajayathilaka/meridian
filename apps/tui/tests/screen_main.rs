@@ -15,6 +15,15 @@
 //! session load, not live arrivals — see `crate::screens::main`'s own module doc), using a real,
 //! offline (no network, no rendezvous server) X3DH-gated `MessageRequest`, mirroring
 //! `apps/core/tests/message_request_gate.rs`'s own minimal recipe.
+//!
+//! ## Task 4.44 additions — the `Effect::LoadHistory` completion/merge/dedup properties
+//! `App`-level, against this file's own fabricated `LiveSession` (no real worker/store I/O — the
+//! real, sealed-on-disk end-to-end proof is `tests/history_load.rs`): `Effect::LoadHistory`
+//! dispatched on open (covered above), its completion merged into the open `Screen::Chat` in the
+//! right order, a live inbound arriving after that load is not double-listed (dedup by `mid`, reused
+//! from `crate::screens::chat::insert_deduped`), a same-session re-open (`Esc` then `Enter` again)
+//! dispatches a fresh load, and a stale completion for an already-popped `Screen::Chat` is a
+//! harmless no-op.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
@@ -27,10 +36,13 @@ use meridian_core::identity::{generate_account, MemorySecretStore};
 use meridian_core::signaling::generate_bundle;
 use meridian_core::trust::{TrustState, TrustStore};
 
-use meridian_tui::app::{App, AppEvent, Screen};
+use meridian_tui::app::{
+    App, AppEvent, Effect, InboundEvent, LoadHistoryEffect, Screen, WorkerEvent,
+};
 use meridian_tui::screens::main::{self, MainState};
 use meridian_tui::session::LiveSession;
 use meridian_tui::store::contacts::{ContactRecord, ContactsDocument, PolicyOverride, TrustLabel};
+use meridian_tui::store::history::{self, Direction as MsgDirection, HistoryEntry, MessageState};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -218,13 +230,25 @@ fn enter_opens_a_real_chat_screen_and_esc_reclaims_the_trust_store_into_main() {
     let (mut app, _own, bob_pubkey) = app_with_main();
 
     let effects = app.update(AppEvent::Key(key(KeyCode::Enter)));
-    assert!(effects.is_empty());
+    assert_eq!(
+        effects.len(),
+        1,
+        "opening a chat must dispatch exactly one Effect::LoadHistory (task 4.44)"
+    );
+    match &effects[0] {
+        meridian_tui::app::Effect::LoadHistory(e) => {
+            assert_eq!(e.request.peer_pubkey, bob_pubkey)
+        }
+        other => panic!("expected Effect::LoadHistory, got {other:?}"),
+    }
     match app.current_screen() {
         Screen::Chat(state) => {
             assert_eq!(state.peer_pubkey, bob_pubkey);
             assert!(
                 state.entries.is_empty(),
-                "no per-peer history in this task's own scope — see crate::screens::main's module doc"
+                "the screen opens instantly with an empty transcript — the real, persisted \
+                 history is merged in once Effect::LoadHistory completes (task 4.44), see \
+                 crate::app::App::apply_loaded_history"
             );
         }
         other => panic!("expected Screen::Chat, got {other:?}"),
@@ -243,6 +267,414 @@ fn enter_opens_a_real_chat_screen_and_esc_reclaims_the_trust_store_into_main() {
         }
         other => panic!("expected Screen::Main, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Task 4.44: a completed Effect::LoadHistory is merged into the open Screen::Chat, in order
+// ---------------------------------------------------------------------------
+
+fn history_entry(
+    mid: &str,
+    dir: MsgDirection,
+    ts: u64,
+    body: &str,
+    state: MessageState,
+) -> HistoryEntry {
+    HistoryEntry {
+        v: history::CURRENT_VERSION,
+        mid: mid.to_string(),
+        dir,
+        ts,
+        stream: "mrd.chat/1".to_string(),
+        body: body.to_string(),
+        state,
+    }
+}
+
+fn completed_load_history(peer_pubkey: [u8; 32], entries: Vec<HistoryEntry>) -> WorkerEvent {
+    WorkerEvent::Completed(Effect::LoadHistory(LoadHistoryEffect {
+        request: meridian_tui::app::LoadHistoryRequest { peer_pubkey },
+        outcome: Some(entries),
+    }))
+}
+
+#[test]
+fn a_completed_load_history_populates_the_open_chats_transcript_in_order() {
+    let (mut app, _own, bob_pubkey) = app_with_main();
+    app.update(AppEvent::Key(key(KeyCode::Enter)));
+    match app.current_screen() {
+        Screen::Chat(state) => assert!(state.entries.is_empty()),
+        other => panic!("expected Screen::Chat, got {other:?}"),
+    }
+
+    let loaded = vec![
+        history_entry(
+            "1".repeat(32).as_str(),
+            MsgDirection::In,
+            1_000,
+            "hi",
+            MessageState::Received,
+        ),
+        history_entry(
+            "2".repeat(32).as_str(),
+            MsgDirection::Out,
+            1_001,
+            "hey",
+            MessageState::Delivered,
+        ),
+    ];
+    let leftover = app.update(AppEvent::Worker(Box::new(completed_load_history(
+        bob_pubkey,
+        loaded.clone(),
+    ))));
+    assert!(leftover.is_empty());
+
+    match app.current_screen() {
+        Screen::Chat(state) => assert_eq!(
+            state.entries, loaded,
+            "the loaded transcript must appear in the same order it was persisted"
+        ),
+        other => panic!("expected Screen::Chat, got {other:?}"),
+    }
+}
+
+/// Deliverable 4's own named dedup assertion: an inbound message arriving live for a peer whose
+/// history was *just* loaded must not be double-listed — reuses `crate::screens::chat::
+/// insert_deduped` on both the load-completion merge and the live-inbound append, so whichever
+/// arrives first, the second is a deduped no-op against the same `mid`.
+#[test]
+fn a_live_inbound_message_after_a_completed_load_is_not_double_listed() {
+    let (mut app, _own, bob_pubkey) = app_with_main();
+    app.update(AppEvent::Key(key(KeyCode::Enter)));
+
+    let already_persisted = history_entry(
+        "3".repeat(32).as_str(),
+        MsgDirection::In,
+        1_000,
+        "already on disk",
+        MessageState::Received,
+    );
+    app.update(AppEvent::Worker(Box::new(completed_load_history(
+        bob_pubkey,
+        vec![already_persisted.clone()],
+    ))));
+
+    // The same message arrives again live (e.g. a re-delivered envelope, or a race with the
+    // worker's own unconditional persist — see `App::handle_inbound`'s own doc comment) — same
+    // `mid`, must not double-list.
+    app.update(AppEvent::Inbound(Box::new(InboundEvent::Message {
+        peer_pubkey: bob_pubkey,
+        entry: already_persisted.clone(),
+    })));
+    match app.current_screen() {
+        Screen::Chat(state) => assert_eq!(
+            state.entries,
+            vec![already_persisted.clone()],
+            "a re-delivered mid must not be double-listed"
+        ),
+        other => panic!("expected Screen::Chat, got {other:?}"),
+    }
+
+    // A genuinely new message, with a new `mid`, is appended normally.
+    let new_message = history_entry(
+        "4".repeat(32).as_str(),
+        MsgDirection::In,
+        1_002,
+        "a new one",
+        MessageState::Received,
+    );
+    app.update(AppEvent::Inbound(Box::new(InboundEvent::Message {
+        peer_pubkey: bob_pubkey,
+        entry: new_message.clone(),
+    })));
+    match app.current_screen() {
+        Screen::Chat(state) => assert_eq!(state.entries, vec![already_persisted, new_message]),
+        other => panic!("expected Screen::Chat, got {other:?}"),
+    }
+}
+
+/// A live inbound message arriving *before* the history load completes must still end up after the
+/// loaded (older) entries once the load does complete — `App::apply_loaded_history` puts `loaded`
+/// first, then folds in whatever was already appended, preserving chronological order rather than
+/// letting a slow disk read shuffle a message that arrived first behind older history.
+#[test]
+fn a_completed_load_arriving_after_a_live_inbound_still_orders_history_first() {
+    let (mut app, _own, bob_pubkey) = app_with_main();
+    app.update(AppEvent::Key(key(KeyCode::Enter)));
+
+    let live_first = history_entry(
+        "5".repeat(32).as_str(),
+        MsgDirection::In,
+        2_000,
+        "arrived while the load was still in flight",
+        MessageState::Received,
+    );
+    app.update(AppEvent::Inbound(Box::new(InboundEvent::Message {
+        peer_pubkey: bob_pubkey,
+        entry: live_first.clone(),
+    })));
+    match app.current_screen() {
+        Screen::Chat(state) => assert_eq!(state.entries, vec![live_first.clone()]),
+        other => panic!("expected Screen::Chat, got {other:?}"),
+    }
+
+    let older = history_entry(
+        "6".repeat(32).as_str(),
+        MsgDirection::Out,
+        1_000,
+        "older, already on disk",
+        MessageState::Delivered,
+    );
+    app.update(AppEvent::Worker(Box::new(completed_load_history(
+        bob_pubkey,
+        vec![older.clone()],
+    ))));
+    match app.current_screen() {
+        Screen::Chat(state) => assert_eq!(
+            state.entries,
+            vec![older, live_first],
+            "loaded history must come first, with whatever arrived live folded in afterward"
+        ),
+        other => panic!("expected Screen::Chat, got {other:?}"),
+    }
+}
+
+/// Permanent regression for the exact race `App::apply_loaded_history`'s own doc comment names: a
+/// message already flushed to disk by the time `Effect::LoadHistory`'s read ran (so it is present in
+/// `loaded`) that is *also* separately delivered live while that same load is still in flight (same
+/// `mid`, arriving **before** the completion lands) must appear exactly once in the final transcript,
+/// not doubled. Unlike `a_live_inbound_message_after_a_completed_load_is_not_double_listed` above
+/// (live arrival *after* the load completes), this pins the opposite ordering of the same race.
+#[test]
+fn same_mid_in_both_loaded_and_a_still_in_flight_live_arrival_is_deduped_not_doubled() {
+    let (mut app, _own, bob_pubkey) = app_with_main();
+    app.update(AppEvent::Key(key(KeyCode::Enter)));
+
+    let shared = history_entry(
+        "a".repeat(32).as_str(),
+        MsgDirection::In,
+        1_000,
+        "flushed to disk, then also delivered live before the load completed",
+        MessageState::Received,
+    );
+
+    // Arrives live first, while Effect::LoadHistory is still in flight.
+    app.update(AppEvent::Inbound(Box::new(InboundEvent::Message {
+        peer_pubkey: bob_pubkey,
+        entry: shared.clone(),
+    })));
+    match app.current_screen() {
+        Screen::Chat(state) => assert_eq!(state.entries, vec![shared.clone()]),
+        other => panic!("expected Screen::Chat, got {other:?}"),
+    }
+
+    // The load then completes; its own read of the sealed file also carries the same entry (same
+    // mid — it was already flushed to disk by the time the read ran).
+    app.update(AppEvent::Worker(Box::new(completed_load_history(
+        bob_pubkey,
+        vec![shared.clone()],
+    ))));
+    match app.current_screen() {
+        Screen::Chat(state) => assert_eq!(
+            state.entries,
+            vec![shared],
+            "the same mid present in both the loaded transcript and a still-in-flight live arrival \
+             must be deduped, not doubled"
+        ),
+        other => panic!("expected Screen::Chat, got {other:?}"),
+    }
+}
+
+/// A same-session re-open (`Esc` then `Enter` again) dispatches a fresh `Effect::LoadHistory` and,
+/// once it completes, shows the transcript again — closing the second half of this task's own named
+/// gap ("Esc out of a chat and back in, which today discards the popped `ChatState`'s entries").
+#[test]
+fn re_opening_a_chat_after_esc_dispatches_a_fresh_load_and_restores_the_transcript() {
+    let (mut app, _own, bob_pubkey) = app_with_main();
+    app.update(AppEvent::Key(key(KeyCode::Enter)));
+    let loaded = vec![history_entry(
+        "7".repeat(32).as_str(),
+        MsgDirection::In,
+        1_000,
+        "seen once already",
+        MessageState::Received,
+    )];
+    app.update(AppEvent::Worker(Box::new(completed_load_history(
+        bob_pubkey,
+        loaded.clone(),
+    ))));
+    match app.current_screen() {
+        Screen::Chat(state) => assert_eq!(state.entries, loaded),
+        other => panic!("expected Screen::Chat, got {other:?}"),
+    }
+
+    // Esc pops Chat — today (pre-4.44-fix) this would have discarded `entries` for good.
+    app.update(AppEvent::Key(key(KeyCode::Esc)));
+    assert!(matches!(app.current_screen(), Screen::Main(_)));
+
+    // Re-open: a fresh Screen::Chat, empty again, plus a fresh Effect::LoadHistory dispatch.
+    let effects = app.update(AppEvent::Key(key(KeyCode::Enter)));
+    assert_eq!(effects.len(), 1);
+    assert!(matches!(&effects[0], Effect::LoadHistory(_)));
+    match app.current_screen() {
+        Screen::Chat(state) => assert!(state.entries.is_empty()),
+        other => panic!("expected Screen::Chat, got {other:?}"),
+    }
+
+    // Completing that fresh load restores the same transcript (as `load_or_default` would, reading
+    // the same still-sealed file — nothing was lost by the Esc/re-open round trip).
+    app.update(AppEvent::Worker(Box::new(completed_load_history(
+        bob_pubkey,
+        loaded.clone(),
+    ))));
+    match app.current_screen() {
+        Screen::Chat(state) => assert_eq!(state.entries, loaded),
+        other => panic!("expected Screen::Chat, got {other:?}"),
+    }
+}
+
+/// The interleaving `App::apply_loaded_history`'s own doc comment cites as *why* it walks the whole
+/// screen stack rather than assuming `Screen::Chat` is on top: `Ctrl-R` is a global binding, reachable
+/// even with a `Screen::Chat` already open, and pushes `Screen::Requests` on top of it while that
+/// chat's own `Effect::LoadHistory` is still in flight. This is the same defect *class* task 4.42's
+/// `apply_accepted_request` was found missing (Finding 1) — mechanically verified by code inspection
+/// there, but until now untested for the `LoadHistory` completion path.
+#[test]
+fn a_load_history_completion_lands_correctly_behind_an_interleaved_ctrl_r_requests_screen() {
+    let (mut app, _own, bob_pubkey) = app_with_main();
+
+    // Open the chat — dispatches Effect::LoadHistory, still in flight.
+    let effects = app.update(AppEvent::Key(key(KeyCode::Enter)));
+    assert_eq!(effects.len(), 1);
+    assert!(matches!(&effects[0], Effect::LoadHistory(_)));
+    assert!(matches!(app.current_screen(), Screen::Chat(_)));
+
+    // Ctrl-R pushes Screen::Requests on top of the still-open Chat while the LoadHistory dispatched
+    // above is still in flight.
+    app.update(AppEvent::Key(ctrl(KeyCode::Char('r'))));
+    assert!(matches!(app.current_screen(), Screen::Requests(_)));
+
+    // The pending Effect::LoadHistory now completes while Requests sits on top.
+    let loaded = vec![history_entry(
+        "9".repeat(32).as_str(),
+        MsgDirection::In,
+        1_000,
+        "loaded while Requests was on top",
+        MessageState::Received,
+    )];
+    let leftover = app.update(AppEvent::Worker(Box::new(completed_load_history(
+        bob_pubkey,
+        loaded.clone(),
+    ))));
+    assert!(leftover.is_empty());
+
+    // Navigation must be undisturbed — still on Screen::Requests.
+    assert!(matches!(app.current_screen(), Screen::Requests(_)));
+
+    // Pop back to the Chat screen underneath and confirm the transcript actually landed there — not
+    // lost, and not misrouted onto Requests or dropped on the floor.
+    let popped = app.pop_screen();
+    assert!(matches!(popped, Some(Screen::Requests(_))));
+    match app.current_screen() {
+        Screen::Chat(state) => assert_eq!(
+            state.entries, loaded,
+            "the completed LoadHistory must land on the Screen::Chat frame underneath the \
+             interleaved Ctrl-R Screen::Requests, not be lost or misrouted"
+        ),
+        other => panic!("expected Screen::Chat underneath Requests, got {other:?}"),
+    }
+}
+
+/// A stale `Effect::LoadHistory` completion for a `Screen::Chat` that has already been popped (e.g.
+/// a slow load racing a quick `Esc`) is a harmless no-op — nothing to merge it into, and nothing
+/// already-persisted is lost (the next `OpenChat` reads it fresh off disk).
+#[test]
+fn a_stale_load_history_completion_with_no_matching_chat_screen_is_a_no_op() {
+    let (mut app, _own, bob_pubkey) = app_with_main();
+    app.update(AppEvent::Key(key(KeyCode::Enter)));
+    app.update(AppEvent::Key(key(KeyCode::Esc)));
+    assert!(matches!(app.current_screen(), Screen::Main(_)));
+
+    let leftover = app.update(AppEvent::Worker(Box::new(completed_load_history(
+        bob_pubkey,
+        vec![history_entry(
+            "8".repeat(32).as_str(),
+            MsgDirection::In,
+            1_000,
+            "stale",
+            MessageState::Received,
+        )],
+    ))));
+    assert!(leftover.is_empty());
+    assert!(matches!(app.current_screen(), Screen::Main(_)));
+}
+
+// ---------------------------------------------------------------------------
+// A failed Effect::LoadHistory (App::note_history_load_failure) — previously untested.
+// ---------------------------------------------------------------------------
+
+fn failed_load_history(peer_pubkey: [u8; 32], message: &str) -> WorkerEvent {
+    WorkerEvent::Failed(
+        Effect::LoadHistory(LoadHistoryEffect {
+            request: meridian_tui::app::LoadHistoryRequest { peer_pubkey },
+            outcome: None,
+        }),
+        message.to_string(),
+    )
+}
+
+/// A failed `Effect::LoadHistory` completion surfaces a notice on the still-open `Screen::Chat` for
+/// the matching peer — mirrors `crate::screens::chat::handle_worker`'s own `Effect::PersistHistory`
+/// failure notice. Nothing already shown is lost: `entries` is left exactly as it was.
+#[test]
+fn a_failed_load_history_surfaces_a_notice_on_the_matching_open_chat() {
+    let (mut app, _own, bob_pubkey) = app_with_main();
+    app.update(AppEvent::Key(key(KeyCode::Enter)));
+    match app.current_screen() {
+        Screen::Chat(state) => assert!(state.notice.is_none()),
+        other => panic!("expected Screen::Chat, got {other:?}"),
+    }
+
+    let leftover = app.update(AppEvent::Worker(Box::new(failed_load_history(
+        bob_pubkey,
+        "disk read failed",
+    ))));
+    assert!(leftover.is_empty());
+    match app.current_screen() {
+        Screen::Chat(state) => {
+            assert!(
+                state.entries.is_empty(),
+                "a failed load must not fabricate or lose any transcript entries"
+            );
+            let notice = state
+                .notice
+                .as_deref()
+                .expect("a failure notice must be shown on the matching open chat");
+            assert!(
+                notice.contains("disk read failed"),
+                "expected the worker's own failure message to appear in the notice, got: {notice}"
+            );
+        }
+        other => panic!("expected Screen::Chat, got {other:?}"),
+    }
+}
+
+/// The same failed completion arriving after the matching `Screen::Chat` has already been popped
+/// (e.g. a slow failing load racing a quick `Esc`) must be a safe no-op — not a panic, not a
+/// misdirected write onto whatever screen is current now.
+#[test]
+fn a_failed_load_history_for_an_already_popped_chat_is_a_safe_no_op() {
+    let (mut app, _own, bob_pubkey) = app_with_main();
+    app.update(AppEvent::Key(key(KeyCode::Enter)));
+    app.update(AppEvent::Key(key(KeyCode::Esc)));
+    assert!(matches!(app.current_screen(), Screen::Main(_)));
+
+    let leftover = app.update(AppEvent::Worker(Box::new(failed_load_history(
+        bob_pubkey,
+        "disk read failed",
+    ))));
+    assert!(leftover.is_empty());
+    assert!(matches!(app.current_screen(), Screen::Main(_)));
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +806,132 @@ fn ctrl_r_merges_the_live_session_load_snapshot_with_anything_that_arrived_live(
         }
         other => panic!("expected Screen::Requests, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Task 4.42 (piece C): a completed Effect::AcceptRequest is reconciled into the live Screen::Main
+// that sits *below* Screen::Requests on the stack — the in-memory half of the fix for 4.41's
+// Defect C, isolated here against this file's own fabricated `LiveSession` (the end-to-end version,
+// driven by the real worker against real sealed files, lives in `tests/accept_to_chat.rs`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_completed_accept_request_is_replayed_into_the_main_screen_underneath_requests() {
+    let (_own, _bob, mut session) = session_with_bob();
+    let sender_ik = establish_pending_request(&mut session.chat);
+
+    let mut app = App::new();
+    push_main(&mut app, MainState::from_session(session));
+    app.update(AppEvent::Key(ctrl(KeyCode::Char('r'))));
+    assert!(matches!(app.current_screen(), Screen::Requests(_)));
+
+    // The worker's own completion payload for a genuine first-contact accept: an empty id/hint
+    // (`MessageRequest` carries no hint, so `Contact::id_string()` cannot succeed) and a plain TOFU
+    // pin. `Screen::Requests` is on top; `Screen::Main` is underneath, and is what must be updated.
+    let added = meridian_tui::app::AddedContact {
+        pubkey: sender_ik,
+        id: String::new(),
+        hint: String::new(),
+        petname: None,
+        added_at: 1_760_000_000,
+        trust: TrustState::Pinned,
+        user_blocked: false,
+        pinned_key_history: vec![meridian_core::trust::PinnedKey {
+            pubkey: sender_ik,
+            first_seen_unix: 1_760_000_000,
+            last_seen_unix: 1_760_000_000,
+        }],
+    };
+    // Enter `Deciding` for this sender first, so the Requests screen itself reacts realistically.
+    app.update(AppEvent::Key(key(KeyCode::Char('a'))));
+    let effects = app.update(AppEvent::Key(key(KeyCode::Char('y'))));
+    assert_eq!(effects.len(), 1);
+    let request = match effects.into_iter().next().unwrap() {
+        meridian_tui::app::Effect::AcceptRequest(e) => e.request,
+        other => panic!("expected Effect::AcceptRequest, got {other:?}"),
+    };
+    app.update(AppEvent::Worker(Box::new(
+        meridian_tui::app::WorkerEvent::Completed(meridian_tui::app::Effect::AcceptRequest(
+            meridian_tui::app::AcceptRequestEffect {
+                request,
+                outcome: Some(added),
+            },
+        )),
+    )));
+
+    app.update(AppEvent::Key(key(KeyCode::Esc)));
+    match app.current_screen() {
+        Screen::Main(main) => {
+            // 1. the display row (previously only `bob`)
+            assert_eq!(main.contacts.entries.len(), 2);
+            let entry = main
+                .contacts
+                .entries
+                .iter()
+                .find(|e| e.pubkey == sender_ik)
+                .expect("the accepted sender must be reachable from the live contacts list");
+            assert_eq!(entry.trust, TrustState::Pinned);
+            assert_eq!(entry.id, "");
+            // 2. the live TrustStore — without this, `v` -> Verify -> mark_verified would err
+            //    `UnknownContact` against a store that never heard of this sender.
+            assert_eq!(main.trust.trust_state(&sender_ik), TrustState::Pinned);
+            assert_eq!(
+                main.trust
+                    .contact(&sender_ik)
+                    .expect("pinned contact")
+                    .pinned_key_history
+                    .len(),
+                1,
+                "replayed with the worker-supplied timestamp — one entry, not a second stamp"
+            );
+            // 3. the live ChatState's pending queue
+            assert!(
+                main.chat.pending_request(&sender_ik).is_none(),
+                "the accepted request must be gone from Screen::Main's own in-memory queue too"
+            );
+        }
+        other => panic!("expected Screen::Main, got {other:?}"),
+    }
+
+    // ...and therefore does not re-appear on the next Ctrl-R.
+    app.update(AppEvent::Key(ctrl(KeyCode::Char('r'))));
+    match app.current_screen() {
+        Screen::Requests(state) => assert!(state.entries.is_empty()),
+        other => panic!("expected Screen::Requests, got {other:?}"),
+    }
+}
+
+/// The same completion arriving with **no** `Screen::Main` anywhere on the stack (a `Screen::
+/// Requests` pushed standalone, as several tests in this crate do) must be a harmless no-op, not a
+/// panic — mirrors `App::reclaim_trust`'s own "nothing to give it back to" contract.
+#[test]
+fn a_completed_accept_request_with_no_main_screen_on_the_stack_is_a_no_op() {
+    let mut app = App::new();
+    app.push_screen(Screen::Requests(Box::new(
+        meridian_tui::screens::requests::RequestsState::new(Vec::new()),
+    )));
+    let added = meridian_tui::app::AddedContact {
+        pubkey: [0x77u8; 32],
+        id: String::new(),
+        hint: String::new(),
+        petname: None,
+        added_at: 1_760_000_000,
+        trust: TrustState::Pinned,
+        user_blocked: false,
+        pinned_key_history: Vec::new(),
+    };
+    let effects = app.update(AppEvent::Worker(Box::new(
+        meridian_tui::app::WorkerEvent::Completed(meridian_tui::app::Effect::AcceptRequest(
+            meridian_tui::app::AcceptRequestEffect {
+                request: meridian_tui::app::AcceptRequestRequest {
+                    sender_ik: [0x77u8; 32],
+                },
+                outcome: Some(added),
+            },
+        )),
+    )));
+    assert!(effects.is_empty());
+    assert!(matches!(app.current_screen(), Screen::Requests(_)));
 }
 
 // ---------------------------------------------------------------------------

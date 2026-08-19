@@ -44,10 +44,19 @@
 //! [`Effect::AcceptRequest`]'s doc comment carries the full reasoning: the future worker executing
 //! it must call `accept_request` **then** `TrustStore::observe` (task 4.7's own fix — never pin
 //! before the user decides), and must pass an empty hint, since `MessageRequest` carries none.
-//! Delivering the accepted `intro` into a conversation transcript is out of this task's scope —
-//! mirrors `crate::screens::chat`'s own "no receive-path wiring" note; there is no
-//! `Screen::Requests` → `Screen::Chat` navigation in this crate yet for the same reason
-//! `crate::screens::contacts`' own `Enter` doesn't yet open `Screen::Chat` either.
+//! Delivering the accepted `intro` into a conversation transcript was out of task 4.21's scope, and
+//! **task 4.42 looked at it again and deliberately deferred it** rather than leaving the question
+//! floating — see [`crate::app::AcceptRequestRequest`]'s own doc comment for the three reasons
+//! (chiefly: it means a sealed per-peer history *write*, and task 4.44 owns the matching *read*).
+//!
+//! There is still no `Screen::Requests` → `Screen::Chat` navigation from this screen: task 4.42
+//! evaluated it ("Shape B") and severed it as optional, because it is not needed to reach the
+//! accepted sender at all. Accepting now synthesizes that sender's `contacts.json` row and replays
+//! it into the live `Screen::Main` (`worker::run_accept_request` + `crate::app::App::
+//! apply_accepted_request`), so `Esc` back to Main lists them like any other contact, where `Enter`
+//! opens `Screen::Chat` and `v` opens `Screen::Verify` — which is also the only route
+//! `docs/architecture/tui-client.md §2` gives Verify at all, so a direct jump from here would not
+//! have sufficed on its own.
 //!
 //! ## Reject: the "leaves no trace" property, at this UI layer
 //! `meridian_core::chat::ChatState::reject_request`'s own doc comment (and

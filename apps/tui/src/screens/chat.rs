@@ -403,7 +403,12 @@ fn transcript_registry(ctx: &RenderCtx) -> MessageRendererRegistry {
 /// this task's own named "local dedup by `mid`" deliverable. Deliberately keyed only on `mid`, not
 /// direction, so a future inbound-receive path can reuse this unchanged (see the module doc's "What
 /// this screen does not do"). Returns whether the entry was actually inserted.
-fn insert_deduped(entries: &mut Vec<HistoryEntry>, entry: HistoryEntry) -> bool {
+///
+/// **`pub(crate)` since task 4.44** (was private): `crate::app::App::apply_loaded_history` reuses
+/// this exact function to merge a completed `Effect::LoadHistory`'s transcript with whatever a live
+/// inbound already appended in memory — see that method's own doc comment for why reusing this,
+/// never a second, divergent dedup, is load-bearing.
+pub(crate) fn insert_deduped(entries: &mut Vec<HistoryEntry>, entry: HistoryEntry) -> bool {
     if entries.iter().any(|e| e.mid == entry.mid) {
         return false;
     }

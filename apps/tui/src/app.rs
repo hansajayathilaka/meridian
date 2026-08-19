@@ -24,7 +24,7 @@ use crate::session::LiveSession;
 
 use crate::screens::chat::{self, ChatState};
 use crate::screens::contact_detail::{self, ContactDetailState};
-use crate::screens::contacts::{self, ContactsState};
+use crate::screens::contacts::{self, ContactEntry, ContactsState};
 use crate::screens::diagnostics::DiagnosticsPane;
 use crate::screens::help::{self, HelpState};
 use crate::screens::main::{self, MainAction, MainState};
@@ -627,6 +627,39 @@ pub struct PersistHistoryEffect {
     pub outcome: Option<()>,
 }
 
+/// Inputs for [`Effect::LoadHistory`] (task 4.44, `crate::screens::main`): read `peer_pubkey`'s whole
+/// sealed transcript — `crate::store::history::load_or_default` (task 4.15), the **same** reader
+/// [`crate::store::export`] already uses, never a second, divergent one — off disk, the "no I/O in
+/// `update`" boundary (`docs/architecture/tui-client.md §4`) this effect exists specifically to
+/// respect: `crate::screens::main::handle_key`'s `ContactsAction::OpenChat` arm dispatches this
+/// alongside pushing `Screen::Chat` (with `entries: Vec::new()`, same as before this task — the
+/// screen still opens instantly), rather than reading the file itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadHistoryRequest {
+    pub peer_pubkey: [u8; 32],
+}
+
+/// [`Effect::LoadHistory`]'s payload — `outcome` carries the loaded transcript (in file order) on
+/// success, mirroring [`AcceptRequestEffect`]'s "outcome carries the real data, not just `()`" shape
+/// rather than [`PersistHistoryEffect`]'s (there is genuine data to hand back here, not just a
+/// completion signal).
+///
+/// **No redaction on `outcome`.** `Vec<HistoryEntry>` carries real, already-decrypted conversation
+/// content — the same plaintext `PersistHistoryEffect`/`SendMessageEffect` already carry through this
+/// exact `#[derive(Debug)]` un-redacted, per `crate::screens::chat::ChatState`'s own doc comment
+/// ("nothing reachable from here is a *secret* in this crate's hand-rolled-`Debug` sense... not
+/// passphrases or key material"). This type carries no `SecretStore`/`KeyHandle`/passphrase of any
+/// kind — only a pubkey and message content — so there is nothing here that precedent would redact;
+/// see `tests::load_history_effect_carries_no_key_material_and_is_not_redacted` (mirrors
+/// `crate::session::LiveSession`'s own redaction test and
+/// `run_worker_account.rs::effect_debug_never_leaks_a_passphrase`, verifying the *opposite* property
+/// deliberately, since there is no secret here to hide).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadHistoryEffect {
+    pub request: LoadHistoryRequest,
+    pub outcome: Option<Vec<HistoryEntry>>,
+}
+
 /// Inputs for [`Effect::AcceptRequest`] (task 4.21, `crate::screens::requests`): accept a pending
 /// message request and TOFU-pin its sender, mirroring `apps/cli/src/chat.rs::answer_request`'s
 /// accept branch **order** exactly — `meridian_core::chat::ChatState::accept_request(sender_ik)`
@@ -648,23 +681,51 @@ pub struct PersistHistoryEffect {
 /// one. `TODO: confirm` whether a later task should extend `MessageRequest`/the wire protocol to
 /// carry a sender-supplied display hint; today none exists to pass through.
 ///
-/// **Does not itself deliver `intro` into a conversation transcript.** Mirrors
-/// `crate::screens::chat`'s own "no receive-path wiring" scope note: there is no
-/// `Effect`/history-append plumbing in this crate yet for an inbound message arriving outside an
-/// active `Screen::Chat` session. A future task that wires `Screen::Requests` → `Screen::Chat`
-/// navigation is also what should decide how the accepted `intro` reaches that peer's transcript.
+/// **Does not itself deliver `intro` into a conversation transcript — task 4.42 looked at this and
+/// deliberately deferred it, rather than leaving the question floating.** The paragraph this
+/// replaces handed the decision to "a future task that wires `Screen::Requests` → `Screen::Chat`
+/// navigation"; task 4.42 is that task, and its answer is *not yet, and not here*:
+/// - The accepted [`meridian_core::chat::MessageRequest`]'s `intro` is real, already-decrypted
+///   content, so delivering it means a **sealed per-peer history append**
+///   ([`Effect::PersistHistory`] → `crate::store::history`), not an in-memory push:
+///   `crate::screens::main`'s `Screen::Chat` construction starts every transcript empty and nothing
+///   re-reads history mid-session, so an in-memory-only append would be silently lost on the next
+///   navigation — worse than not writing it.
+/// - Doing that write here would also duplicate whatever the *live* inbound path
+///   ([`App::handle_inbound`]'s `InboundEvent::Message` arm, whose "no unread indication while no
+///   chat is open" half task 4.42 names as explicitly deferred) settles on, risking two writers of
+///   the same transcript entry with no shared de-duplication key.
+/// - Task [4.44](../../../docs/tasks/phase-4/4.44-chat-history-load-on-open.md) owns loading a
+///   peer's persisted transcript when a chat opens; the honest sequencing is for the *reader* to
+///   exist before a second *writer* is added, and task 4.42's own Scope forbids absorbing it.
+///
+/// So: deferred on purpose, with the reason recorded, not an omission. An accepted sender's intro is
+/// still visible in the request detail pane right up to the moment it is accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptRequestRequest {
     pub sender_ik: [u8; 32],
 }
 
-/// [`Effect::AcceptRequest`]'s payload. No separate outcome data — same contract as
-/// [`SetPetnameEffect`]/[`RegisterRequest`]: the mere fact of `WorkerEvent::Completed` arriving is
-/// the only signal [`crate::screens::requests`] needs.
+/// [`Effect::AcceptRequest`]'s payload.
+///
+/// **`outcome` carries an [`AddedContact`] since task 4.42 (piece C).** It used to be `Option<()>`
+/// — "the mere fact of `WorkerEvent::Completed` arriving is the only signal
+/// [`crate::screens::requests`] needs", which is still true *of that screen*. What it missed is that
+/// nothing re-reads `contacts.json`/`trust.bin` mid-session: `crate::screens::main::MainState` owns
+/// the only live `TrustStore`/`ChatState`/contacts list, built once at session load. So the
+/// `contacts.json` row and TOFU pin `worker::run_accept_request` now writes would not become visible
+/// until the *next* restart unless the same mutation is replayed in memory — which is what
+/// [`App::apply_accepted_request`] does with exactly the fields this outcome carries (including
+/// `added_at`, the **worker-supplied** timestamp, so `App::update` never has to read a clock).
+///
+/// `Some(..)` on a genuine accept (or on a partial-failure retry that completed the still-owed
+/// pin); `None` both on `WorkerEvent::Failed` and on a `Completed` no-op — a phantom sender with no
+/// session, or a fully-completed retry — where there is genuinely no decision to replay. See
+/// `worker::run_accept_request`'s own doc comment for that guard's full derivation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptRequestEffect {
     pub request: AcceptRequestRequest,
-    pub outcome: Option<()>,
+    pub outcome: Option<AddedContact>,
 }
 
 /// Inputs for [`Effect::RejectRequest`] (task 4.21, `crate::screens::requests`):
@@ -879,7 +940,10 @@ pub struct RunDoctorEffect {
 /// (task 4.24) one new one — see [`SaveSettingEffect`]; `RunDoctor` is the diagnostics screen's (task
 /// 4.25) one new one — see [`RunDoctorEffect`]; `LoadSession` is task 4.29's own new one — the
 /// OS-keystore/no-account-yet counterpart to `Unlock`'s now-extended file-backed path — see
-/// [`LoadSessionEffect`].
+/// [`LoadSessionEffect`]; `LoadHistory` is task 4.44's own new one — the read half of
+/// `PersistHistory`'s write, dispatched whenever `Screen::Chat` opens (first time or a same-session
+/// re-open) so the transcript reflects `crate::store::history`'s real, sealed on-disk state rather
+/// than starting empty — see [`LoadHistoryEffect`] and `crate::app::App::apply_loaded_history`.
 ///
 /// **Does not derive `PartialEq`/`Eq`** (unlike most of the payload structs above): `Unlock`/
 /// `LoadSession` carry a [`SessionOutcome`], and the [`crate::session::LiveSession`] it wraps
@@ -904,6 +968,7 @@ pub enum Effect {
     FetchBundle,
     PublishBundle(PublishBundleEffect),
     PersistHistory(PersistHistoryEffect),
+    LoadHistory(LoadHistoryEffect),
     /// Boxed: `clippy::large_enum_variant` flags the size gap against the smaller variants
     /// otherwise, once [`UnlockEffect::outcome`] can carry a whole [`LiveSession`] — the same
     /// `clippy::large_enum_variant` reason [`LoadSessionOutcome::Loaded`] is boxed too.
@@ -1854,6 +1919,52 @@ impl App {
             // task's own Status write-up, for a follow-up to resolve deliberately rather than by
             // omission.
             WorkerEvent::Failed(Effect::LoadSession(_), _) => return Vec::new(),
+            // Task 4.42 (piece C): a completed `Effect::AcceptRequest` is reconciled into whichever
+            // `Screen::Main` is on the stack *before* the per-screen dispatch below hands the same
+            // event to `Screen::Requests` (which owns only its own queue) — matched on the event
+            // first, regardless of what is on top, for the same reason `Effect::LoadSession` above
+            // is: no single screen owns this consequence. The event is then handed on unchanged, so
+            // `requests::handle_worker`'s own `Deciding` → `List` transition is untouched.
+            WorkerEvent::Completed(Effect::AcceptRequest(effect)) => {
+                if let Some(added) = effect.outcome.clone() {
+                    self.apply_accepted_request(added);
+                }
+                WorkerEvent::Completed(Effect::AcceptRequest(effect))
+            }
+            // Task 4.42 review fix (Finding 3): mirrors the `AcceptRequest` arm immediately above —
+            // matched on the event first, regardless of what is on top, for the same reason. Only on
+            // a genuine success (`outcome: Some(())`); a `Failed`/retry-exhausted reject leaves
+            // nothing to replay.
+            WorkerEvent::Completed(Effect::RejectRequest(effect)) => {
+                if effect.outcome.is_some() {
+                    self.apply_rejected_request(effect.request.sender_ik);
+                }
+                WorkerEvent::Completed(Effect::RejectRequest(effect))
+            }
+            // Task 4.44: a completed `Effect::LoadHistory` is merged into whichever `Screen::Chat`
+            // matches its peer — matched on the event first, regardless of what is on top (`Ctrl-R`
+            // can push `Screen::Requests` on top of an already-open `Screen::Chat` while this is
+            // still in flight, exactly the scenario `App::apply_accepted_request`'s own doc comment
+            // already documents for the identical "no single screen owns this" reasoning), by
+            // [`App::apply_loaded_history`]. A no-op if no matching `Screen::Chat` exists any more
+            // (e.g. `Esc` already popped it) — the next `OpenChat` dispatches its own fresh
+            // `Effect::LoadHistory`, so nothing already-persisted is ever lost, only briefly not
+            // shown.
+            WorkerEvent::Completed(Effect::LoadHistory(effect)) => {
+                if let Some(loaded) = effect.outcome.clone() {
+                    self.apply_loaded_history(effect.request.peer_pubkey, loaded);
+                }
+                WorkerEvent::Completed(Effect::LoadHistory(effect))
+            }
+            // A failed load leaves `Screen::Chat` exactly as it was (still empty, or whatever a live
+            // inbound has already appended in the meantime) rather than losing anything already
+            // shown — surfaced as a notice on the matching `Screen::Chat`, if one is still open,
+            // mirroring `crate::screens::chat::handle_worker`'s own `Effect::PersistHistory` failure
+            // notice.
+            WorkerEvent::Failed(Effect::LoadHistory(effect), message) => {
+                self.note_history_load_failure(effect.request.peer_pubkey, &message);
+                WorkerEvent::Failed(Effect::LoadHistory(effect), message)
+            }
             other => other,
         };
         match self.screens.last_mut() {
@@ -2031,6 +2142,173 @@ impl App {
                     contacts::apply_update(&mut main.contacts, refreshed, false);
                 }
                 return;
+            }
+        }
+    }
+
+    /// Replays a completed [`Effect::AcceptRequest`]'s persisted mutations into whichever
+    /// [`Screen::Main`] is on the stack (task 4.42, piece C) — the in-memory half of the fix for
+    /// task 4.41's Defect C.
+    ///
+    /// `worker::run_accept_request` has, by the time this runs, already TOFU-pinned the sender in
+    /// the real `trust.bin` and written its `contacts.json` display row. But `MainState` owns the
+    /// only live `TrustStore`/`ChatState`/contacts list this process has, built once by
+    /// [`MainState::from_session`] at session load, and **nothing re-reads either file
+    /// mid-session** — so without this, the accepted sender would only appear after a restart,
+    /// reproducing the very symptom Defect C describes one restart later. All three steps replay
+    /// state that is *already durable*; none of them decides anything:
+    /// 1. `trust.observe(pubkey, "", added.added_at)` — the same call, with the same empty hint and
+    ///    the **worker-supplied** timestamp (never `SystemTime::now()`: `App::update` and
+    ///    `crate::screens` stay clock-free, mirroring `TrustStore::observe`'s own "time is
+    ///    injected, not read" discipline). Without this, `v` → `Screen::Verify` → `mark_verified`
+    ///    would fail `TrustError::UnknownContact` against a store that has never heard of the
+    ///    sender. It produces exactly a TOFU pin — never `Verified`, never any softer gate; the
+    ///    row's rendered trust state is read straight off this `TrustStore` afterwards.
+    /// 2. [`contacts::apply_update`] with [`ContactEntry::from_added`] — pushes the display row when
+    ///    absent (the accepted-sender case) and replaces it in place when present, so
+    ///    `Screen::Main`'s embedded contacts list matches the `contacts.json` the worker just wrote.
+    /// 3. `chat.accept_request(&pubkey)` — **in-memory only**, and never saved back from here (the
+    ///    worker already resealed `sessions.bin`; this copy is never written to disk by `App`, so
+    ///    there is no clobber risk). Without it, a request that was restored from `sessions.bin` at
+    ///    session load stays in `MainState::chat`'s `pending_requests()` forever and re-appears on
+    ///    the next `r`/`Ctrl-R`, because [`App::requests_snapshot`] rebuilds that list from this
+    ///    exact in-memory copy.
+    ///
+    /// Uses the same stack walk as [`App::reclaim_trust`] to find `Screen::Main` (anywhere on the
+    /// stack, not just on top — the accept always completes while `Screen::Requests` sits above it),
+    /// and is likewise a no-op when there is no `Screen::Main` at all (a `Screen::Requests` pushed
+    /// standalone in a test, with no backing session to reconcile into).
+    ///
+    /// **`Ctrl-R` is a global binding, reachable with a `Screen::Chat`/`Screen::Verify` already open
+    /// on top of `Screen::Main`** (open Chat with A, `Ctrl-R` pushes `Screen::Requests` on top of
+    /// that, accept a request from B): `MainState::trust` is `std::mem::take`n by whichever of those
+    /// two screens is open (see `crate::screens::main`'s "moved, not borrowed" doc), leaving a
+    /// placeholder `TrustStore::default()` behind on the `Main` frame itself — an `observe` call
+    /// against *that* placeholder would be silently discarded when [`App::reclaim_trust`] later
+    /// overwrites `main.trust` wholesale with the popped screen's own (unrelated) store. So the
+    /// `trust.observe` step below is routed to wherever the live store for this `Screen::Main`
+    /// actually is: the first `Screen::Chat`/`Screen::Verify` frame **above** it on the stack, if one
+    /// exists (there is at most one at a time — the whole point of "moved, not cloned"), else
+    /// `Screen::Main` itself. `main.chat`/`main.contacts` are never moved by that same `mem::take`
+    /// (only `trust` is — see `crate::screens::main`'s "moved" doc again), so those two steps always
+    /// land on the `Screen::Main` frame directly, regardless of what else is stacked above it.
+    fn apply_accepted_request(&mut self, added: AddedContact) {
+        let Some(main_idx) = self
+            .screens
+            .iter()
+            .position(|s| matches!(s, Screen::Main(_)))
+        else {
+            return;
+        };
+        let live_trust_idx = self.screens[main_idx + 1..]
+            .iter()
+            .position(|s| matches!(s, Screen::Chat(_) | Screen::Verify(_)))
+            .map(|offset| main_idx + 1 + offset);
+        match live_trust_idx {
+            Some(idx) => match &mut self.screens[idx] {
+                Screen::Chat(chat) => {
+                    chat.trust.observe(added.pubkey, "", added.added_at);
+                }
+                Screen::Verify(verify) => {
+                    verify.trust.observe(added.pubkey, "", added.added_at);
+                }
+                _ => unreachable!("live_trust_idx only ever points at Chat|Verify"),
+            },
+            None => {
+                let Some(Screen::Main(main)) = self.screens.get_mut(main_idx) else {
+                    return;
+                };
+                main.trust.observe(added.pubkey, "", added.added_at);
+            }
+        }
+        let Some(Screen::Main(main)) = self.screens.get_mut(main_idx) else {
+            return;
+        };
+        main.chat.accept_request(&added.pubkey);
+        contacts::apply_update(&mut main.contacts, ContactEntry::from_added(added), false);
+    }
+
+    /// Mirrors [`App::apply_accepted_request`]'s `main.chat.accept_request` step for a completed
+    /// [`Effect::RejectRequest`] (task 4.42 review fix, Finding 3): replays
+    /// `meridian_core::chat::ChatState::reject_request` into `MainState::chat` so a rejected request,
+    /// same as an accepted one, does not reappear on a later `Ctrl-R`/`r` in the same session (see
+    /// `crate::screens::main`'s own doc, "A rejected one still does" — this closes that gap).
+    ///
+    /// **Unlike `trust`, `MainState::chat` is never `std::mem::take`n by `Screen::Chat`/
+    /// `Screen::Verify`** (only `trust` is — see those screens' own module docs), so this never needs
+    /// the `live_trust_idx` routing `apply_accepted_request` does: a plain walk to the one
+    /// `Screen::Main` on the stack is always correct, exactly like [`App::reclaim_trust`]'s own walk.
+    fn apply_rejected_request(&mut self, sender_ik: [u8; 32]) {
+        for screen in &mut self.screens {
+            if let Screen::Main(main) = screen {
+                main.chat.reject_request(&sender_ik);
+                return;
+            }
+        }
+    }
+
+    /// Merges a completed [`Effect::LoadHistory`]'s `loaded` transcript into whichever
+    /// [`Screen::Chat`] matches `peer_pubkey` — task 4.44's own fix for the traced gap
+    /// `crate::screens::main`'s own module doc used to name: `ContactsAction::OpenChat` pushes
+    /// `Screen::Chat` with `entries: Vec::new()` (unchanged — the screen still opens instantly, no
+    /// I/O in `update`), and this is where the real, sealed on-disk transcript actually lands once
+    /// the worker round trip that read it completes.
+    ///
+    /// **Merge, not overwrite — `loaded` first, then whatever is already there, deduped by `mid`.**
+    /// Between the moment `Effect::LoadHistory` was dispatched and this completion arriving, a live
+    /// inbound message for the same peer may already have been appended in memory
+    /// (`crate::screens::chat::handle_inbound_message`, task 4.35). **Only if `Screen::Chat` is
+    /// literally on top of the stack**, though — `App::handle_inbound`'s own `InboundEvent::Message`
+    /// arm checks `self.screens.last_mut()`, not "is a matching `Screen::Chat` open anywhere". During
+    /// the exact `Ctrl-R`-interleaving window this doc comment's next paragraph names, a live inbound
+    /// arriving while `Screen::Requests` sits on top of that same `Screen::Chat` is therefore *not*
+    /// captured into `chat.entries` here — it is still persisted to disk unconditionally
+    /// (`App::handle_inbound`'s own doc comment), so nothing is lost or duplicated, only not yet shown;
+    /// the next completed load picks it back up. That gap is 4.41's already-deferred, correctly
+    /// out-of-scope "no unread indication while no matching chat is open" gap (see the deferral note
+    /// on [`AcceptRequestRequest`]'s own doc comment), not a new regression introduced here.
+    ///
+    /// Putting `loaded` first preserves chronological order (the disk read reflects everything up to
+    /// the moment it ran; anything already appended in memory happened no earlier than that read
+    /// started). [`chat::insert_deduped`] (reused unchanged, never a second, divergent dedup) then
+    /// folds the in-memory entries in on top, so a message that is in *both* (e.g. already flushed to
+    /// disk by the time the read ran, and also separately delivered live) is kept exactly once — this
+    /// is the "assert an inbound message arriving live for a peer whose history was just loaded is not
+    /// double-listed" property this task's own Deliverable 4 names.
+    ///
+    /// Walks the **whole** stack, not just the top (`Ctrl-R` can push `Screen::Requests` on top of
+    /// an already-open `Screen::Chat` while this load is still in flight) — mirrors
+    /// [`App::apply_accepted_request`]'s identical stack walk. A no-op if no `Screen::Chat` for this
+    /// peer exists any more (already popped via `Esc`) — see [`App::handle_worker`]'s own doc
+    /// comment on the `Effect::LoadHistory` arm for why that is safe: a re-open dispatches its own
+    /// fresh load.
+    fn apply_loaded_history(&mut self, peer_pubkey: [u8; 32], loaded: Vec<HistoryEntry>) {
+        for screen in &mut self.screens {
+            if let Screen::Chat(chat) = screen {
+                if chat.peer_pubkey == peer_pubkey {
+                    let mut merged = loaded;
+                    for entry in chat.entries.drain(..) {
+                        chat::insert_deduped(&mut merged, entry);
+                    }
+                    chat.entries = merged;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The failure counterpart to [`App::apply_loaded_history`] — surfaces `message` as a transient
+    /// notice on whichever `Screen::Chat` matches `peer_pubkey`, if one is still open, exactly like
+    /// [`crate::screens::chat::handle_worker`]'s own `Effect::PersistHistory` failure arm. A no-op
+    /// (nothing to surface a notice on) if that screen was already popped — the same "safe to lose,
+    /// a re-open tries again" reasoning as the success path.
+    fn note_history_load_failure(&mut self, peer_pubkey: [u8; 32], message: &str) {
+        for screen in &mut self.screens {
+            if let Screen::Chat(chat) = screen {
+                if chat.peer_pubkey == peer_pubkey {
+                    chat.notice = Some(format!("could not load message history: {message}"));
+                    return;
+                }
             }
         }
     }
@@ -2295,6 +2573,57 @@ mod tests {
         let debug = format!("{req:?}");
         assert!(!debug.contains("correct horse battery staple"));
         assert!(debug.contains("redacted"));
+    }
+
+    /// Deliverable 5 (task 4.44): the redaction check for `Effect::LoadHistory` — this task's own
+    /// new widening of what a live process holds in memory (a peer's whole persisted transcript).
+    /// Mirrors `crate::session::LiveSession`'s own redaction test and
+    /// `unlock_request_debug_redacts_passphrase`/`run_worker_account.rs::
+    /// effect_debug_never_leaks_a_passphrase` above/nearby in *shape* (plant a sentinel, assert on
+    /// its presence/absence in `format!("{:?}", ..)`), but pins the **opposite** conclusion for the
+    /// opposite reason: unlike `UnlockRequest`/`StoreChoice::File`, [`LoadHistoryRequest`]/
+    /// [`LoadHistoryEffect`] carry no `SecretStore`/`KeyHandle`/passphrase of any kind — only a
+    /// pubkey and already-decrypted [`HistoryEntry`] rows — so there is no secret here for a
+    /// redaction to hide, and the message body sentinel below is expected to print in full,
+    /// verbatim, exactly like `PersistHistoryEffect`/`SendMessageEffect` (task 4.20/4.33) already do
+    /// through the same un-redacted `#[derive(Debug)]` — matching `crate::screens::chat::ChatState`'s
+    /// own already-reviewed judgment call that conversation content is not a *secret* in this crate's
+    /// hand-rolled-`Debug` sense, only passphrases/key material are. This test exists to make that
+    /// judgment call for `LoadHistoryEffect` explicit and falsifiable, not silently assumed: if a
+    /// future change ever adds a `SecretStore`/`KeyHandle`/passphrase field to this type without
+    /// hand-rolling `Debug` for it (the `StoreChoice::File`/`UnlockRequest` precedent), this is the
+    /// test that should start failing to catch it.
+    #[test]
+    fn load_history_effect_carries_no_key_material_and_is_not_redacted() {
+        let key_sentinel = "SENTINEL-DO-NOT-LEAK-KEY-MATERIAL-4f9c";
+        let body_sentinel = "SENTINEL-CONVERSATION-BODY-are-you-free-tonight";
+        let effect = Effect::LoadHistory(LoadHistoryEffect {
+            request: LoadHistoryRequest {
+                peer_pubkey: [0x42u8; 32],
+            },
+            outcome: Some(vec![HistoryEntry {
+                v: crate::store::history::CURRENT_VERSION,
+                mid: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+                dir: crate::store::history::Direction::In,
+                ts: 1_760_000_000,
+                stream: "mrd.chat/1".to_string(),
+                body: body_sentinel.to_string(),
+                state: crate::store::history::MessageState::Received,
+            }]),
+        });
+        let dump = format!("{effect:?}");
+        assert!(
+            !dump.contains(key_sentinel),
+            "sanity: the sentinel we're checking for absence of was never planted anywhere \
+             reachable — this type structurally has no SecretStore/KeyHandle/passphrase field, so \
+             there is nothing to redact"
+        );
+        assert!(
+            dump.contains(body_sentinel),
+            "message body content is deliberately NOT redacted (matches ChatState's own reviewed \
+             precedent, task 4.20) — a silently-redacted transcript would be a debugging footgun, \
+             not a security improvement, since it is not a passphrase or key material: {dump}"
+        );
     }
 
     fn unlock_state() -> UnlockState {

@@ -49,9 +49,10 @@ use meridian_core::trust::{TrustError, TrustState, TrustStore};
 
 use meridian_tui::app::{
     AcceptRequestEffect, AcceptRequestRequest, AcknowledgeKeyChangeEffect,
-    AcknowledgeKeyChangeRequest, Effect, MarkVerifiedEffect, MarkVerifiedRequest,
+    AcknowledgeKeyChangeRequest, AddedContact, Effect, MarkVerifiedEffect, MarkVerifiedRequest,
     RejectRequestEffect, RejectRequestRequest, WorkerEvent,
 };
+use meridian_tui::store::contacts::{self as contacts_store, ContactsDocument};
 use meridian_tui::worker::{dispatch, OnboardingSession};
 
 const NOW: u64 = 1_760_000_000;
@@ -128,6 +129,15 @@ fn read_chat(bob: &AccountId) -> ChatState {
     let os = OsSecretStore::new(SERVICE);
     let bytes = std::fs::read(account::sessions_path().unwrap()).expect("sessions.bin exists");
     ChatState::open_at_rest(&os, bob.handle(), &bytes).expect("open sessions.bin")
+}
+
+/// The real, sealed `contacts.json` as it stands on disk — read back through the same
+/// `crate::store::contacts` loader the TUI itself uses (task 4.42: `run_accept_request` now writes
+/// this file too, so every accept test below asserts the display row it produced, not only
+/// `trust.bin`).
+fn read_contacts(bob: &AccountId) -> ContactsDocument {
+    let os = OsSecretStore::new(SERVICE);
+    contacts_store::load_or_default(&os, bob.handle()).expect("load contacts.json")
 }
 
 fn write_chat(bob: &AccountId, chat: &ChatState) {
@@ -272,13 +282,13 @@ async fn accept_request_delivers_the_session_and_tofu_pins_the_sender_with_an_em
         },
         outcome: None,
     });
-    match dispatch_effect(effect).await {
+    let added = match dispatch_effect(effect).await {
         WorkerEvent::Completed(Effect::AcceptRequest(AcceptRequestEffect {
-            outcome: Some(()),
+            outcome: Some(added),
             ..
-        })) => {}
+        })) => added,
         other => panic!("expected AcceptRequest to complete, got {other:?}"),
-    }
+    };
 
     let chat_after = read_chat(&bob);
     assert!(
@@ -302,6 +312,128 @@ async fn accept_request_delivers_the_session_and_tofu_pins_the_sender_with_an_em
          empty hint through, never fabricate one"
     );
     assert_eq!(contact.pinned_key_history.len(), 1);
+
+    // --- Task 4.42 (Shape A): the display row this accept must also have written ---------------
+    let doc = read_contacts(&bob);
+    assert_eq!(
+        doc.contacts.len(),
+        1,
+        "accept must synthesize exactly one contacts.json display row for the sender — without it \
+         `screens::main::build_contact_entries`' contacts.json-driven join leaves the accepted \
+         sender invisible in the live UI (task 4.41's Defect C)"
+    );
+    let record = &doc.contacts[0];
+    assert_eq!(record.pubkey, hex::encode(alice_ik));
+    assert_eq!(
+        record.id, "",
+        "no `mrd1:` id may be invented for a sender whose hint is empty — `Contact::id_string()` \
+         genuinely fails there (ADR 0001's self-certifying-key + routing-hint identity), so the \
+         row records the honest empty string"
+    );
+    assert_eq!(record.hint, "");
+    assert_eq!(
+        record.petname, None,
+        "a wire-observed key never gets a petname"
+    );
+    assert_eq!(
+        record.trust,
+        meridian_tui::store::contacts::TrustLabel::Pinned
+    );
+    assert_eq!(
+        record.conv_handle, None,
+        "conv_handle stays None until a conversation is first opened"
+    );
+    assert_eq!(record.added_at, record.last_activity_at);
+    assert_eq!(record.unread, 0);
+    assert_eq!(doc.v, meridian_tui::store::contacts::CURRENT_VERSION);
+
+    // --- and the AddedContact the effect carries back, for `App`'s in-memory replay -------------
+    assert_eq!(
+        added,
+        AddedContact {
+            pubkey: alice_ik,
+            id: String::new(),
+            hint: String::new(),
+            petname: None,
+            added_at: record.added_at,
+            trust: TrustState::Pinned,
+            user_blocked: false,
+            pinned_key_history: contact.pinned_key_history.clone(),
+        },
+        "the outcome must be read back off the real post-observe Contact, never an assumed \
+         fresh-TOFU shape (task 4.19 Finding 1's rule, applied to the accept path)"
+    );
+}
+
+/// End-state property 4's worker half (task 4.42, Deliverable 5): dispatching the **same**
+/// `Effect::AcceptRequest` twice — what the UI does when a completion event is lost, or a stale
+/// effect is replayed — must leave exactly the same on-disk state as one dispatch, and must report
+/// the second one honestly as "nothing decided" (`outcome: None`) rather than fabricating a second
+/// `AddedContact` that `App` would replay into the live screen a second time.
+#[tokio::test]
+async fn accept_request_is_idempotent_under_a_repeated_dispatch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let bob = setup_os_account();
+
+    let mut bob_chat = ChatState::default();
+    let alice = receive_first_contact(&bob, &mut bob_chat);
+    let alice_ik = alice.ik();
+    write_chat(&bob, &bob_chat);
+
+    let accept = || {
+        Effect::AcceptRequest(AcceptRequestEffect {
+            request: AcceptRequestRequest {
+                sender_ik: alice_ik,
+            },
+            outcome: None,
+        })
+    };
+
+    let first = match dispatch_effect(accept()).await {
+        WorkerEvent::Completed(Effect::AcceptRequest(AcceptRequestEffect {
+            outcome: Some(added),
+            ..
+        })) => added,
+        other => panic!("expected the first accept to complete with a contact, got {other:?}"),
+    };
+    let doc_after_first = read_contacts(&bob);
+    let trust_after_first = read_trust(&bob);
+    let contact_after_first = trust_after_first
+        .contact(&alice_ik)
+        .cloned()
+        .expect("pinned");
+
+    match dispatch_effect(accept()).await {
+        WorkerEvent::Completed(Effect::AcceptRequest(AcceptRequestEffect {
+            outcome: None,
+            ..
+        })) => {}
+        other => {
+            panic!("a repeated dispatch must still complete, but decide nothing — got {other:?}")
+        }
+    }
+
+    let doc_after_second = read_contacts(&bob);
+    assert_eq!(
+        doc_after_second, doc_after_first,
+        "a repeated accept must not duplicate, re-stamp or otherwise disturb the display row"
+    );
+    assert_eq!(doc_after_second.contacts.len(), 1);
+    let contact_after_second = read_trust(&bob)
+        .contact(&alice_ik)
+        .cloned()
+        .expect("still pinned");
+    assert_eq!(
+        contact_after_second.state, contact_after_first.state,
+        "still a plain TOFU pin — a repeat accept never escalates trust"
+    );
+    assert_eq!(contact_after_second.state, TrustState::Pinned);
+    assert_eq!(
+        contact_after_second.pinned_key_history, contact_after_first.pinned_key_history,
+        "no second history entry for the same key"
+    );
+    assert_eq!(first.added_at, doc_after_second.contacts[0].added_at);
 }
 
 #[tokio::test]
@@ -321,10 +453,13 @@ async fn accept_request_for_an_already_decided_sender_is_a_harmless_no_op() {
     });
     match dispatch_effect(effect).await {
         WorkerEvent::Completed(Effect::AcceptRequest(AcceptRequestEffect {
-            outcome: Some(()),
+            outcome: None,
             ..
         })) => {}
-        other => panic!("expected a no-op accept to still complete, got {other:?}"),
+        other => panic!(
+            "expected a no-op accept to still complete, carrying no AddedContact (nothing was \
+             decided, so there is nothing for App to replay), got {other:?}"
+        ),
     }
 
     // Mirrors `answer_request`'s own `if let Some(req) = ...` guard: nothing was accepted, so
@@ -332,6 +467,12 @@ async fn accept_request_for_an_already_decided_sender_is_a_harmless_no_op() {
     assert!(
         !account::trust_path().unwrap().exists(),
         "a no-op accept must never create a trust.bin pin out of nowhere"
+    );
+    // Task 4.42: and no display row either — the synthesized `contacts.json` row rides on exactly
+    // the same `accepted || pin_still_owed` guard, so a sender with no session never gets one.
+    assert!(
+        read_contacts(&bob).contacts.is_empty(),
+        "a no-op accept must never create a contacts.json display row out of nowhere"
     );
 }
 
@@ -380,7 +521,7 @@ async fn accept_request_retry_after_a_partial_failure_still_completes_the_pin() 
     });
     match dispatch_effect(effect).await {
         WorkerEvent::Completed(Effect::AcceptRequest(AcceptRequestEffect {
-            outcome: Some(()),
+            outcome: Some(_),
             ..
         })) => {}
         other => panic!("expected the retry to complete, got {other:?}"),
@@ -395,6 +536,13 @@ async fn accept_request_retry_after_a_partial_failure_still_completes_the_pin() 
     assert_eq!(contact.state, TrustState::Pinned);
     assert_eq!(contact.hint, "");
     assert_eq!(contact.pinned_key_history.len(), 1);
+    // Task 4.42: the display row rides on the same `pin_still_owed` disjunct, so the retry that
+    // completes the owed pin also completes the owed row — the sender is never left pinned but
+    // invisible in the UI.
+    let doc = read_contacts(&bob);
+    assert_eq!(doc.contacts.len(), 1);
+    assert_eq!(doc.contacts[0].pubkey, hex::encode(alice_ik));
+    assert_eq!(doc.contacts[0].id, "");
 }
 
 // ---------------------------------------------------------------------------

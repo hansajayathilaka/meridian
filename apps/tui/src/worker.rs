@@ -17,7 +17,7 @@
 //! (`generate_account` → `AccountDescriptor::save`; `SignalingClient::connect` →
 //! `publish_bundle`), never inventing a different one.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tokio::sync::mpsc;
 
@@ -35,12 +35,13 @@ use crate::app::{
     AcknowledgeKeyChangeRequest, AddContactEffect, AddContactRequest, AddedContact,
     DeleteContactEffect, DeleteContactRequest, Effect, GenerateAccountEffect,
     GenerateAccountRequest, GeneratedAccount, ImportContactQrEffect, ImportContactQrRequest,
-    LoadSessionEffect, LoadSessionOutcome, MarkVerifiedEffect, MarkVerifiedRequest,
-    PersistHistoryEffect, PersistHistoryRequest, PublishBundleEffect, PublishedBundle,
-    RegisterRequest, RejectRequestEffect, RejectRequestRequest, RunDoctorEffect, SaveSettingEffect,
-    SendMessageEffect, SendMessageRequest, SentMessage, SessionOutcome, SetPetnameEffect,
-    SetPetnameRequest, SetPolicyOverrideEffect, SetPolicyOverrideRequest, SetUserBlockedEffect,
-    SetUserBlockedRequest, StoreChoice, UnlockEffect, UnlockRequest, WorkerEvent,
+    LoadHistoryEffect, LoadHistoryRequest, LoadSessionEffect, LoadSessionOutcome,
+    MarkVerifiedEffect, MarkVerifiedRequest, PersistHistoryEffect, PersistHistoryRequest,
+    PublishBundleEffect, PublishedBundle, RegisterRequest, RejectRequestEffect,
+    RejectRequestRequest, RunDoctorEffect, SaveSettingEffect, SendMessageEffect,
+    SendMessageRequest, SentMessage, SessionOutcome, SetPetnameEffect, SetPetnameRequest,
+    SetPolicyOverrideEffect, SetPolicyOverrideRequest, SetUserBlockedEffect, SetUserBlockedRequest,
+    StoreChoice, UnlockEffect, UnlockRequest, WorkerEvent,
 };
 use crate::session::LiveSession;
 use crate::store::contacts::{ContactRecord, ContactsDocument, PinnedKeyRecord, TrustLabel};
@@ -269,6 +270,10 @@ pub async fn dispatch(effect: Effect, session: &mut OnboardingSession) -> Worker
         // Task 4.33: outbound chat (the send half of the T17 demo's "both sides chat" step).
         Effect::SendMessage(effect) => handle_send_message(effect, session).await,
         Effect::PersistHistory(effect) => handle_persist_history(effect, session).await,
+        // Task 4.44: the read half of `PersistHistory` above — dispatched whenever `Screen::Chat`
+        // opens (`crate::screens::main::handle_key`'s `OpenChat` arm), so the transcript reflects
+        // this exact same `crate::store::history` file rather than starting empty.
+        Effect::LoadHistory(effect) => handle_load_history(effect, session).await,
         // Task 4.34: settings write-back / diagnostics — both already-built, already-reviewed
         // functions (`crate::config_write::write_setting_at` from task 4.24,
         // `crate::screens::diagnostics::run_doctor_binary` from task 4.25); this task is purely
@@ -792,6 +797,14 @@ fn to_pinned_key_records(history: &[PinnedKey]) -> Vec<PinnedKeyRecord> {
 /// policy override or unread count on a mere re-observe would be a worse regression than leaving
 /// them be. `TODO: confirm`: no doc this task read pins down re-add semantics for these four fields
 /// specifically; this is a considered, conservative default, not a documented one.
+///
+/// **Task 4.42 added a second caller, [`run_accept_request`], and that `TODO: confirm` now covers it
+/// too — with its meaning unchanged.** The accept path reaches the "already has a row" branch only
+/// when the sender was already a known contact (possible: `ChatState::open_inbound` gates on "no
+/// established session", not on "unknown key"), and it wants exactly the same conservative
+/// treatment: refresh what `TrustStore` owns, leave `added_at`/`policy_override`/`conv_handle`/
+/// `unread` alone. Nothing about the note is weakened or re-scoped by that second caller; it is
+/// still an undocumented-by-design default awaiting a real answer.
 fn upsert_contact_record(doc: &mut ContactsDocument, id: &str, contact: &Contact, now: u64) {
     let pubkey_hex = hex::encode(contact.pubkey);
     if let Some(existing) = doc.contacts.iter_mut().find(|c| c.pubkey == pubkey_hex) {
@@ -1092,11 +1105,15 @@ fn run_delete_contact(
 // `TrustError::NotAcknowledgeable`) rather than treating a refusal as success, and
 // `run_accept_request`/`run_reject_request` replay `ChatState::accept_request`/`reject_request`
 // exactly as `apps/cli/src/chat.rs::answer_request` does — same calls, same order, just reloaded
-// fresh from disk and resealed rather than applied to an already-open in-memory value. Only
-// `trust.bin`/`sessions.bin` are touched here — never `contacts.json` (this task's own scope note;
-// `crate::screens::requests`'s and `crate::screens::verify`'s own module docs name no
-// `contacts.json` interaction for any of these four effects, unlike `handle_add_contact`/
-// `handle_set_petname` above).
+// fresh from disk and resealed rather than applied to an already-open in-memory value.
+//
+// **Task 4.42 amends the scope note that used to end this paragraph** ("Only `trust.bin`/
+// `sessions.bin` are touched here — never `contacts.json`"). That is still true of
+// `run_reject_request`/`run_mark_verified`/`run_acknowledge_key_change`, but no longer of
+// [`run_accept_request`], which now also writes the accepted sender's `contacts.json` display row —
+// see that function's own doc comment for why it *has* to be the one that does (task 4.41's Defect
+// C: `Contact::id_string()` fails for an accept-observed sender, so no other code path in this crate
+// can ever create that row).
 // ---------------------------------------------------------------------------
 
 // --- AcceptRequest -------------------------------------------------------------------------------
@@ -1107,9 +1124,9 @@ async fn handle_accept_request(
 ) -> WorkerEvent {
     let AcceptRequestEffect { request, .. } = effect;
     match run_accept_request(&request, session).await {
-        Ok(()) => WorkerEvent::Completed(Effect::AcceptRequest(AcceptRequestEffect {
+        Ok(outcome) => WorkerEvent::Completed(Effect::AcceptRequest(AcceptRequestEffect {
             request,
-            outcome: Some(()),
+            outcome,
         })),
         Err(message) => WorkerEvent::Failed(
             Effect::AcceptRequest(AcceptRequestEffect {
@@ -1163,10 +1180,72 @@ async fn handle_accept_request(
 /// same as [`run_reject_request`]/[`run_send_message`] — see that function's own doc comment for why
 /// (`sessions.bin` is a single serialized document covering every peer's session, and the persistent
 /// inbound receive loop touches the same file concurrently on its own tokio task).
+///
+/// **Task 4.42 (Shape A — the fix for task 4.41's Defect C):** on the same `accepted ||
+/// pin_still_owed` branch, this now *also* upserts and saves the sender's `contacts.json` display
+/// row, through [`crate::store::contacts::save`] (sealed via `at_rest::seal`, per ADR 0021) —
+/// exactly the pair of writes [`run_add_contact`] already performs for the initiator side, in the
+/// same order (`trust.bin` first, the display cache second: the crypto-relevant source of truth is
+/// never allowed to lag behind the display row that asserts it). Accept is the responder-side twin
+/// of add, and this is the **only** code path that can ever create that row: `TrustStore::observe`
+/// here passes an empty hint (see above), so the resulting `Contact::id_string()` fails
+/// (`validate_hint` rejects an empty hint) and the "re-add the sender by hand via the contacts
+/// screen" workaround is structurally impossible, not merely un-implemented — see task 4.42's own
+/// file. Without the row, `crate::screens::main::build_contact_entries`' `contacts.json`-driven join
+/// leaves an accepted sender invisible in the live UI forever.
+///
+/// The synthesized row therefore carries `id: ""` and `hint: ""` for a genuinely first-contact
+/// sender. **No hint-less `mrd1:` id form is invented** for it (that would touch the wire-critical,
+/// conformance-vectored `meridian-identity` crate and contradict [ADR 0001]'s self-certifying-key +
+/// routing-hint identity); `crate::screens::contacts::ContactEntry::display_label`'s existing
+/// petname → hint → `short_pubkey` fallback renders the row as the same fingerprint the Requests
+/// pane showed. `conv_handle` stays `None` until a conversation is first opened
+/// ([`ContactRecord::conv_handle_or_mint`](crate::store::contacts::ContactRecord::conv_handle_or_mint)),
+/// and no schema change is involved. The `id` passed to [`upsert_contact_record`] is
+/// `contact.id_string().unwrap_or_default()`, not a hard-coded `""`: for the (rare, but reachable)
+/// case of a sender who is *already* a known contact with a real hint — `ChatState::open_inbound`
+/// gates on "no established session", not on "unknown key", so an added-but-never-messaged contact's
+/// first inbound message is still a message request — that reads back the contact's real canonical
+/// id rather than blanking the existing row's. [`upsert_contact_record`]'s own `TODO: confirm` about
+/// re-add semantics for `added_at`/`policy_override`/`conv_handle`/`unread` applies verbatim to that
+/// accept-side re-observe too: those four purely-local fields are left untouched on an existing row,
+/// for exactly the reasons stated there, and this task did not find a design doc resolving them
+/// either.
+///
+/// **Retry idempotency, unchanged in shape:** the row write sits behind the *same* `accepted ||
+/// pin_still_owed` guard as the pin, so a same-effect retry can never create a display row for a
+/// sender with no session (the phantom-sender case the guard's own derivation above covers), and a
+/// fully-completed retry still takes no action at all. One residual, narrower-than-the-pin window
+/// remains: if `save_trust` succeeds and `contacts::save` then fails, this returns `Err`, and the
+/// retry finds `accepted == false` and `pin_still_owed == false` (the pin *is* complete) and so
+/// writes no row. Widening the guard with a third "the row is missing" disjunct is deliberately
+/// **not** done — it would resurrect a display row the user had since locally deleted
+/// (`crate::app::DeleteContactRequest`'s "deleting removes only the local row, the `TrustStore`
+/// record survives" invariant), which is exactly the direction-of-the-join property task 4.42's own
+/// file protects. `TODO: confirm`: no design doc read for this task resolves how a display row lost
+/// to that specific partial failure should be recovered. Recommended direction for a dedicated
+/// follow-up task (out of this task's own scope — new diagnostics/UI surface, not a `run_worker`
+/// change alone): a diagnostics-surfaced repair action that rebuilds *only* the display rows missing
+/// from `contacts.json` for a `trust.bin` contact — driven from `chat.has_session`/`trust.contact`
+/// the same way this guard is, so it stays explicitly distinct from, and can never resurrect, the
+/// legitimate delete-tombstone case (`crate::app::DeleteContactRequest`'s row-deleted-but-`TrustStore`
+/// -record-survives case above) — never a blanket "resync contacts.json from trust.bin" that would
+/// conflate the two. Left unimplemented here; flagged for that follow-up rather than absorbed
+/// silently or rushed into this task's own diff.
+///
+/// Returns the [`AddedContact`] the accept produced, so `crate::app::App` can replay the same
+/// mutation into the live, already-open `Screen::Main` (task 4.42, piece C) instead of only fixing
+/// the next restart — built from the real post-`observe` [`Contact`] read back via
+/// `TrustStore::contact`, never an assumed fresh-TOFU shape, exactly as [`run_add_contact`] does
+/// (the task 4.19 Finding 1 rule). `Ok(None)` is the honest "this dispatch decided nothing" answer
+/// for the no-op/fully-completed-retry cases: the effect still *completes* (nothing failed), it just
+/// carries no contact for `App` to apply.
+///
+/// [ADR 0001]: ../../../docs/adr/0001-identity-scheme.md
 async fn run_accept_request(
     request: &AcceptRequestRequest,
     session: &OnboardingSession,
-) -> Result<(), String> {
+) -> Result<Option<AddedContact>, String> {
     let account_store = open_account_store(session)?;
     let (store, handle) = account_store.parts();
     let _chat_guard = chat_state_lock().lock().await;
@@ -1178,11 +1257,34 @@ async fn run_accept_request(
 
     let mut trust = load_trust(store, handle)?;
     let pin_still_owed = has_session && trust.contact(&request.sender_ik).is_none();
-    if accepted || pin_still_owed {
-        trust.observe(request.sender_ik, "", now_unix());
-        save_trust(&trust, store, handle)?;
+    if !(accepted || pin_still_owed) {
+        return Ok(None);
     }
-    Ok(())
+
+    let now = now_unix();
+    trust.observe(request.sender_ik, "", now);
+    let contact = trust
+        .contact(&request.sender_ik)
+        .cloned()
+        .expect("just observed above — always present");
+    save_trust(&trust, store, handle)?;
+
+    let id = contact.id_string().unwrap_or_default();
+    let mut doc =
+        crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
+    upsert_contact_record(&mut doc, &id, &contact, now);
+    crate::store::contacts::save(&doc, store, handle).map_err(|e| e.to_string())?;
+
+    Ok(Some(AddedContact {
+        pubkey: request.sender_ik,
+        id,
+        hint: contact.hint,
+        petname: contact.petname,
+        added_at: now,
+        trust: contact.state,
+        user_blocked: contact.user_blocked,
+        pinned_key_history: contact.pinned_key_history,
+    }))
 }
 
 // --- RejectRequest -------------------------------------------------------------------------------
@@ -1679,6 +1781,47 @@ fn run_persist_history(
         .map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// LoadHistory (task 4.44) — the read half of PersistHistory above
+// ---------------------------------------------------------------------------
+
+async fn handle_load_history(
+    effect: LoadHistoryEffect,
+    session: &OnboardingSession,
+) -> WorkerEvent {
+    let LoadHistoryEffect { request, .. } = effect;
+    match run_load_history(&request, session) {
+        Ok(entries) => WorkerEvent::Completed(Effect::LoadHistory(LoadHistoryEffect {
+            request,
+            outcome: Some(entries),
+        })),
+        Err(message) => WorkerEvent::Failed(
+            Effect::LoadHistory(LoadHistoryEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Reads `request.peer_pubkey`'s whole sealed transcript — `crate::store::history::load_or_default`
+/// (task 4.15), the **same** reader `crate::store::export` already uses, fresh `SecretStore`/
+/// `KeyHandle` via [`open_account_store`] like every other handler in this module, never a request
+/// field (mirrors [`run_persist_history`] exactly). Returns an empty transcript, not an error, if no
+/// `history/<peer>.jsonl` exists yet for this peer — `load_or_default`'s own contract (a peer with no
+/// prior conversation is not a failure).
+fn run_load_history(
+    request: &LoadHistoryRequest,
+    session: &OnboardingSession,
+) -> Result<Vec<crate::store::history::HistoryEntry>, String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
+    let peer_pubkey_hex = hex::encode(request.peer_pubkey);
+    crate::store::history::load_or_default(&peer_pubkey_hex, store, handle)
+        .map_err(|e| e.to_string())
+}
+
 /// Seals and writes `chat` to `sessions.bin` — mirrors [`save_trust`] (and
 /// `apps/cli/src/chat.rs::save_state`) exactly.
 fn save_chat(
@@ -1750,8 +1893,56 @@ fn chat_state_lock() -> &'static tokio::sync::Mutex<()> {
 
 /// What [`crate::run_worker`] needs to spawn [`run_inbound_loop`] — see [`inbound_handoff`]'s own
 /// doc comment for exactly when and how this is built.
+///
+/// **Deliberately carries two stores** (task 4.43), one per consumer, because their cost profiles
+/// are opposites: `store` signs once per delivered envelope for the whole session, while
+/// `bulk_signing_store` signs `1 + DEFAULT_OTK_COUNT` = 101 times in one burst and is then dropped.
+/// See each field's own doc comment. This type deliberately has **no `Debug` impl at all**:
+/// `Box<dyn SecretStore>` has no `Debug` supertrait, so a `#[derive(Debug)]` here would not compile
+/// — a compile-time guarantee that neither store can ever be `{:?}`-dumped, stronger than the
+/// hand-rolled redaction [`OnboardingSession`] needs (that type *is* `Debug`-reachable and so has
+/// to redact by hand). Never log, `Debug`-print, or persist either field or the material it holds.
 pub struct InboundHandoff {
+    /// The **per-delivery** store [`run_inbound_loop`] is handed and keeps for the rest of the
+    /// process's life. For a file-backed account this is the raw `FileSecretStore` — one age/scrypt
+    /// unwrap per `use_key`/`derive_key`, which is the right trade for a loop that signs once per
+    /// received envelope and would otherwise hold a raw seed resident forever. Unchanged by task
+    /// 4.43: `run_inbound_loop`'s behavior is byte-for-byte as task 4.35 shipped it.
     pub store: Box<dyn SecretStore>,
+    /// The **bulk-signing** store [`crate::run_worker`] hands to [`republish_bundle`] — the one
+    /// call in this path that signs 101 times (1 SPK + `DEFAULT_OTK_COUNT` OTKs) plus the
+    /// connect-time auth signature and `load_chat`/`save_chat`'s at-rest `derive_key`.
+    ///
+    /// - **File-backed** (`Effect::Unlock`): a [`MemorySecretStore`] whose seed was unwrapped
+    ///   **once**, here, by [`unwrap_keyfile_for_bulk_signing`] — the exact mechanism onboarding's
+    ///   own `Register`/`PublishBundle` pair already uses via [`open_store_for_bulk_signing`], and
+    ///   the reason the 101-signature burst that took ~190 s through `store` above now costs
+    ///   **~0.052 s** (O(1) scrypt vs. O(101); task 4.39 recorded the defect, task 4.41 measured it
+    ///   live, task 4.43 closes it).
+    /// - **OS-keystore** (`Effect::LoadSession`): a second [`OsSecretStore`] — free to construct,
+    ///   no KDF per op, so the call site needs no branch.
+    ///
+    /// **Where a file-backed session start's remaining time actually goes (measured, task 4.43).**
+    /// After the fix, completed-`Effect::Unlock` → `run_inbound_loop` spawn is ~1.45-1.92 s, and
+    /// [`republish_bundle`] itself is only ~0.052 s of that — **~97% is the single age/scrypt
+    /// unwrap this field's own construction performs** (`unwrap_keyfile_for_bulk_signing`, ~1.4-1.6 s
+    /// at the shipped scrypt parameters). That one unwrap is the irreducible floor for a
+    /// passphrase-wrapped keyfile — it is what scrypt is *for* — so a file-backed session start
+    /// stays ~1.5-2 s regardless of what happens to the republish. A later task chasing residual
+    /// file-backed latency (task 4.45) should not attribute it to the republish path.
+    ///
+    /// **Residency bound (load-bearing, not incidental).** For the file-backed case this is the
+    /// only place in the process holding the *raw seed* rather than the passphrase, and
+    /// [`crate::run_worker`] **drops it before spawning [`run_inbound_loop`]** — so `MemorySecretStore`'s
+    /// `Zeroizing<Vec<u8>>` is zeroized at republish completion, not at process exit. Per the
+    /// measurement above that is a residency of **~50 ms**, not the ~2 s the session start takes:
+    /// the expensive part of that window is the unwrap that happens *before* this store exists.
+    /// That bound is what makes this change a *reduction* in exposure (the same seed was previously
+    /// materialized 101 times across ~190 s by `FileSecretStore::decrypt_seed`), and it is what
+    /// task 4.43's own security rationale rests on — a future caller that keeps this alive longer,
+    /// or hands it to `run_inbound_loop`, is making a materially different decision that needs its
+    /// own security sign-off (that task's "The boundary").
+    pub bulk_signing_store: Box<dyn SecretStore>,
     pub handle: KeyHandle,
     pub account_pub: [u8; 32],
     pub server: String,
@@ -1805,6 +1996,10 @@ pub fn inbound_handoff(event: &WorkerEvent) -> Option<InboundHandoff> {
             let server = resolve_server(&descriptor).ok()?;
             Some(InboundHandoff {
                 store: Box::new(OsSecretStore::new(&service)),
+                // Task 4.43: a second, independent `OsSecretStore` for `republish_bundle`'s own
+                // bulk signing. Free (no KDF, no passphrase held), so this branch needs no
+                // unwrap-once treatment and is otherwise byte-for-byte unchanged.
+                bulk_signing_store: Box::new(OsSecretStore::new(&service)),
                 handle,
                 account_pub,
                 server,
@@ -1814,10 +2009,31 @@ pub fn inbound_handoff(event: &WorkerEvent) -> Option<InboundHandoff> {
             let descriptor = AccountDescriptor::load().ok()?;
             let fs = FileSecretStore::new(&boxed.request.keyfile, boxed.request.passphrase.clone());
             let handle = KeyHandle::from_label(&descriptor.label);
+            // Task 4.43: the one-time seed unwrap for `republish_bundle`'s 101 signatures, done
+            // *here* because this is the last place the concrete `FileSecretStore` (and so the
+            // inherent, deliberately-not-on-`SecretStore` `export_seed`) is still in scope — see
+            // `InboundHandoff::bulk_signing_store`. Keyed by `descriptor.label`, the exact label
+            // `handle` above carries, since `MemorySecretStore` looks up by label. Reads the same
+            // already-completed round trip's `request.keyfile`/`request.passphrase` this function
+            // already reads (see this function's own doc comment) — the passphrase is not threaded
+            // any further down, and in particular never into `republish_bundle`.
+            //
+            // `None` on failure, like every other step here: an unwrap failure means this process
+            // cannot decrypt the keyfile at all, so `store` above could not sign a delivery either
+            // — a handoff built anyway would be a handoff that cannot work. (Unreachable in
+            // practice: `run_unlock` already ran `export_seed` successfully against this exact
+            // keyfile/passphrase moments earlier, in the very round trip being peeked.)
+            let bulk_signing_store = unwrap_keyfile_for_bulk_signing(
+                &boxed.request.keyfile,
+                &boxed.request.passphrase,
+                &descriptor.label,
+            )
+            .ok()?;
             let account_pub = account_pub_bytes(&descriptor).ok()?;
             let server = resolve_server(&descriptor).ok()?;
             Some(InboundHandoff {
                 store: Box::new(fs),
+                bulk_signing_store,
                 handle,
                 account_pub,
                 server,
@@ -1852,8 +2068,20 @@ pub fn inbound_handoff(event: &WorkerEvent) -> Option<InboundHandoff> {
 ///
 /// Takes `store`/`handle`/`account_pub`/`server` by reference/value directly (the same shape
 /// [`InboundHandoff`] carries) rather than an `&InboundHandoff`, so `crate::run_worker` can borrow
-/// `handoff.store`/`handoff.handle` for this call and *then* still move the whole `handoff` into
+/// the store/handle for this call and *then* still move the rest of the `handoff` into
 /// `run_inbound_loop` right after — see that call site's own comment.
+///
+/// **`store` must be a bulk-signing store — pass [`InboundHandoff::bulk_signing_store`], never
+/// [`InboundHandoff::store`] (task 4.43).** This function performs `1 + DEFAULT_OTK_COUNT` = 101
+/// real signatures, plus the connect-time auth signature and `load_chat`/`save_chat`'s at-rest
+/// `derive_key`. A raw `FileSecretStore` runs a full age/scrypt unwrap on *every one* of those
+/// calls, which is why a file-backed session start measured **194.5 s** here (and 188 s live in
+/// task 4.41) before this task; an unwrap-once [`MemorySecretStore`] makes the same work O(1)
+/// scrypt. Both stores derive from the same Ed25519 seed and
+/// `derive_key_from_seed(seed, info)` is identical for both, so the resealed `sessions.bin` stays
+/// readable by every other handler's `FileSecretStore` path — a store swap, not a format change.
+/// `crate::run_worker` drops the bulk store immediately after this call returns, before
+/// `run_inbound_loop` is spawned; nothing here retains it.
 ///
 /// **Failure UX (`TODO: confirm` — no design doc this task read specifies visible-status vs.
 /// log-only for a failed republish):** logged to stderr and otherwise swallowed by the caller,
@@ -2257,16 +2485,49 @@ fn open_store_for_bulk_signing(
 ) -> Result<Box<dyn SecretStore>, String> {
     match store {
         StoreChoice::Os => open_store(store),
+        // Onboarding never asks for a custom keyfile path (see `default_keyfile_path`'s own doc
+        // comment), so this branch resolves the default one and delegates — one implementation of
+        // the unwrap-once dance, shared with `inbound_handoff`, never two copies that could drift.
         StoreChoice::File { passphrase } => {
             let keyfile = default_keyfile_path()?;
-            let fs = FileSecretStore::new(&keyfile, passphrase.clone());
-            let seed = fs.export_seed().map_err(|e| e.to_string())?;
-            let mem = MemorySecretStore::new();
-            mem.store(label, seed.as_slice())
-                .map_err(|e| e.to_string())?;
-            Ok(Box::new(mem))
+            unwrap_keyfile_for_bulk_signing(&keyfile, passphrase, label)
         }
     }
+}
+
+/// The unwrap-**once** core of [`open_store_for_bulk_signing`]'s `StoreChoice::File` branch, split
+/// out (task 4.43) so the one other call site that needs exactly this — [`inbound_handoff`]'s own
+/// `Effect::Unlock` arm, which holds a caller-supplied `request.keyfile` rather than
+/// [`default_keyfile_path`]'s default — shares this implementation instead of copying it.
+///
+/// Reads the age/scrypt keyfile at `keyfile` with `passphrase`, extracts the seed **once**
+/// (`FileSecretStore::export_seed`), and hands back a [`MemorySecretStore`] holding it under
+/// `label`. Every subsequent `use_key`/`derive_key` is then a `HashMap` lookup plus the op — O(1)
+/// scrypt work for the whole caller, instead of the O(n) `FileSecretStore` pays (its `use_key` and
+/// `derive_key` each call `decrypt_seed()` — a full age/scrypt unwrap — on *every single call*).
+///
+/// **Key residency, deliberately bounded by the caller.** The returned store holds the raw seed in
+/// a `Zeroizing<Vec<u8>>`, zeroized the moment it drops — so how long that material stays resident
+/// is exactly how long the caller keeps the box. Both callers keep it for one bounded burst of
+/// work: onboarding's `Register` -> `PublishBundle` pair (via [`OnboardingSession`]'s cache) and
+/// [`crate::run_worker`]'s single [`republish_bundle`] call, which drops it *before* spawning
+/// [`run_inbound_loop`] (task 4.43's own security bound — see [`InboundHandoff::bulk_signing_store`]).
+/// Never log, `Debug`-print, or persist the returned store or the seed it wraps.
+///
+/// `label` must be the same label the caller's [`KeyHandle`] carries: `MemorySecretStore::store`
+/// keys by label, and its `use_key`/`derive_key` look up by `h.label` — a mismatch fails closed
+/// with `StoreError::NotFound`, never a wrong-key signature.
+fn unwrap_keyfile_for_bulk_signing(
+    keyfile: &Path,
+    passphrase: &str,
+    label: &str,
+) -> Result<Box<dyn SecretStore>, String> {
+    let fs = FileSecretStore::new(keyfile, passphrase);
+    let seed = fs.export_seed().map_err(|e| e.to_string())?;
+    let mem = MemorySecretStore::new();
+    mem.store(label, seed.as_slice())
+        .map_err(|e| e.to_string())?;
+    Ok(Box::new(mem))
 }
 
 // ---------------------------------------------------------------------------

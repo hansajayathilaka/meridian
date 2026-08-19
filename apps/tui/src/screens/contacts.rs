@@ -143,7 +143,12 @@ impl ContactEntry {
     /// fresh TOFU pin. [`AddedContact`] now carries the real post-`observe` `trust`/`user_blocked`/
     /// `pinned_key_history` straight from the worker's read of the actual `Contact` — this method
     /// just copies them through, never assumes a shape.
-    fn from_added(added: AddedContact) -> Self {
+    ///
+    /// `pub(crate)` since task 4.42: `crate::app::App::apply_accepted_request` builds the same entry
+    /// from a completed `Effect::AcceptRequest`'s own [`AddedContact`], so the accepted sender's row
+    /// enters `Screen::Main`'s live contacts list through this exact constructor rather than a
+    /// second, hand-assembled one that could drift from it.
+    pub(crate) fn from_added(added: AddedContact) -> Self {
         Self {
             pubkey: added.pubkey,
             id: added.id,

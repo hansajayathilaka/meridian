@@ -53,22 +53,29 @@
 //!   during the session are task 4.35's `AppEvent::Inbound`/`App::pending_inbound_requests`
 //!   mechanism (already built), which `crate::app::App::requests_snapshot` layers on top of this
 //!   screen's own static snapshot. Accepting/rejecting a request from an opened `Screen::Requests`
-//!   removes it from that screen's own in-memory list (task 4.21, unchanged) but does **not**
-//!   reach back into `MainState::chat` — so a second `Ctrl-R`/`r` later in the same run could show
-//!   an already-decided entry again alongside anything genuinely new. This is the task's own scope
-//!   text, applied literally ("this task only needs to reflect `pending_requests()` as of session
-//!   load"), not an oversight.
-//! - **`Screen::Chat` opened from here always starts with an empty transcript.**
-//!   [`crate::session::LiveSession`] (task 4.29) deliberately carries no per-peer history — history
-//!   lives in `crate::store::history`'s sealed, per-peer `.jsonl` files, and reading one is I/O this
-//!   crate's `update` never performs directly (`docs/architecture/tui-client.md §4`). Loading it
-//!   would need either widening `LiveSession` or a new `Effect::LoadHistory` this task never adds —
-//!   both real `run_worker`/store-loading changes outside "screen content/navigation," this task's
-//!   own stated boundary (see this task's own Risks/notes: "not this task's own scope to fix — it
-//!   owns screen content/navigation, not `run_worker` internals," the same boundary applied here to
-//!   a gap this task's own construction path introduces, not just the one it inherited). Restart-
-//!   persistent history itself is unaffected — `crate::screens::chat`'s own persistence path was
-//!   never in question, only *this screen's own initial load* of it.
+//!   removes it from that screen's own in-memory list (task 4.21, unchanged); **since task 4.42 both
+//!   accept and reject also reach back into `MainState::chat`** (`crate::app::App::
+//!   apply_accepted_request`/`App::apply_rejected_request` replay `ChatState::accept_request`/
+//!   `reject_request` in memory, matching the `sessions.bin` the worker already resealed), so neither
+//!   an accepted nor a rejected request re-appears on a later `Ctrl-R`/`r` (task 4.42's own review
+//!   pass closed the reject half, which its first pass had left open — see `App::
+//!   apply_rejected_request`'s own doc comment).
+//! - **`Screen::Chat` opened from here now actually loads its real, persisted transcript (task
+//!   4.44) — but not synchronously, on the spot.** [`crate::session::LiveSession`] (task 4.29)
+//!   deliberately carries no per-peer history — history lives in `crate::store::history`'s sealed,
+//!   per-peer `.jsonl` files, and reading one is I/O this crate's `update` never performs directly
+//!   (`docs/architecture/tui-client.md §4`). So `handle_key`'s `ContactsAction::OpenChat` arm still
+//!   pushes `Screen::Chat` immediately with `entries: Vec::new()` (the screen opens instantly, same
+//!   as before this task) — but now also dispatches an `Effect::LoadHistory` alongside it,
+//!   `crate::app::App::apply_loaded_history` merges the real, sealed transcript in (deduped against
+//!   whatever a racing live inbound may have already appended, oldest-first) once that worker round
+//!   trip completes. This is true on **both** paths a chat opens: a fresh `Enter` from this screen,
+//!   and a same-session re-open after `Esc` (which — unlike before this task — no longer discards
+//!   the popped `ChatState`'s transcript for good, since the very next `OpenChat` re-reads it off
+//!   disk rather than starting over from nothing remembered). See
+//!   [`crate::app::LoadHistoryEffect`] and `crate::app::App::apply_loaded_history`'s own doc
+//!   comments for the full merge/ordering reasoning, and `crate::store::history::load_or_default`
+//!   (task 4.15, reused unchanged — never a second, divergent reader) for the read itself.
 //! - **Fabricated `LiveSession`, by design.** Per this task's own Scope note, everything above is
 //!   built and tested against a hand-built `LiveSession` — zero dependency on `Preflight` (task
 //!   4.37) or a real `run_worker` existing.
@@ -82,7 +89,7 @@ use meridian_core::account::AccountDescriptor;
 use meridian_core::chat::ChatState as CoreChatState;
 use meridian_core::trust::{Contact, PinnedKey, TrustState, TrustStore};
 
-use crate::app::{Effect, WorkerEvent};
+use crate::app::{Effect, LoadHistoryEffect, LoadHistoryRequest, WorkerEvent};
 use crate::screens::chat::ChatState;
 use crate::screens::contacts::{self, ContactEntry, ContactsAction, ContactsState};
 use crate::screens::verify::VerifyState;
@@ -114,12 +121,25 @@ fn parse_pubkey_hex(s: &str) -> Option<[u8; 32]> {
 /// from the list" property actually hold here: a deleted contact's `contacts.json` row is gone, so
 /// it stays absent from this join even though its `TrustStore` record still exists.
 ///
-/// **Known gap, not this task's to close.** A `TrustStore` contact with no matching `contacts.json`
-/// row at all — reachable today only via `Effect::AcceptRequest`'s own `TrustStore::observe` call,
-/// which (per that effect's own doc comment) never touches `contacts.json` — is invisible to this
-/// join entirely, not merely missing its display-only fields. `TODO: confirm`: no design doc this
-/// task read resolves whether an accepted message-request sender should get a synthesized
-/// `contacts.json` row; left as a pre-existing, orthogonal gap this task did not introduce.
+/// **That gap is closed, and the standing `TODO: confirm` with it (task 4.42).** This doc used to
+/// note that a `TrustStore` contact with no matching `contacts.json` row — reachable only via
+/// `Effect::AcceptRequest`'s own `TrustStore::observe` call, which never touched `contacts.json` —
+/// was invisible to this join entirely, and that no design doc resolved whether an accepted
+/// message-request sender should get a synthesized row. Task 4.41's exit gate then found that exact
+/// hole as its blocking Defect C, and task 4.42 resolved it: **yes, it gets one, and
+/// `Effect::AcceptRequest` is the only path that can ever create it.** A `MessageRequest` carries no
+/// hint, so an accept-observed `Contact` has `hint == ""`, so `Contact::id_string()` fails
+/// (`validate_hint` rejects an empty hint) — which makes the "show the sender's full `mrd1:` id so
+/// the user re-adds them by hand" alternative structurally impossible rather than merely
+/// un-implemented, and inventing a hint-less id form would contradict
+/// [ADR 0001](../../../../docs/adr/0001-identity-scheme.md). So `worker::run_accept_request` now
+/// upserts the row itself (`id: ""`, `hint: ""`, `conv_handle: None`), exactly as `run_add_contact`
+/// does for the initiator side — see that function's own doc comment, and
+/// `crate::app::App::apply_accepted_request` for the matching in-memory replay that makes it visible
+/// without waiting for a restart. **The direction of the join is unchanged**, so the
+/// "locally-deleted contact stays deleted" property above still holds: accept adds a *writer* behind
+/// an affirmative user act, it does not let a stale `TrustStore` record resurrect a row on its own.
+/// The `None` fallback below therefore stays as pure defense against an inconsistent store.
 pub fn build_contact_entries(trust: &TrustStore, contacts: &ContactsDocument) -> Vec<ContactEntry> {
     contacts
         .contacts
@@ -298,7 +318,7 @@ pub enum MainAction {
 /// `trust`/`account` to build one from — see this module's own doc's "`trust` is moved, not
 /// borrowed" section for why `state.trust` is `std::mem::take`n here rather than cloned).
 pub fn handle_key(state: &mut MainState, key: KeyEvent) -> (Vec<Effect>, MainAction) {
-    let (effects, action) = contacts::handle_key(&mut state.contacts, key);
+    let (mut effects, action) = contacts::handle_key(&mut state.contacts, key);
     let action = match action {
         ContactsAction::None => MainAction::None,
         ContactsAction::Pop => MainAction::Pop,
@@ -306,8 +326,19 @@ pub fn handle_key(state: &mut MainState, key: KeyEvent) -> (Vec<Effect>, MainAct
         ContactsAction::OpenDetail(entry) => MainAction::OpenContactDetail(entry),
         ContactsAction::OpenChat(entry) => {
             let trust = std::mem::take(&mut state.trust);
+            let peer_pubkey = entry.pubkey;
+            // Task 4.44: the screen still opens instantly, with an empty transcript — no I/O in
+            // `update` (`docs/architecture/tui-client.md §4`). `Effect::LoadHistory`, dispatched
+            // alongside, is what actually reads `crate::store::history`'s real, sealed transcript;
+            // `crate::app::App::apply_loaded_history` merges it in once the worker round trip
+            // completes — see this module's own doc's "opened from here" section and that method's
+            // own doc comment for the full merge/ordering reasoning.
+            effects.push(Effect::LoadHistory(LoadHistoryEffect {
+                request: LoadHistoryRequest { peer_pubkey },
+                outcome: None,
+            }));
             MainAction::OpenChat(Box::new(ChatState::new(
-                entry.pubkey,
+                peer_pubkey,
                 entry.hint,
                 trust,
                 Vec::new(),
@@ -520,13 +551,23 @@ mod tests {
                 crossterm::event::KeyModifiers::NONE,
             ),
         );
-        assert!(effects.is_empty());
+        assert_eq!(
+            effects.len(),
+            1,
+            "OpenChat must dispatch exactly one Effect::LoadHistory (task 4.44)"
+        );
+        match &effects[0] {
+            Effect::LoadHistory(e) => assert_eq!(e.request.peer_pubkey, [0x42u8; 32]),
+            other => panic!("expected Effect::LoadHistory, got {other:?}"),
+        }
         match action {
             MainAction::OpenChat(chat) => {
                 assert_eq!(chat.peer_pubkey, [0x42u8; 32]);
                 assert!(
                     chat.entries.is_empty(),
-                    "no per-peer history in this task's scope"
+                    "the screen still opens instantly with an empty transcript — the real, \
+                     persisted history is merged in once Effect::LoadHistory completes (task 4.44), \
+                     see crate::app::App::apply_loaded_history"
                 );
             }
             _ => panic!("expected OpenChat"),

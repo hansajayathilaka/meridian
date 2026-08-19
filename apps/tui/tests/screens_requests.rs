@@ -18,8 +18,8 @@ use ratatui::Terminal;
 use meridian_core::envelope::ChatContent;
 
 use meridian_tui::app::{
-    AcceptRequestEffect, AcceptRequestRequest, Effect, RejectRequestEffect, RejectRequestRequest,
-    WorkerEvent,
+    AcceptRequestEffect, AcceptRequestRequest, AddedContact, Effect, RejectRequestEffect,
+    RejectRequestRequest, WorkerEvent,
 };
 use meridian_tui::screens::requests::{self, Decision, RequestEntry, RequestsMode, RequestsState};
 
@@ -44,6 +44,31 @@ fn entry(tag: u8, body: &str) -> RequestEntry {
             id: [tag; 16],
             body: body.to_string(),
         },
+    }
+}
+
+/// The [`AddedContact`] a real, completed `Effect::AcceptRequest` carries back since task 4.42 —
+/// exactly the shape `worker::run_accept_request` produces for a genuine first-contact sender: an
+/// empty `id`/`hint` (`MessageRequest` carries no hint, so `Contact::id_string()` cannot succeed —
+/// see that function's own doc comment) and a plain TOFU `Pinned` state, never `Verified`.
+///
+/// This screen deliberately ignores the outcome — its own contract is unchanged, and the tests below
+/// that feed one in are asserting exactly that (the reconcile into `Screen::Main` is
+/// `App::apply_accepted_request`'s job, covered in `tests/accept_to_chat.rs`).
+fn accepted(tag: u8) -> AddedContact {
+    AddedContact {
+        pubkey: [tag; 32],
+        id: String::new(),
+        hint: String::new(),
+        petname: None,
+        added_at: 1_760_000_000,
+        trust: meridian_core::trust::TrustState::Pinned,
+        user_blocked: false,
+        pinned_key_history: vec![meridian_core::trust::PinnedKey {
+            pubkey: [tag; 32],
+            first_seen_unix: 1_760_000_000,
+            last_seen_unix: 1_760_000_000,
+        }],
     }
 }
 
@@ -357,7 +382,7 @@ fn irrelevant_worker_event_in_list_mode_is_a_no_op() {
             request: AcceptRequestRequest {
                 sender_ik: [1u8; 32],
             },
-            outcome: Some(()),
+            outcome: Some(accepted(1)),
         })),
     );
     assert!(effects.is_empty());
@@ -412,7 +437,7 @@ fn a_completion_naming_a_different_sender_is_ignored_even_with_a_matching_effect
             request: AcceptRequestRequest {
                 sender_ik: [0xAA; 32],
             },
-            outcome: Some(()),
+            outcome: Some(accepted(0xAA)),
         })),
     );
     assert!(effects.is_empty());
