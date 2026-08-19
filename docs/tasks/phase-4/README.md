@@ -3,18 +3,22 @@
 
 # Phase 4 — Verification & Trust + Terminal TUI Client
 
-**Kind:** build · **Status:** in progress — 45/45 tasks done (4.1–4.45), but per the task-tracking
-skill's own §7 ("a build phase isn't done until its acceptance demo runs"), the phase is **still not
-closed**: task 4.28 found T17's acceptance demo did not run end to end; 4.29–4.37 closed that specific
-gap, but 4.38 — the second exit-gate attempt — found the demo *still* doesn't pass, for two reasons.
-Fix tasks 4.39/4.40 closed both of those, genuinely, confirmed live — but 4.41, the third exit-gate
-attempt, found a third defect (Defect C). The third gap-closure wave, 4.42–4.45, fixed Defect C, the
-188 s republish defect, and the predicted history-load gap — but **4.45, the fourth exit-gate attempt,
-found a fourth, new, independently-confirmed defect**: `Effect::AddContact` never reconciles into the
-live in-memory `TrustStore`, so an initiator can't mark their own plainly-added contact verified in the
-same session (see [exit criteria](#exit-criteria) for the full writeup). `/plan-phase` needs to run
-again against this finding to scope a fourth gap-closure wave (task **4.46**) · **Reviews phase(s):** n/a
-(build phase; Phase 5 will review it, once it's actually closeable)
+**Kind:** build · **Status:** in progress — 45/48 tasks done (4.1–4.45); the fourth exit-gate attempt
+(4.45) found a fourth genuine defect and `/plan-phase` has now scoped the fourth gap-closure wave to
+close it: **4.46** (`Effect::AddContact` never reconciles into the live `MainState::trust`, plus a
+second, closely related interleaving gap traced during this planning pass), **4.47** (a doc-only
+`--export-json` demo-script fix, split out since it's unrelated in root cause), and **4.48** (the fifth
+exit-gate attempt, hard-joined on both). Neither 4.46 nor 4.47 needs a pre-code consult or a new ADR
+(recorded in each task file's own text) — both are mechanical fixes with one obvious,
+already-precedented shape. Per the task-tracking skill's own §7 ("a build phase isn't done until its
+acceptance demo runs"), the phase is **still not closed**: task 4.28 found T17's acceptance demo did not
+run end to end; 4.29–4.37 closed that specific gap, but 4.38 — the second exit-gate attempt — found the
+demo *still* doesn't pass, for two reasons. Fix tasks 4.39/4.40 closed both of those, genuinely,
+confirmed live — but 4.41, the third exit-gate attempt, found a third defect (Defect C). The third
+gap-closure wave, 4.42–4.45, fixed Defect C, the 188 s republish defect, and the predicted history-load
+gap — but 4.45, the fourth exit-gate attempt, found the fourth defect above (see
+[exit criteria](#exit-criteria) for the full writeup) · **Reviews phase(s):** n/a (build phase; Phase 5
+will review it, once it's actually closeable)
 
 ## Goal
 Ship **Feature 08 — Verification & Contact Trust** and **Feature 17 — Terminal TUI Client** together,
@@ -254,7 +258,20 @@ pre-code consult, and neither needs a new ADR.
   recorded and left open, measured live by 4.41; **land first**) — [file](./4.43-file-backed-republish-performance.md)
 - [x] **4.44** Load a chat's persisted transcript when the chat screen opens (predicted "Defect D",
   traced in source at plan time — **verify first, then fix**) — [file](./4.44-chat-history-load-on-open.md)
-- [~] **4.45** T17 acceptance-demo closure, fourth exit-gate attempt (hard join on 4.42, 4.43, 4.44) — [file](./4.45-t17-acceptance-demo-closure-attempt-4.md)
+- [x] **4.45** T17 acceptance-demo closure, fourth exit-gate attempt (hard join on 4.42, 4.43, 4.44) — [file](./4.45-t17-acceptance-demo-closure-attempt-4.md)
+
+**Fourth gap-closure wave (planned by `/plan-phase` against 4.45's findings)** — fixes the fourth
+defect (`Effect::AddContact` never reconciling into the live `MainState::trust`, plus a second,
+closely related interleaving gap traced during this planning pass), the doc-only `--export-json`
+mismatch 4.45 also recorded, then a fifth exit-gate attempt. Neither fix task needs a pre-code
+consult or a new ADR — unlike the third wave's 4.40/4.42, neither has a genuine design choice to make
+(recorded in each task file's own text).
+- [ ] **4.46** Reconcile `Effect::AddContact` into the live `MainState::trust` (fix for 4.45's fourth
+  defect — the initiator-verify-in-session gap) — [file](./4.46-add-contact-trust-reconciliation.md)
+- [ ] **4.47** Fix `--export-json` demo-script/spec wording (directory layout, not a flat file;
+  doc-only, pre-existing since task 4.15) — [file](./4.47-export-json-doc-fix.md)
+- [ ] **4.48** T17 acceptance-demo closure, fifth exit-gate attempt (hard join on 4.46, 4.47) —
+  [file](./4.48-t17-acceptance-demo-closure-attempt-5.md)
 
 **Findings with no task yet — surfaced by 4.42's own review, owned by no open task:**
 - **Shape B** (an `OpenChat`-style transition from `Screen::Requests` straight to Chat) was evaluated and
@@ -318,7 +335,16 @@ everything ──► 4.28
 4.42 ──► 4.44 (chat-history load; logically independent, land after 4.42 to avoid a
                  simultaneous diff on ChatState construction + App's screen stack)
 4.42,4.43,4.44 ──► 4.45 (fourth exit-gate attempt — hard join, no partial credit)
+
+-- Fourth gap-closure wave (added post-4.45, planned via /plan-phase) --
+4.19,4.36,4.42 ──► 4.46 (AddContact trust reconciliation — no open design question)
+(no deps, doc-only) ──► 4.47 (export-json doc fix — disjoint files from 4.46, land in either order)
+4.46,4.47 ──► 4.48 (fifth exit-gate attempt — hard join, no partial credit)
 ```
+**Landing order (fourth wave).** 4.46 and 4.47 touch disjoint files (`apps/tui/src/app.rs` + its tests
+vs. `docs/architecture/features/17-terminal-tui-client.md`), so either may land first — no
+simultaneous-diff conflict risk like the third wave's shared `worker.rs` had. 4.48 hard-joins both.
+
 **Numbering vs. landing order (third wave).** Files are numbered 4.42–4.45 (4.42 = Defect C, as already
 pre-announced by 4.41's Status, this README, and the master tracker), but the recommended *landing* order
 is **4.43 → 4.42 → 4.44 → 4.45**, mirroring the 4.39-before-4.40 precedent: 4.43 has no open design
@@ -455,14 +481,16 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   OS-keystore restart methodology reasoning (kill only the app process, not the surrounding D-Bus/keyring
   session) was independently endorsed from source but only live-confirmed by one of the two runs. Full
   writeup: [4.45's own Status section](./4.45-t17-acceptance-demo-closure-attempt-4.md). **Not fixed by
-  4.45 itself**, per its own explicit scope — needs a new task, working number **4.46**, whose shape is
-  already sketched in 4.45's Status section (mirror `App::apply_accepted_request`'s pattern for
-  `AddContact`, plus the missing screen-level regression test 4.42's review round flagged as a gap). This
-  box stays `[ ]` until a fourth gap-closure wave closes 4.46 and a fifth exit-gate attempt confirms a
-  genuine pass.
+  4.45 itself**, per its own explicit scope. `/plan-phase` has now scoped that fourth gap-closure wave:
+  **[4.46](./4.46-add-contact-trust-reconciliation.md)** (the `Effect::AddContact` reconciliation fix,
+  mirroring `App::apply_accepted_request`'s own precedent, plus a second interleaving gap traced during
+  planning), **[4.47](./4.47-export-json-doc-fix.md)** (the doc-only `--export-json` demo-script fix,
+  split out as its own task since it is unrelated in root cause), and
+  **[4.48](./4.48-t17-acceptance-demo-closure-attempt-5.md)** (the fifth exit-gate attempt, hard-joined
+  on both). This box stays `[ ]` until 4.48 confirms a genuine pass.
 - [x] The envelope-v2 obligation above was re-deferred with a concrete, mechanical trigger (see
   [above](#envelope-v2-re-deferred--the-concrete-trigger)) — not silently dropped.
 - Then: **not yet** `/start-review-phase` for Phase 5 — the task-tracking skill's own §7 still applies
-  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. `/plan-phase` needs
-  to run again against 4.45's finding to scope task 4.46 (a fourth gap-closure wave) before the next
-  exit-gate attempt; see [docs/tasks/README.md](../README.md)'s carry-forward section.
+  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. The fourth
+  gap-closure wave (4.46–4.48, planned and scoped) must close the gap above first; see
+  [docs/tasks/README.md](../README.md)'s carry-forward section.
