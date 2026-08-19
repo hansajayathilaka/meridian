@@ -3,18 +3,18 @@
 
 # Phase 4 — Verification & Trust + Terminal TUI Client
 
-**Kind:** build · **Status:** in progress — 41/41 originally-planned tasks done (4.1–4.41), but per the
-task-tracking skill's own §7 ("a build phase isn't done until its acceptance demo runs"), the phase is
-**still not closed**: task 4.28 found T17's acceptance demo did not run end to end; 4.29–4.37 closed that
-specific gap, but 4.38 — the second exit-gate attempt — found the demo *still* doesn't pass, for two
-reasons (one already flagged by 4.37, one newly discovered live by 4.38 itself). Fix tasks 4.39/4.40
-closed both of those, genuinely, confirmed live — but **4.41, the third exit-gate attempt, found a third,
-new, independently-confirmed defect** (Defect C: a responder has no live-UI path to open a chat with a
-sender whose message request it just accepted) that still blocks the demo. `/plan-phase` was re-invoked
-against that finding and produced a **third gap-closure wave, 4.42–4.45** (Defect C; the 188 s republish
-defect 4.39 left open and 4.41 measured; a fourth defect predicted from source at plan time; and a fourth
-exit-gate attempt) · **Reviews phase(s):** n/a (build phase; Phase 5 will review it, once it's actually
-closeable)
+**Kind:** build · **Status:** in progress — 45/45 tasks done (4.1–4.45), but per the task-tracking
+skill's own §7 ("a build phase isn't done until its acceptance demo runs"), the phase is **still not
+closed**: task 4.28 found T17's acceptance demo did not run end to end; 4.29–4.37 closed that specific
+gap, but 4.38 — the second exit-gate attempt — found the demo *still* doesn't pass, for two reasons.
+Fix tasks 4.39/4.40 closed both of those, genuinely, confirmed live — but 4.41, the third exit-gate
+attempt, found a third defect (Defect C). The third gap-closure wave, 4.42–4.45, fixed Defect C, the
+188 s republish defect, and the predicted history-load gap — but **4.45, the fourth exit-gate attempt,
+found a fourth, new, independently-confirmed defect**: `Effect::AddContact` never reconciles into the
+live in-memory `TrustStore`, so an initiator can't mark their own plainly-added contact verified in the
+same session (see [exit criteria](#exit-criteria) for the full writeup). `/plan-phase` needs to run
+again against this finding to scope a fourth gap-closure wave (task **4.46**) · **Reviews phase(s):** n/a
+(build phase; Phase 5 will review it, once it's actually closeable)
 
 ## Goal
 Ship **Feature 08 — Verification & Contact Trust** and **Feature 17 — Terminal TUI Client** together,
@@ -430,12 +430,39 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   **[4.44](./4.44-chat-history-load-on-open.md)** (a fourth defect
   predicted from source at plan time: `screens/main.rs` builds every chat with a literal `Vec::new()`
   history and nothing in the crate loads per-peer history into a screen, so the demo's restart-restore
-  step cannot currently pass — scoped verify-first so it closes cheaply if that trace is wrong), and
-  finally **[4.45](./4.45-t17-acceptance-demo-closure-attempt-4.md)**, the fourth exit-gate attempt, which
-  is the only task permitted to flip this box.
+  step cannot currently pass — scoped verify-first so it closes cheaply if that trace is wrong;
+  **confirmed live, not a false trace, and landed**: a new `Effect::LoadHistory` round trip, dispatched
+  from `ContactsAction::OpenChat`, merges disk-loaded history with any live-arrived entries via the
+  existing `chat::insert_deduped`; `LiveSession` stays genuinely untouched, so no architect pre-consult
+  was triggered; restart-restore and same-session re-open both verified working, with review-round
+  coverage added for the `Ctrl-R`-behind-an-open-chat interleaving and the load-failure path — this
+  checkbox still stays `[ ]`, since 4.45 is the only task permitted to flip it), and finally
+  **[4.45](./4.45-t17-acceptance-demo-closure-attempt-4.md)**, the fourth exit-gate attempt — **run,
+  verdict FAIL, a fourth new defect found and independently confirmed twice over** (source read +
+  isolated test + two full live two-peer PTY runs, by both the implementer and a genuinely independent
+  second run): `Effect::AddContact` has no reconciliation arm in `App::handle_worker` (unlike
+  `AcceptRequest`/`RejectRequest`/`LoadHistory`/`LoadSession`, each of which does), so a contact added via
+  the plain `n`-add flow never syncs into the live in-memory `TrustStore` — its own initiator cannot mark
+  it verified in the same session (`TrustError::UnknownContact`), and `TrustStore::can_send`'s fail-open
+  for unknown contacts means the key-change/MITM warn gate is also blind to that peer for the rest of the
+  session (real invariant break; not yet actively exploitable today, since receive-side key-change
+  detection isn't wired into the TUI's live inbound loop for *any* contact yet — a separate, already-
+  tracked task-4.35 gap). **Pre-existing since task 4.19** — this wave's own fixes are what let a live run
+  reach the code path for the first time, not something 4.42/4.43/4.44 introduced. Two secondary findings
+  also recorded, not silently absorbed: `--export-json` writes a directory (correct, intentional, sealed-
+  layout-mirroring) but the feature spec's demo script and this task's own step 7 both wrote the `jq`
+  invocation as if it were a flat file (pre-existing since task 4.15, doc-only fix needed); and the
+  OS-keystore restart methodology reasoning (kill only the app process, not the surrounding D-Bus/keyring
+  session) was independently endorsed from source but only live-confirmed by one of the two runs. Full
+  writeup: [4.45's own Status section](./4.45-t17-acceptance-demo-closure-attempt-4.md). **Not fixed by
+  4.45 itself**, per its own explicit scope — needs a new task, working number **4.46**, whose shape is
+  already sketched in 4.45's Status section (mirror `App::apply_accepted_request`'s pattern for
+  `AddContact`, plus the missing screen-level regression test 4.42's review round flagged as a gap). This
+  box stays `[ ]` until a fourth gap-closure wave closes 4.46 and a fifth exit-gate attempt confirms a
+  genuine pass.
 - [x] The envelope-v2 obligation above was re-deferred with a concrete, mechanical trigger (see
   [above](#envelope-v2-re-deferred--the-concrete-trigger)) — not silently dropped.
 - Then: **not yet** `/start-review-phase` for Phase 5 — the task-tracking skill's own §7 still applies
-  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. The third
-  gap-closure wave (4.42–4.45, planned and scoped) must close the gap above first; see
-  [docs/tasks/README.md](../README.md)'s carry-forward section.
+  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. `/plan-phase` needs
+  to run again against 4.45's finding to scope task 4.46 (a fourth gap-closure wave) before the next
+  exit-gate attempt; see [docs/tasks/README.md](../README.md)'s carry-forward section.

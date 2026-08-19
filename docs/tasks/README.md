@@ -16,73 +16,55 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 4 (T08 + T17) is 41/41 originally-planned tasks done (4.1–4.41), but still NOT
-  closed.** T08's track (4.3→4.10) is fully done and its acceptance demo genuinely passes. T17's track
-  needed a second gap-closure wave (4.29–4.37) after task **4.28** (the phase's first exit-gate attempt)
-  found `meridian tui` hanging forever during onboarding — that wave genuinely closed the hang. **Task
-  4.38 — the second exit-gate attempt — re-ran the demo live and found it still didn't pass**, for two
-  reasons: Defect A (no code path ever republished a prekey bundle with vault-persisted secrets, so a
-  peer's first-contact message could never be decrypted, for any account type) and Defect B (file-backed
-  accounts reached a live `Screen::Main` and then failed closed on their first contacts/trust/send
-  action). `/plan-phase` broke these into [4.39](./phase-4/4.39-prekey-bundle-republish.md) (Defect A
-  fix), [4.40](./phase-4/4.40-file-backed-live-session-store.md) (Defect B fix — landed behind a
-  mandatory pre-code architect + security-reviewer consult, GO WITH MODIFICATIONS, no new ADR needed,
-  since it genuinely extends decrypted key-material residency to the whole session lifetime), and
-  [4.41](./phase-4/4.41-t17-acceptance-demo-closure-attempt-3.md) (a third exit-gate attempt). **All
-  three are now done, reviewed, and independently confirmed.** 4.39 and 4.40 genuinely closed Defects A
-  and B — confirmed live by 4.41's own two-peer PTY runs (both account types): a responder genuinely
-  receives and correctly decrypts a real first-contact message over the real wire, and a file-backed
-  account's `AddContact` genuinely succeeds post-`Screen::Main`. **But 4.41 — the third exit-gate
-  attempt — reached new ground no prior attempt reached (a real, live, two-peer first-contact exchange
-  driven entirely through the interactive UI) and found a third, new, independently-confirmed defect
-  (Defect C):** after a responder accepts a message request, there is no live-UI path to open a chat
-  with (or verify, or reply to) the sender — `worker.rs::run_accept_request` never writes a
-  `contacts.json` row, `screens/main.rs::build_contact_entries` joins off `contacts.json` only (a gap
-  its own doc comment already flagged as a `TODO: confirm` during task 4.36), and `screens/requests.rs`'s
-  accept action has no `OpenChat`-style transition. The underlying ratchet session and trust record are
-  confirmed fully functional — this is a live-UI-affordance gap only, not a crypto/session defect. Both
-  the implementer (test-engineer) and an independent confirmation pass (`reviewer` + a second
-  `test-engineer`) agree: **FAIL**, root cause confirmed, independent of 4.39/4.40. Full writeup:
-  [4.41's own Status section](./phase-4/4.41-t17-acceptance-demo-closure-attempt-3.md) and
-  [Phase 4's README](./phase-4/README.md#exit-criteria). Per 4.41's own explicit scope (verification
-  only — report a genuine defect, never patch around it), **Defect C was not fixed** — it needs a new
-  task, working number **4.42**, whose fix shape (synthesize a `contacts.json` row on accept, vs. give
-  `Screen::Requests`' accept action a real `OpenChat`-style transition) is itself a genuine design
-  decision per 4.41's own Status section, not one to be decided unilaterally — it belongs behind the same
-  kind of pre-code architect/security-reviewer consult 4.40 held for its own comparably-shaped decision.
-  **`/plan-phase` has since run** against that finding and produced the third gap-closure wave,
-  **4.42–4.45**, with both open design questions decided at plan time rather than deferred into the
-  tasks (see below).
-- **NEXT:** `/next-task` for **4.45** — the fourth exit-gate attempt, and the only remaining task
-  in this wave. **4.42, 4.43 and 4.44 are all now done**, each landed clean with its own `reviewer` +
-  `test-engineer` sign-off (4.42's review round found and closed one genuine blocking defect of its own —
-  a `Ctrl-R`-behind-an-open-`Screen::Chat` stack configuration that could silently drop a trust replay;
-  independently re-verified by a second `reviewer` pass). Summary of what 4.45 inherits:
-  - **4.42** closed the phase's blocking defect (Defect C): an accepted message-request sender is
-    reachable from the live UI using on-screen affordances alone, across a restart, always the real TOFU
-    `pinned` state. Two follow-ups tracked (not inline-only) in
-    [phase-4/README.md](./phase-4/README.md#tasks-todo)'s "Findings with no task yet": a severed
-    `OpenChat`-from-Requests transition (Shape B), and a repair action for a narrow partial-failure
-    window in `run_accept_request`.
-  - **4.43** cut the file-backed republish window 194.5 s → 1.92 s in-process / 211.5 s → ~3.7 s through
-    the real UI. **4.45 must not attribute residual file-backed latency to the republish** — the ~1.5 s
-    floor left is the one unavoidable scrypt unwrap, not the republish (0.05 s). Also recorded, not
-    fixed: `SignalingClient::connect` has no timeout, so an unreachable server can still freeze
-    "Unlocking" for the ~130 s SYN budget (not a regression; own follow-up task).
-  - **4.44** confirmed the predicted history-load gap was real (reproduced live, not a false trace) and
-    fixed it via a new `Effect::LoadHistory` round trip — `LiveSession` genuinely untouched, so no
-    architect pre-consult was triggered. Restart-restore and same-session re-open both verified working.
-  **4.45** is the only task permitted to flip the phase's exit-criteria checkbox. Only once it confirms a
-  genuine pass does `/start-review-phase` for Phase 5 become the correct next command — not before.
+- **NOW:** **Phase 4 (T08 + T17) is 45/45 tasks done (4.1–4.45), but still NOT closed** — the fourth
+  exit-gate attempt (4.45) found a fourth genuine defect. T08's track (4.3→4.10) is fully done and its
+  acceptance demo genuinely passes; that part of the phase is not in question. T17's track has now been
+  through four exit-gate attempts (4.28, 4.38, 4.41, 4.45), each closing the ground the previous one
+  reached and finding new ground broken one step further into the demo script:
+  - **4.28** found onboarding hanging forever → **4.29–4.37** closed it.
+  - **4.38** found two defects (no prekey republish; file-backed accounts failing closed post-`Main`) →
+    **4.39/4.40** closed both, confirmed live by 4.41.
+  - **4.41** reached the first real two-peer first-contact exchange and found Defect C (no live-UI path
+    to chat/verify an accepted sender) → **4.42** closed it (plus **4.43** cut file-backed session start
+    from ~194 s to ~2–4 s, and **4.44** confirmed and fixed a predicted chat-history-load gap).
+  - **4.45** — this wave's own exit-gate attempt — reached the *next* step (an initiator marking their
+    own plainly-added contact verified) and found a fourth defect, independently confirmed twice over
+    (source read + isolated test + two full live two-peer PTY runs, by two separate agent runs):
+    **`Effect::AddContact` has no reconciliation arm in `App::handle_worker`**, unlike
+    `AcceptRequest`/`RejectRequest`/`LoadHistory`/`LoadSession`, so a contact added via the plain `n`-add
+    flow never syncs into the live in-memory `TrustStore` — its own initiator gets
+    `TrustError::UnknownContact` trying to mark it verified in the same session (fixed by a restart —
+    this is a pure live-session staleness gap, `trust.bin` is written correctly). Real security
+    consequence, calibrated: `TrustStore::can_send`'s fail-open for unknown contacts means the key-change/
+    MITM warn gate is blind to that peer for the rest of the session too — not yet actively exploitable
+    today, since receive-side key-change detection isn't wired into the TUI's live inbound loop for *any*
+    contact yet (a separate, already-tracked task-4.35 gap), but a real invariant break worth closing in
+    the same fix. **Pre-existing since task 4.19** — this wave's own fixes are what let a live run reach
+    the code path for the first time, not a regression 4.42/4.43/4.44 introduced. Full writeup:
+    [4.45's own Status section](./phase-4/4.45-t17-acceptance-demo-closure-attempt-4.md) and
+    [Phase 4's README](./phase-4/README.md#exit-criteria). Per 4.45's own scope (verification only —
+    report, never patch around it), **not fixed** — needs a new task, working number **4.46**, whose
+    shape is already sketched in 4.45's Status section (mirror `App::apply_accepted_request`'s pattern,
+    plus the missing screen-level regression test). Two secondary findings also recorded, not silently
+    absorbed: a pre-existing (task 4.15) doc/demo-script mismatch (`--export-json` writes a directory,
+    correctly, but the spec's demo script and 4.45's own step 7 assume a flat file), and the OS-keystore
+    restart methodology (kill only the app process, keep the D-Bus/keyring session alive) — endorsed from
+    source but live-confirmed by only one of the two independent runs.
+- **NEXT:** `/plan-phase` needs to run again against 4.45's finding to scope task **4.46** (a fourth
+  gap-closure wave) — mirroring exactly how 4.41's Defect C became 4.42. Only once a fifth exit-gate
+  attempt confirms a genuine pass does `/start-review-phase` for Phase 5 become the correct next command
+  — not before.
 
-**Why 4.29–4.41 extended Phase 4 rather than opening a new phase or a review phase**: the task-tracking
+**Why this keeps extending Phase 4 rather than opening a new phase or a review phase**: the task-tracking
 skill's own phase-lifecycle rule is that a build phase isn't done until its acceptance demo runs, so
 Phase 4 was never actually finished — these are legitimately still Phase 4 build tasks, closing gaps
 Phase 4 itself created, not new scope. A review phase (`/start-review-phase`) was considered and rejected
-for this specific gap, twice now: review phases turn *discovered* findings into fix-tasks, but 4.28 and
-4.38 already did the discovery and diagnosis work in full each time — routing that through a review-phase
-sweep would re-derive conclusions already on record, not add anything. Phase 5 remains the right venue
-for whatever *new* findings a full sweep of this phase's diff turns up once 4.41 actually closes it.
+for this specific gap, repeatedly: review phases turn *discovered* findings into fix-tasks, but each
+exit-gate attempt already does the discovery and diagnosis work in full — routing that through a
+review-phase sweep would re-derive conclusions already on record, not add anything. Phase 5 remains the
+right venue for whatever *new* findings a full sweep of this phase's diff turns up once a genuine pass
+actually closes it.
+
 
 ### Live carry-forwards (not owned by any open task)
 Everything else is owned by a Phase-4 task; these are the exceptions that would otherwise evaporate:
@@ -335,7 +317,7 @@ pre-announced.
 - [x] **4.42** Post-accept path to chat/verify with a message-request sender (Defect C — the blocking defect) — [file](./phase-4/4.42-post-accept-chat-affordance.md)
 - [x] **4.43** File-backed prekey republish performance, 188 s → seconds (4.39's recorded, unfixed defect; land first) — [file](./phase-4/4.43-file-backed-republish-performance.md)
 - [x] **4.44** Load a chat's persisted transcript when the chat screen opens (predicted "Defect D"; verify first, then fix) — [file](./phase-4/4.44-chat-history-load-on-open.md)
-- [~] **4.45** T17 acceptance-demo closure, fourth exit-gate attempt (hard join on 4.42, 4.43, 4.44) — [file](./phase-4/4.45-t17-acceptance-demo-closure-attempt-4.md)
+- [x] **4.45** T17 acceptance-demo closure, fourth exit-gate attempt (hard join on 4.42, 4.43, 4.44) — [file](./phase-4/4.45-t17-acceptance-demo-closure-attempt-4.md)
 
 ---
 
