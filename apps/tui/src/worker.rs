@@ -35,12 +35,13 @@ use crate::app::{
     AcknowledgeKeyChangeRequest, AddContactEffect, AddContactRequest, AddedContact,
     DeleteContactEffect, DeleteContactRequest, Effect, GenerateAccountEffect,
     GenerateAccountRequest, GeneratedAccount, ImportContactQrEffect, ImportContactQrRequest,
-    LoadSessionEffect, LoadSessionOutcome, MarkVerifiedEffect, MarkVerifiedRequest,
-    PersistHistoryEffect, PersistHistoryRequest, PublishBundleEffect, PublishedBundle,
-    RegisterRequest, RejectRequestEffect, RejectRequestRequest, RunDoctorEffect, SaveSettingEffect,
-    SendMessageEffect, SendMessageRequest, SentMessage, SessionOutcome, SetPetnameEffect,
-    SetPetnameRequest, SetPolicyOverrideEffect, SetPolicyOverrideRequest, SetUserBlockedEffect,
-    SetUserBlockedRequest, StoreChoice, UnlockEffect, UnlockRequest, WorkerEvent,
+    LoadHistoryEffect, LoadHistoryRequest, LoadSessionEffect, LoadSessionOutcome,
+    MarkVerifiedEffect, MarkVerifiedRequest, PersistHistoryEffect, PersistHistoryRequest,
+    PublishBundleEffect, PublishedBundle, RegisterRequest, RejectRequestEffect,
+    RejectRequestRequest, RunDoctorEffect, SaveSettingEffect, SendMessageEffect,
+    SendMessageRequest, SentMessage, SessionOutcome, SetPetnameEffect, SetPetnameRequest,
+    SetPolicyOverrideEffect, SetPolicyOverrideRequest, SetUserBlockedEffect, SetUserBlockedRequest,
+    StoreChoice, UnlockEffect, UnlockRequest, WorkerEvent,
 };
 use crate::session::LiveSession;
 use crate::store::contacts::{ContactRecord, ContactsDocument, PinnedKeyRecord, TrustLabel};
@@ -269,6 +270,10 @@ pub async fn dispatch(effect: Effect, session: &mut OnboardingSession) -> Worker
         // Task 4.33: outbound chat (the send half of the T17 demo's "both sides chat" step).
         Effect::SendMessage(effect) => handle_send_message(effect, session).await,
         Effect::PersistHistory(effect) => handle_persist_history(effect, session).await,
+        // Task 4.44: the read half of `PersistHistory` above — dispatched whenever `Screen::Chat`
+        // opens (`crate::screens::main::handle_key`'s `OpenChat` arm), so the transcript reflects
+        // this exact same `crate::store::history` file rather than starting empty.
+        Effect::LoadHistory(effect) => handle_load_history(effect, session).await,
         // Task 4.34: settings write-back / diagnostics — both already-built, already-reviewed
         // functions (`crate::config_write::write_setting_at` from task 4.24,
         // `crate::screens::diagnostics::run_doctor_binary` from task 4.25); this task is purely
@@ -1773,6 +1778,47 @@ fn run_persist_history(
     let (store, handle) = account_store.parts();
     let peer_pubkey_hex = hex::encode(request.peer_pubkey);
     crate::store::history::append(&peer_pubkey_hex, &request.entry, store, handle)
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// LoadHistory (task 4.44) — the read half of PersistHistory above
+// ---------------------------------------------------------------------------
+
+async fn handle_load_history(
+    effect: LoadHistoryEffect,
+    session: &OnboardingSession,
+) -> WorkerEvent {
+    let LoadHistoryEffect { request, .. } = effect;
+    match run_load_history(&request, session) {
+        Ok(entries) => WorkerEvent::Completed(Effect::LoadHistory(LoadHistoryEffect {
+            request,
+            outcome: Some(entries),
+        })),
+        Err(message) => WorkerEvent::Failed(
+            Effect::LoadHistory(LoadHistoryEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Reads `request.peer_pubkey`'s whole sealed transcript — `crate::store::history::load_or_default`
+/// (task 4.15), the **same** reader `crate::store::export` already uses, fresh `SecretStore`/
+/// `KeyHandle` via [`open_account_store`] like every other handler in this module, never a request
+/// field (mirrors [`run_persist_history`] exactly). Returns an empty transcript, not an error, if no
+/// `history/<peer>.jsonl` exists yet for this peer — `load_or_default`'s own contract (a peer with no
+/// prior conversation is not a failure).
+fn run_load_history(
+    request: &LoadHistoryRequest,
+    session: &OnboardingSession,
+) -> Result<Vec<crate::store::history::HistoryEntry>, String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
+    let peer_pubkey_hex = hex::encode(request.peer_pubkey);
+    crate::store::history::load_or_default(&peer_pubkey_hex, store, handle)
         .map_err(|e| e.to_string())
 }
 

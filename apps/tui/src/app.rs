@@ -627,6 +627,39 @@ pub struct PersistHistoryEffect {
     pub outcome: Option<()>,
 }
 
+/// Inputs for [`Effect::LoadHistory`] (task 4.44, `crate::screens::main`): read `peer_pubkey`'s whole
+/// sealed transcript — `crate::store::history::load_or_default` (task 4.15), the **same** reader
+/// [`crate::store::export`] already uses, never a second, divergent one — off disk, the "no I/O in
+/// `update`" boundary (`docs/architecture/tui-client.md §4`) this effect exists specifically to
+/// respect: `crate::screens::main::handle_key`'s `ContactsAction::OpenChat` arm dispatches this
+/// alongside pushing `Screen::Chat` (with `entries: Vec::new()`, same as before this task — the
+/// screen still opens instantly), rather than reading the file itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadHistoryRequest {
+    pub peer_pubkey: [u8; 32],
+}
+
+/// [`Effect::LoadHistory`]'s payload — `outcome` carries the loaded transcript (in file order) on
+/// success, mirroring [`AcceptRequestEffect`]'s "outcome carries the real data, not just `()`" shape
+/// rather than [`PersistHistoryEffect`]'s (there is genuine data to hand back here, not just a
+/// completion signal).
+///
+/// **No redaction on `outcome`.** `Vec<HistoryEntry>` carries real, already-decrypted conversation
+/// content — the same plaintext `PersistHistoryEffect`/`SendMessageEffect` already carry through this
+/// exact `#[derive(Debug)]` un-redacted, per `crate::screens::chat::ChatState`'s own doc comment
+/// ("nothing reachable from here is a *secret* in this crate's hand-rolled-`Debug` sense... not
+/// passphrases or key material"). This type carries no `SecretStore`/`KeyHandle`/passphrase of any
+/// kind — only a pubkey and message content — so there is nothing here that precedent would redact;
+/// see `tests::load_history_effect_carries_no_key_material_and_is_not_redacted` (mirrors
+/// `crate::session::LiveSession`'s own redaction test and
+/// `run_worker_account.rs::effect_debug_never_leaks_a_passphrase`, verifying the *opposite* property
+/// deliberately, since there is no secret here to hide).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadHistoryEffect {
+    pub request: LoadHistoryRequest,
+    pub outcome: Option<Vec<HistoryEntry>>,
+}
+
 /// Inputs for [`Effect::AcceptRequest`] (task 4.21, `crate::screens::requests`): accept a pending
 /// message request and TOFU-pin its sender, mirroring `apps/cli/src/chat.rs::answer_request`'s
 /// accept branch **order** exactly — `meridian_core::chat::ChatState::accept_request(sender_ik)`
@@ -907,7 +940,10 @@ pub struct RunDoctorEffect {
 /// (task 4.24) one new one — see [`SaveSettingEffect`]; `RunDoctor` is the diagnostics screen's (task
 /// 4.25) one new one — see [`RunDoctorEffect`]; `LoadSession` is task 4.29's own new one — the
 /// OS-keystore/no-account-yet counterpart to `Unlock`'s now-extended file-backed path — see
-/// [`LoadSessionEffect`].
+/// [`LoadSessionEffect`]; `LoadHistory` is task 4.44's own new one — the read half of
+/// `PersistHistory`'s write, dispatched whenever `Screen::Chat` opens (first time or a same-session
+/// re-open) so the transcript reflects `crate::store::history`'s real, sealed on-disk state rather
+/// than starting empty — see [`LoadHistoryEffect`] and `crate::app::App::apply_loaded_history`.
 ///
 /// **Does not derive `PartialEq`/`Eq`** (unlike most of the payload structs above): `Unlock`/
 /// `LoadSession` carry a [`SessionOutcome`], and the [`crate::session::LiveSession`] it wraps
@@ -932,6 +968,7 @@ pub enum Effect {
     FetchBundle,
     PublishBundle(PublishBundleEffect),
     PersistHistory(PersistHistoryEffect),
+    LoadHistory(LoadHistoryEffect),
     /// Boxed: `clippy::large_enum_variant` flags the size gap against the smaller variants
     /// otherwise, once [`UnlockEffect::outcome`] can carry a whole [`LiveSession`] — the same
     /// `clippy::large_enum_variant` reason [`LoadSessionOutcome::Loaded`] is boxed too.
@@ -1904,6 +1941,30 @@ impl App {
                 }
                 WorkerEvent::Completed(Effect::RejectRequest(effect))
             }
+            // Task 4.44: a completed `Effect::LoadHistory` is merged into whichever `Screen::Chat`
+            // matches its peer — matched on the event first, regardless of what is on top (`Ctrl-R`
+            // can push `Screen::Requests` on top of an already-open `Screen::Chat` while this is
+            // still in flight, exactly the scenario `App::apply_accepted_request`'s own doc comment
+            // already documents for the identical "no single screen owns this" reasoning), by
+            // [`App::apply_loaded_history`]. A no-op if no matching `Screen::Chat` exists any more
+            // (e.g. `Esc` already popped it) — the next `OpenChat` dispatches its own fresh
+            // `Effect::LoadHistory`, so nothing already-persisted is ever lost, only briefly not
+            // shown.
+            WorkerEvent::Completed(Effect::LoadHistory(effect)) => {
+                if let Some(loaded) = effect.outcome.clone() {
+                    self.apply_loaded_history(effect.request.peer_pubkey, loaded);
+                }
+                WorkerEvent::Completed(Effect::LoadHistory(effect))
+            }
+            // A failed load leaves `Screen::Chat` exactly as it was (still empty, or whatever a live
+            // inbound has already appended in the meantime) rather than losing anything already
+            // shown — surfaced as a notice on the matching `Screen::Chat`, if one is still open,
+            // mirroring `crate::screens::chat::handle_worker`'s own `Effect::PersistHistory` failure
+            // notice.
+            WorkerEvent::Failed(Effect::LoadHistory(effect), message) => {
+                self.note_history_load_failure(effect.request.peer_pubkey, &message);
+                WorkerEvent::Failed(Effect::LoadHistory(effect), message)
+            }
             other => other,
         };
         match self.screens.last_mut() {
@@ -2186,6 +2247,72 @@ impl App {
         }
     }
 
+    /// Merges a completed [`Effect::LoadHistory`]'s `loaded` transcript into whichever
+    /// [`Screen::Chat`] matches `peer_pubkey` — task 4.44's own fix for the traced gap
+    /// `crate::screens::main`'s own module doc used to name: `ContactsAction::OpenChat` pushes
+    /// `Screen::Chat` with `entries: Vec::new()` (unchanged — the screen still opens instantly, no
+    /// I/O in `update`), and this is where the real, sealed on-disk transcript actually lands once
+    /// the worker round trip that read it completes.
+    ///
+    /// **Merge, not overwrite — `loaded` first, then whatever is already there, deduped by `mid`.**
+    /// Between the moment `Effect::LoadHistory` was dispatched and this completion arriving, a live
+    /// inbound message for the same peer may already have been appended in memory
+    /// (`crate::screens::chat::handle_inbound_message`, task 4.35). **Only if `Screen::Chat` is
+    /// literally on top of the stack**, though — `App::handle_inbound`'s own `InboundEvent::Message`
+    /// arm checks `self.screens.last_mut()`, not "is a matching `Screen::Chat` open anywhere". During
+    /// the exact `Ctrl-R`-interleaving window this doc comment's next paragraph names, a live inbound
+    /// arriving while `Screen::Requests` sits on top of that same `Screen::Chat` is therefore *not*
+    /// captured into `chat.entries` here — it is still persisted to disk unconditionally
+    /// (`App::handle_inbound`'s own doc comment), so nothing is lost or duplicated, only not yet shown;
+    /// the next completed load picks it back up. That gap is 4.41's already-deferred, correctly
+    /// out-of-scope "no unread indication while no matching chat is open" gap (see the deferral note
+    /// on [`AcceptRequestRequest`]'s own doc comment), not a new regression introduced here.
+    ///
+    /// Putting `loaded` first preserves chronological order (the disk read reflects everything up to
+    /// the moment it ran; anything already appended in memory happened no earlier than that read
+    /// started). [`chat::insert_deduped`] (reused unchanged, never a second, divergent dedup) then
+    /// folds the in-memory entries in on top, so a message that is in *both* (e.g. already flushed to
+    /// disk by the time the read ran, and also separately delivered live) is kept exactly once — this
+    /// is the "assert an inbound message arriving live for a peer whose history was just loaded is not
+    /// double-listed" property this task's own Deliverable 4 names.
+    ///
+    /// Walks the **whole** stack, not just the top (`Ctrl-R` can push `Screen::Requests` on top of
+    /// an already-open `Screen::Chat` while this load is still in flight) — mirrors
+    /// [`App::apply_accepted_request`]'s identical stack walk. A no-op if no `Screen::Chat` for this
+    /// peer exists any more (already popped via `Esc`) — see [`App::handle_worker`]'s own doc
+    /// comment on the `Effect::LoadHistory` arm for why that is safe: a re-open dispatches its own
+    /// fresh load.
+    fn apply_loaded_history(&mut self, peer_pubkey: [u8; 32], loaded: Vec<HistoryEntry>) {
+        for screen in &mut self.screens {
+            if let Screen::Chat(chat) = screen {
+                if chat.peer_pubkey == peer_pubkey {
+                    let mut merged = loaded;
+                    for entry in chat.entries.drain(..) {
+                        chat::insert_deduped(&mut merged, entry);
+                    }
+                    chat.entries = merged;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The failure counterpart to [`App::apply_loaded_history`] — surfaces `message` as a transient
+    /// notice on whichever `Screen::Chat` matches `peer_pubkey`, if one is still open, exactly like
+    /// [`crate::screens::chat::handle_worker`]'s own `Effect::PersistHistory` failure arm. A no-op
+    /// (nothing to surface a notice on) if that screen was already popped — the same "safe to lose,
+    /// a re-open tries again" reasoning as the success path.
+    fn note_history_load_failure(&mut self, peer_pubkey: [u8; 32], message: &str) {
+        for screen in &mut self.screens {
+            if let Screen::Chat(chat) = screen {
+                if chat.peer_pubkey == peer_pubkey {
+                    chat.notice = Some(format!("could not load message history: {message}"));
+                    return;
+                }
+            }
+        }
+    }
+
     /// Builds a live pending-requests snapshot (task 4.36): entries from whichever `Screen::Main`
     /// is on the stack (its own `chat.pending_requests()`, a read-only, in-memory-only call — see
     /// `crate::screens::main`'s own doc for why this is "as of session load", not live), plus
@@ -2446,6 +2573,57 @@ mod tests {
         let debug = format!("{req:?}");
         assert!(!debug.contains("correct horse battery staple"));
         assert!(debug.contains("redacted"));
+    }
+
+    /// Deliverable 5 (task 4.44): the redaction check for `Effect::LoadHistory` — this task's own
+    /// new widening of what a live process holds in memory (a peer's whole persisted transcript).
+    /// Mirrors `crate::session::LiveSession`'s own redaction test and
+    /// `unlock_request_debug_redacts_passphrase`/`run_worker_account.rs::
+    /// effect_debug_never_leaks_a_passphrase` above/nearby in *shape* (plant a sentinel, assert on
+    /// its presence/absence in `format!("{:?}", ..)`), but pins the **opposite** conclusion for the
+    /// opposite reason: unlike `UnlockRequest`/`StoreChoice::File`, [`LoadHistoryRequest`]/
+    /// [`LoadHistoryEffect`] carry no `SecretStore`/`KeyHandle`/passphrase of any kind — only a
+    /// pubkey and already-decrypted [`HistoryEntry`] rows — so there is no secret here for a
+    /// redaction to hide, and the message body sentinel below is expected to print in full,
+    /// verbatim, exactly like `PersistHistoryEffect`/`SendMessageEffect` (task 4.20/4.33) already do
+    /// through the same un-redacted `#[derive(Debug)]` — matching `crate::screens::chat::ChatState`'s
+    /// own already-reviewed judgment call that conversation content is not a *secret* in this crate's
+    /// hand-rolled-`Debug` sense, only passphrases/key material are. This test exists to make that
+    /// judgment call for `LoadHistoryEffect` explicit and falsifiable, not silently assumed: if a
+    /// future change ever adds a `SecretStore`/`KeyHandle`/passphrase field to this type without
+    /// hand-rolling `Debug` for it (the `StoreChoice::File`/`UnlockRequest` precedent), this is the
+    /// test that should start failing to catch it.
+    #[test]
+    fn load_history_effect_carries_no_key_material_and_is_not_redacted() {
+        let key_sentinel = "SENTINEL-DO-NOT-LEAK-KEY-MATERIAL-4f9c";
+        let body_sentinel = "SENTINEL-CONVERSATION-BODY-are-you-free-tonight";
+        let effect = Effect::LoadHistory(LoadHistoryEffect {
+            request: LoadHistoryRequest {
+                peer_pubkey: [0x42u8; 32],
+            },
+            outcome: Some(vec![HistoryEntry {
+                v: crate::store::history::CURRENT_VERSION,
+                mid: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+                dir: crate::store::history::Direction::In,
+                ts: 1_760_000_000,
+                stream: "mrd.chat/1".to_string(),
+                body: body_sentinel.to_string(),
+                state: crate::store::history::MessageState::Received,
+            }]),
+        });
+        let dump = format!("{effect:?}");
+        assert!(
+            !dump.contains(key_sentinel),
+            "sanity: the sentinel we're checking for absence of was never planted anywhere \
+             reachable — this type structurally has no SecretStore/KeyHandle/passphrase field, so \
+             there is nothing to redact"
+        );
+        assert!(
+            dump.contains(body_sentinel),
+            "message body content is deliberately NOT redacted (matches ChatState's own reviewed \
+             precedent, task 4.20) — a silently-redacted transcript would be a debugging footgun, \
+             not a security improvement, since it is not a passphrase or key material: {dump}"
+        );
     }
 
     fn unlock_state() -> UnlockState {

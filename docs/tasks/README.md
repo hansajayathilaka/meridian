@@ -53,31 +53,27 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   **`/plan-phase` has since run** against that finding and produced the third gap-closure wave,
   **4.42–4.45**, with both open design questions decided at plan time rather than deferred into the
   tasks (see below).
-- **NEXT:** `/next-task` for **4.44 → 4.45**. **4.42 is now done**, closing the phase's blocking
-  defect (Defect C): an accepted message-request sender is reachable from the live UI using on-screen
-  affordances alone (Contacts row → `Enter` → Chat; `v` → Verify, same safety number), across a restart,
-  always the real TOFU `pinned` state, never fabricated. The review round found and closed one genuine
-  blocking defect of its own — `App::apply_accepted_request`'s stack walk missed a `Screen::Chat`/
-  `Screen::Verify` already open on top of `Screen::Main` when `Ctrl-R` (a global binding) was used to
-  reach Requests, so the in-memory trust replay could land on a placeholder and silently vanish on pop.
-  Fixed by routing the replay to wherever the live store actually is; independently re-verified by a
-  second `reviewer` pass that traced the screen-stack invariant structurally rather than re-running the
-  one new test. Two follow-ups recorded, not silently dropped: an `OpenChat`-style transition from
-  Requests (Shape B, severed — A+C alone independently confirmed sufficient) and a repair action for a
-  narrow partial-failure window in `run_accept_request` — both tracked in
-  [phase-4/README.md](./phase-4/README.md#tasks-todo)'s "Findings with no task yet," not just inline
-  comments. **4.43 is also done** (landed first, as planned): the file-backed republish window went
-  194.5 s → 1.92 s in-process and 211.5 s → ~3.7 s through the real UI, re-measured locally before and
-  after rather than reusing 4.41's numbers. Two things it recorded for later rather than fixing: the
-  residual ~1.5 s file-backed start floor is the one unavoidable scrypt unwrap, **not** the republish
-  (0.05 s) — 4.45 must not attribute leftover latency to this path — and `SignalingClient::connect` has
-  no timeout, so an unreachable server can still freeze "Unlocking" for the ~130 s SYN budget (not a
-  regression; own follow-up task). Remaining: **4.44** (a fourth defect predicted from source at plan
-  time — nothing in `apps/tui` ever loads per-peer history into a chat screen, so the demo's
-  restart-restore step cannot pass — scoped verify-first so it closes cheaply if that trace is wrong),
-  then **4.45**, the fourth exit-gate attempt and the only task permitted to flip the phase's
-  exit-criteria checkbox. Only once 4.45 confirms a genuine pass does `/start-review-phase` for Phase 5
-  become the correct next command — not before.
+- **NEXT:** `/next-task` for **4.45** — the fourth exit-gate attempt, and the only remaining task
+  in this wave. **4.42, 4.43 and 4.44 are all now done**, each landed clean with its own `reviewer` +
+  `test-engineer` sign-off (4.42's review round found and closed one genuine blocking defect of its own —
+  a `Ctrl-R`-behind-an-open-`Screen::Chat` stack configuration that could silently drop a trust replay;
+  independently re-verified by a second `reviewer` pass). Summary of what 4.45 inherits:
+  - **4.42** closed the phase's blocking defect (Defect C): an accepted message-request sender is
+    reachable from the live UI using on-screen affordances alone, across a restart, always the real TOFU
+    `pinned` state. Two follow-ups tracked (not inline-only) in
+    [phase-4/README.md](./phase-4/README.md#tasks-todo)'s "Findings with no task yet": a severed
+    `OpenChat`-from-Requests transition (Shape B), and a repair action for a narrow partial-failure
+    window in `run_accept_request`.
+  - **4.43** cut the file-backed republish window 194.5 s → 1.92 s in-process / 211.5 s → ~3.7 s through
+    the real UI. **4.45 must not attribute residual file-backed latency to the republish** — the ~1.5 s
+    floor left is the one unavoidable scrypt unwrap, not the republish (0.05 s). Also recorded, not
+    fixed: `SignalingClient::connect` has no timeout, so an unreachable server can still freeze
+    "Unlocking" for the ~130 s SYN budget (not a regression; own follow-up task).
+  - **4.44** confirmed the predicted history-load gap was real (reproduced live, not a false trace) and
+    fixed it via a new `Effect::LoadHistory` round trip — `LiveSession` genuinely untouched, so no
+    architect pre-consult was triggered. Restart-restore and same-session re-open both verified working.
+  **4.45** is the only task permitted to flip the phase's exit-criteria checkbox. Only once it confirms a
+  genuine pass does `/start-review-phase` for Phase 5 become the correct next command — not before.
 
 **Why 4.29–4.41 extended Phase 4 rather than opening a new phase or a review phase**: the task-tracking
 skill's own phase-lifecycle rule is that a build phase isn't done until its acceptance demo runs, so
@@ -338,7 +334,7 @@ Recommended landing order is **4.43 → 4.42 → 4.44 → 4.45**; numbering keep
 pre-announced.
 - [x] **4.42** Post-accept path to chat/verify with a message-request sender (Defect C — the blocking defect) — [file](./phase-4/4.42-post-accept-chat-affordance.md)
 - [x] **4.43** File-backed prekey republish performance, 188 s → seconds (4.39's recorded, unfixed defect; land first) — [file](./phase-4/4.43-file-backed-republish-performance.md)
-- [~] **4.44** Load a chat's persisted transcript when the chat screen opens (predicted "Defect D"; verify first, then fix) — [file](./phase-4/4.44-chat-history-load-on-open.md)
+- [x] **4.44** Load a chat's persisted transcript when the chat screen opens (predicted "Defect D"; verify first, then fix) — [file](./phase-4/4.44-chat-history-load-on-open.md)
 - [ ] **4.45** T17 acceptance-demo closure, fourth exit-gate attempt (hard join on 4.42, 4.43, 4.44) — [file](./phase-4/4.45-t17-acceptance-demo-closure-attempt-4.md)
 
 ---
