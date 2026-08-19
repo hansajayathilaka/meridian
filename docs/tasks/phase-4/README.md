@@ -250,7 +250,7 @@ time** by an architect consult (recorded in 4.42's and 4.43's own files) — nei
 pre-code consult, and neither needs a new ADR.
 - [ ] **4.42** Post-accept path to chat/verify with a message-request sender (fix for 4.41's Defect C —
   the phase's blocking defect) — [file](./4.42-post-accept-chat-affordance.md)
-- [ ] **4.43** File-backed prekey republish performance, 188 s → seconds (fix for the defect 4.39
+- [~] **4.43** File-backed prekey republish performance, 188 s → seconds (fix for the defect 4.39
   recorded and left open, measured live by 4.41; **land first**) — [file](./4.43-file-backed-republish-performance.md)
 - [ ] **4.44** Load a chat's persisted transcript when the chat screen opens (predicted "Defect D",
   traced in source at plan time — **verify first, then fix**) — [file](./4.44-chat-history-load-on-open.md)
