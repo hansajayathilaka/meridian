@@ -3,13 +3,16 @@
 
 # Phase 4 — Verification & Trust + Terminal TUI Client
 
-**Kind:** build · **Status:** in progress — 38/41 tasks done (4.1–4.38), but per the task-tracking
-skill's own §7 ("a build phase isn't done until its acceptance demo runs"), the phase is **still not
-closed**: task 4.28 found T17's acceptance demo did not run end to end; 4.29–4.37 closed that specific
-gap, but 4.38 — the second exit-gate attempt — found the demo *still* doesn't pass, for two reasons (one
-already flagged by 4.37, one newly discovered live by 4.38 itself). Two fix tasks (4.39, 4.40) and a
-third exit-gate attempt (4.41) were planned via `/plan-phase` to close them · **Reviews phase(s):** n/a
-(build phase; Phase 5 will review it, once it's actually closeable)
+**Kind:** build · **Status:** in progress — 41/41 originally-planned tasks done (4.1–4.41), but per the
+task-tracking skill's own §7 ("a build phase isn't done until its acceptance demo runs"), the phase is
+**still not closed**: task 4.28 found T17's acceptance demo did not run end to end; 4.29–4.37 closed that
+specific gap, but 4.38 — the second exit-gate attempt — found the demo *still* doesn't pass, for two
+reasons (one already flagged by 4.37, one newly discovered live by 4.38 itself). Fix tasks 4.39/4.40
+closed both of those, genuinely, confirmed live — but **4.41, the third exit-gate attempt, found a third,
+new, independently-confirmed defect** (Defect C: a responder has no live-UI path to open a chat with a
+sender whose message request it just accepted) that still blocks the demo. Needs a new fix task (working
+number **4.42**), to be broken out via `/plan-phase` · **Reviews phase(s):** n/a (build phase; Phase 5
+will review it, once it's actually closeable)
 
 ## Goal
 Ship **Feature 08 — Verification & Contact Trust** and **Feature 17 — Terminal TUI Client** together,
@@ -233,7 +236,10 @@ reopened) lives in each task file's own text plus the architect consult recorded
   no first-contact message can ever be decrypted, for any account type) — [file](./4.39-prekey-bundle-republish.md)
 - [x] **4.40** Thread the live-session secret store through file-backed contacts/trust/send handlers (fix
   for 4.38's Defect B — file-backed accounts fail closed post-`Screen::Main`) — [file](./4.40-file-backed-live-session-store.md)
-- [~] **4.41** T17 acceptance-demo closure, third exit-gate attempt (needs both 4.39 and 4.40) — [file](./4.41-t17-acceptance-demo-closure-attempt-3.md)
+- [x] **4.41** T17 acceptance-demo closure, third exit-gate attempt (needs both 4.39 and 4.40) — [file](./4.41-t17-acceptance-demo-closure-attempt-3.md)
+  — **done in the sense 4.28/4.38 were done**: its own verification-only scope is fully executed and
+  independently confirmed; the demo it verified still does **not** pass (Defect C — see Exit criteria
+  below) — a new task, working number **4.42**, is needed next, not a reopening of this one.
 
 ### Dependency order
 ```
@@ -337,41 +343,33 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   is illustrative shorthand for this harness (there is no standalone `meridian-mitm-sim` binary with
   those flags — see task [4.10](./4.10-mitm-sim-trust-matrix.md)'s own Status section, which already
   recorded this); the harness itself is what actually ships and actually runs.
-- [ ] **T17's acceptance demo still does NOT run end to end — re-confirmed empirically by 4.38, not
-  assumed.** 4.29–4.37 genuinely closed 4.28's own hang (`Preflight`/`Screen::Main` live navigation and
-  a real `run_worker` now exist; onboarding, registration, and bundle publish all genuinely complete,
-  reaching a live, connected `Screen::Main` — confirmed live via a PTY-driven `meridian tui` run). Two
-  distinct defects still blocked the rest of the demo, both found/reconfirmed by 4.38's own live re-run:
-  **(1) Defect B, closed by [4.40](./4.40-file-backed-live-session-store.md)** — the already-flagged
-  file-backed-account gap (4.37's own Status section: `worker.rs::open_account_store` fails closed for a
-  passphrase-keyfile account) — reproduced live for the first time by 4.38: a file-backed account
-  reaches `Screen::Main` and then fails, with the exact predicted message, the moment it tries to add a
-  contact. 4.40 closed this via a new, `StoreKind::File`-only `OnboardingSession::live_store` cache —
-  populated once by `handle_unlock`'s success path, consulted by `open_account_store`'s `StoreKind::File`
-  branch on every later contacts/trust/chat dispatch instead of failing closed — see that task's own
-  Status section for the architect + security-reviewer consult that cleared the design and the exact
-  shape landed. **(2) Defect A, closed by [4.39](./4.39-prekey-bundle-republish.md)** — a
-  **newly-discovered** defect, found by 4.38's own new two-process regression test
-  (`apps/tui/tests/live_session_e2e.rs`): no code path in `meridian-tui` ever republished a prekey bundle
-  with its secret scalars persisted into `sessions.bin`'s `PrekeyVault` (`Effect::PublishBundle` fired
-  exactly once, at onboarding, mirroring `apps/cli/src/main.rs::cmd_register`'s own latent version of the
-  same gap — but unlike the CLI, which covers for it via `apps/cli/src/chat.rs::run`'s own unconditional
-  republish-before-listening, nothing in `meridian-tui` republished at all) — so a peer's first-contact
-  message could never be decrypted (`ChatError::UnknownPrekey`, silently dropped), for **any** account
-  type, OS-keystore included. 4.39 closed this via `worker::republish_bundle`, wired into
-  `run_worker`'s `inbound_handoff` branch (once per session, before `run_inbound_loop` is spawned) — see
-  that task's own Status section and `tui-client.md §11`'s update. Full original writeup:
-  [tui-client.md §11](../../architecture/tui-client.md#11-current-implementation-status-as-of-task-438--the-phases-second-exit-gate-attempt)
-  and [4.38's own Status section](./4.38-t17-acceptance-demo-closure.md). **Neither defect was fixed by
-  4.38 itself** — its own scope was verification only, per this project's "report, don't patch around it"
-  rule for a genuine finding. This checkbox stays `[ ]` until *both* defects are closed and the demo is
-  re-confirmed end to end — that re-confirmation is [4.41](./4.41-t17-acceptance-demo-closure-attempt-3.md)'s
-  own job, not this task's.
+- [ ] **T17's acceptance demo still does NOT run end to end — re-confirmed empirically by 4.41, not
+  assumed.** 4.29–4.37 genuinely closed 4.28's own hang. 4.39 and 4.40 genuinely closed the two defects
+  4.38 found — **both confirmed live by 4.41's own two-peer PTY runs, for both account types**: Defect A
+  (no prekey republish) is closed — a responder genuinely receives and correctly decrypts a real
+  first-contact message, byte-for-byte, over the real wire. Defect B (file-backed accounts failing
+  closed) is closed — a file-backed account's `AddContact` genuinely succeeds post-`Screen::Main`, no
+  fail-closed error. **But 4.41's own live re-run reached new ground no prior attempt reached (a real,
+  live, two-peer first-contact exchange driven entirely through the interactive UI) and found a third,
+  new, independently-confirmed defect: Defect C.** After a responder accepts a message request
+  (`Effect::AcceptRequest`), the sender never appears in the Contacts list and there is no live-UI path
+  to open a chat with them, verify them, or reply — for either account type, reproduced identically
+  twice. Root cause: `worker.rs::run_accept_request` writes `sessions.bin`/`trust.bin` but never
+  `contacts.json`; `screens/main.rs::build_contact_entries` joins off `contacts.json` only (a gap its own
+  doc comment already flagged as a `TODO: confirm` during task 4.36); `screens/requests.rs`'s accept
+  action has no `OpenChat`-style transition; no command-palette entry reaches a non-contact peer either.
+  The underlying ratchet session and trust record are confirmed fully functional (`live_session_e2e.rs`
+  proves `SendMessage`/`MarkVerified` both succeed against the accepted sender directly through
+  `worker::dispatch`) — this is a live-UI-affordance gap only, not a crypto/session defect. Full writeup:
+  [4.41's own Status section](./4.41-t17-acceptance-demo-closure-attempt-3.md). **Not fixed by 4.41
+  itself** — its own scope was verification only, per this project's "report, don't patch around it" rule.
+  This checkbox stays `[ ]` until Defect C is closed (via a new task, working number **4.42**, to be
+  scoped by `/plan-phase` — its own resolution shape is a genuine design decision, not a mechanical fix,
+  per 4.41's own Status section) and the demo is re-confirmed end to end by a fourth exit-gate attempt.
 - [x] The envelope-v2 obligation above was re-deferred with a concrete, mechanical trigger (see
   [above](#envelope-v2-re-deferred--the-concrete-trigger)) — not silently dropped.
 - Then: **not yet** `/start-review-phase` for Phase 5 — the task-tracking skill's own §7 still applies
-  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. Tasks
-  [4.39](./4.39-prekey-bundle-republish.md), [4.40](./4.40-file-backed-live-session-store.md), and
-  [4.41](./4.41-t17-acceptance-demo-closure-attempt-3.md) need to close the two defects above and confirm
-  the demo genuinely passes before this phase can exit; see [docs/tasks/README.md](../README.md)'s
+  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. A new task, working
+  number **4.42** (Defect C fix, to be scoped via `/plan-phase`) and a fourth exit-gate attempt need to
+  close the gap above before this phase can exit; see [docs/tasks/README.md](../README.md)'s
   carry-forward section.
