@@ -250,7 +250,7 @@ time** by an architect consult (recorded in 4.42's and 4.43's own files) — nei
 pre-code consult, and neither needs a new ADR.
 - [ ] **4.42** Post-accept path to chat/verify with a message-request sender (fix for 4.41's Defect C —
   the phase's blocking defect) — [file](./4.42-post-accept-chat-affordance.md)
-- [~] **4.43** File-backed prekey republish performance, 188 s → seconds (fix for the defect 4.39
+- [x] **4.43** File-backed prekey republish performance, 188 s → seconds (fix for the defect 4.39
   recorded and left open, measured live by 4.41; **land first**) — [file](./4.43-file-backed-republish-performance.md)
 - [ ] **4.44** Load a chat's persisted transcript when the chat screen opens (predicted "Defect D",
   traced in source at plan time — **verify first, then fix**) — [file](./4.44-chat-history-load-on-open.md)
@@ -398,7 +398,13 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   structurally impossible; plus a required in-memory propagation piece neither of 4.41's candidate shapes
   considered), **[4.43](./4.43-file-backed-republish-performance.md)** (the 188 s republish defect 4.39
   recorded and 4.41 measured live — settled by 4.40's own consult, since the correct fix *reduces* key
-  residency rather than extending it), **[4.44](./4.44-chat-history-load-on-open.md)** (a fourth defect
+  residency rather than extending it; **landed**: `worker::inbound_handoff` now also builds an
+  unwrap-once `MemorySecretStore` for `worker::republish_bundle`, and `run_worker` drops it before
+  spawning `run_inbound_loop`, taking a file-backed completed-`Effect::Unlock` → `run_inbound_loop`
+  spawn from a locally re-measured **194.5 s to 1.92 s** and a real PTY-driven "Unlocking" →
+  `Screen::Main` from **211.5 s to 3.6 s**; `InboundHandoff::store` and the OS-keystore branch are
+  unchanged — this checkbox still stays `[ ]`, since 4.45 is the only task permitted to flip it),
+  **[4.44](./4.44-chat-history-load-on-open.md)** (a fourth defect
   predicted from source at plan time: `screens/main.rs` builds every chat with a literal `Vec::new()`
   history and nothing in the crate loads per-peer history into a screen, so the demo's restart-restore
   step cannot currently pass — scoped verify-first so it closes cheaply if that trace is wrong), and

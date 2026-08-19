@@ -590,3 +590,41 @@ file-backed account — only the OS-keystore path, and only the specific first-c
 section's finding 2 covered, is unblocked by 4.39 alone. A third, hopefully-final exit-gate re-attempt
 (4.41) is still needed once 4.40 also lands — see
 [docs/tasks/phase-4/README.md](../tasks/phase-4/README.md)'s exit criteria for where this now stands.
+
+**Update (task 4.43): the performance defect 4.39's own fix introduced for file-backed accounts is now
+closed.** The 4.39 note above stays as written (historical record, like §10 and the rest of §11); this
+adds what it did not yet know. 4.39 wired `worker::republish_bundle` to `InboundHandoff::store`, which
+for a file-backed account is a raw `FileSecretStore` — and `FileSecretStore::use_key`/`derive_key` each
+run a **full age/scrypt unwrap on every call**. A republish is `1 + DEFAULT_OTK_COUNT` = 101
+signatures, so every file-backed session start froze on "Unlocking" for ~3 minutes (4.39 recorded
+"> 90 s and climbing"; 4.41 measured 188.0 s/188.8 s live; 4.43 re-measured **194.5 s** from a completed
+`Effect::Unlock` to `run_inbound_loop`'s spawn, and **211.5 s** from the "Unlocking" screen to a
+rendered `Screen::Main` in a real PTY-driven `meridian tui`).
+
+`worker::inbound_handoff` now also builds an **unwrap-once** `MemorySecretStore`
+(`InboundHandoff::bulk_signing_store`) via the same `unwrap_keyfile_for_bulk_signing` helper
+`open_store_for_bulk_signing` uses for onboarding's own `PublishBundle` — one `export_seed` for the
+whole 101-signature burst instead of 101 of them (O(1) scrypt, not O(prekeys)). `run_worker` hands that
+store to `republish_bundle` and **drops it before spawning `run_inbound_loop`**, so raw-seed residency
+ends at republish completion rather than at process exit — which is why this change *reduces* key
+residency rather than extending it (the same seed was previously materialized 101 times across those
+~190 s). `InboundHandoff::store`, and therefore `run_inbound_loop`'s own behavior, is byte-for-byte
+unchanged, as is the OS-keystore branch. Same measurements after the fix: **1.92 s** completed-`Unlock`
+→ spawn, **3.6 s** "Unlocking" → `Screen::Main`. The republish deliberately remains *on* the critical
+path to `Screen::Main` (recorded decision, not an oversight — see 4.43's own Status section). Full
+writeup, methodology and machine conditions:
+[4.43's own Status section](../tasks/phase-4/4.43-file-backed-republish-performance.md).
+
+**Where the residual ~1.5-2 s actually goes — and what that means for the residency bound.** Measured
+separately after the fix, `republish_bundle` itself is **~0.052 s** of the ~1.45-1.92 s
+completed-`Unlock` → spawn window; **~97% of it is the single age/scrypt keyfile unwrap**
+`inbound_handoff` now performs once (~1.4-1.6 s at the shipped scrypt parameters). Two consequences,
+both worth stating precisely rather than rounding to "the republish takes ~2 s":
+
+- The `MemorySecretStore`'s raw-seed residency is **~50 ms**, not ~2 s — it is constructed *after* the
+  expensive unwrap and dropped at republish completion. The security rationale for this shape (residency
+  reduced, not extended) is therefore stronger than a "~2 s" reading of it suggests.
+- A file-backed session start will stay **~1.5-2 s regardless of the republish**, because that floor is
+  one unavoidable passphrase-KDF unwrap — that is what scrypt is for. Later work chasing residual
+  file-backed latency (e.g. the T17 exit-gate re-attempt) should not attribute it to this path; the only
+  ways down are KDF parameters or fewer unwraps per session, both separate decisions.

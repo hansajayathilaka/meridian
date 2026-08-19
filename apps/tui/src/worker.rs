@@ -17,7 +17,7 @@
 //! (`generate_account` → `AccountDescriptor::save`; `SignalingClient::connect` →
 //! `publish_bundle`), never inventing a different one.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tokio::sync::mpsc;
 
@@ -1750,8 +1750,56 @@ fn chat_state_lock() -> &'static tokio::sync::Mutex<()> {
 
 /// What [`crate::run_worker`] needs to spawn [`run_inbound_loop`] — see [`inbound_handoff`]'s own
 /// doc comment for exactly when and how this is built.
+///
+/// **Deliberately carries two stores** (task 4.43), one per consumer, because their cost profiles
+/// are opposites: `store` signs once per delivered envelope for the whole session, while
+/// `bulk_signing_store` signs `1 + DEFAULT_OTK_COUNT` = 101 times in one burst and is then dropped.
+/// See each field's own doc comment. This type deliberately has **no `Debug` impl at all**:
+/// `Box<dyn SecretStore>` has no `Debug` supertrait, so a `#[derive(Debug)]` here would not compile
+/// — a compile-time guarantee that neither store can ever be `{:?}`-dumped, stronger than the
+/// hand-rolled redaction [`OnboardingSession`] needs (that type *is* `Debug`-reachable and so has
+/// to redact by hand). Never log, `Debug`-print, or persist either field or the material it holds.
 pub struct InboundHandoff {
+    /// The **per-delivery** store [`run_inbound_loop`] is handed and keeps for the rest of the
+    /// process's life. For a file-backed account this is the raw `FileSecretStore` — one age/scrypt
+    /// unwrap per `use_key`/`derive_key`, which is the right trade for a loop that signs once per
+    /// received envelope and would otherwise hold a raw seed resident forever. Unchanged by task
+    /// 4.43: `run_inbound_loop`'s behavior is byte-for-byte as task 4.35 shipped it.
     pub store: Box<dyn SecretStore>,
+    /// The **bulk-signing** store [`crate::run_worker`] hands to [`republish_bundle`] — the one
+    /// call in this path that signs 101 times (1 SPK + `DEFAULT_OTK_COUNT` OTKs) plus the
+    /// connect-time auth signature and `load_chat`/`save_chat`'s at-rest `derive_key`.
+    ///
+    /// - **File-backed** (`Effect::Unlock`): a [`MemorySecretStore`] whose seed was unwrapped
+    ///   **once**, here, by [`unwrap_keyfile_for_bulk_signing`] — the exact mechanism onboarding's
+    ///   own `Register`/`PublishBundle` pair already uses via [`open_store_for_bulk_signing`], and
+    ///   the reason the 101-signature burst that took ~190 s through `store` above now costs
+    ///   **~0.052 s** (O(1) scrypt vs. O(101); task 4.39 recorded the defect, task 4.41 measured it
+    ///   live, task 4.43 closes it).
+    /// - **OS-keystore** (`Effect::LoadSession`): a second [`OsSecretStore`] — free to construct,
+    ///   no KDF per op, so the call site needs no branch.
+    ///
+    /// **Where a file-backed session start's remaining time actually goes (measured, task 4.43).**
+    /// After the fix, completed-`Effect::Unlock` → `run_inbound_loop` spawn is ~1.45-1.92 s, and
+    /// [`republish_bundle`] itself is only ~0.052 s of that — **~97% is the single age/scrypt
+    /// unwrap this field's own construction performs** (`unwrap_keyfile_for_bulk_signing`, ~1.4-1.6 s
+    /// at the shipped scrypt parameters). That one unwrap is the irreducible floor for a
+    /// passphrase-wrapped keyfile — it is what scrypt is *for* — so a file-backed session start
+    /// stays ~1.5-2 s regardless of what happens to the republish. A later task chasing residual
+    /// file-backed latency (task 4.45) should not attribute it to the republish path.
+    ///
+    /// **Residency bound (load-bearing, not incidental).** For the file-backed case this is the
+    /// only place in the process holding the *raw seed* rather than the passphrase, and
+    /// [`crate::run_worker`] **drops it before spawning [`run_inbound_loop`]** — so `MemorySecretStore`'s
+    /// `Zeroizing<Vec<u8>>` is zeroized at republish completion, not at process exit. Per the
+    /// measurement above that is a residency of **~50 ms**, not the ~2 s the session start takes:
+    /// the expensive part of that window is the unwrap that happens *before* this store exists.
+    /// That bound is what makes this change a *reduction* in exposure (the same seed was previously
+    /// materialized 101 times across ~190 s by `FileSecretStore::decrypt_seed`), and it is what
+    /// task 4.43's own security rationale rests on — a future caller that keeps this alive longer,
+    /// or hands it to `run_inbound_loop`, is making a materially different decision that needs its
+    /// own security sign-off (that task's "The boundary").
+    pub bulk_signing_store: Box<dyn SecretStore>,
     pub handle: KeyHandle,
     pub account_pub: [u8; 32],
     pub server: String,
@@ -1805,6 +1853,10 @@ pub fn inbound_handoff(event: &WorkerEvent) -> Option<InboundHandoff> {
             let server = resolve_server(&descriptor).ok()?;
             Some(InboundHandoff {
                 store: Box::new(OsSecretStore::new(&service)),
+                // Task 4.43: a second, independent `OsSecretStore` for `republish_bundle`'s own
+                // bulk signing. Free (no KDF, no passphrase held), so this branch needs no
+                // unwrap-once treatment and is otherwise byte-for-byte unchanged.
+                bulk_signing_store: Box::new(OsSecretStore::new(&service)),
                 handle,
                 account_pub,
                 server,
@@ -1814,10 +1866,31 @@ pub fn inbound_handoff(event: &WorkerEvent) -> Option<InboundHandoff> {
             let descriptor = AccountDescriptor::load().ok()?;
             let fs = FileSecretStore::new(&boxed.request.keyfile, boxed.request.passphrase.clone());
             let handle = KeyHandle::from_label(&descriptor.label);
+            // Task 4.43: the one-time seed unwrap for `republish_bundle`'s 101 signatures, done
+            // *here* because this is the last place the concrete `FileSecretStore` (and so the
+            // inherent, deliberately-not-on-`SecretStore` `export_seed`) is still in scope — see
+            // `InboundHandoff::bulk_signing_store`. Keyed by `descriptor.label`, the exact label
+            // `handle` above carries, since `MemorySecretStore` looks up by label. Reads the same
+            // already-completed round trip's `request.keyfile`/`request.passphrase` this function
+            // already reads (see this function's own doc comment) — the passphrase is not threaded
+            // any further down, and in particular never into `republish_bundle`.
+            //
+            // `None` on failure, like every other step here: an unwrap failure means this process
+            // cannot decrypt the keyfile at all, so `store` above could not sign a delivery either
+            // — a handoff built anyway would be a handoff that cannot work. (Unreachable in
+            // practice: `run_unlock` already ran `export_seed` successfully against this exact
+            // keyfile/passphrase moments earlier, in the very round trip being peeked.)
+            let bulk_signing_store = unwrap_keyfile_for_bulk_signing(
+                &boxed.request.keyfile,
+                &boxed.request.passphrase,
+                &descriptor.label,
+            )
+            .ok()?;
             let account_pub = account_pub_bytes(&descriptor).ok()?;
             let server = resolve_server(&descriptor).ok()?;
             Some(InboundHandoff {
                 store: Box::new(fs),
+                bulk_signing_store,
                 handle,
                 account_pub,
                 server,
@@ -1852,8 +1925,20 @@ pub fn inbound_handoff(event: &WorkerEvent) -> Option<InboundHandoff> {
 ///
 /// Takes `store`/`handle`/`account_pub`/`server` by reference/value directly (the same shape
 /// [`InboundHandoff`] carries) rather than an `&InboundHandoff`, so `crate::run_worker` can borrow
-/// `handoff.store`/`handoff.handle` for this call and *then* still move the whole `handoff` into
+/// the store/handle for this call and *then* still move the rest of the `handoff` into
 /// `run_inbound_loop` right after — see that call site's own comment.
+///
+/// **`store` must be a bulk-signing store — pass [`InboundHandoff::bulk_signing_store`], never
+/// [`InboundHandoff::store`] (task 4.43).** This function performs `1 + DEFAULT_OTK_COUNT` = 101
+/// real signatures, plus the connect-time auth signature and `load_chat`/`save_chat`'s at-rest
+/// `derive_key`. A raw `FileSecretStore` runs a full age/scrypt unwrap on *every one* of those
+/// calls, which is why a file-backed session start measured **194.5 s** here (and 188 s live in
+/// task 4.41) before this task; an unwrap-once [`MemorySecretStore`] makes the same work O(1)
+/// scrypt. Both stores derive from the same Ed25519 seed and
+/// `derive_key_from_seed(seed, info)` is identical for both, so the resealed `sessions.bin` stays
+/// readable by every other handler's `FileSecretStore` path — a store swap, not a format change.
+/// `crate::run_worker` drops the bulk store immediately after this call returns, before
+/// `run_inbound_loop` is spawned; nothing here retains it.
 ///
 /// **Failure UX (`TODO: confirm` — no design doc this task read specifies visible-status vs.
 /// log-only for a failed republish):** logged to stderr and otherwise swallowed by the caller,
@@ -2257,16 +2342,49 @@ fn open_store_for_bulk_signing(
 ) -> Result<Box<dyn SecretStore>, String> {
     match store {
         StoreChoice::Os => open_store(store),
+        // Onboarding never asks for a custom keyfile path (see `default_keyfile_path`'s own doc
+        // comment), so this branch resolves the default one and delegates — one implementation of
+        // the unwrap-once dance, shared with `inbound_handoff`, never two copies that could drift.
         StoreChoice::File { passphrase } => {
             let keyfile = default_keyfile_path()?;
-            let fs = FileSecretStore::new(&keyfile, passphrase.clone());
-            let seed = fs.export_seed().map_err(|e| e.to_string())?;
-            let mem = MemorySecretStore::new();
-            mem.store(label, seed.as_slice())
-                .map_err(|e| e.to_string())?;
-            Ok(Box::new(mem))
+            unwrap_keyfile_for_bulk_signing(&keyfile, passphrase, label)
         }
     }
+}
+
+/// The unwrap-**once** core of [`open_store_for_bulk_signing`]'s `StoreChoice::File` branch, split
+/// out (task 4.43) so the one other call site that needs exactly this — [`inbound_handoff`]'s own
+/// `Effect::Unlock` arm, which holds a caller-supplied `request.keyfile` rather than
+/// [`default_keyfile_path`]'s default — shares this implementation instead of copying it.
+///
+/// Reads the age/scrypt keyfile at `keyfile` with `passphrase`, extracts the seed **once**
+/// (`FileSecretStore::export_seed`), and hands back a [`MemorySecretStore`] holding it under
+/// `label`. Every subsequent `use_key`/`derive_key` is then a `HashMap` lookup plus the op — O(1)
+/// scrypt work for the whole caller, instead of the O(n) `FileSecretStore` pays (its `use_key` and
+/// `derive_key` each call `decrypt_seed()` — a full age/scrypt unwrap — on *every single call*).
+///
+/// **Key residency, deliberately bounded by the caller.** The returned store holds the raw seed in
+/// a `Zeroizing<Vec<u8>>`, zeroized the moment it drops — so how long that material stays resident
+/// is exactly how long the caller keeps the box. Both callers keep it for one bounded burst of
+/// work: onboarding's `Register` -> `PublishBundle` pair (via [`OnboardingSession`]'s cache) and
+/// [`crate::run_worker`]'s single [`republish_bundle`] call, which drops it *before* spawning
+/// [`run_inbound_loop`] (task 4.43's own security bound — see [`InboundHandoff::bulk_signing_store`]).
+/// Never log, `Debug`-print, or persist the returned store or the seed it wraps.
+///
+/// `label` must be the same label the caller's [`KeyHandle`] carries: `MemorySecretStore::store`
+/// keys by label, and its `use_key`/`derive_key` look up by `h.label` — a mismatch fails closed
+/// with `StoreError::NotFound`, never a wrong-key signature.
+fn unwrap_keyfile_for_bulk_signing(
+    keyfile: &Path,
+    passphrase: &str,
+    label: &str,
+) -> Result<Box<dyn SecretStore>, String> {
+    let fs = FileSecretStore::new(keyfile, passphrase);
+    let seed = fs.export_seed().map_err(|e| e.to_string())?;
+    let mem = MemorySecretStore::new();
+    mem.store(label, seed.as_slice())
+        .map_err(|e| e.to_string())?;
+    Ok(Box::new(mem))
 }
 
 // ---------------------------------------------------------------------------

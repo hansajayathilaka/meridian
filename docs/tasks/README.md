@@ -53,7 +53,15 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   **`/plan-phase` has since run** against that finding and produced the third gap-closure wave,
   **4.42–4.45**, with both open design questions decided at plan time rather than deferred into the
   tasks (see below).
-- **NEXT:** `/next-task` for **4.43 → 4.42 → 4.44 → 4.45**, in that landing order. All four are planned,
+- **NEXT:** `/next-task` for **4.42 → 4.44 → 4.45**. **4.43 is now done** (landed first, as planned): the
+  file-backed republish window went 194.5 s → 1.92 s in-process and 211.5 s → ~3.7 s through the real UI,
+  re-measured locally before and after rather than reusing 4.41's numbers; all three `reviewer` lenses
+  PASS and `test-engineer` signed off after falsifying the new tests against three real mutations. Two
+  things it recorded for later rather than fixing: the residual ~1.5 s file-backed start floor is the one
+  unavoidable scrypt unwrap, **not** the republish (0.05 s) — 4.45 must not attribute leftover latency to
+  this path — and `SignalingClient::connect` has no timeout, so an unreachable server can still freeze
+  "Unlocking" for the ~130 s SYN budget (not a regression; own follow-up task). The original landing order
+  and its reasoning, for the remaining three:
   scoped, and unblocked; the numbering keeps 4.42 = Defect C as it was pre-announced, but **4.43 lands
   first** — it has no open design question and cuts every later live file-backed verification cycle from
   ~190 s/peer to ~3 s/peer, which 4.42, 4.44 and 4.45 all pay repeatedly (the same reasoning that put
@@ -324,7 +332,7 @@ an architect consult recorded in their own files; neither needs a further pre-co
 Recommended landing order is **4.43 → 4.42 → 4.44 → 4.45**; numbering keeps 4.42 = Defect C as
 pre-announced.
 - [ ] **4.42** Post-accept path to chat/verify with a message-request sender (Defect C — the blocking defect) — [file](./phase-4/4.42-post-accept-chat-affordance.md)
-- [~] **4.43** File-backed prekey republish performance, 188 s → seconds (4.39's recorded, unfixed defect; land first) — [file](./phase-4/4.43-file-backed-republish-performance.md)
+- [x] **4.43** File-backed prekey republish performance, 188 s → seconds (4.39's recorded, unfixed defect; land first) — [file](./phase-4/4.43-file-backed-republish-performance.md)
 - [ ] **4.44** Load a chat's persisted transcript when the chat screen opens (predicted "Defect D"; verify first, then fix) — [file](./phase-4/4.44-chat-history-load-on-open.md)
 - [ ] **4.45** T17 acceptance-demo closure, fourth exit-gate attempt (hard join on 4.42, 4.43, 4.44) — [file](./phase-4/4.45-t17-acceptance-demo-closure-attempt-4.md)
 
