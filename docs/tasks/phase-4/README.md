@@ -248,7 +248,7 @@ still-open 188 s republish defect 4.39 recorded and 4.41 measured, and one defec
 at plan time, then a fourth exit-gate attempt. Both fix-shape design questions were **decided at plan
 time** by an architect consult (recorded in 4.42's and 4.43's own files) — neither needs a further
 pre-code consult, and neither needs a new ADR.
-- [ ] **4.42** Post-accept path to chat/verify with a message-request sender (fix for 4.41's Defect C —
+- [~] **4.42** Post-accept path to chat/verify with a message-request sender (fix for 4.41's Defect C —
   the phase's blocking defect) — [file](./4.42-post-accept-chat-affordance.md)
 - [x] **4.43** File-backed prekey republish performance, 188 s → seconds (fix for the defect 4.39
   recorded and left open, measured live by 4.41; **land first**) — [file](./4.43-file-backed-republish-performance.md)
