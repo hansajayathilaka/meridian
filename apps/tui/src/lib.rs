@@ -200,6 +200,17 @@ fn translate_event(event: crossterm::event::Event) -> Option<AppEvent> {
 /// `AppEvent::ConnectionStatus` pushes reach `App` exactly like every other worker-originated event.
 /// The persistent connection this spawns is deliberately never re-derived on a later effect — see
 /// that function's own doc comment for the architect-approved lifecycle this realizes.
+///
+/// **Task 4.39:** immediately before that spawn — still inside the same `inbound_started`-guarded,
+/// once-per-session branch, so it too runs exactly once per session — this awaits
+/// [`worker::republish_bundle`] against `handoff.store`/`handoff.handle` (borrowed here; the same
+/// `handoff` is then moved into `run_inbound_loop` right after, per that struct's own doc comment on
+/// why `republish_bundle` takes its inputs by reference/value rather than `&InboundHandoff`), closing
+/// task 4.38's Defect A: without this, no `meridian-tui` session ever persisted a bundle's secret
+/// scalars into `sessions.bin`'s `PrekeyVault`, so a peer's first-contact message could never be
+/// decrypted. A failed republish is logged (by `worker::republish_bundle` itself) and otherwise never
+/// blocks `run_inbound_loop` from starting — see that function's own doc comment for the considered,
+/// `TODO: confirm`-flagged failure UX.
 async fn run_worker(
     mut effects: mpsc::UnboundedReceiver<Effect>,
     replies: mpsc::UnboundedSender<AppEvent>,
@@ -212,6 +223,16 @@ async fn run_worker(
         if !inbound_started {
             if let Some(handoff) = worker::inbound_handoff(&outcome) {
                 inbound_started = true;
+                if let Err(e) = worker::republish_bundle(
+                    handoff.store.as_ref(),
+                    &handoff.handle,
+                    handoff.account_pub,
+                    &handoff.server,
+                )
+                .await
+                {
+                    eprintln!("meridian tui: could not republish prekey bundle: {e}");
+                }
                 let backoff_ms = load_config(&[])
                     .map(|c| c.network.reconnect_backoff_ms)
                     .unwrap_or_default();

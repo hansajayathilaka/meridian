@@ -569,3 +569,24 @@ type). Neither is fixed here, per this task's own explicit scope — see
 own Status section for the full evidentiary writeup, and
 [docs/tasks/README.md](../tasks/README.md)'s carry-forward section for where this now stands in the
 tracker.
+
+**Update (task 4.39): Defect A (finding 2 above — no bundle republish/vault persistence) is now
+closed.** The rest of this section is left as 4.38's own historical record (several other task files
+link into it by anchor), but the paragraph immediately above no longer describes the current state of
+finding 2. `worker::republish_bundle` (`apps/tui/src/worker.rs`) now runs once per session — wired
+into `apps/tui/src/lib.rs::run_worker`'s existing `inbound_handoff` branch, immediately before
+`run_inbound_loop` is spawned, guarded by the same one-shot `inbound_started` flag — and performs the
+exact connect → `publish_bundle` → `vault.set_bundle(...)` → save sequence
+`apps/cli/src/chat.rs::run` always did, closing the gap this section originally found: a peer's
+first-contact message can now be decrypted, for either account type.
+`apps/tui/tests/live_session_e2e.rs`'s own `LIVE_E2E_RUN` gate (added as a stopgap so this
+known-reproducing regression test would not hard-block CI) has been removed and the test now passes
+unconditionally — see [4.39's own Status section](../tasks/phase-4/4.39-prekey-bundle-republish.md) for
+the full writeup, including its own new narrow tests at the `worker::dispatch`/`inbound_handoff`
+boundary. **Finding 1 above (Defect B — the file-backed-account gap in `worker.rs::open_account_store`)
+is still open**, tracked by [4.40](../tasks/phase-4/4.40-file-backed-live-session-store.md) (not yet
+started as of this update). The T17 acceptance demo therefore still does not run end to end for a
+file-backed account — only the OS-keystore path, and only the specific first-contact-receive step this
+section's finding 2 covered, is unblocked by 4.39 alone. A third, hopefully-final exit-gate re-attempt
+(4.41) is still needed once 4.40 also lands — see
+[docs/tasks/phase-4/README.md](../tasks/phase-4/README.md)'s exit criteria for where this now stands.

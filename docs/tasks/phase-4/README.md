@@ -3,13 +3,18 @@
 
 # Phase 4 — Verification & Trust + Terminal TUI Client
 
-**Kind:** build · **Status:** in progress — 38/41 tasks done (4.1–4.38), but per the task-tracking
-skill's own §7 ("a build phase isn't done until its acceptance demo runs"), the phase is **still not
-closed**: task 4.28 found T17's acceptance demo did not run end to end; 4.29–4.37 closed that specific
-gap, but 4.38 — the second exit-gate attempt — found the demo *still* doesn't pass, for two reasons (one
-already flagged by 4.37, one newly discovered live by 4.38 itself). Two fix tasks (4.39, 4.40) and a
-third exit-gate attempt (4.41) were planned via `/plan-phase` to close them · **Reviews phase(s):** n/a
-(build phase; Phase 5 will review it, once it's actually closeable)
+**Kind:** build · **Status:** in progress — 41/41 originally-planned tasks done (4.1–4.41), but per the
+task-tracking skill's own §7 ("a build phase isn't done until its acceptance demo runs"), the phase is
+**still not closed**: task 4.28 found T17's acceptance demo did not run end to end; 4.29–4.37 closed that
+specific gap, but 4.38 — the second exit-gate attempt — found the demo *still* doesn't pass, for two
+reasons (one already flagged by 4.37, one newly discovered live by 4.38 itself). Fix tasks 4.39/4.40
+closed both of those, genuinely, confirmed live — but **4.41, the third exit-gate attempt, found a third,
+new, independently-confirmed defect** (Defect C: a responder has no live-UI path to open a chat with a
+sender whose message request it just accepted) that still blocks the demo. `/plan-phase` was re-invoked
+against that finding and produced a **third gap-closure wave, 4.42–4.45** (Defect C; the 188 s republish
+defect 4.39 left open and 4.41 measured; a fourth defect predicted from source at plan time; and a fourth
+exit-gate attempt) · **Reviews phase(s):** n/a (build phase; Phase 5 will review it, once it's actually
+closeable)
 
 ## Goal
 Ship **Feature 08 — Verification & Contact Trust** and **Feature 17 — Terminal TUI Client** together,
@@ -229,11 +234,27 @@ reopened) lives in each task file's own text plus the architect consult recorded
 
 **Second gap-closure wave (planned by `/plan-phase` against 4.38's own findings)** — fixes both defects
 4.38 found live, then a third, hopefully-final exit-gate attempt.
-- [ ] **4.39** Prekey bundle republish + vault persistence on session start (fix for 4.38's Defect A —
+- [x] **4.39** Prekey bundle republish + vault persistence on session start (fix for 4.38's Defect A —
   no first-contact message can ever be decrypted, for any account type) — [file](./4.39-prekey-bundle-republish.md)
-- [ ] **4.40** Thread the live-session secret store through file-backed contacts/trust/send handlers (fix
+- [x] **4.40** Thread the live-session secret store through file-backed contacts/trust/send handlers (fix
   for 4.38's Defect B — file-backed accounts fail closed post-`Screen::Main`) — [file](./4.40-file-backed-live-session-store.md)
-- [ ] **4.41** T17 acceptance-demo closure, third exit-gate attempt (needs both 4.39 and 4.40) — [file](./4.41-t17-acceptance-demo-closure-attempt-3.md)
+- [x] **4.41** T17 acceptance-demo closure, third exit-gate attempt (needs both 4.39 and 4.40) — [file](./4.41-t17-acceptance-demo-closure-attempt-3.md)
+  — **done in the sense 4.28/4.38 were done**: its own verification-only scope is fully executed and
+  independently confirmed; the demo it verified still does **not** pass (Defect C — see Exit criteria
+  below) — the third gap-closure wave below is what's needed next, not a reopening of this one.
+
+**Third gap-closure wave (planned by `/plan-phase` against 4.41's findings)** — fixes Defect C, the
+still-open 188 s republish defect 4.39 recorded and 4.41 measured, and one defect predicted from source
+at plan time, then a fourth exit-gate attempt. Both fix-shape design questions were **decided at plan
+time** by an architect consult (recorded in 4.42's and 4.43's own files) — neither needs a further
+pre-code consult, and neither needs a new ADR.
+- [ ] **4.42** Post-accept path to chat/verify with a message-request sender (fix for 4.41's Defect C —
+  the phase's blocking defect) — [file](./4.42-post-accept-chat-affordance.md)
+- [ ] **4.43** File-backed prekey republish performance, 188 s → seconds (fix for the defect 4.39
+  recorded and left open, measured live by 4.41; **land first**) — [file](./4.43-file-backed-republish-performance.md)
+- [ ] **4.44** Load a chat's persisted transcript when the chat screen opens (predicted "Defect D",
+  traced in source at plan time — **verify first, then fix**) — [file](./4.44-chat-history-load-on-open.md)
+- [ ] **4.45** T17 acceptance-demo closure, fourth exit-gate attempt (hard join on 4.42, 4.43, 4.44) — [file](./4.45-t17-acceptance-demo-closure-attempt-4.md)
 
 ### Dependency order
 ```
@@ -277,7 +298,20 @@ everything ──► 4.28
                                           to avoid a simultaneous diff on worker.rs's
                                           session-threading machinery)
 4.39,4.40 ──► 4.41 (third exit-gate attempt)
+
+-- Third gap-closure wave (added post-4.41, planned via /plan-phase) --
+4.39,4.40 ──► 4.43 (file-backed republish perf — 188s; no open design question,
+                      land FIRST: it cuts every later live file-backed verification
+                      cycle from ~190s/peer to ~3s/peer, which 4.42/4.44/4.45 all pay)
+4.32,4.36,4.37,4.40 ──► 4.42 (Defect C — post-accept chat/verify affordance)
+4.42 ──► 4.44 (chat-history load; logically independent, land after 4.42 to avoid a
+                 simultaneous diff on ChatState construction + App's screen stack)
+4.42,4.43,4.44 ──► 4.45 (fourth exit-gate attempt — hard join, no partial credit)
 ```
+**Numbering vs. landing order (third wave).** Files are numbered 4.42–4.45 (4.42 = Defect C, as already
+pre-announced by 4.41's Status, this README, and the master tracker), but the recommended *landing* order
+is **4.43 → 4.42 → 4.44 → 4.45**, mirroring the 4.39-before-4.40 precedent: 4.43 has no open design
+question and pays for itself immediately in every later live verification cycle.
 **Parallel tracks.** Track ADR (4.1, 4.2) — no code. Track T08 (4.3→4.10) — the phase's longest
 sequential chain, zero dependency on the ADRs or on any T17 task. Track T17-infra (4.13 independent;
 4.11/4.12/4.18 need only 4.1) — runs alongside Track T08. Once 4.1+4.2 land, 4.14/4.15/4.16/4.17 proceed
@@ -337,32 +371,42 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   is illustrative shorthand for this harness (there is no standalone `meridian-mitm-sim` binary with
   those flags — see task [4.10](./4.10-mitm-sim-trust-matrix.md)'s own Status section, which already
   recorded this); the harness itself is what actually ships and actually runs.
-- [ ] **T17's acceptance demo still does NOT run end to end — re-confirmed empirically by 4.38, not
-  assumed.** 4.29–4.37 genuinely closed 4.28's own hang (`Preflight`/`Screen::Main` live navigation and
-  a real `run_worker` now exist; onboarding, registration, and bundle publish all genuinely complete,
-  reaching a live, connected `Screen::Main` — confirmed live via a PTY-driven `meridian tui` run). Two
-  distinct defects still block the rest of the demo, both found/reconfirmed by 4.38's own live re-run:
-  **(1)** the already-flagged file-backed-account gap (4.37's own Status section:
-  `worker.rs::open_account_store` fails closed for a passphrase-keyfile account) — reproduced live for
-  the first time: a file-backed account reaches `Screen::Main` and then fails, with the exact predicted
-  message, the moment it tries to add a contact; **(2)** a **newly-discovered** defect, found by 4.38's
-  own new two-process regression test (`apps/tui/tests/live_session_e2e.rs`): no code path in
-  `meridian-tui` ever republishes a prekey bundle with its secret scalars persisted into
-  `sessions.bin`'s `PrekeyVault` (`Effect::PublishBundle` fires exactly once, at onboarding, mirroring
-  `apps/cli/src/main.rs::cmd_register`'s own latent version of the same gap — but unlike the CLI, which
-  covers for it via `apps/cli/src/chat.rs::run`'s own unconditional republish-before-listening, nothing
-  in `meridian-tui` ever republishes at all) — so a peer's first-contact message can never be decrypted
-  (`ChatError::UnknownPrekey`, silently dropped), for **any** account type, OS-keystore included. Full
-  writeup: [tui-client.md §11](../../architecture/tui-client.md#11-current-implementation-status-as-of-task-438--the-phases-second-exit-gate-attempt)
-  and [4.38's own Status section](./4.38-t17-acceptance-demo-closure.md). **Neither defect was fixed by
-  4.38** — its own scope is verification only, per this project's "report, don't patch around it" rule
-  for a genuine finding. Both need a new task (not a reopened 4.37, per this project's numbering
-  convention) before this checkbox can honestly flip.
+- [ ] **T17's acceptance demo still does NOT run end to end — re-confirmed empirically by 4.41, not
+  assumed.** 4.29–4.37 genuinely closed 4.28's own hang. 4.39 and 4.40 genuinely closed the two defects
+  4.38 found — **both confirmed live by 4.41's own two-peer PTY runs, for both account types**: Defect A
+  (no prekey republish) is closed — a responder genuinely receives and correctly decrypts a real
+  first-contact message, byte-for-byte, over the real wire. Defect B (file-backed accounts failing
+  closed) is closed — a file-backed account's `AddContact` genuinely succeeds post-`Screen::Main`, no
+  fail-closed error. **But 4.41's own live re-run reached new ground no prior attempt reached (a real,
+  live, two-peer first-contact exchange driven entirely through the interactive UI) and found a third,
+  new, independently-confirmed defect: Defect C.** After a responder accepts a message request
+  (`Effect::AcceptRequest`), the sender never appears in the Contacts list and there is no live-UI path
+  to open a chat with them, verify them, or reply — for either account type, reproduced identically
+  twice. Root cause: `worker.rs::run_accept_request` writes `sessions.bin`/`trust.bin` but never
+  `contacts.json`; `screens/main.rs::build_contact_entries` joins off `contacts.json` only (a gap its own
+  doc comment already flagged as a `TODO: confirm` during task 4.36); `screens/requests.rs`'s accept
+  action has no `OpenChat`-style transition; no command-palette entry reaches a non-contact peer either.
+  The underlying ratchet session and trust record are confirmed fully functional (`live_session_e2e.rs`
+  proves `SendMessage`/`MarkVerified` both succeed against the accepted sender directly through
+  `worker::dispatch`) — this is a live-UI-affordance gap only, not a crypto/session defect. Full writeup:
+  [4.41's own Status section](./4.41-t17-acceptance-demo-closure-attempt-3.md). **Not fixed by 4.41
+  itself** — its own scope was verification only, per this project's "report, don't patch around it" rule.
+  This checkbox stays `[ ]` until the third gap-closure wave closes it: **[4.42](./4.42-post-accept-chat-affordance.md)**
+  (Defect C — its fix shape was decided at plan time by an architect consult recorded in that file:
+  synthesizing a `contacts.json` row on accept is *mandatory*, because `TrustStore::observe` gives the
+  sender `hint == ""` and `to_id_string` rejects an empty hint, making the "re-add manually" workaround
+  structurally impossible; plus a required in-memory propagation piece neither of 4.41's candidate shapes
+  considered), **[4.43](./4.43-file-backed-republish-performance.md)** (the 188 s republish defect 4.39
+  recorded and 4.41 measured live — settled by 4.40's own consult, since the correct fix *reduces* key
+  residency rather than extending it), **[4.44](./4.44-chat-history-load-on-open.md)** (a fourth defect
+  predicted from source at plan time: `screens/main.rs` builds every chat with a literal `Vec::new()`
+  history and nothing in the crate loads per-peer history into a screen, so the demo's restart-restore
+  step cannot currently pass — scoped verify-first so it closes cheaply if that trace is wrong), and
+  finally **[4.45](./4.45-t17-acceptance-demo-closure-attempt-4.md)**, the fourth exit-gate attempt, which
+  is the only task permitted to flip this box.
 - [x] The envelope-v2 obligation above was re-deferred with a concrete, mechanical trigger (see
   [above](#envelope-v2-re-deferred--the-concrete-trigger)) — not silently dropped.
 - Then: **not yet** `/start-review-phase` for Phase 5 — the task-tracking skill's own §7 still applies
-  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. Tasks
-  [4.39](./4.39-prekey-bundle-republish.md), [4.40](./4.40-file-backed-live-session-store.md), and
-  [4.41](./4.41-t17-acceptance-demo-closure-attempt-3.md) need to close the two defects above and confirm
-  the demo genuinely passes before this phase can exit; see [docs/tasks/README.md](../README.md)'s
-  carry-forward section.
+  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. The third
+  gap-closure wave (4.42–4.45, planned and scoped) must close the gap above first; see
+  [docs/tasks/README.md](../README.md)'s carry-forward section.
