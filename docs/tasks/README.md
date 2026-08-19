@@ -50,13 +50,21 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   `Screen::Requests`' accept action a real `OpenChat`-style transition) is itself a genuine design
   decision per 4.41's own Status section, not one to be decided unilaterally — it belongs behind the same
   kind of pre-code architect/security-reviewer consult 4.40 held for its own comparably-shaped decision.
-- **NEXT:** `/plan-phase` to scope task **4.42** (Defect C fix) — this is a planning step, not a
-  `/next-task` pickup, since 4.42's file doesn't exist yet and its fix shape is an open design question.
-  Once 4.42 is planned and closed, a **fourth exit-gate attempt** (working number 4.43) will need to
-  re-confirm the T17 demo genuinely passes end to end, holding to the same two-independent-runs
-  discipline 4.28/4.38/4.41 all used — three exit-gate attempts in a row have each found a real defect
-  this way. Only once that fourth attempt confirms a genuine pass does `/start-review-phase` for Phase 5
-  become the correct next command — not before.
+  **`/plan-phase` has since run** against that finding and produced the third gap-closure wave,
+  **4.42–4.45**, with both open design questions decided at plan time rather than deferred into the
+  tasks (see below).
+- **NEXT:** `/next-task` for **4.43 → 4.42 → 4.44 → 4.45**, in that landing order. All four are planned,
+  scoped, and unblocked; the numbering keeps 4.42 = Defect C as it was pre-announced, but **4.43 lands
+  first** — it has no open design question and cuts every later live file-backed verification cycle from
+  ~190 s/peer to ~3 s/peer, which 4.42, 4.44 and 4.45 all pay repeatedly (the same reasoning that put
+  4.39 before 4.40). The wave covers: **4.42** Defect C, **4.43** the 188 s republish defect 4.39 recorded
+  and 4.41 measured live, **4.44** a fourth defect predicted from source at plan time (nothing in
+  `apps/tui` ever loads per-peer history into a chat screen, so the demo's restart-restore step cannot
+  pass — scoped verify-first so it closes cheaply if that trace is wrong), and **4.45** the fourth
+  exit-gate attempt, the only task permitted to flip the phase's exit-criteria checkbox. **Neither 4.42
+  nor 4.43 needs a further pre-code consult or a new ADR** — an architect consult ran during `/plan-phase`
+  and both decisions are recorded as binding in their own task files. Only once 4.45 confirms a genuine
+  pass does `/start-review-phase` for Phase 5 become the correct next command — not before.
 
 **Why 4.29–4.41 extended Phase 4 rather than opening a new phase or a review phase**: the task-tracking
 skill's own phase-lifecycle rule is that a build phase isn't done until its acceptance demo runs, so
@@ -310,8 +318,15 @@ succeed exit-gate attempt) — see [Phase 4's own task list](./phase-4/README.md
 - [x] **4.39** Prekey bundle republish + vault persistence on session start (fix for 4.38's Defect A) — [file](./phase-4/4.39-prekey-bundle-republish.md)
 - [x] **4.40** Thread the live-session secret store through file-backed contacts/trust/send handlers (fix for 4.38's Defect B) — [file](./phase-4/4.40-file-backed-live-session-store.md)
 - [x] **4.41** T17 acceptance-demo closure, third exit-gate attempt — [file](./phase-4/4.41-t17-acceptance-demo-closure-attempt-3.md)
-- [ ] **4.42** T17 Defect C fix — no live-UI path to open a chat with an accepted message-request sender
-  (to be scoped via `/plan-phase`) — file not yet created
+
+**Third gap-closure wave — added post-4.41** (fix shapes for 4.42 and 4.43 were decided at plan time by
+an architect consult recorded in their own files; neither needs a further pre-code consult or a new ADR).
+Recommended landing order is **4.43 → 4.42 → 4.44 → 4.45**; numbering keeps 4.42 = Defect C as
+pre-announced.
+- [ ] **4.42** Post-accept path to chat/verify with a message-request sender (Defect C — the blocking defect) — [file](./phase-4/4.42-post-accept-chat-affordance.md)
+- [ ] **4.43** File-backed prekey republish performance, 188 s → seconds (4.39's recorded, unfixed defect; land first) — [file](./phase-4/4.43-file-backed-republish-performance.md)
+- [ ] **4.44** Load a chat's persisted transcript when the chat screen opens (predicted "Defect D"; verify first, then fix) — [file](./phase-4/4.44-chat-history-load-on-open.md)
+- [ ] **4.45** T17 acceptance-demo closure, fourth exit-gate attempt (hard join on 4.42, 4.43, 4.44) — [file](./phase-4/4.45-t17-acceptance-demo-closure-attempt-4.md)
 
 ---
 
