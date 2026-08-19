@@ -347,16 +347,16 @@ async fn file_backed_session_supports_accept_request_post_unlock() {
         },
         outcome: None,
     });
-    match dispatch(effect, &mut session).await {
+    let added = match dispatch(effect, &mut session).await {
         WorkerEvent::Completed(Effect::AcceptRequest(AcceptRequestEffect {
-            outcome: Some(()),
+            outcome: Some(added),
             ..
-        })) => {}
+        })) => added,
         other => panic!(
             "expected AcceptRequest to complete for a file-backed session post-Unlock, got \
              {other:?}"
         ),
-    }
+    };
 
     let chat_after = read_chat(&keyfile, &bob);
     assert!(chat_after.pending_request(&alice_ik).is_none());
@@ -367,6 +367,22 @@ async fn file_backed_session_supports_accept_request_post_unlock() {
         .contact(&alice_ik)
         .expect("accept must TOFU-pin the sender");
     assert_eq!(contact.hint, "");
+
+    // Task 4.42 (Shape A): the sealed `contacts.json` display row the accept now also writes —
+    // proven here for the **file-backed** store specifically, i.e. through the same cached
+    // `live_store` this file exists to cover, with no second passphrase prompt anywhere in the path
+    // (`crate::store::contacts::save` seals through the very same `SecretStore`/`KeyHandle`).
+    assert_eq!(added.pubkey, alice_ik);
+    assert_eq!(added.id, "");
+    assert_eq!(added.trust, meridian_core::trust::TrustState::Pinned);
+    let fs = FileSecretStore::new(&keyfile, PASSPHRASE);
+    let doc = meridian_tui::store::contacts::load_or_default(&fs, bob.handle())
+        .expect("load contacts.json");
+    assert_eq!(doc.contacts.len(), 1);
+    assert_eq!(doc.contacts[0].pubkey, hex::encode(alice_ik));
+    assert_eq!(doc.contacts[0].id, "");
+    assert_eq!(doc.contacts[0].hint, "");
+    assert_eq!(doc.contacts[0].conv_handle, None);
 }
 
 // ---------------------------------------------------------------------------

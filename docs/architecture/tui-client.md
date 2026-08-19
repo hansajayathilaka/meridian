@@ -85,7 +85,7 @@ exist yet in `App::handle_key`/`App::handle_worker` — see
 | **Main** | Contacts + conversation + composer + status bar | after unlock |
 | **Add contact** | Paste an `mrd1:` ID or import a QR image, assign a petname | `n` on the Contacts screen |
 | **Requests** | First-contact gate queue (§3.5): sender key, safety number, intro, accept/reject | `^R` (global), or `r` on the Contacts screen |
-| **Verify** | 60-digit safety number + QR, mark verified, block | `v` on a selected contact |
+| **Verify** | 60-digit safety number + QR, mark verified, block | `v` on a selected contact — including a contact created by **accepting a message request** (task 4.42): accepting synthesizes that sender's contacts row, so `Esc` back to Main lists them like any other contact and both `Enter` (chat) and `v` (verify) work unchanged |
 | **Contact detail** | Trust state, key history, per-contact relay policy, petname, block/delete | `Enter` on a contact with the detail toggle |
 | **Settings** | Server URL, relay policy, theme, timestamps, bell, retention | palette → *Settings* |
 | **Diagnostics** | `doctor` output, live connection/transport state, why a path was chosen | palette → *Diagnostics* |
@@ -628,3 +628,31 @@ both worth stating precisely rather than rounding to "the republish takes ~2 s":
   one unavoidable passphrase-KDF unwrap — that is what scrypt is for. Later work chasing residual
   file-backed latency (e.g. the T17 exit-gate re-attempt) should not attribute it to this path; the only
   ways down are KDF parameters or fewer unwraps per session, both separate decisions.
+
+**Update (task 4.42): Defect C — the responder side of a first contact was a dead end — is now
+closed.** Task 4.41's exit-gate attempt found that accepting a message request left the sender
+reachable from *no* screen at all: `Effect::AcceptRequest` wrote only `trust.bin`/`sessions.bin`, and
+§2's contacts list is driven by `contacts.json`, so the accepted sender never appeared in it — and
+could not be added by hand either, because a `MessageRequest` carries no routing hint, so the
+resulting `Contact` has `hint == ""` and `Contact::id_string()` genuinely fails (`validate_hint`
+rejects an empty hint). There was therefore no string the "add contact" form would have accepted; the
+gap was structural, not a missing button. Two changes close it, and no new ADR was needed
+(nothing here changes trust semantics — an accept still produces a TOFU pin and nothing more):
+
+- `worker::run_accept_request` now also upserts and saves that sender's sealed `contacts.json` row
+  (`id: ""`, `hint: ""`, `conv_handle: None`), on exactly the same `accepted || pin_still_owed` guard
+  as the pin, so a retry never fabricates a row for a sender with no session. **No hint-less `mrd1:`
+  id form was invented** — that would touch the wire-critical `meridian-identity` crate and
+  contradict [ADR 0001](../adr/0001-identity-scheme.md); the row renders through the existing
+  petname → hint → short-pubkey fallback, i.e. as the same fingerprint the Requests pane showed.
+- `App::apply_accepted_request` replays the same three mutations into the live `Screen::Main` beneath
+  the Requests screen (`trust.observe` with the **worker-supplied** timestamp, the contacts-row
+  update, and an in-memory `chat.accept_request`), so the sender is reachable immediately rather than
+  only after the next restart, `v` → Verify → mark-verified has a contact record to transition, and
+  an accepted request no longer re-appears on the next `^R`. A **rejected** one still can, within the
+  same session — that half is unchanged and deliberately out of 4.42's scope.
+
+Screen-level coverage for this lives in `apps/tui/tests/accept_to_chat.rs` (real key events through
+`App`, real `worker::dispatch` against a real sealed `$MERIDIAN_HOME`, plus a restart rebuilt from
+disk only) — the layer `live_session_e2e.rs` structurally cannot reach, which is why three exit-gate
+attempts passed while this was broken.

@@ -248,13 +248,24 @@ still-open 188 s republish defect 4.39 recorded and 4.41 measured, and one defec
 at plan time, then a fourth exit-gate attempt. Both fix-shape design questions were **decided at plan
 time** by an architect consult (recorded in 4.42's and 4.43's own files) — neither needs a further
 pre-code consult, and neither needs a new ADR.
-- [~] **4.42** Post-accept path to chat/verify with a message-request sender (fix for 4.41's Defect C —
+- [x] **4.42** Post-accept path to chat/verify with a message-request sender (fix for 4.41's Defect C —
   the phase's blocking defect) — [file](./4.42-post-accept-chat-affordance.md)
 - [x] **4.43** File-backed prekey republish performance, 188 s → seconds (fix for the defect 4.39
   recorded and left open, measured live by 4.41; **land first**) — [file](./4.43-file-backed-republish-performance.md)
 - [ ] **4.44** Load a chat's persisted transcript when the chat screen opens (predicted "Defect D",
   traced in source at plan time — **verify first, then fix**) — [file](./4.44-chat-history-load-on-open.md)
 - [ ] **4.45** T17 acceptance-demo closure, fourth exit-gate attempt (hard join on 4.42, 4.43, 4.44) — [file](./4.45-t17-acceptance-demo-closure-attempt-4.md)
+
+**Findings with no task yet — surfaced by 4.42's own review, owned by no open task:**
+- **Shape B** (an `OpenChat`-style transition from `Screen::Requests` straight to Chat) was evaluated and
+  deliberately severed from 4.42 — the `RequestsAction` enum it needs ripples through ~30 call sites in
+  `screens_requests.rs`. A+C alone were independently re-confirmed (by `reviewer`) to satisfy the
+  acceptance criterion, so this is a flow-quality follow-up, not a defect.
+- **A repair action for `run_accept_request`'s partial-failure window** (`trust.bin` saves, `contacts.json`
+  save then fails ⇒ retry writes no row ⇒ peer durably trusted but permanently unreachable through any
+  on-screen affordance, since ADR 0001 also forbids a hint-less manual re-add). `apps/tui/src/worker.rs`
+  carries the design direction inline (a diagnostics-surfaced action rebuilding only rows missing for an
+  existing `trust.bin` contact, explicitly distinct from the delete-tombstone case) but no task exists yet.
 
 ### Dependency order
 ```
@@ -396,7 +407,19 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   synthesizing a `contacts.json` row on accept is *mandatory*, because `TrustStore::observe` gives the
   sender `hint == ""` and `to_id_string` rejects an empty hint, making the "re-add manually" workaround
   structurally impossible; plus a required in-memory propagation piece neither of 4.41's candidate shapes
-  considered), **[4.43](./4.43-file-backed-republish-performance.md)** (the 188 s republish defect 4.39
+  considered; **landed — Defect C closed**: `worker::run_accept_request` now also upserts and saves the
+  sender's sealed `contacts.json` row (`id: ""`, `hint: ""`, `conv_handle: None`) on the same
+  `accepted || pin_still_owed` retry guard as the pin, with no hint-less `mrd1:` id form invented
+  (ADR 0001 held); `AcceptRequestEffect.outcome` widened to `Option<AddedContact>` and
+  `App::apply_accepted_request` replays `trust.observe` (worker-supplied timestamp), the contacts-row
+  update and an in-memory `chat.accept_request` into the live `Screen::Main`, so the sender is reachable
+  for chat/reply/verify immediately *and* after a restart, and an accepted request no longer re-appears
+  on the next `^R`. Proven at the screen level by a new `apps/tui/tests/accept_to_chat.rs` — real key
+  events through `App` + the real `worker::dispatch` against a real sealed `$MERIDIAN_HOME` — the layer
+  `live_session_e2e.rs` structurally cannot reach and the reason three exit-gate attempts passed while
+  this was broken. Shape B (an `OpenChat` transition from the Requests screen itself) was severed as
+  the task file permits, and is *not* required for the acceptance criterion. This checkbox still stays
+  `[ ]`, since 4.45 is the only task permitted to flip it), **[4.43](./4.43-file-backed-republish-performance.md)** (the 188 s republish defect 4.39
   recorded and 4.41 measured live — settled by 4.40's own consult, since the correct fix *reduces* key
   residency rather than extending it; **landed**: `worker::inbound_handoff` now also builds an
   unwrap-once `MemorySecretStore` for `worker::republish_bundle`, and `run_worker` drops it before

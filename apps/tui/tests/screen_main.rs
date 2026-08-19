@@ -377,6 +377,132 @@ fn ctrl_r_merges_the_live_session_load_snapshot_with_anything_that_arrived_live(
 }
 
 // ---------------------------------------------------------------------------
+// Task 4.42 (piece C): a completed Effect::AcceptRequest is reconciled into the live Screen::Main
+// that sits *below* Screen::Requests on the stack — the in-memory half of the fix for 4.41's
+// Defect C, isolated here against this file's own fabricated `LiveSession` (the end-to-end version,
+// driven by the real worker against real sealed files, lives in `tests/accept_to_chat.rs`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_completed_accept_request_is_replayed_into_the_main_screen_underneath_requests() {
+    let (_own, _bob, mut session) = session_with_bob();
+    let sender_ik = establish_pending_request(&mut session.chat);
+
+    let mut app = App::new();
+    push_main(&mut app, MainState::from_session(session));
+    app.update(AppEvent::Key(ctrl(KeyCode::Char('r'))));
+    assert!(matches!(app.current_screen(), Screen::Requests(_)));
+
+    // The worker's own completion payload for a genuine first-contact accept: an empty id/hint
+    // (`MessageRequest` carries no hint, so `Contact::id_string()` cannot succeed) and a plain TOFU
+    // pin. `Screen::Requests` is on top; `Screen::Main` is underneath, and is what must be updated.
+    let added = meridian_tui::app::AddedContact {
+        pubkey: sender_ik,
+        id: String::new(),
+        hint: String::new(),
+        petname: None,
+        added_at: 1_760_000_000,
+        trust: TrustState::Pinned,
+        user_blocked: false,
+        pinned_key_history: vec![meridian_core::trust::PinnedKey {
+            pubkey: sender_ik,
+            first_seen_unix: 1_760_000_000,
+            last_seen_unix: 1_760_000_000,
+        }],
+    };
+    // Enter `Deciding` for this sender first, so the Requests screen itself reacts realistically.
+    app.update(AppEvent::Key(key(KeyCode::Char('a'))));
+    let effects = app.update(AppEvent::Key(key(KeyCode::Char('y'))));
+    assert_eq!(effects.len(), 1);
+    let request = match effects.into_iter().next().unwrap() {
+        meridian_tui::app::Effect::AcceptRequest(e) => e.request,
+        other => panic!("expected Effect::AcceptRequest, got {other:?}"),
+    };
+    app.update(AppEvent::Worker(Box::new(
+        meridian_tui::app::WorkerEvent::Completed(meridian_tui::app::Effect::AcceptRequest(
+            meridian_tui::app::AcceptRequestEffect {
+                request,
+                outcome: Some(added),
+            },
+        )),
+    )));
+
+    app.update(AppEvent::Key(key(KeyCode::Esc)));
+    match app.current_screen() {
+        Screen::Main(main) => {
+            // 1. the display row (previously only `bob`)
+            assert_eq!(main.contacts.entries.len(), 2);
+            let entry = main
+                .contacts
+                .entries
+                .iter()
+                .find(|e| e.pubkey == sender_ik)
+                .expect("the accepted sender must be reachable from the live contacts list");
+            assert_eq!(entry.trust, TrustState::Pinned);
+            assert_eq!(entry.id, "");
+            // 2. the live TrustStore — without this, `v` -> Verify -> mark_verified would err
+            //    `UnknownContact` against a store that never heard of this sender.
+            assert_eq!(main.trust.trust_state(&sender_ik), TrustState::Pinned);
+            assert_eq!(
+                main.trust
+                    .contact(&sender_ik)
+                    .expect("pinned contact")
+                    .pinned_key_history
+                    .len(),
+                1,
+                "replayed with the worker-supplied timestamp — one entry, not a second stamp"
+            );
+            // 3. the live ChatState's pending queue
+            assert!(
+                main.chat.pending_request(&sender_ik).is_none(),
+                "the accepted request must be gone from Screen::Main's own in-memory queue too"
+            );
+        }
+        other => panic!("expected Screen::Main, got {other:?}"),
+    }
+
+    // ...and therefore does not re-appear on the next Ctrl-R.
+    app.update(AppEvent::Key(ctrl(KeyCode::Char('r'))));
+    match app.current_screen() {
+        Screen::Requests(state) => assert!(state.entries.is_empty()),
+        other => panic!("expected Screen::Requests, got {other:?}"),
+    }
+}
+
+/// The same completion arriving with **no** `Screen::Main` anywhere on the stack (a `Screen::
+/// Requests` pushed standalone, as several tests in this crate do) must be a harmless no-op, not a
+/// panic — mirrors `App::reclaim_trust`'s own "nothing to give it back to" contract.
+#[test]
+fn a_completed_accept_request_with_no_main_screen_on_the_stack_is_a_no_op() {
+    let mut app = App::new();
+    app.push_screen(Screen::Requests(Box::new(
+        meridian_tui::screens::requests::RequestsState::new(Vec::new()),
+    )));
+    let added = meridian_tui::app::AddedContact {
+        pubkey: [0x77u8; 32],
+        id: String::new(),
+        hint: String::new(),
+        petname: None,
+        added_at: 1_760_000_000,
+        trust: TrustState::Pinned,
+        user_blocked: false,
+        pinned_key_history: Vec::new(),
+    };
+    let effects = app.update(AppEvent::Worker(Box::new(
+        meridian_tui::app::WorkerEvent::Completed(meridian_tui::app::Effect::AcceptRequest(
+            meridian_tui::app::AcceptRequestEffect {
+                request: meridian_tui::app::AcceptRequestRequest {
+                    sender_ik: [0x77u8; 32],
+                },
+                outcome: Some(added),
+            },
+        )),
+    )));
+    assert!(effects.is_empty());
+    assert!(matches!(app.current_screen(), Screen::Requests(_)));
+}
+
+// ---------------------------------------------------------------------------
 // Settings palette command (deliverable 3)
 // ---------------------------------------------------------------------------
 

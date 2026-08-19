@@ -24,7 +24,7 @@ use crate::session::LiveSession;
 
 use crate::screens::chat::{self, ChatState};
 use crate::screens::contact_detail::{self, ContactDetailState};
-use crate::screens::contacts::{self, ContactsState};
+use crate::screens::contacts::{self, ContactEntry, ContactsState};
 use crate::screens::diagnostics::DiagnosticsPane;
 use crate::screens::help::{self, HelpState};
 use crate::screens::main::{self, MainAction, MainState};
@@ -648,23 +648,51 @@ pub struct PersistHistoryEffect {
 /// one. `TODO: confirm` whether a later task should extend `MessageRequest`/the wire protocol to
 /// carry a sender-supplied display hint; today none exists to pass through.
 ///
-/// **Does not itself deliver `intro` into a conversation transcript.** Mirrors
-/// `crate::screens::chat`'s own "no receive-path wiring" scope note: there is no
-/// `Effect`/history-append plumbing in this crate yet for an inbound message arriving outside an
-/// active `Screen::Chat` session. A future task that wires `Screen::Requests` → `Screen::Chat`
-/// navigation is also what should decide how the accepted `intro` reaches that peer's transcript.
+/// **Does not itself deliver `intro` into a conversation transcript — task 4.42 looked at this and
+/// deliberately deferred it, rather than leaving the question floating.** The paragraph this
+/// replaces handed the decision to "a future task that wires `Screen::Requests` → `Screen::Chat`
+/// navigation"; task 4.42 is that task, and its answer is *not yet, and not here*:
+/// - The accepted [`meridian_core::chat::MessageRequest`]'s `intro` is real, already-decrypted
+///   content, so delivering it means a **sealed per-peer history append**
+///   ([`Effect::PersistHistory`] → `crate::store::history`), not an in-memory push:
+///   `crate::screens::main`'s `Screen::Chat` construction starts every transcript empty and nothing
+///   re-reads history mid-session, so an in-memory-only append would be silently lost on the next
+///   navigation — worse than not writing it.
+/// - Doing that write here would also duplicate whatever the *live* inbound path
+///   ([`App::handle_inbound`]'s `InboundEvent::Message` arm, whose "no unread indication while no
+///   chat is open" half task 4.42 names as explicitly deferred) settles on, risking two writers of
+///   the same transcript entry with no shared de-duplication key.
+/// - Task [4.44](../../../docs/tasks/phase-4/4.44-chat-history-load-on-open.md) owns loading a
+///   peer's persisted transcript when a chat opens; the honest sequencing is for the *reader* to
+///   exist before a second *writer* is added, and task 4.42's own Scope forbids absorbing it.
+///
+/// So: deferred on purpose, with the reason recorded, not an omission. An accepted sender's intro is
+/// still visible in the request detail pane right up to the moment it is accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptRequestRequest {
     pub sender_ik: [u8; 32],
 }
 
-/// [`Effect::AcceptRequest`]'s payload. No separate outcome data — same contract as
-/// [`SetPetnameEffect`]/[`RegisterRequest`]: the mere fact of `WorkerEvent::Completed` arriving is
-/// the only signal [`crate::screens::requests`] needs.
+/// [`Effect::AcceptRequest`]'s payload.
+///
+/// **`outcome` carries an [`AddedContact`] since task 4.42 (piece C).** It used to be `Option<()>`
+/// — "the mere fact of `WorkerEvent::Completed` arriving is the only signal
+/// [`crate::screens::requests`] needs", which is still true *of that screen*. What it missed is that
+/// nothing re-reads `contacts.json`/`trust.bin` mid-session: `crate::screens::main::MainState` owns
+/// the only live `TrustStore`/`ChatState`/contacts list, built once at session load. So the
+/// `contacts.json` row and TOFU pin `worker::run_accept_request` now writes would not become visible
+/// until the *next* restart unless the same mutation is replayed in memory — which is what
+/// [`App::apply_accepted_request`] does with exactly the fields this outcome carries (including
+/// `added_at`, the **worker-supplied** timestamp, so `App::update` never has to read a clock).
+///
+/// `Some(..)` on a genuine accept (or on a partial-failure retry that completed the still-owed
+/// pin); `None` both on `WorkerEvent::Failed` and on a `Completed` no-op — a phantom sender with no
+/// session, or a fully-completed retry — where there is genuinely no decision to replay. See
+/// `worker::run_accept_request`'s own doc comment for that guard's full derivation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptRequestEffect {
     pub request: AcceptRequestRequest,
-    pub outcome: Option<()>,
+    pub outcome: Option<AddedContact>,
 }
 
 /// Inputs for [`Effect::RejectRequest`] (task 4.21, `crate::screens::requests`):
@@ -1854,6 +1882,28 @@ impl App {
             // task's own Status write-up, for a follow-up to resolve deliberately rather than by
             // omission.
             WorkerEvent::Failed(Effect::LoadSession(_), _) => return Vec::new(),
+            // Task 4.42 (piece C): a completed `Effect::AcceptRequest` is reconciled into whichever
+            // `Screen::Main` is on the stack *before* the per-screen dispatch below hands the same
+            // event to `Screen::Requests` (which owns only its own queue) — matched on the event
+            // first, regardless of what is on top, for the same reason `Effect::LoadSession` above
+            // is: no single screen owns this consequence. The event is then handed on unchanged, so
+            // `requests::handle_worker`'s own `Deciding` → `List` transition is untouched.
+            WorkerEvent::Completed(Effect::AcceptRequest(effect)) => {
+                if let Some(added) = effect.outcome.clone() {
+                    self.apply_accepted_request(added);
+                }
+                WorkerEvent::Completed(Effect::AcceptRequest(effect))
+            }
+            // Task 4.42 review fix (Finding 3): mirrors the `AcceptRequest` arm immediately above —
+            // matched on the event first, regardless of what is on top, for the same reason. Only on
+            // a genuine success (`outcome: Some(())`); a `Failed`/retry-exhausted reject leaves
+            // nothing to replay.
+            WorkerEvent::Completed(Effect::RejectRequest(effect)) => {
+                if effect.outcome.is_some() {
+                    self.apply_rejected_request(effect.request.sender_ik);
+                }
+                WorkerEvent::Completed(Effect::RejectRequest(effect))
+            }
             other => other,
         };
         match self.screens.last_mut() {
@@ -2030,6 +2080,107 @@ impl App {
                     let refreshed = main::refresh_entry(contact, &main.contacts.entries);
                     contacts::apply_update(&mut main.contacts, refreshed, false);
                 }
+                return;
+            }
+        }
+    }
+
+    /// Replays a completed [`Effect::AcceptRequest`]'s persisted mutations into whichever
+    /// [`Screen::Main`] is on the stack (task 4.42, piece C) — the in-memory half of the fix for
+    /// task 4.41's Defect C.
+    ///
+    /// `worker::run_accept_request` has, by the time this runs, already TOFU-pinned the sender in
+    /// the real `trust.bin` and written its `contacts.json` display row. But `MainState` owns the
+    /// only live `TrustStore`/`ChatState`/contacts list this process has, built once by
+    /// [`MainState::from_session`] at session load, and **nothing re-reads either file
+    /// mid-session** — so without this, the accepted sender would only appear after a restart,
+    /// reproducing the very symptom Defect C describes one restart later. All three steps replay
+    /// state that is *already durable*; none of them decides anything:
+    /// 1. `trust.observe(pubkey, "", added.added_at)` — the same call, with the same empty hint and
+    ///    the **worker-supplied** timestamp (never `SystemTime::now()`: `App::update` and
+    ///    `crate::screens` stay clock-free, mirroring `TrustStore::observe`'s own "time is
+    ///    injected, not read" discipline). Without this, `v` → `Screen::Verify` → `mark_verified`
+    ///    would fail `TrustError::UnknownContact` against a store that has never heard of the
+    ///    sender. It produces exactly a TOFU pin — never `Verified`, never any softer gate; the
+    ///    row's rendered trust state is read straight off this `TrustStore` afterwards.
+    /// 2. [`contacts::apply_update`] with [`ContactEntry::from_added`] — pushes the display row when
+    ///    absent (the accepted-sender case) and replaces it in place when present, so
+    ///    `Screen::Main`'s embedded contacts list matches the `contacts.json` the worker just wrote.
+    /// 3. `chat.accept_request(&pubkey)` — **in-memory only**, and never saved back from here (the
+    ///    worker already resealed `sessions.bin`; this copy is never written to disk by `App`, so
+    ///    there is no clobber risk). Without it, a request that was restored from `sessions.bin` at
+    ///    session load stays in `MainState::chat`'s `pending_requests()` forever and re-appears on
+    ///    the next `r`/`Ctrl-R`, because [`App::requests_snapshot`] rebuilds that list from this
+    ///    exact in-memory copy.
+    ///
+    /// Uses the same stack walk as [`App::reclaim_trust`] to find `Screen::Main` (anywhere on the
+    /// stack, not just on top — the accept always completes while `Screen::Requests` sits above it),
+    /// and is likewise a no-op when there is no `Screen::Main` at all (a `Screen::Requests` pushed
+    /// standalone in a test, with no backing session to reconcile into).
+    ///
+    /// **`Ctrl-R` is a global binding, reachable with a `Screen::Chat`/`Screen::Verify` already open
+    /// on top of `Screen::Main`** (open Chat with A, `Ctrl-R` pushes `Screen::Requests` on top of
+    /// that, accept a request from B): `MainState::trust` is `std::mem::take`n by whichever of those
+    /// two screens is open (see `crate::screens::main`'s "moved, not borrowed" doc), leaving a
+    /// placeholder `TrustStore::default()` behind on the `Main` frame itself — an `observe` call
+    /// against *that* placeholder would be silently discarded when [`App::reclaim_trust`] later
+    /// overwrites `main.trust` wholesale with the popped screen's own (unrelated) store. So the
+    /// `trust.observe` step below is routed to wherever the live store for this `Screen::Main`
+    /// actually is: the first `Screen::Chat`/`Screen::Verify` frame **above** it on the stack, if one
+    /// exists (there is at most one at a time — the whole point of "moved, not cloned"), else
+    /// `Screen::Main` itself. `main.chat`/`main.contacts` are never moved by that same `mem::take`
+    /// (only `trust` is — see `crate::screens::main`'s "moved" doc again), so those two steps always
+    /// land on the `Screen::Main` frame directly, regardless of what else is stacked above it.
+    fn apply_accepted_request(&mut self, added: AddedContact) {
+        let Some(main_idx) = self
+            .screens
+            .iter()
+            .position(|s| matches!(s, Screen::Main(_)))
+        else {
+            return;
+        };
+        let live_trust_idx = self.screens[main_idx + 1..]
+            .iter()
+            .position(|s| matches!(s, Screen::Chat(_) | Screen::Verify(_)))
+            .map(|offset| main_idx + 1 + offset);
+        match live_trust_idx {
+            Some(idx) => match &mut self.screens[idx] {
+                Screen::Chat(chat) => {
+                    chat.trust.observe(added.pubkey, "", added.added_at);
+                }
+                Screen::Verify(verify) => {
+                    verify.trust.observe(added.pubkey, "", added.added_at);
+                }
+                _ => unreachable!("live_trust_idx only ever points at Chat|Verify"),
+            },
+            None => {
+                let Some(Screen::Main(main)) = self.screens.get_mut(main_idx) else {
+                    return;
+                };
+                main.trust.observe(added.pubkey, "", added.added_at);
+            }
+        }
+        let Some(Screen::Main(main)) = self.screens.get_mut(main_idx) else {
+            return;
+        };
+        main.chat.accept_request(&added.pubkey);
+        contacts::apply_update(&mut main.contacts, ContactEntry::from_added(added), false);
+    }
+
+    /// Mirrors [`App::apply_accepted_request`]'s `main.chat.accept_request` step for a completed
+    /// [`Effect::RejectRequest`] (task 4.42 review fix, Finding 3): replays
+    /// `meridian_core::chat::ChatState::reject_request` into `MainState::chat` so a rejected request,
+    /// same as an accepted one, does not reappear on a later `Ctrl-R`/`r` in the same session (see
+    /// `crate::screens::main`'s own doc, "A rejected one still does" — this closes that gap).
+    ///
+    /// **Unlike `trust`, `MainState::chat` is never `std::mem::take`n by `Screen::Chat`/
+    /// `Screen::Verify`** (only `trust` is — see those screens' own module docs), so this never needs
+    /// the `live_trust_idx` routing `apply_accepted_request` does: a plain walk to the one
+    /// `Screen::Main` on the stack is always correct, exactly like [`App::reclaim_trust`]'s own walk.
+    fn apply_rejected_request(&mut self, sender_ik: [u8; 32]) {
+        for screen in &mut self.screens {
+            if let Screen::Main(main) = screen {
+                main.chat.reject_request(&sender_ik);
                 return;
             }
         }

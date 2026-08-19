@@ -792,6 +792,14 @@ fn to_pinned_key_records(history: &[PinnedKey]) -> Vec<PinnedKeyRecord> {
 /// policy override or unread count on a mere re-observe would be a worse regression than leaving
 /// them be. `TODO: confirm`: no doc this task read pins down re-add semantics for these four fields
 /// specifically; this is a considered, conservative default, not a documented one.
+///
+/// **Task 4.42 added a second caller, [`run_accept_request`], and that `TODO: confirm` now covers it
+/// too — with its meaning unchanged.** The accept path reaches the "already has a row" branch only
+/// when the sender was already a known contact (possible: `ChatState::open_inbound` gates on "no
+/// established session", not on "unknown key"), and it wants exactly the same conservative
+/// treatment: refresh what `TrustStore` owns, leave `added_at`/`policy_override`/`conv_handle`/
+/// `unread` alone. Nothing about the note is weakened or re-scoped by that second caller; it is
+/// still an undocumented-by-design default awaiting a real answer.
 fn upsert_contact_record(doc: &mut ContactsDocument, id: &str, contact: &Contact, now: u64) {
     let pubkey_hex = hex::encode(contact.pubkey);
     if let Some(existing) = doc.contacts.iter_mut().find(|c| c.pubkey == pubkey_hex) {
@@ -1092,11 +1100,15 @@ fn run_delete_contact(
 // `TrustError::NotAcknowledgeable`) rather than treating a refusal as success, and
 // `run_accept_request`/`run_reject_request` replay `ChatState::accept_request`/`reject_request`
 // exactly as `apps/cli/src/chat.rs::answer_request` does — same calls, same order, just reloaded
-// fresh from disk and resealed rather than applied to an already-open in-memory value. Only
-// `trust.bin`/`sessions.bin` are touched here — never `contacts.json` (this task's own scope note;
-// `crate::screens::requests`'s and `crate::screens::verify`'s own module docs name no
-// `contacts.json` interaction for any of these four effects, unlike `handle_add_contact`/
-// `handle_set_petname` above).
+// fresh from disk and resealed rather than applied to an already-open in-memory value.
+//
+// **Task 4.42 amends the scope note that used to end this paragraph** ("Only `trust.bin`/
+// `sessions.bin` are touched here — never `contacts.json`"). That is still true of
+// `run_reject_request`/`run_mark_verified`/`run_acknowledge_key_change`, but no longer of
+// [`run_accept_request`], which now also writes the accepted sender's `contacts.json` display row —
+// see that function's own doc comment for why it *has* to be the one that does (task 4.41's Defect
+// C: `Contact::id_string()` fails for an accept-observed sender, so no other code path in this crate
+// can ever create that row).
 // ---------------------------------------------------------------------------
 
 // --- AcceptRequest -------------------------------------------------------------------------------
@@ -1107,9 +1119,9 @@ async fn handle_accept_request(
 ) -> WorkerEvent {
     let AcceptRequestEffect { request, .. } = effect;
     match run_accept_request(&request, session).await {
-        Ok(()) => WorkerEvent::Completed(Effect::AcceptRequest(AcceptRequestEffect {
+        Ok(outcome) => WorkerEvent::Completed(Effect::AcceptRequest(AcceptRequestEffect {
             request,
-            outcome: Some(()),
+            outcome,
         })),
         Err(message) => WorkerEvent::Failed(
             Effect::AcceptRequest(AcceptRequestEffect {
@@ -1163,10 +1175,72 @@ async fn handle_accept_request(
 /// same as [`run_reject_request`]/[`run_send_message`] — see that function's own doc comment for why
 /// (`sessions.bin` is a single serialized document covering every peer's session, and the persistent
 /// inbound receive loop touches the same file concurrently on its own tokio task).
+///
+/// **Task 4.42 (Shape A — the fix for task 4.41's Defect C):** on the same `accepted ||
+/// pin_still_owed` branch, this now *also* upserts and saves the sender's `contacts.json` display
+/// row, through [`crate::store::contacts::save`] (sealed via `at_rest::seal`, per ADR 0021) —
+/// exactly the pair of writes [`run_add_contact`] already performs for the initiator side, in the
+/// same order (`trust.bin` first, the display cache second: the crypto-relevant source of truth is
+/// never allowed to lag behind the display row that asserts it). Accept is the responder-side twin
+/// of add, and this is the **only** code path that can ever create that row: `TrustStore::observe`
+/// here passes an empty hint (see above), so the resulting `Contact::id_string()` fails
+/// (`validate_hint` rejects an empty hint) and the "re-add the sender by hand via the contacts
+/// screen" workaround is structurally impossible, not merely un-implemented — see task 4.42's own
+/// file. Without the row, `crate::screens::main::build_contact_entries`' `contacts.json`-driven join
+/// leaves an accepted sender invisible in the live UI forever.
+///
+/// The synthesized row therefore carries `id: ""` and `hint: ""` for a genuinely first-contact
+/// sender. **No hint-less `mrd1:` id form is invented** for it (that would touch the wire-critical,
+/// conformance-vectored `meridian-identity` crate and contradict [ADR 0001]'s self-certifying-key +
+/// routing-hint identity); `crate::screens::contacts::ContactEntry::display_label`'s existing
+/// petname → hint → `short_pubkey` fallback renders the row as the same fingerprint the Requests
+/// pane showed. `conv_handle` stays `None` until a conversation is first opened
+/// ([`ContactRecord::conv_handle_or_mint`](crate::store::contacts::ContactRecord::conv_handle_or_mint)),
+/// and no schema change is involved. The `id` passed to [`upsert_contact_record`] is
+/// `contact.id_string().unwrap_or_default()`, not a hard-coded `""`: for the (rare, but reachable)
+/// case of a sender who is *already* a known contact with a real hint — `ChatState::open_inbound`
+/// gates on "no established session", not on "unknown key", so an added-but-never-messaged contact's
+/// first inbound message is still a message request — that reads back the contact's real canonical
+/// id rather than blanking the existing row's. [`upsert_contact_record`]'s own `TODO: confirm` about
+/// re-add semantics for `added_at`/`policy_override`/`conv_handle`/`unread` applies verbatim to that
+/// accept-side re-observe too: those four purely-local fields are left untouched on an existing row,
+/// for exactly the reasons stated there, and this task did not find a design doc resolving them
+/// either.
+///
+/// **Retry idempotency, unchanged in shape:** the row write sits behind the *same* `accepted ||
+/// pin_still_owed` guard as the pin, so a same-effect retry can never create a display row for a
+/// sender with no session (the phantom-sender case the guard's own derivation above covers), and a
+/// fully-completed retry still takes no action at all. One residual, narrower-than-the-pin window
+/// remains: if `save_trust` succeeds and `contacts::save` then fails, this returns `Err`, and the
+/// retry finds `accepted == false` and `pin_still_owed == false` (the pin *is* complete) and so
+/// writes no row. Widening the guard with a third "the row is missing" disjunct is deliberately
+/// **not** done — it would resurrect a display row the user had since locally deleted
+/// (`crate::app::DeleteContactRequest`'s "deleting removes only the local row, the `TrustStore`
+/// record survives" invariant), which is exactly the direction-of-the-join property task 4.42's own
+/// file protects. `TODO: confirm`: no design doc read for this task resolves how a display row lost
+/// to that specific partial failure should be recovered. Recommended direction for a dedicated
+/// follow-up task (out of this task's own scope — new diagnostics/UI surface, not a `run_worker`
+/// change alone): a diagnostics-surfaced repair action that rebuilds *only* the display rows missing
+/// from `contacts.json` for a `trust.bin` contact — driven from `chat.has_session`/`trust.contact`
+/// the same way this guard is, so it stays explicitly distinct from, and can never resurrect, the
+/// legitimate delete-tombstone case (`crate::app::DeleteContactRequest`'s row-deleted-but-`TrustStore`
+/// -record-survives case above) — never a blanket "resync contacts.json from trust.bin" that would
+/// conflate the two. Left unimplemented here; flagged for that follow-up rather than absorbed
+/// silently or rushed into this task's own diff.
+///
+/// Returns the [`AddedContact`] the accept produced, so `crate::app::App` can replay the same
+/// mutation into the live, already-open `Screen::Main` (task 4.42, piece C) instead of only fixing
+/// the next restart — built from the real post-`observe` [`Contact`] read back via
+/// `TrustStore::contact`, never an assumed fresh-TOFU shape, exactly as [`run_add_contact`] does
+/// (the task 4.19 Finding 1 rule). `Ok(None)` is the honest "this dispatch decided nothing" answer
+/// for the no-op/fully-completed-retry cases: the effect still *completes* (nothing failed), it just
+/// carries no contact for `App` to apply.
+///
+/// [ADR 0001]: ../../../docs/adr/0001-identity-scheme.md
 async fn run_accept_request(
     request: &AcceptRequestRequest,
     session: &OnboardingSession,
-) -> Result<(), String> {
+) -> Result<Option<AddedContact>, String> {
     let account_store = open_account_store(session)?;
     let (store, handle) = account_store.parts();
     let _chat_guard = chat_state_lock().lock().await;
@@ -1178,11 +1252,34 @@ async fn run_accept_request(
 
     let mut trust = load_trust(store, handle)?;
     let pin_still_owed = has_session && trust.contact(&request.sender_ik).is_none();
-    if accepted || pin_still_owed {
-        trust.observe(request.sender_ik, "", now_unix());
-        save_trust(&trust, store, handle)?;
+    if !(accepted || pin_still_owed) {
+        return Ok(None);
     }
-    Ok(())
+
+    let now = now_unix();
+    trust.observe(request.sender_ik, "", now);
+    let contact = trust
+        .contact(&request.sender_ik)
+        .cloned()
+        .expect("just observed above — always present");
+    save_trust(&trust, store, handle)?;
+
+    let id = contact.id_string().unwrap_or_default();
+    let mut doc =
+        crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
+    upsert_contact_record(&mut doc, &id, &contact, now);
+    crate::store::contacts::save(&doc, store, handle).map_err(|e| e.to_string())?;
+
+    Ok(Some(AddedContact {
+        pubkey: request.sender_ik,
+        id,
+        hint: contact.hint,
+        petname: contact.petname,
+        added_at: now,
+        trust: contact.state,
+        user_blocked: contact.user_blocked,
+        pinned_key_history: contact.pinned_key_history,
+    }))
 }
 
 // --- RejectRequest -------------------------------------------------------------------------------

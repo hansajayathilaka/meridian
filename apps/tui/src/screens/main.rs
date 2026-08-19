@@ -53,11 +53,13 @@
 //!   during the session are task 4.35's `AppEvent::Inbound`/`App::pending_inbound_requests`
 //!   mechanism (already built), which `crate::app::App::requests_snapshot` layers on top of this
 //!   screen's own static snapshot. Accepting/rejecting a request from an opened `Screen::Requests`
-//!   removes it from that screen's own in-memory list (task 4.21, unchanged) but does **not**
-//!   reach back into `MainState::chat` — so a second `Ctrl-R`/`r` later in the same run could show
-//!   an already-decided entry again alongside anything genuinely new. This is the task's own scope
-//!   text, applied literally ("this task only needs to reflect `pending_requests()` as of session
-//!   load"), not an oversight.
+//!   removes it from that screen's own in-memory list (task 4.21, unchanged); **since task 4.42 both
+//!   accept and reject also reach back into `MainState::chat`** (`crate::app::App::
+//!   apply_accepted_request`/`App::apply_rejected_request` replay `ChatState::accept_request`/
+//!   `reject_request` in memory, matching the `sessions.bin` the worker already resealed), so neither
+//!   an accepted nor a rejected request re-appears on a later `Ctrl-R`/`r` (task 4.42's own review
+//!   pass closed the reject half, which its first pass had left open — see `App::
+//!   apply_rejected_request`'s own doc comment).
 //! - **`Screen::Chat` opened from here always starts with an empty transcript.**
 //!   [`crate::session::LiveSession`] (task 4.29) deliberately carries no per-peer history — history
 //!   lives in `crate::store::history`'s sealed, per-peer `.jsonl` files, and reading one is I/O this
@@ -114,12 +116,25 @@ fn parse_pubkey_hex(s: &str) -> Option<[u8; 32]> {
 /// from the list" property actually hold here: a deleted contact's `contacts.json` row is gone, so
 /// it stays absent from this join even though its `TrustStore` record still exists.
 ///
-/// **Known gap, not this task's to close.** A `TrustStore` contact with no matching `contacts.json`
-/// row at all — reachable today only via `Effect::AcceptRequest`'s own `TrustStore::observe` call,
-/// which (per that effect's own doc comment) never touches `contacts.json` — is invisible to this
-/// join entirely, not merely missing its display-only fields. `TODO: confirm`: no design doc this
-/// task read resolves whether an accepted message-request sender should get a synthesized
-/// `contacts.json` row; left as a pre-existing, orthogonal gap this task did not introduce.
+/// **That gap is closed, and the standing `TODO: confirm` with it (task 4.42).** This doc used to
+/// note that a `TrustStore` contact with no matching `contacts.json` row — reachable only via
+/// `Effect::AcceptRequest`'s own `TrustStore::observe` call, which never touched `contacts.json` —
+/// was invisible to this join entirely, and that no design doc resolved whether an accepted
+/// message-request sender should get a synthesized row. Task 4.41's exit gate then found that exact
+/// hole as its blocking Defect C, and task 4.42 resolved it: **yes, it gets one, and
+/// `Effect::AcceptRequest` is the only path that can ever create it.** A `MessageRequest` carries no
+/// hint, so an accept-observed `Contact` has `hint == ""`, so `Contact::id_string()` fails
+/// (`validate_hint` rejects an empty hint) — which makes the "show the sender's full `mrd1:` id so
+/// the user re-adds them by hand" alternative structurally impossible rather than merely
+/// un-implemented, and inventing a hint-less id form would contradict
+/// [ADR 0001](../../../../docs/adr/0001-identity-scheme.md). So `worker::run_accept_request` now
+/// upserts the row itself (`id: ""`, `hint: ""`, `conv_handle: None`), exactly as `run_add_contact`
+/// does for the initiator side — see that function's own doc comment, and
+/// `crate::app::App::apply_accepted_request` for the matching in-memory replay that makes it visible
+/// without waiting for a restart. **The direction of the join is unchanged**, so the
+/// "locally-deleted contact stays deleted" property above still holds: accept adds a *writer* behind
+/// an affirmative user act, it does not let a stale `TrustStore` record resurrect a row on its own.
+/// The `None` fallback below therefore stays as pure defense against an inconsistent store.
 pub fn build_contact_entries(trust: &TrustStore, contacts: &ContactsDocument) -> Vec<ContactEntry> {
     contacts
         .contacts
