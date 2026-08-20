@@ -16,36 +16,38 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 4 (T08 + T17) is 45/48 tasks done, still NOT closed** — the fourth exit-gate
-  attempt (4.45) found a fourth genuine defect, and `/plan-phase` has now scoped the fourth gap-closure
-  wave to close it. T08's track (4.3→4.10) is fully done and its acceptance demo genuinely passes; that
-  part of the phase is not in question. T17's track has been through four exit-gate attempts (4.28,
-  4.38, 4.41, 4.45), each closing the ground the previous one reached and finding new ground broken one
-  step further into the demo script — full lineage in [Phase 4's README](./phase-4/README.md#exit-criteria).
-  **4.45's finding** (the one this wave fixes): `Effect::AddContact` has no reconciliation arm in
-  `App::handle_worker`, unlike `AcceptRequest`/`RejectRequest`/`LoadHistory`/`LoadSession`, so a contact
-  added via the plain `n`-add flow never syncs into the live in-memory `TrustStore` — its own initiator
-  gets `TrustError::UnknownContact` trying to mark it verified in the same session (a restart fixes it;
-  `trust.bin` is written correctly — pure live-session staleness). Real but calibrated security
-  consequence: `TrustStore::can_send`'s fail-open for unknown contacts also blinds the key-change/MITM
-  warn gate to that peer for the rest of the session — not yet actively exploitable today, since
-  receive-side key-change detection isn't wired into the TUI's live inbound loop for *any* contact yet
-  (a separate, already-tracked task-4.35 gap). Pre-existing since task 4.19, independently confirmed
-  three separate ways by two separate live-run agents plus a phase-wide reviewer pass. Full writeup:
-  [4.45's own Status section](./phase-4/4.45-t17-acceptance-demo-closure-attempt-4.md).
-- **NEXT:** `/next-task` for **4.46 → 4.47 → 4.48**. `/plan-phase` has scoped the fourth gap-closure
-  wave: **[4.46](./phase-4/4.46-add-contact-trust-reconciliation.md)** (the `Effect::AddContact` fix,
-  mirroring `App::apply_accepted_request`'s precedent from 4.42 — plus a second, closely related
-  interleaving gap traced during planning: `Ctrl+R` can race the add-contact sub-flow and leave both the
-  form stuck and the live Contacts list stale), **[4.47](./phase-4/4.47-export-json-doc-fix.md)** (a
-  doc-only fix for 4.45's `--export-json` secondary finding — pre-existing since task 4.15, unrelated
-  root cause, split into its own task), and **[4.48](./phase-4/4.48-t17-acceptance-demo-closure-attempt-5.md)**
-  (the fifth exit-gate attempt, hard-joined on both, the only task permitted to flip the phase's
-  exit-criteria checkbox). 4.46 and 4.47 touch disjoint files and may land in either order. **Neither
-  4.46 nor 4.47 needs a pre-code consult or a new ADR** — both are mechanical fixes with one obvious,
-  already-precedented shape, recorded as a binding call in each task file's own text. Only once 4.48
-  confirms a genuine pass does `/start-review-phase` for Phase 5 become the correct next command — not
-  before.
+- **NOW:** **Phase 4 (T08 + T17) is 48/48 tasks attempted, still NOT closed** — the fifth exit-gate
+  attempt (4.48) found a fifth genuine defect. T08's track (4.3→4.10) is fully done and its acceptance
+  demo genuinely passes; not in question. T17's track has been through five exit-gate attempts (4.28,
+  4.38, 4.41, 4.45, 4.48), each closing the ground the previous one reached and finding new ground
+  broken one step further into the demo script — full lineage in
+  [Phase 4's README](./phase-4/README.md#exit-criteria). **4.48 is the first attempt where the two
+  required independent live runs disagreed** — the implementer's run reported PASS (the demo genuinely
+  completed end to end for the first time, including 4.46's own fix), but the second, genuinely
+  independent run found a real defect the first missed, then a third, source-level confirmation pass
+  independently verified it from code rather than trusting either transcript. **4.48's finding:**
+  `worker::run_accept_request` writes `sessions.bin`/`trust.bin`/`contacts.json` but never persists the
+  accepted sender's intro message into the responder's `history.jsonl`, even though the intro
+  (`MessageRequest.intro`) is fully in hand at the point it's discarded — so the very first message of
+  every accepted conversation is silently, permanently absent from the responder's own transcript, both
+  live and after restart, confirmed by direct decrypted on-disk proof for both account types. Narrow in
+  scope: every other message, before and after, persists correctly. **Already flagged and deliberately
+  deferred once**, by 4.42's own Status section ("reader-before-second-writer... 4.44 owns the reader
+  half") — 4.44 built only the reader, no task ever built the writer, and the gap fell out of the
+  tracker between being named and now. Full writeup:
+  [4.48's own Status section](./phase-4/4.48-t17-acceptance-demo-closure-attempt-5.md). Per 4.48's own
+  scope (verification only — report, never patch around it), **not fixed** — needs a new task, working
+  number **4.49**, whose shape is already sketched in 4.48's Status section (persist
+  `MessageRequest.intro` via `history::append`, reusing the same `mid` so 4.44's existing dedup picks it
+  up cleanly). A second, non-blocking finding also recorded: the T17 feature spec's demo script still
+  says `^N`/`^V` where the real bindings are plain `n`/`v` (half of this was flagged back in 4.42 and
+  never fixed) — tracked in [phase-4/README.md](./phase-4/README.md#tasks-todo)'s "Findings with no
+  task yet."
+- **NEXT:** `/plan-phase` needs to run again against 4.48's finding to scope task **4.49** (a fifth
+  gap-closure wave) — mirroring exactly how 4.45's finding became 4.46. Only once a sixth exit-gate
+  attempt confirms a genuine pass does `/start-review-phase` for Phase 5 become the correct next command
+  — not before.
+
 
 **Why this keeps extending Phase 4 rather than opening a new phase or a review phase**: the task-tracking
 skill's own phase-lifecycle rule is that a build phase isn't done until its acceptance demo runs, so
@@ -312,7 +314,7 @@ pre-announced.
 - [x] **4.45** T17 acceptance-demo closure, fourth exit-gate attempt (hard join on 4.42, 4.43, 4.44) — [file](./phase-4/4.45-t17-acceptance-demo-closure-attempt-4.md)
 - [x] **4.46** Reconcile `Effect::AddContact` into the live `MainState::trust` (fix for 4.45's fourth defect) — [file](./phase-4/4.46-add-contact-trust-reconciliation.md)
 - [x] **4.47** Fix `--export-json` demo-script/spec wording (doc-only) — [file](./phase-4/4.47-export-json-doc-fix.md)
-- [~] **4.48** T17 acceptance-demo closure, fifth exit-gate attempt — [file](./phase-4/4.48-t17-acceptance-demo-closure-attempt-5.md)
+- [x] **4.48** T17 acceptance-demo closure, fifth exit-gate attempt — [file](./phase-4/4.48-t17-acceptance-demo-closure-attempt-5.md)
 
 ---
 

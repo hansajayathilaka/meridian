@@ -3,20 +3,17 @@
 
 # Phase 4 — Verification & Trust + Terminal TUI Client
 
-**Kind:** build · **Status:** in progress — 45/48 tasks done (4.1–4.45); the fourth exit-gate attempt
-(4.45) found a fourth genuine defect and `/plan-phase` has now scoped the fourth gap-closure wave to
-close it: **4.46** (`Effect::AddContact` never reconciles into the live `MainState::trust`, plus a
-second, closely related interleaving gap traced during this planning pass), **4.47** (a doc-only
-`--export-json` demo-script fix, split out since it's unrelated in root cause), and **4.48** (the fifth
-exit-gate attempt, hard-joined on both). Neither 4.46 nor 4.47 needs a pre-code consult or a new ADR
-(recorded in each task file's own text) — both are mechanical fixes with one obvious,
-already-precedented shape. Per the task-tracking skill's own §7 ("a build phase isn't done until its
-acceptance demo runs"), the phase is **still not closed**: task 4.28 found T17's acceptance demo did not
-run end to end; 4.29–4.37 closed that specific gap, but 4.38 — the second exit-gate attempt — found the
-demo *still* doesn't pass, for two reasons. Fix tasks 4.39/4.40 closed both of those, genuinely,
-confirmed live — but 4.41, the third exit-gate attempt, found a third defect (Defect C). The third
-gap-closure wave, 4.42–4.45, fixed Defect C, the 188 s republish defect, and the predicted history-load
-gap — but 4.45, the fourth exit-gate attempt, found the fourth defect above (see
+**Kind:** build · **Status:** in progress — 48/48 tasks done (4.1–4.48); the fifth exit-gate attempt
+(4.48) found a fifth genuine defect, independently confirmed after the two required live runs
+disagreed (implementer PASS, second independent run FAIL). `/plan-phase` needs to run again to scope a
+fifth gap-closure wave: task **4.49** (persist the accepted sender's intro into the responder's
+`history.jsonl` — `worker::run_accept_request` currently discards it even though it's fully in hand).
+Per the task-tracking skill's own §7 ("a build phase isn't done until its acceptance demo runs"), the
+phase is **still not closed**: task 4.28 found T17's acceptance demo did not run end to end; 4.29–4.37
+closed that gap, but 4.38 found the demo *still* doesn't pass, for two reasons; 4.39/4.40 closed both,
+confirmed live — but 4.41 found a third defect (Defect C), closed by the third gap-closure wave
+(4.42–4.44), whose own re-verification (4.45) found a fourth defect, closed by the fourth gap-closure
+wave (4.46–4.47), whose own re-verification (4.48) found the fifth defect above (see
 [exit criteria](#exit-criteria) for the full writeup) · **Reviews phase(s):** n/a (build phase; Phase 5
 will review it, once it's actually closeable)
 
@@ -270,7 +267,7 @@ consult or a new ADR — unlike the third wave's 4.40/4.42, neither has a genuin
   defect — the initiator-verify-in-session gap) — [file](./4.46-add-contact-trust-reconciliation.md)
 - [x] **4.47** Fix `--export-json` demo-script/spec wording (directory layout, not a flat file;
   doc-only, pre-existing since task 4.15) — [file](./4.47-export-json-doc-fix.md)
-- [~] **4.48** T17 acceptance-demo closure, fifth exit-gate attempt (hard join on 4.46, 4.47) —
+- [x] **4.48** T17 acceptance-demo closure, fifth exit-gate attempt (hard join on 4.46, 4.47) —
   [file](./4.48-t17-acceptance-demo-closure-attempt-5.md)
 
 **Findings with no task yet — surfaced by 4.42's own review, owned by no open task:**
@@ -283,6 +280,21 @@ consult or a new ADR — unlike the third wave's 4.40/4.42, neither has a genuin
   on-screen affordance, since ADR 0001 also forbids a hint-less manual re-add). `apps/tui/src/worker.rs`
   carries the design direction inline (a diagnostics-surfaced action rebuilding only rows missing for an
   existing `trust.bin` contact, explicitly distinct from the delete-tombstone case) but no task exists yet.
+
+**Findings with no task yet — surfaced by 4.48's fifth exit-gate attempt, owned by no open task:**
+- **A stale keybinding notation in the T17 feature spec's demo script.**
+  `docs/architecture/features/17-terminal-tui-client.md`'s "Working output" section writes `^N`/`^V`, but
+  the real, correctly-implemented bindings are plain `n`/`v` (`docs/architecture/tui-client.md`'s own
+  reference table gets this right). Half of this (`^V`) was already flagged in
+  [4.42's own Risks/notes](./4.42-post-accept-chat-affordance.md) ("route through `/doc-sync`, do not
+  change the keybinding to match the spec prose") but never actually fixed; the `^N` half was never named
+  before 4.48's review round. Non-blocking — every live run across five exit-gate attempts has typed the
+  correct literal key and succeeded — but genuinely missed by every prior sweep including 4.47's own
+  demo-script fix pass over the same file. A tiny doc-only fix, mirroring 4.47's shape.
+- **The intro-message-persistence gap itself is not listed here** — it is significant enough (a real
+  functional defect, not a doc nit) to be pre-named as its own task, **4.49**, rather than parked in this
+  list. See the [exit criteria](#exit-criteria) writeup and [4.48's own Status section](./4.48-t17-acceptance-demo-closure-attempt-5.md)
+  for the full trace.
 
 ### Dependency order
 ```
@@ -509,10 +521,32 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   flip it), **[4.47](./4.47-export-json-doc-fix.md)** (the doc-only `--export-json` demo-script fix,
   split out as its own task since it is unrelated in root cause), and
   **[4.48](./4.48-t17-acceptance-demo-closure-attempt-5.md)** (the fifth exit-gate attempt, hard-joined
-  on both). This box stays `[ ]` until 4.48 confirms a genuine pass.
+  on both) — **run, verdict FAIL, a fifth new defect found and independently confirmed twice over**: of
+  the two required independent live runs, the first (implementer's) reported PASS, but the second,
+  genuinely independent run found the intro-message-persistence defect below — the disagreement itself
+  is exactly what the two-run discipline exists to catch, and a third, source-level confirmation pass
+  verified the finding rather than trusting either transcript. `worker::run_accept_request` writes
+  `sessions.bin`/`trust.bin`/`contacts.json` but never persists the accepted sender's intro message into
+  the responder's `history.jsonl`, even though the intro is fully in hand at the point it's discarded —
+  so the very first message of every accepted conversation is silently, permanently absent from the
+  responder's own transcript, both live and after restart, confirmed by direct decrypted on-disk proof
+  for both account types. Narrow in scope (every other message, before and after, persists correctly).
+  **Already flagged and deliberately deferred once** by [4.42's own Status section](./4.42-post-accept-chat-affordance.md#status)
+  ("reader-before-second-writer... [4.44] owns the reader half") — [4.44](./4.44-chat-history-load-on-open.md)
+  built only the reader, no task ever built the writer, and the gap fell out of the tracker between being
+  named and now (not listed in "Findings with no task yet" below, until this entry). Full writeup:
+  [4.48's own Status section](./4.48-t17-acceptance-demo-closure-attempt-5.md). **Not fixed by 4.48
+  itself**, per its own explicit scope — needs a new task, working number **4.49**, whose shape is
+  already sketched in 4.48's Status section (persist `MessageRequest.intro` via `history::append`,
+  reusing the same `mid` so 4.44's existing dedup picks it up cleanly). A second, non-blocking finding
+  also recorded: `docs/architecture/features/17-terminal-tui-client.md`'s demo script still says
+  `^N`/`^V` where the real bindings are plain `n`/`v` (half of this was flagged back in 4.42's own
+  Risks/notes and never fixed) — tracked earlier in this file, in "Findings with no task yet," not silently dropped a
+  second time. This box stays `[ ]` until 4.49 closes the gap and a sixth exit-gate attempt confirms a
+  genuine pass.
 - [x] The envelope-v2 obligation above was re-deferred with a concrete, mechanical trigger (see
   [above](#envelope-v2-re-deferred--the-concrete-trigger)) — not silently dropped.
 - Then: **not yet** `/start-review-phase` for Phase 5 — the task-tracking skill's own §7 still applies
-  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. The fourth
-  gap-closure wave (4.46–4.48, planned and scoped) must close the gap above first; see
+  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. `/plan-phase` needs
+  to run again to scope a fifth gap-closure wave (task 4.49) before the next exit-gate attempt; see
   [docs/tasks/README.md](../README.md)'s carry-forward section.
