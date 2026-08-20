@@ -698,3 +698,42 @@ Screen-level coverage for both properties lives in `apps/tui/tests/accept_to_cha
 `a_ctrl_r_interleaved_while_add_contact_is_in_flight_still_reconciles_the_live_contacts_list` (the
 interleaving-gap regression) — reusing that file's existing real-key-event/real-worker/real-sealed-
 `$MERIDIAN_HOME` harness rather than duplicating it into a new file.
+
+**Update (task 4.49): the fifth defect 4.48's own T17 exit-gate attempt found — an accepted sender's
+intro message was silently, permanently absent from the responder's own transcript, live and after
+restart — is now closed.** `worker::run_accept_request` wrote `sessions.bin`/`trust.bin`/`contacts.json`
+on accept but never `history.jsonl`, so `crate::store::history::append` was never called for the
+`meridian_core::chat::MessageRequest::intro` an accept had already taken out of `pending_requests` (and
+could therefore never recover afterward). The fix is a fourth write inside `run_accept_request` itself,
+not a follow-up `Effect`: on the genuine, fresh-accept branch only (never the `pin_still_owed`-only
+retry branch, which has no `MessageRequest` to source content from), after the existing
+`trust.bin`/`contacts.json` writes succeed, a `HistoryEntry` mirroring
+`process_inbound_delivery`'s own ordinary-inbound-Text construction field-for-field (`ts` is accept-time,
+reusing the same `now` already computed for `trust.observe` — `MessageRequest` carries no original
+arrival timestamp, so this is a deliberate, stated approximation) is appended into the sender's
+`history.jsonl`. A `ChatContent::Receipt` intro (reachable only from a degenerate first envelope) is
+skipped, never invented into a history entry — mirroring `screens/requests.rs::intro_summary`'s
+existing "not a text message" precedent. A narrower partial-failure window survives, named rather than
+fixed, the same "do not resurrect a case that should not self-heal automatically" discipline
+`run_accept_request`'s own doc comment already applies to the analogous missing-`contacts.json`-row
+case: if `history::append` itself fails after the trust/contacts writes already succeeded, a client
+retry finds `accepted == false && pin_still_owed == false` and never re-attempts the history write —
+the peer stays durably trusted and reachable, but the intro is then permanently missing.
+
+Coverage spans three levels: `apps/tui/tests/run_worker_trust.rs`
+(`accept_request_delivers_the_session_and_tofu_pins_the_sender_with_an_empty_hint`, extended) asserts
+the raw `history.jsonl` write directly off disk, and that the `pin_still_owed`-only retry branch
+correctly writes nothing; `apps/tui/tests/accept_to_chat.rs`
+(`the_accepted_senders_intro_appears_exactly_once_in_the_opened_chat_transcript`, new) races a live,
+in-memory duplicate of the same intro (same `mid`) into `ChatState::entries` *before* completing the
+`Effect::LoadHistory` round trip — a fresh `Screen::Chat` opens with `entries: Vec::new()`, so without
+this seeded race there would be nothing for the disk-loaded entry to coalesce against and
+`chat::insert_deduped` would never actually run — then asserts the intro still appears exactly once in
+the real, rendered transcript, proving 4.44's dedup-by-`mid` genuinely coalesces the two rather than
+merely asserting the file is correct in isolation; and that same file's
+`the_accepted_sender_is_still_reachable_after_a_restart` (extended) asserts restart parity — the intro
+survives a restart in the correct position relative to a reply persisted after it. The `persist_entry`
+hand-rolled workaround `apps/tui/tests/live_session_e2e.rs` previously used to cover this same gap for
+its own two-process demo scenario is now removed as redundant, since production performs the equivalent
+write; that file's own module doc records the remaining precise-content coverage now lives in the two
+files above.

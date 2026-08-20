@@ -276,7 +276,7 @@ pre-code consult needed — the planning pass, reading `run_accept_request`, `Me
 `ChatContent` and `history::append` directly, found the fix reuses the crate's existing
 multi-document-write pattern with no new mechanism and no genuine design choice to make (recorded in
 4.49's own file).
-- [~] **4.49** Persist the accepted sender's intro into `history.jsonl` (fix for 4.48's fifth defect) —
+- [x] **4.49** Persist the accepted sender's intro into `history.jsonl` (fix for 4.48's fifth defect) —
   [file](./4.49-persist-accepted-intro-history.md)
 - [ ] **4.50** T17 acceptance-demo closure, sixth exit-gate attempt (hard join on 4.49) —
   [file](./4.50-t17-acceptance-demo-closure-attempt-6.md)
@@ -559,13 +559,33 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   itself**, per its own explicit scope. `/plan-phase` has now scoped the fifth gap-closure wave:
   **[4.49](./4.49-persist-accepted-intro-history.md)** (persist `MessageRequest.intro` via
   `history::append`, reusing the same `mid` so 4.44's existing dedup picks it up cleanly — no pre-code
-  consult required, per that task's own recorded assessment) and
+  consult required, per that task's own recorded assessment; **landed — the fifth defect closed**:
+  `worker::run_accept_request` now captures the real `Option<MessageRequest>` `chat.accept_request`
+  returns (not just its presence) and, on the genuine fresh-accept branch only — never the
+  `pin_still_owed`-only retry branch, which has no `MessageRequest` to source content from — appends a
+  fourth sealed document after the existing `trust.bin`/`contacts.json` writes succeed: a `HistoryEntry`
+  mirroring `process_inbound_delivery`'s own ordinary-inbound-Text construction field-for-field (`ts`
+  reuses the same accept-time `now` already computed for `trust.observe`, a deliberate approximation —
+  `MessageRequest` carries no original arrival timestamp), skipping a `ChatContent::Receipt` intro
+  entirely rather than inventing a history entry for it. A narrower partial-failure window survives,
+  named rather than fixed (if `history::append` itself fails after the trust/contacts writes already
+  succeeded, a retry finds both guard disjuncts false and never re-attempts the write), the same
+  "do not resurrect a case that should not self-heal automatically" discipline the function's own doc
+  comment already applies to the analogous missing-`contacts.json`-row case. Proven at three levels:
+  `apps/tui/tests/run_worker_trust.rs` (extended) asserts the raw `history.jsonl` write off disk and
+  that the retry branch writes nothing; `apps/tui/tests/accept_to_chat.rs` proves the intro appears
+  exactly once in a real, rendered `Screen::Chat` transcript after a real `Effect::LoadHistory` round
+  trip (screen-level dedup-by-`mid` coverage, task 4.44's own contract), plus a restart-parity extension
+  asserting the intro survives in the correct position relative to a reply persisted after it. The
+  `persist_entry` hand-rolled workaround `apps/tui/tests/live_session_e2e.rs` previously needed for this
+  same gap is now removed as redundant. This checkbox still stays `[ ]`, since 4.50 is the only task
+  permitted to flip it) and
   **[4.50](./4.50-t17-acceptance-demo-closure-attempt-6.md)** (the sixth exit-gate attempt, hard-joined
   on 4.49 alone). A second, non-blocking finding also recorded: `docs/architecture/features/
   17-terminal-tui-client.md`'s demo script still says `^N`/`^V` where the real bindings are plain `n`/`v`
   (half of this was flagged back in 4.42's own Risks/notes and never fixed) — tracked earlier in this
   file, in "Findings with no task yet," not silently dropped a second time and deliberately not folded
-  into 4.49. This box stays `[ ]` until 4.49 closes the gap and 4.50 confirms a genuine pass.
+  into 4.49. This box stays `[ ]` until 4.50 confirms a genuine pass.
 - [x] The envelope-v2 obligation above was re-deferred with a concrete, mechanical trigger (see
   [above](#envelope-v2-re-deferred--the-concrete-trigger)) — not silently dropped.
 - Then: **not yet** `/start-review-phase` for Phase 5 — the task-tracking skill's own §7 still applies

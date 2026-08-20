@@ -16,37 +16,22 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 4 (T08 + T17) is 48/48 previously-planned tasks attempted, still NOT closed** —
-  the fifth exit-gate attempt (4.48) found a fifth genuine defect, and `/plan-phase` has now scoped the
-  fifth gap-closure wave to fix it: task **4.49** (persist the accepted sender's intro into the
-  responder's `history.jsonl` — `worker::run_accept_request` currently discards it even though it's
-  fully in hand; no pre-code consult needed, per that task's own recorded assessment) and task **4.50**
-  (a sixth exit-gate attempt, hard-joined on 4.49 alone). T08's track (4.3→4.10) is fully done and its
-  acceptance demo genuinely passes; not in question. T17's track has been through five exit-gate
-  attempts (4.28, 4.38, 4.41, 4.45, 4.48), each closing the ground the previous one reached and finding
-  new ground broken one step further into the demo script — full lineage in
-  [Phase 4's README](./phase-4/README.md#exit-criteria). **4.48 is the first attempt where the two
-  required independent live runs disagreed** — the implementer's run reported PASS (the demo genuinely
-  completed end to end for the first time, including 4.46's own fix), but the second, genuinely
-  independent run found a real defect the first missed, then a third, source-level confirmation pass
-  independently verified it from code rather than trusting either transcript. **4.48's finding:**
-  `worker::run_accept_request` writes `sessions.bin`/`trust.bin`/`contacts.json` but never persists the
-  accepted sender's intro message into the responder's `history.jsonl`, even though the intro
-  (`MessageRequest.intro`) is fully in hand at the point it's discarded — so the very first message of
-  every accepted conversation is silently, permanently absent from the responder's own transcript, both
-  live and after restart, confirmed by direct decrypted on-disk proof for both account types. Narrow in
-  scope: every other message, before and after, persists correctly. **Already flagged and deliberately
-  deferred once**, by 4.42's own Status section ("reader-before-second-writer... 4.44 owns the reader
-  half") — 4.44 built only the reader, no task ever built the writer, and the gap fell out of the
-  tracker between being named and now. Full writeup:
-  [4.48's own Status section](./phase-4/4.48-t17-acceptance-demo-closure-attempt-5.md). A second,
-  non-blocking finding also recorded: the T17 feature spec's demo script still says `^N`/`^V` where the
-  real bindings are plain `n`/`v` (half of this was flagged back in 4.42 and never fixed) — tracked in
-  [phase-4/README.md](./phase-4/README.md#tasks-todo)'s "Findings with no task yet," deliberately not
-  folded into 4.49.
-- **NEXT:** `/next-task` — 4.49 (the fix) is unblocked now; 4.50 (the sixth exit-gate attempt) is
-  hard-joined on it and follows. Only once 4.50 confirms a genuine pass does `/start-review-phase` for
-  Phase 5 become the correct next command — not before.
+- **NOW:** **Phase 4 (T08 + T17) is 49/50 tasks attempted, still NOT closed** — **4.49 is now done**,
+  closing the fifth exit-gate defect (4.48's finding): `worker::run_accept_request` now persists the
+  accepted sender's intro into the responder's `history.jsonl` via the same writer the ordinary inbound
+  path already uses, exactly the shape the plan-time "no pre-code consult needed" assessment predicted.
+  Review round found and closed one genuine should-fix: the new "two writers agree on `mid`" test
+  (`accept_to_chat.rs`) didn't actually exercise the dedup path, since a freshly-opened `Screen::Chat`
+  starts empty — strengthened to race a live, in-memory duplicate into `ChatState::entries` before the
+  disk load completes, falsified (confirmed it fails against a naive-concat mutation) before trusting
+  it. A single non-reproducible test flake seen once during review was independently stress-tested
+  (20× isolated, 4× the combined-binary invocation) with zero reproductions — treated as transient, not
+  blocking. Full lineage of all five exit-gate attempts in
+  [Phase 4's README](./phase-4/README.md#exit-criteria).
+- **NEXT:** `/next-task` for **4.50** — the sixth exit-gate attempt, hard-joined on 4.49 alone. Only
+  once it confirms a genuine pass does `/start-review-phase` for Phase 5 become the correct next
+  command — not before.
+
 
 **Why this keeps extending Phase 4 rather than opening a new phase or a review phase**: the task-tracking
 skill's own phase-lifecycle rule is that a build phase isn't done until its acceptance demo runs, so
@@ -314,7 +299,7 @@ pre-announced.
 - [x] **4.46** Reconcile `Effect::AddContact` into the live `MainState::trust` (fix for 4.45's fourth defect) — [file](./phase-4/4.46-add-contact-trust-reconciliation.md)
 - [x] **4.47** Fix `--export-json` demo-script/spec wording (doc-only) — [file](./phase-4/4.47-export-json-doc-fix.md)
 - [x] **4.48** T17 acceptance-demo closure, fifth exit-gate attempt — [file](./phase-4/4.48-t17-acceptance-demo-closure-attempt-5.md)
-- [~] **4.49** Persist the accepted sender's intro into `history.jsonl` (fix for 4.48's fifth defect) — [file](./phase-4/4.49-persist-accepted-intro-history.md)
+- [x] **4.49** Persist the accepted sender's intro into `history.jsonl` (fix for 4.48's fifth defect) — [file](./phase-4/4.49-persist-accepted-intro-history.md)
 - [ ] **4.50** T17 acceptance-demo closure, sixth exit-gate attempt — [file](./phase-4/4.50-t17-acceptance-demo-closure-attempt-6.md)
 
 ---

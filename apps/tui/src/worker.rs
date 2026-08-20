@@ -1114,6 +1114,10 @@ fn run_delete_contact(
 // see that function's own doc comment for why it *has* to be the one that does (task 4.41's Defect
 // C: `Contact::id_string()` fails for an accept-observed sender, so no other code path in this crate
 // can ever create that row).
+//
+// **Task 4.49 extends this further:** [`run_accept_request`] now also appends the accepted sender's
+// intro to `history.jsonl` on a genuine accept — see that function's own doc comment for the fourth
+// write and the narrower partial-failure window it introduces.
 // ---------------------------------------------------------------------------
 
 // --- AcceptRequest -------------------------------------------------------------------------------
@@ -1241,6 +1245,35 @@ async fn handle_accept_request(
 /// for the no-op/fully-completed-retry cases: the effect still *completes* (nothing failed), it just
 /// carries no contact for `App` to apply.
 ///
+/// **Task 4.49 (the fix for 4.48's fifth defect):** on the same genuine-accept branch, this now also
+/// writes a fourth sealed document: the [`meridian_core::chat::MessageRequest::intro`] this accept
+/// just took, appended into the sender's own `history.jsonl` via [`crate::store::history::append`] —
+/// the same writer, same call shape, [`run_persist_history`] already uses. This is placed *after*
+/// the `trust.bin`/`contacts.json` writes above succeed, and reads `request_taken` (the real
+/// `Option<MessageRequest>` `chat.accept_request` returned), never re-deriving it from `accepted`
+/// alone — the `pin_still_owed`-only retry branch has no `MessageRequest` to source content from
+/// (`chat.accept_request` already returned `None` there; see the partial-failure doc comment above),
+/// so the history write is skipped on that branch, not attempted with a fabricated body. The
+/// `HistoryEntry` built mirrors `process_inbound_delivery`'s own ordinary-inbound-Text construction
+/// field-for-field, except `ts`, which reuses this function's own `now` (accept-time, not
+/// original-request-arrival-time — `MessageRequest` carries no arrival timestamp to source a more
+/// precise one from; a deliberate, stated approximation, not a `TODO`). A `ChatContent::Receipt`
+/// intro (reachable only from a degenerate/adversarial first envelope — see `intro_summary`'s own
+/// "not a text message" precedent) is skipped entirely: no history entry is invented for it, and it
+/// is not treated as an error.
+///
+/// **A narrower partial-failure window, named rather than fixed.** This fourth write is gated on
+/// `accepted` only (via `request_taken`, which is `Some` exactly when `accepted` is true), sitting
+/// after `save_trust`/`contacts::save` have already succeeded. If `history::append` itself then
+/// fails, the function returns `Err`, and a client retry finds `accepted == false && pin_still_owed
+/// == false` (the pin is already complete) — the same early `Ok(None)` return the guard above
+/// already takes for a fully-completed retry — so the retry never re-attempts the history write: the
+/// peer stays durably trusted and reachable, but the intro is then permanently missing. This is
+/// **not** fixed by widening the guard, for the same "do not resurrect a case that should not
+/// self-heal automatically" reason the `contacts.json`-row-missing case above is not fixed either —
+/// it is a narrower analog of that same already-tracked repair-action follow-up, not a third,
+/// freestanding partial-failure task.
+///
 /// [ADR 0001]: ../../../docs/adr/0001-identity-scheme.md
 async fn run_accept_request(
     request: &AcceptRequestRequest,
@@ -1251,7 +1284,8 @@ async fn run_accept_request(
     let _chat_guard = chat_state_lock().lock().await;
 
     let mut chat = load_chat(store, handle)?;
-    let accepted = chat.accept_request(&request.sender_ik).is_some();
+    let request_taken = chat.accept_request(&request.sender_ik);
+    let accepted = request_taken.is_some();
     let has_session = chat.has_session(&request.sender_ik);
     save_chat(&chat, store, handle)?;
 
@@ -1274,6 +1308,31 @@ async fn run_accept_request(
         crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
     upsert_contact_record(&mut doc, &id, &contact, now);
     crate::store::contacts::save(&doc, store, handle).map_err(|e| e.to_string())?;
+
+    // Task 4.49: persist the intro into the sender's own `history.jsonl`, on the genuine fresh-accept
+    // branch only (`request_taken`, not the `pin_still_owed`-only retry branch — a retry finds
+    // `chat.accept_request` already returned `None`, so there is no `MessageRequest` to source a body
+    // from; that branch's intro was, if ever, written by the first, partially-successful attempt).
+    // Mirrors the ordinary inbound-Text handler's own `HistoryEntry` construction
+    // (`process_inbound_delivery`) field-for-field, except `ts`, which reuses the `now` already
+    // computed above for `trust.observe` — see this function's own doc comment for why. A
+    // `ChatContent::Receipt` intro (degenerate, not normal — see the doc comment) is skipped, never
+    // errored or invented into a receipt-shaped entry.
+    if let Some(taken) = request_taken {
+        if let ChatContent::Text { id, body } = taken.intro {
+            let entry = crate::store::history::HistoryEntry {
+                v: crate::store::history::CURRENT_VERSION,
+                mid: hex::encode(id),
+                dir: crate::store::history::Direction::In,
+                ts: now,
+                stream: "mrd.chat/1".to_string(),
+                body,
+                state: crate::store::history::MessageState::Received,
+            };
+            crate::store::history::append(&hex::encode(request.sender_ik), &entry, store, handle)
+                .map_err(|e| e.to_string())?;
+        }
+    }
 
     Ok(Some(AddedContact {
         pubkey: request.sender_ik,

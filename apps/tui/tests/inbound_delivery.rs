@@ -671,9 +671,19 @@ async fn inbound_text_message_while_chat_open_appends_live_and_persists() {
     let os = OsSecretStore::new(SERVICE);
     let saved = meridian_tui::store::history::load_or_default(&peer_pub_hex, &os, &handle)
         .expect("load history");
-    assert_eq!(saved.len(), 1);
-    assert_eq!(saved[0].mid, entry.mid);
-    assert_eq!(saved[0].body, entry.body);
+    // Task 4.49: `establish_accepted_conversation`'s own `Effect::AcceptRequest` now also persists
+    // the peer's first-contact intro ("hi, it's me") into this same `history.jsonl` — a real,
+    // separate write this test's own fixture triggers, not something this test drives itself. So
+    // this second, live-appended message lands as entry index 1, not 0; `saved.len()` is 2, not 1.
+    assert_eq!(
+        saved.len(),
+        2,
+        "expected the accepted intro plus this second message"
+    );
+    assert_eq!(saved[0].dir, MsgDirection::In);
+    assert_eq!(saved[0].body, "hi, it's me");
+    assert_eq!(saved[1].mid, entry.mid);
+    assert_eq!(saved[1].body, entry.body);
 }
 
 /// Deliverable (b)'s own dedup requirement: an inbound message racing a *already-applied* outbound
