@@ -311,7 +311,7 @@ pre-announced.
 - [x] **4.49** Persist the accepted sender's intro into `history.jsonl` (fix for 4.48's fifth defect) — [file](./phase-4/4.49-persist-accepted-intro-history.md)
 - [x] **4.50** T17 acceptance-demo closure, sixth exit-gate attempt (verdict FAIL — sixth defect found;
   closed by the sixth gap-closure wave, 4.51/4.52) — [file](./phase-4/4.50-t17-acceptance-demo-closure-attempt-6.md)
-- [ ] **4.51** Root-cause and fix the file-backed responder's blocking-scrypt hazard (fix for 4.50's
+- [~] **4.51** Root-cause and fix the file-backed responder's blocking-scrypt hazard (fix for 4.50's
   sixth defect) — [file](./phase-4/4.51-file-backed-inbound-blocking-fix.md)
 - [ ] **4.52** T17 acceptance-demo closure, seventh exit-gate attempt — [file](./phase-4/4.52-t17-acceptance-demo-closure-attempt-7.md)
 

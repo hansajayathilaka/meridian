@@ -292,7 +292,7 @@ prior wave's fix task, **4.51's own pre-code consult determination is conditiona
 time**: whether an architect + security-reviewer consult is mandatory depends on which fix shape its own
 in-task investigation lands on (recorded in that task's own file) — mirroring 4.35's/4.9's precedent for
 an in-task consult rather than a plan-time one, because the investigation genuinely has to run first.
-- [ ] **4.51** Root-cause and fix the file-backed responder's blocking-scrypt hazard (fix for 4.50's
+- [~] **4.51** Root-cause and fix the file-backed responder's blocking-scrypt hazard (fix for 4.50's
   sixth defect; opportunistically also closes the already-known `run_mark_verified`/`run_set_petname`
   latency finding if it generalizes cleanly) — [file](./4.51-file-backed-inbound-blocking-fix.md)
 - [ ] **4.52** T17 acceptance-demo closure, seventh exit-gate attempt (hard join on 4.51 alone) —
