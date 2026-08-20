@@ -60,6 +60,19 @@
 //!    mirror of property 4: `App::apply_rejected_request` replays `main.chat.reject_request` the same
 //!    way piece C's accept path replays `accept_request`, so a rejected request does not re-appear on
 //!    a later `Ctrl-R`/`r` either.
+//!
+//! ## Task 4.46 additions — the initiator-side half of the same acceptance criterion
+//! 7. [`add_contact_makes_the_added_peer_reachable_for_verify`] — the mirror of property 1/3 above
+//!    for the plain `n`-add flow (`Effect::AddContact`) instead of accept: `App::apply_added_contact`
+//!    replays `trust.observe` into the live `TrustStore` the same way `apply_accepted_request` already
+//!    does, so a peer added this session is immediately reachable for `Screen::Verify`, no restart
+//!    required.
+//! 8. [`a_ctrl_r_interleaved_while_add_contact_is_in_flight_still_reconciles_the_live_contacts_list`]
+//!    — the interleaving-gap fix this task's own planning pass traced: `Ctrl-R` is reachable mid
+//!    `AddContactState::Adding` (unlike the accept flow, the add-contact sub-flow is embedded in
+//!    `Screen::Main` itself, not a separately pushed screen), so the completion can land with
+//!    `Screen::Requests` on top instead of `Screen::Main`; `App::apply_added_contact` must reconcile
+//!    the display row and close the sub-flow regardless.
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -902,5 +915,298 @@ async fn accepting_a_request_behind_an_already_open_chat_still_leaves_the_sender
             assert_eq!(state.trust.trust_state(&alice_ik), TrustState::Verified);
         }
         other => panic!("expected Screen::Verify, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 4.46 — `Effect::AddContact` reconciliation into the live in-memory `TrustStore`.
+//
+// This file already owns the harness these two properties need (real `crossterm` key events through
+// `App`, real `worker::dispatch` against a real sealed `$MERIDIAN_HOME`, `EnvGuard`/`boot_to_main`/
+// `render_to_text` — see this file's own module doc's "Why a new file, and why this level") — reused
+// here rather than duplicated into a new file. Mirrors this file's own
+// `accepting_a_request_behind_an_already_open_chat_still_leaves_the_sender_verifiable` (the
+// interleaving precedent, task 4.42's review Finding 1) and
+// `marking_verified_after_an_accept_works_because_the_pin_was_replayed_in_memory` (the same-session
+// verify precedent), just for the plain `n`-add flow (`Effect::AddContact`) instead of the
+// accept-a-request flow (`Effect::AcceptRequest`) — closing the initiator-side half of T17's own
+// acceptance criterion, the responder-side half already closed by 4.42.
+// ---------------------------------------------------------------------------
+
+/// A second, independent identity — the peer these two tests add via the plain `n`-add flow. Mirrors
+/// `tests/run_worker_contacts.rs::peer_id` exactly (a real `mrd1:` id string a real `parse_id` inside
+/// `crate::screens::contacts::handle_enter_id` must accept) — inlined here rather than shared across
+/// files, since this crate's integration test binaries have no shared `tests/support` module (every
+/// other file in this crate that needs an id fixture duplicates its own, the same way).
+fn peer_identity() -> (String, [u8; 32]) {
+    let store = MemorySecretStore::new();
+    let peer = generate_account(&store, "peer.example").expect("peer generate_account");
+    (peer.to_id_string(), *peer.public_key().as_bytes())
+}
+
+/// Types `text` into whatever text field is currently focused, one real `KeyCode::Char` at a time —
+/// the same one-char-per-key discipline
+/// `accept_makes_the_sender_reachable_for_chat_and_verify_from_on_screen_affordances_alone`'s own
+/// `for c in "hello alice".chars() { ... }` reply-typing step already uses, pulled out here since both
+/// tests below type two fields (id, then petname) rather than one.
+fn type_text(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.update(AppEvent::Key(char_key(c)));
+    }
+}
+
+/// Drives the plain `n`-add flow's first two steps from `Screen::Main` — `n`, paste `id`, `Enter`,
+/// type `petname`, `Enter` — and returns the single `Effect::AddContact` the last `Enter` dispatches.
+/// Deliberately stops short of running it through the worker: the interleaving test below needs that
+/// window open (to press `Ctrl-R` while it's still in flight); the plain reachability test dispatches
+/// it immediately after.
+fn start_add_contact(app: &mut App, id: &str, petname: &str) -> Effect {
+    let effects = app.update(AppEvent::Key(char_key('n')));
+    assert!(
+        effects.is_empty(),
+        "n alone only opens the add-contact form"
+    );
+    type_text(app, id);
+    let effects = app.update(AppEvent::Key(key(KeyCode::Enter)));
+    assert!(
+        effects.is_empty(),
+        "Enter on a valid id only advances to the petname step, dispatches nothing yet"
+    );
+    type_text(app, petname);
+    let effects = app.update(AppEvent::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        effects.len(),
+        1,
+        "Enter on the petname step must dispatch exactly one Effect::AddContact"
+    );
+    let effect = effects.into_iter().next().unwrap();
+    assert!(matches!(effect, Effect::AddContact(_)));
+    effect
+}
+
+// ---------------------------------------------------------------------------
+// Deliverable 3 (task 4.46) — same-session reachability: add, then verify, no restart in between.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn add_contact_makes_the_added_peer_reachable_for_verify() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    setup_os_account();
+    let (id, peer_pubkey) = peer_identity();
+
+    let (mut app, mut session) = boot_to_main().await;
+    match app.current_screen() {
+        Screen::Main(main) => assert!(
+            main.contacts.entries.is_empty(),
+            "fixture sanity: a pristine account has no contacts yet"
+        ),
+        other => panic!("expected Screen::Main, got {other:?}"),
+    }
+
+    let effect = start_add_contact(&mut app, &id, "Peer");
+    let event = dispatch(effect, &mut session).await;
+    assert!(
+        matches!(
+            event,
+            meridian_tui::app::WorkerEvent::Completed(Effect::AddContact(_))
+        ),
+        "expected Effect::AddContact to complete against the real trust.bin, got {event:?}"
+    );
+    let completed_added_at = match &event {
+        meridian_tui::app::WorkerEvent::Completed(Effect::AddContact(effect)) => {
+            effect
+                .outcome
+                .as_ref()
+                .expect("the fixture's request must succeed")
+                .added_at
+        }
+        _ => unreachable!("matched above"),
+    };
+    let leftover = app.update(AppEvent::Worker(Box::new(event)));
+    assert!(leftover.is_empty());
+
+    // The new contact is present, the add form is closed, and — the actual defect this task exists
+    // to fix — the live in-memory TrustStore genuinely knows about the peer, not just the display
+    // row `contacts::handle_worker`'s own per-screen path already produced.
+    match app.current_screen() {
+        Screen::Main(main) => {
+            assert!(
+                main.contacts.add.is_none(),
+                "the add-contact form must close on completion"
+            );
+            assert_eq!(main.contacts.entries.len(), 1);
+            let entry = &main.contacts.entries[0];
+            assert_eq!(entry.pubkey, peer_pubkey);
+            assert_eq!(entry.id, id);
+            assert_eq!(entry.petname.as_deref(), Some("Peer"));
+            assert_eq!(
+                main.trust.trust_state(&peer_pubkey),
+                TrustState::Pinned,
+                "the real, live TrustStore must already have observed this peer — this is task \
+                 4.46's own defect: without App::apply_added_contact this would still read \
+                 TrustState::default(), and mark-verified below would fail with \
+                 TrustError::UnknownContact"
+            );
+            // The live observe() must genuinely replay the worker-supplied added_at, not a
+            // wall-clock stand-in or a hardcoded value — read back from the real TrustStore, not
+            // from the display-row copy (ContactEntry's own added_at is sourced independently,
+            // straight from AddedContact, so it can't catch a divergence in the trust.observe()
+            // call this test actually exists to exercise).
+            let contact = main
+                .trust
+                .contact(&peer_pubkey)
+                .expect("trust.observe() must have created a Contact record");
+            assert_eq!(
+                contact.pinned_key_history[0].first_seen_unix, completed_added_at,
+                "App::apply_added_contact must replay the worker-supplied added_at into \
+                 trust.observe(), not App::update's own wall-clock or a stale value"
+            );
+        }
+        other => panic!("expected Screen::Main, got {other:?}"),
+    }
+
+    // Reachable for verify, in the SAME session, no restart — Screen::Verify must render the real
+    // safety number rather than erroring on an unknown contact.
+    app.update(AppEvent::Key(char_key('v')));
+    match app.current_screen() {
+        Screen::Verify(state) => {
+            assert_eq!(state.peer_pubkey, peer_pubkey);
+            assert_eq!(state.trust.trust_state(&peer_pubkey), TrustState::Pinned);
+            assert!(
+                !state.safety_number.is_empty(),
+                "a real safety number must render, not an UnknownContact error"
+            );
+        }
+        other => panic!(
+            "expected Screen::Verify to open successfully for the newly-added peer, got {other:?}"
+        ),
+    }
+    let verify_pane = render_to_text(&app, 80, 24);
+    assert!(
+        !verify_pane.to_lowercase().contains("unknown contact"),
+        "must never render TrustError::UnknownContact for a peer just added this session:\n{}",
+        verify_pane
+    );
+
+    // v -> y really marks the peer verified, and reads back from the real post-mutation store —
+    // never fabricated by the UI, same discipline as 4.42's own Deliverable 3 property 3.
+    app.update(AppEvent::Key(char_key('v')));
+    let effects = app.update(AppEvent::Key(char_key('y')));
+    assert_eq!(effects.len(), 1, "y must dispatch Effect::MarkVerified");
+    match &effects[0] {
+        Effect::MarkVerified(e) => assert_eq!(e.request.pubkey, peer_pubkey),
+        other => panic!("expected Effect::MarkVerified, got {other:?}"),
+    }
+    match app.current_screen() {
+        Screen::Verify(state) => assert_eq!(
+            state.trust.trust_state(&peer_pubkey),
+            TrustState::Verified,
+            "mark_verified must have found a real contact record to transition"
+        ),
+        other => panic!("expected Screen::Verify, got {other:?}"),
+    }
+
+    // And it really persists through the real worker.
+    let effect = effects.into_iter().next().unwrap();
+    match dispatch(effect, &mut session).await {
+        meridian_tui::app::WorkerEvent::Completed(Effect::MarkVerified(_)) => {}
+        other => panic!("expected MarkVerified to complete against the real trust.bin: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deliverable 4 (task 4.46) — the interleaving-gap regression: `Ctrl-R` fires while
+// `Effect::AddContact` is still in flight (a global, unconditional binding — `App::handle_key` checks
+// it before any screen-specific key interception, reachable even while `ContactsState.add` is
+// `Some(Adding)`), pushing `Screen::Requests` on top of `Screen::Main`. The completion must still
+// reconcile into `Screen::Main` (`App::apply_added_contact`, matched on the event, not on top of the
+// stack) rather than being silently swallowed by `requests::handle_worker`, which forwards nothing —
+// and the add-contact sub-flow must not be left stuck in `Adding` forever.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_ctrl_r_interleaved_while_add_contact_is_in_flight_still_reconciles_the_live_contacts_list(
+) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    setup_os_account();
+    let (id, peer_pubkey) = peer_identity();
+
+    let (mut app, mut session) = boot_to_main().await;
+    let effect = start_add_contact(&mut app, &id, "Peer");
+    match app.current_screen() {
+        Screen::Main(main) => assert!(
+            matches!(
+                main.contacts.add,
+                Some(meridian_tui::screens::contacts::AddContactState::Adding(_))
+            ),
+            "fixture sanity: the add-contact sub-flow must genuinely be mid-Adding before Ctrl-R"
+        ),
+        other => panic!("expected Screen::Main, got {other:?}"),
+    }
+
+    // Ctrl-R, global and unconditional, reachable mid-`Adding` — pushes Screen::Requests on top of
+    // Screen::Main while Effect::AddContact is still out with the worker.
+    let effects = app.update(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('r'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(effects.is_empty());
+    assert!(
+        matches!(app.current_screen(), Screen::Requests(_)),
+        "Ctrl-R must have pushed Screen::Requests on top of Screen::Main mid-Adding"
+    );
+
+    // The completion arrives while Screen::Requests is on top — the exact interleaving window this
+    // test exists to cover.
+    let event = dispatch(effect, &mut session).await;
+    assert!(
+        matches!(
+            event,
+            meridian_tui::app::WorkerEvent::Completed(Effect::AddContact(_))
+        ),
+        "expected Effect::AddContact to complete against the real trust.bin, got {event:?}"
+    );
+    let leftover = app.update(AppEvent::Worker(Box::new(event)));
+    assert!(leftover.is_empty());
+
+    // Esc back to Main.
+    app.update(AppEvent::Key(key(KeyCode::Esc)));
+    match app.current_screen() {
+        Screen::Main(main) => {
+            assert!(
+                main.contacts.add.is_none(),
+                "the add-contact form must not be left stuck in Adding — this is task 4.46's own \
+                 interleaving-gap defect"
+            );
+            assert_eq!(
+                main.contacts.entries.len(),
+                1,
+                "the new contact must appear in the live Contacts list even though the completion \
+                 landed with Screen::Requests on top"
+            );
+            let entry = &main.contacts.entries[0];
+            assert_eq!(entry.pubkey, peer_pubkey);
+            assert_eq!(entry.petname.as_deref(), Some("Peer"));
+            assert_eq!(
+                main.trust.trust_state(&peer_pubkey),
+                TrustState::Pinned,
+                "the live TrustStore must also have observed the peer, not just the display row"
+            );
+        }
+        other => panic!("expected Screen::Main, got {other:?}"),
+    }
+
+    // And reachable for verify, same session, no restart.
+    app.update(AppEvent::Key(char_key('v')));
+    match app.current_screen() {
+        Screen::Verify(state) => {
+            assert_eq!(state.peer_pubkey, peer_pubkey);
+            assert_eq!(state.trust.trust_state(&peer_pubkey), TrustState::Pinned);
+        }
+        other => panic!(
+            "expected Screen::Verify to open successfully for the newly-added peer, got {other:?}"
+        ),
     }
 }

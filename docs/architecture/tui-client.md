@@ -656,3 +656,44 @@ Screen-level coverage for this lives in `apps/tui/tests/accept_to_chat.rs` (real
 `App`, real `worker::dispatch` against a real sealed `$MERIDIAN_HOME`, plus a restart rebuilt from
 disk only) — the layer `live_session_e2e.rs` structurally cannot reach, which is why three exit-gate
 attempts passed while this was broken.
+
+**Update (task 4.46): the fourth defect 4.45's own T17 exit-gate attempt found — `Effect::AddContact`
+never reconciled into the live in-memory `TrustStore` — is now closed.** This is the initiator-side
+mirror of 4.42's Defect C immediately above: an initiator who added a contact via the plain `n`-add
+flow could send them a first-contact message and still get `TrustError::UnknownContact` pressing
+`v`→`v`→`y`, because `worker::run_add_contact`'s real `trust.bin`/`contacts.json` writes never synced
+into `MainState::trust`/`main.contacts` for the rest of that session — only a restart picked them up
+(`MainState::from_session` rebuilds `trust` fresh from `trust.bin` at boot, so the bug was a pure
+live-session staleness gap, never a persistence one). `App::apply_added_contact` (`apps/tui/src/app.rs`)
+closes it, reusing `App::apply_accepted_request`'s exact `live_trust_idx` stack-walk verbatim in
+structure: locate `Screen::Main`, scan above it for a `Screen::Chat`/`Screen::Verify` frame (where
+`MainState::trust` would have been `std::mem::take`n), and route `trust.observe(added.pubkey, "",
+added.added_at)` there if one exists, else directly onto `Screen::Main`. No new trust decision is
+made anywhere in this fix — it replays exactly what the worker already wrote, mirroring 4.42's own
+"TOFU is not verification" guardrail.
+
+A second, closely related interleaving gap was traced during this task's planning pass and fixed in
+the same diff, not deferred: unlike `AcceptRequest` (dispatched from a separately-pushed
+`Screen::Requests`), `Effect::AddContact` is dispatched from `Screen::Main`'s own embedded
+`ContactsState.add` sub-flow — and `Ctrl-R` is a genuinely global, unconditional binding, checked in
+`App::handle_key` before any screen-specific key interception, reachable even mid `AddContactState::
+Adding`. Pressing it there pushes `Screen::Requests` on top of `Screen::Main` while the effect is still
+in flight; without a fix, the completion would then route through the per-screen fallback dispatch to
+`Screen::Requests` (whose own `requests::handle_worker` forwards nothing) instead of `Screen::Main`, so
+`contacts::handle_worker`'s `AddContactState::Adding` arm — the only place that closes the sub-flow and
+upserts the display row — would never run: the add-contact form would be stuck in `Adding` forever, and
+the new contact would never appear in the live Contacts list for the rest of the session. `App::
+apply_added_contact` therefore also calls `contacts::apply_update` and resets `main.contacts.add` to
+`None` **unconditionally**, on whichever `Screen::Main` frame exists, regardless of what is on top of
+the stack — and runs strictly before the per-screen fallback dispatch, so resetting `add` to `None`
+here pre-empts the per-screen `Adding` arm rather than racing it: `contacts::apply_update` runs
+exactly once, from `App::apply_added_contact`, in both the ordinary and interleaved cases
+(`contacts::apply_update` is in fact an idempotent upsert-by-pubkey and would tolerate a genuine
+double call too, but no such double call actually occurs — verified by instrumenting the per-screen
+`Adding` arm and confirming it never runs in either of this task's regression tests).
+
+Screen-level coverage for both properties lives in `apps/tui/tests/accept_to_chat.rs`:
+`add_contact_makes_the_added_peer_reachable_for_verify` (same-session add-then-verify, no restart) and
+`a_ctrl_r_interleaved_while_add_contact_is_in_flight_still_reconciles_the_live_contacts_list` (the
+interleaving-gap regression) — reusing that file's existing real-key-event/real-worker/real-sealed-
+`$MERIDIAN_HOME` harness rather than duplicating it into a new file.

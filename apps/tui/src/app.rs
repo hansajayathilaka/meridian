@@ -1931,6 +1931,23 @@ impl App {
                 }
                 WorkerEvent::Completed(Effect::AcceptRequest(effect))
             }
+            // Task 4.46: a completed `Effect::AddContact` is reconciled into whichever
+            // `Screen::Main` is on the stack *before* the per-screen dispatch below hands the
+            // same event to whatever screen actually sits on top — matched on the event first,
+            // regardless of what is on top, for the same "no single screen owns this
+            // consequence" reason `AcceptRequest`/`RejectRequest`/`LoadHistory` already are (4.45's
+            // own root-cause trace named the missing version of exactly this arm as the fourth
+            // defect T17's exit gate found). The event is still handed on unchanged, so
+            // `contacts::handle_worker`'s own `Adding` → close-the-form transition (reached via
+            // `main::handle_worker`, only when `Screen::Main` happens to still be on top) runs
+            // exactly as before; see `App::apply_added_contact`'s own doc comment for why this
+            // arm's job is broader than that per-screen path alone.
+            WorkerEvent::Completed(Effect::AddContact(effect)) => {
+                if let Some(added) = effect.outcome.clone() {
+                    self.apply_added_contact(added);
+                }
+                WorkerEvent::Completed(Effect::AddContact(effect))
+            }
             // Task 4.42 review fix (Finding 3): mirrors the `AcceptRequest` arm immediately above —
             // matched on the event first, regardless of what is on top, for the same reason. Only on
             // a genuine success (`outcome: Some(())`); a `Failed`/retry-exhausted reject leaves
@@ -2226,6 +2243,97 @@ impl App {
         };
         main.chat.accept_request(&added.pubkey);
         contacts::apply_update(&mut main.contacts, ContactEntry::from_added(added), false);
+    }
+
+    /// Reconciles a completed [`Effect::AddContact`] into the live in-memory `TrustStore` (task
+    /// 4.46 — the fourth defect 4.45's own T17 exit-gate attempt found: an initiator who adds a
+    /// contact via the plain `n`-add flow could send them a first-contact message and still get
+    /// `TrustError::UnknownContact` pressing `v`→`v`→`y`, because the completion never synced into
+    /// `MainState::trust`). `worker::run_add_contact` has, by the time this runs, already
+    /// TOFU-pinned the peer in the real `trust.bin` (and, if a petname was given, called
+    /// `set_petname`) and written its `contacts.json` display row — same "replay durable state,
+    /// decide nothing" character as [`App::apply_accepted_request`], whose exact `live_trust_idx`
+    /// stack walk this reuses verbatim in structure (see that method's own doc comment for the
+    /// full "moved, not cloned" reasoning; not re-derived here): locate `Screen::Main`, then scan
+    /// above it for a `Screen::Chat`/`Screen::Verify` frame — if one exists, `MainState::trust` was
+    /// `std::mem::take`n into it, so `trust.observe(added.pubkey, "", added.added_at)` routes there
+    /// instead of the placeholder left on `Main`; else it routes to `Screen::Main` directly.
+    ///
+    /// This planning pass traced that `Screen::Chat`/`Screen::Verify` cannot actually be pushed on
+    /// top of `Screen::Main` while an `Effect::AddContact` is in flight today (unlike the accepted-
+    /// request case, the add-contact sub-flow is embedded in `Screen::Main` itself, not a
+    /// separately pushed screen, so there is no navigation path that opens Chat/Verify while it is
+    /// running) — the stack walk is reused anyway, deliberately not hand-optimized to a bare
+    /// `Screen::Main`-only lookup, because reusing the general mechanism is cheap and forecloses a
+    /// future navigation feature silently reintroducing this exact defect class a third time
+    /// (`apply_accepted_request`'s own "not reachable today" claim already turned out false once,
+    /// under 4.42's own review).
+    ///
+    /// **A second, closely related interleaving gap** (traced during 4.46's planning pass, fixed
+    /// here rather than deferred): `Effect::AddContact` is dispatched from `Screen::Main`'s own
+    /// embedded `ContactsState.add` sub-flow (`crate::screens::contacts`), not from a separately
+    /// pushed screen the way `AcceptRequest` is from `Screen::Requests`. `Ctrl-R` is a genuinely
+    /// global, unconditional binding checked in `App::handle_key` *before* any screen-specific key
+    /// interception — reachable even while `state.contacts.add` is `Some` (mid `Adding`), pushing
+    /// `Screen::Requests` on top of `Screen::Main`. When `Effect::AddContact` then completes, the
+    /// per-screen fallback dispatch in `App::handle_worker` would otherwise route it to
+    /// `Screen::Requests` instead of `Screen::Main` — whose own `requests::handle_worker` does not
+    /// forward it anywhere — so `contacts::handle_worker`'s `AddContactState::Adding` arm (the
+    /// *only* place that closes the sub-flow and calls `contacts::apply_update` for the display
+    /// row) never runs: the add-contact form is stuck in `Adding` forever, and the new contact
+    /// never appears in the live Contacts list for the rest of the session. Closed by doing the
+    /// same `contacts::apply_update` + sub-flow reset **unconditionally** here, on whichever
+    /// `Screen::Main` frame exists, regardless of what is on top of the stack. This call runs
+    /// inside `App::handle_worker`'s event-first match, strictly *before* the per-screen fallback
+    /// dispatch that would otherwise reach `contacts::handle_worker`'s own `Adding` arm — and since
+    /// this call already resets `main.contacts.add` to `None`, that arm's own
+    /// `if let Some(add) = state.add.as_mut()` guard never fires afterward. So in the ordinary
+    /// non-interleaved case (`Screen::Main` still on top), `contacts::apply_update` runs exactly
+    /// **once**, from here — the per-screen path is pre-empted, not raced. (`contacts::apply_update`
+    /// is a plain upsert-by-pubkey and would in fact be idempotent under a genuine double call too,
+    /// but no such double call actually occurs; verified by instrumenting the per-screen `Adding`
+    /// arm and confirming it never runs, in both
+    /// `add_contact_makes_the_added_peer_reachable_for_verify` and the interleaving regression test
+    /// below.)
+    fn apply_added_contact(&mut self, added: AddedContact) {
+        let Some(main_idx) = self
+            .screens
+            .iter()
+            .position(|s| matches!(s, Screen::Main(_)))
+        else {
+            return;
+        };
+        let live_trust_idx = self.screens[main_idx + 1..]
+            .iter()
+            .position(|s| matches!(s, Screen::Chat(_) | Screen::Verify(_)))
+            .map(|offset| main_idx + 1 + offset);
+        match live_trust_idx {
+            Some(idx) => match &mut self.screens[idx] {
+                Screen::Chat(chat) => {
+                    chat.trust.observe(added.pubkey, "", added.added_at);
+                }
+                Screen::Verify(verify) => {
+                    verify.trust.observe(added.pubkey, "", added.added_at);
+                }
+                _ => unreachable!("live_trust_idx only ever points at Chat|Verify"),
+            },
+            None => {
+                let Some(Screen::Main(main)) = self.screens.get_mut(main_idx) else {
+                    return;
+                };
+                main.trust.observe(added.pubkey, "", added.added_at);
+            }
+        }
+        let Some(Screen::Main(main)) = self.screens.get_mut(main_idx) else {
+            return;
+        };
+        // Interleaving-gap fix (see doc comment above): unconditionally upsert the display row and
+        // resolve the add-contact sub-flow out of `Adding`, regardless of whether `Screen::Main` is
+        // on top of the stack right now. Safe to run alongside the untouched per-screen path
+        // (`contacts::handle_worker`'s own `Adding` arm) — `contacts::apply_update` is an
+        // idempotent upsert-by-pubkey.
+        contacts::apply_update(&mut main.contacts, ContactEntry::from_added(added), false);
+        main.contacts.add = None;
     }
 
     /// Mirrors [`App::apply_accepted_request`]'s `main.chat.accept_request` step for a completed

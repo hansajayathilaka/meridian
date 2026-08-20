@@ -266,7 +266,7 @@ closely related interleaving gap traced during this planning pass), the doc-only
 mismatch 4.45 also recorded, then a fifth exit-gate attempt. Neither fix task needs a pre-code
 consult or a new ADR — unlike the third wave's 4.40/4.42, neither has a genuine design choice to make
 (recorded in each task file's own text).
-- [~] **4.46** Reconcile `Effect::AddContact` into the live `MainState::trust` (fix for 4.45's fourth
+- [x] **4.46** Reconcile `Effect::AddContact` into the live `MainState::trust` (fix for 4.45's fourth
   defect — the initiator-verify-in-session gap) — [file](./4.46-add-contact-trust-reconciliation.md)
 - [x] **4.47** Fix `--export-json` demo-script/spec wording (directory layout, not a flat file;
   doc-only, pre-existing since task 4.15) — [file](./4.47-export-json-doc-fix.md)
@@ -484,7 +484,29 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   4.45 itself**, per its own explicit scope. `/plan-phase` has now scoped that fourth gap-closure wave:
   **[4.46](./4.46-add-contact-trust-reconciliation.md)** (the `Effect::AddContact` reconciliation fix,
   mirroring `App::apply_accepted_request`'s own precedent, plus a second interleaving gap traced during
-  planning), **[4.47](./4.47-export-json-doc-fix.md)** (the doc-only `--export-json` demo-script fix,
+  planning; **landed — the fourth defect closed**: a new `WorkerEvent::Completed(Effect::AddContact(_))`
+  arm in `App::handle_worker`'s event-first match, alongside `AcceptRequest`/`RejectRequest`/
+  `LoadHistory`, calls `App::apply_added_contact`, which reuses `apply_accepted_request`'s exact
+  `live_trust_idx` stack-walk verbatim in structure to replay `trust.observe(added.pubkey, "",
+  added.added_at)` into whichever `TrustStore` is actually live (`Screen::Main`, or a `Screen::Chat`/
+  `Screen::Verify` frame above it if `MainState::trust` was `mem::take`n) — closing the initiator-side
+  half of T17's own acceptance criterion, the responder-side half already closed by 4.42. A second,
+  closely related interleaving gap traced during planning was also confirmed reachable and fixed in the
+  same diff, not deferred: `Ctrl-R` is a global, unconditional binding reachable even mid
+  `AddContactState::Adding` (the add-contact sub-flow is embedded in `Screen::Main` itself, unlike
+  `AcceptRequest`'s separately-pushed `Screen::Requests`), so a completion could otherwise land with
+  `Screen::Requests` on top and never reach `contacts::handle_worker`'s `Adding`-closing arm, leaving the
+  add-contact form stuck forever and the new contact absent from the live Contacts list;
+  `App::apply_added_contact` now also calls `contacts::apply_update` and resets `main.contacts.add` to
+  `None` unconditionally, which runs strictly before the per-screen fallback dispatch and so pre-empts
+  the untouched per-screen path's own `Adding` arm rather than racing it — `contacts::apply_update` runs
+  exactly once, confirmed by review-round instrumentation, not a tolerated double call as first
+  documented. Proven at the screen level by two new tests in `apps/tui/tests/accept_to_chat.rs` —
+  `add_contact_makes_the_added_peer_reachable_for_verify` (same-session add-then-verify, no restart) and
+  `a_ctrl_r_interleaved_while_add_contact_is_in_flight_still_reconciles_the_live_contacts_list` (the
+  interleaving-gap regression) — reusing that file's existing real-key-event/real-worker/real-sealed-
+  `$MERIDIAN_HOME` harness. This checkbox still stays `[ ]`, since 4.48 is the only task permitted to
+  flip it), **[4.47](./4.47-export-json-doc-fix.md)** (the doc-only `--export-json` demo-script fix,
   split out as its own task since it is unrelated in root cause), and
   **[4.48](./4.48-t17-acceptance-demo-closure-attempt-5.md)** (the fifth exit-gate attempt, hard-joined
   on both). This box stays `[ ]` until 4.48 confirms a genuine pass.
