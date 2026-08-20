@@ -689,8 +689,9 @@ the stack — and runs strictly before the per-screen fallback dispatch, so rese
 here pre-empts the per-screen `Adding` arm rather than racing it: `contacts::apply_update` runs
 exactly once, from `App::apply_added_contact`, in both the ordinary and interleaved cases
 (`contacts::apply_update` is in fact an idempotent upsert-by-pubkey and would tolerate a genuine
-double call too, but no such double call actually occurs — verified by instrumenting the per-screen
-`Adding` arm and confirming it never runs in either of this task's regression tests).
+double call too, but no such double call actually occurs — guaranteed by construction (the
+reset-before-dispatch ordering above), confirmed during review by instrumenting the per-screen
+`Adding` arm and observing it never runs in either of this task's regression tests).
 
 Screen-level coverage for both properties lives in `apps/tui/tests/accept_to_chat.rs`:
 `add_contact_makes_the_added_peer_reachable_for_verify` (same-session add-then-verify, no restart) and

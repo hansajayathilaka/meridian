@@ -2291,8 +2291,9 @@ impl App {
     /// non-interleaved case (`Screen::Main` still on top), `contacts::apply_update` runs exactly
     /// **once**, from here — the per-screen path is pre-empted, not raced. (`contacts::apply_update`
     /// is a plain upsert-by-pubkey and would in fact be idempotent under a genuine double call too,
-    /// but no such double call actually occurs; verified by instrumenting the per-screen `Adding`
-    /// arm and confirming it never runs, in both
+    /// but no such double call actually occurs — guaranteed by construction (the reset-before-dispatch
+    /// ordering above), confirmed during review by instrumenting the per-screen `Adding` arm and
+    /// observing it never runs, in both
     /// `add_contact_makes_the_added_peer_reachable_for_verify` and the interleaving regression test
     /// below.)
     fn apply_added_contact(&mut self, added: AddedContact) {
@@ -2329,9 +2330,11 @@ impl App {
         };
         // Interleaving-gap fix (see doc comment above): unconditionally upsert the display row and
         // resolve the add-contact sub-flow out of `Adding`, regardless of whether `Screen::Main` is
-        // on top of the stack right now. Safe to run alongside the untouched per-screen path
-        // (`contacts::handle_worker`'s own `Adding` arm) — `contacts::apply_update` is an
-        // idempotent upsert-by-pubkey.
+        // on top of the stack right now. This resets `main.contacts.add` to `None` before the
+        // per-screen fallback dispatch can reach `contacts::handle_worker`'s own `Adding` arm, so
+        // that arm's own guard never fires afterward — `contacts::apply_update` runs exactly once,
+        // pre-empting the per-screen path rather than racing it (also happens to be an idempotent
+        // upsert-by-pubkey, so a hypothetical double call would be harmless too, but none occurs).
         contacts::apply_update(&mut main.contacts, ContactEntry::from_added(added), false);
         main.contacts.add = None;
     }
