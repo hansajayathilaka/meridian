@@ -3,19 +3,18 @@
 
 # Phase 4 — Verification & Trust + Terminal TUI Client
 
-**Kind:** build · **Status:** in progress — 48/48 previously-planned tasks done (4.1–4.48); the fifth
-exit-gate attempt (4.48) found a fifth genuine defect. `/plan-phase` has now scoped the fifth
-gap-closure wave: task **4.49** (persist the accepted sender's intro into the responder's
-`history.jsonl` — no open design question, see that task's own pre-code consult assessment) and task
-**4.50** (a sixth exit-gate attempt, hard-joined on 4.49 only). Per the task-tracking skill's own §7
-("a build phase isn't done until its acceptance demo runs"), the phase is **still not closed**: task
-4.28 found T17's acceptance demo did not run end to end; 4.29–4.37 closed that gap, but 4.38 found the
-demo *still* doesn't pass, for two reasons; 4.39/4.40 closed both, confirmed live — but 4.41 found a
-third defect (Defect C), closed by the third gap-closure wave (4.42–4.44), whose own re-verification
-(4.45) found a fourth defect, closed by the fourth gap-closure wave (4.46–4.47), whose own
-re-verification (4.48) found the fifth defect above (see [exit criteria](#exit-criteria) for the full
-writeup) · **Reviews phase(s):** n/a (build phase; Phase 5 will review it, once it's actually
-closeable)
+**Kind:** build · **Status:** in progress — 50/50 previously-planned tasks done (4.1–4.50); the sixth
+exit-gate attempt (4.50) found a sixth genuine defect. `/plan-phase` is now scoping the sixth
+gap-closure wave: a fix task (working number **4.51**) for the delivery-reliability defect, and a
+seventh exit-gate attempt hard-joined on it. Per the task-tracking skill's own §7 ("a build phase
+isn't done until its acceptance demo runs"), the phase is **still not closed**: task 4.28 found T17's
+acceptance demo did not run end to end; 4.29–4.37 closed that gap, but 4.38 found the demo *still*
+doesn't pass, for two reasons; 4.39/4.40 closed both, confirmed live — but 4.41 found a third defect
+(Defect C), closed by the third gap-closure wave (4.42–4.44), whose own re-verification (4.45) found a
+fourth defect, closed by the fourth gap-closure wave (4.46–4.47), whose own re-verification (4.48)
+found a fifth defect, closed by the fifth gap-closure wave (4.49), whose own re-verification (4.50)
+found the sixth defect above (see [exit criteria](#exit-criteria) for the full writeup) · **Reviews
+phase(s):** n/a (build phase; Phase 5 will review it, once it's actually closeable)
 
 ## Goal
 Ship **Feature 08 — Verification & Contact Trust** and **Feature 17 — Terminal TUI Client** together,
@@ -278,8 +277,11 @@ multi-document-write pattern with no new mechanism and no genuine design choice 
 4.49's own file).
 - [x] **4.49** Persist the accepted sender's intro into `history.jsonl` (fix for 4.48's fifth defect) —
   [file](./4.49-persist-accepted-intro-history.md)
-- [~] **4.50** T17 acceptance-demo closure, sixth exit-gate attempt (hard join on 4.49) —
-  [file](./4.50-t17-acceptance-demo-closure-attempt-6.md)
+- [x] **4.50** T17 acceptance-demo closure, sixth exit-gate attempt (hard join on 4.49) —
+  [file](./4.50-t17-acceptance-demo-closure-attempt-6.md) — **done in the sense 4.28/4.38/4.41/4.45/4.48
+  were done**: its own verification-only scope is fully executed and independently confirmed (two live
+  runs + a reviewer consistency pass); the demo it verified still does **not** pass (a sixth defect —
+  see Exit criteria below) — a sixth gap-closure wave is what's needed next, not a reopening of this one.
 
 **Findings with no task yet — surfaced by 4.42's own review, owned by no open task:**
 - **Shape B** (an `OpenChat`-style transition from `Screen::Requests` straight to Chat) was evaluated and
@@ -306,6 +308,21 @@ multi-document-write pattern with no new mechanism and no genuine design choice 
   functional defect, not a doc nit) to be pre-named as its own task, **4.49**, rather than parked in this
   list. See the [exit criteria](#exit-criteria) writeup and [4.48's own Status section](./4.48-t17-acceptance-demo-closure-attempt-5.md)
   for the full trace.
+
+**Findings with no task yet — surfaced by 4.50's sixth exit-gate attempt, owned by no open task:**
+- **`contacts.json`'s own `trust` field is stale after live verification.** `run_mark_verified` only
+  updates `trust.bin`; it never touches the matching row's `trust` field in `contacts.json`, and
+  `apps/tui/src/store/export.rs::export_json` never exports `trust.bin`'s content at all — so a
+  `--export-json` dump shows `"trust": "pinned"` for a contact the live TUI correctly displays as
+  "verified" (sourced from the in-memory join in `screens/main.rs::build_contact_entries`).
+  Non-blocking (doesn't affect the live UI or the demo's own `.petname` check) but a real gap in
+  exported state; a small, well-understood fix (either write-through on `run_mark_verified`, or have
+  `export_json` join `trust.bin` the same way `build_contact_entries` does) — not yet scoped as its
+  own task.
+- **The delivery-reliability defect itself is not listed here** — it is significant enough (a real,
+  reproducible functional defect, not a doc nit) to be pre-named as its own task, **4.51**, rather
+  than parked in this list. See the [exit criteria](#exit-criteria) writeup and
+  [4.50's own Status section](./4.50-t17-acceptance-demo-closure-attempt-6.md) for the full trace.
 
 ### Dependency order
 ```
@@ -581,14 +598,42 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   same gap is now removed as redundant. This checkbox still stays `[ ]`, since 4.50 is the only task
   permitted to flip it) and
   **[4.50](./4.50-t17-acceptance-demo-closure-attempt-6.md)** (the sixth exit-gate attempt, hard-joined
-  on 4.49 alone). A second, non-blocking finding also recorded: `docs/architecture/features/
-  17-terminal-tui-client.md`'s demo script still says `^N`/`^V` where the real bindings are plain `n`/`v`
-  (half of this was flagged back in 4.42's own Risks/notes and never fixed) — tracked earlier in this
-  file, in "Findings with no task yet," not silently dropped a second time and deliberately not folded
-  into 4.49. This box stays `[ ]` until 4.50 confirms a genuine pass.
+  on 4.49 alone) — **run, verdict FAIL, a sixth new defect found, held to the same
+  two-independent-live-runs-plus-reviewer discipline as every prior attempt**: the first live run
+  reported PASS (4.49's fix and every earlier-wave fix all re-confirmed live, including the intro
+  appearing in the responder's transcript for the first time under this discipline, plus 4.46's
+  same-session initiator-verify), but the second, genuinely independent run — its own PTY driver
+  built from scratch, its own re-derived environment setup — found a real, reproducible defect
+  through its own adversarial probing, outside the demo script's literal steps: **first-contact
+  message delivery is non-deterministically silent or very slow (70s–260s) when the X3DH initiator is
+  OS-keystore-backed and the responder is file-backed**, reproduced across ~15 fresh two-peer trials
+  (9/9 reliable in the reverse direction), even though the sender receives a genuine
+  server-acknowledged delivery confirmation within ~1–11s. A third, independent `reviewer` pass traced
+  the implicated code from source and corroborated the mechanism as plausible and directionally
+  correct but not fully root-caused: `apps/store/src/file.rs::FileSecretStore`'s uncached, per-call
+  `decrypt_seed()` scrypt unwrap runs synchronously and non-yielding on the single-threaded
+  `tokio::runtime::Builder::new_current_thread()` runtime every I/O in this crate depends on
+  (`apps/cli/src/main.rs`), costing a file-backed responder's first-contact path exactly two such
+  unwraps (~2.8–3.2s) — enough to explain the directional asymmetry but not the full observed range,
+  so a reconnect-storm compounding factor and an in-sandbox remeasurement of `decrypt_seed()`'s actual
+  cost remain open questions for the fix task to close. This is the same underlying mechanism as an
+  already-known, twice-independently-confirmed latency finding (File-backed `run_mark_verified` ≈
+  3.4s, `run_set_petname` ≈ 6.9s, both from the same uncached-unwrap pattern task 4.43 fixed only for
+  the bulk-signing path) — worth scoping as one shared fix rather than two patches, per the reviewer's
+  own recommendation. Full writeup: [4.50's own Status section](./4.50-t17-acceptance-demo-closure-attempt-6.md).
+  **Not fixed by 4.50 itself**, per its own explicit scope. A second, non-blocking finding also
+  recorded: `docs/architecture/features/17-terminal-tui-client.md`'s demo script still says `^N`/`^V`
+  where the real bindings are plain `n`/`v` (half of this was flagged back in 4.42's own Risks/notes
+  and never fixed) — tracked earlier in this file, in "Findings with no task yet," not silently
+  dropped a second time. A third, non-blocking finding newly recorded by 4.50's Run 2: `--export-json`'s
+  `contacts.json` still reports `"trust": "pinned"` after live verification, since `run_mark_verified`
+  never updates `contacts.json`'s own `trust` field and `export_json` never exports `trust.bin`'s
+  content — verification state is invisible in an exported dump; owned by no task yet, listed below in
+  "Findings with no task yet." This box stays `[ ]` until a future attempt confirms a genuine pass.
 - [x] The envelope-v2 obligation above was re-deferred with a concrete, mechanical trigger (see
   [above](#envelope-v2-re-deferred--the-concrete-trigger)) — not silently dropped.
 - Then: **not yet** `/start-review-phase` for Phase 5 — the task-tracking skill's own §7 still applies
-  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. `/plan-phase` has
-  now scoped the fifth gap-closure wave (4.49, 4.50); `/next-task` is the correct next command; see
-  [docs/tasks/README.md](../README.md)'s carry-forward section.
+  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. `/plan-phase` is
+  scoping the sixth gap-closure wave now (a fix task and a seventh exit-gate attempt); `/next-task` is
+  the correct next command once it lands; see [docs/tasks/README.md](../README.md)'s carry-forward
+  section.

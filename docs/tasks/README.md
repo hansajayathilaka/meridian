@@ -16,21 +16,26 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 4 (T08 + T17) is 49/50 tasks attempted, still NOT closed** — **4.49 is now done**,
-  closing the fifth exit-gate defect (4.48's finding): `worker::run_accept_request` now persists the
-  accepted sender's intro into the responder's `history.jsonl` via the same writer the ordinary inbound
-  path already uses, exactly the shape the plan-time "no pre-code consult needed" assessment predicted.
-  Review round found and closed one genuine should-fix: the new "two writers agree on `mid`" test
-  (`accept_to_chat.rs`) didn't actually exercise the dedup path, since a freshly-opened `Screen::Chat`
-  starts empty — strengthened to race a live, in-memory duplicate into `ChatState::entries` before the
-  disk load completes, falsified (confirmed it fails against a naive-concat mutation) before trusting
-  it. A single non-reproducible test flake seen once during review was independently stress-tested
-  (20× isolated, 4× the combined-binary invocation) with zero reproductions — treated as transient, not
-  blocking. Full lineage of all five exit-gate attempts in
+- **NOW:** **Phase 4 (T08 + T17) is 50/50 tasks attempted, still NOT closed** — **4.50 is now done,
+  verdict FAIL**, the sixth exit-gate attempt. Held to the same two-independent-live-runs-plus-reviewer
+  discipline as every prior attempt: the first live run reported PASS (4.49's intro-persistence fix and
+  every earlier-wave fix all re-confirmed live for the first time under this discipline), but the
+  second, genuinely independent run — its own PTY driver built from scratch — found a real,
+  reproducible sixth defect through its own adversarial probing: first-contact message delivery is
+  non-deterministically silent or very slow (70s–260s) when the X3DH initiator is OS-keystore-backed
+  and the responder is file-backed, reproduced across ~15 fresh two-peer trials (9/9 reliable in the
+  reverse direction). A third, independent `reviewer` pass traced the implicated code from source and
+  corroborated the mechanism as plausible and directionally correct but not fully root-caused:
+  `FileSecretStore`'s uncached, per-call scrypt unwrap runs synchronously on the single-threaded tokio
+  runtime every I/O in this crate depends on — the same underlying mechanism as an already-known,
+  twice-confirmed latency finding (`run_mark_verified` ≈3.4s, `run_set_petname` ≈6.9s on file-backed
+  accounts), worth scoping as one shared fix. Not fixed by 4.50 itself, per its own explicit scope.
+  `/plan-phase` is now scoping the sixth gap-closure wave. Full lineage of all six exit-gate attempts in
   [Phase 4's README](./phase-4/README.md#exit-criteria).
-- **NEXT:** `/next-task` for **4.50** — the sixth exit-gate attempt, hard-joined on 4.49 alone. Only
-  once it confirms a genuine pass does `/start-review-phase` for Phase 5 become the correct next
-  command — not before.
+- **NEXT:** `/plan-phase` output for the sixth gap-closure wave (a fix task, working number **4.51**,
+  and a seventh exit-gate attempt hard-joined on it), then `/next-task` to drive them. Only once an
+  exit-gate attempt confirms a genuine pass does `/start-review-phase` for Phase 5 become the correct
+  next command — not before.
 
 
 **Why this keeps extending Phase 4 rather than opening a new phase or a review phase**: the task-tracking
