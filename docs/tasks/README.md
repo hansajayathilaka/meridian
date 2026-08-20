@@ -312,7 +312,7 @@ pre-announced.
 - [x] **4.45** T17 acceptance-demo closure, fourth exit-gate attempt (hard join on 4.42, 4.43, 4.44) — [file](./phase-4/4.45-t17-acceptance-demo-closure-attempt-4.md)
 - [x] **4.46** Reconcile `Effect::AddContact` into the live `MainState::trust` (fix for 4.45's fourth defect) — [file](./phase-4/4.46-add-contact-trust-reconciliation.md)
 - [x] **4.47** Fix `--export-json` demo-script/spec wording (doc-only) — [file](./phase-4/4.47-export-json-doc-fix.md)
-- [ ] **4.48** T17 acceptance-demo closure, fifth exit-gate attempt — [file](./phase-4/4.48-t17-acceptance-demo-closure-attempt-5.md)
+- [~] **4.48** T17 acceptance-demo closure, fifth exit-gate attempt — [file](./phase-4/4.48-t17-acceptance-demo-closure-attempt-5.md)
 
 ---
 
