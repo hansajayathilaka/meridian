@@ -311,7 +311,7 @@ pre-announced.
   closed by the sixth gap-closure wave, 4.51/4.52) — [file](./phase-4/4.50-t17-acceptance-demo-closure-attempt-6.md)
 - [x] **4.51** Root-cause and fix the file-backed responder's blocking-scrypt hazard (fix for 4.50's
   sixth defect) — [file](./phase-4/4.51-file-backed-inbound-blocking-fix.md)
-- [ ] **4.52** T17 acceptance-demo closure, seventh exit-gate attempt — [file](./phase-4/4.52-t17-acceptance-demo-closure-attempt-7.md)
+- [~] **4.52** T17 acceptance-demo closure, seventh exit-gate attempt — [file](./phase-4/4.52-t17-acceptance-demo-closure-attempt-7.md)
 
 ---
 

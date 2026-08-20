@@ -296,7 +296,7 @@ an in-task consult rather than a plan-time one, because the investigation genuin
 - [x] **4.51** Root-cause and fix the file-backed responder's blocking-scrypt hazard (fix for 4.50's
   sixth defect; the `run_mark_verified`/`run_set_petname` latency finding was evaluated and split off
   rather than forced — see its own Status section) — [file](./4.51-file-backed-inbound-blocking-fix.md)
-- [ ] **4.52** T17 acceptance-demo closure, seventh exit-gate attempt (hard join on 4.51 alone) —
+- [~] **4.52** T17 acceptance-demo closure, seventh exit-gate attempt (hard join on 4.51 alone) —
   [file](./4.52-t17-acceptance-demo-closure-attempt-7.md)
 
 **Findings with no task yet — surfaced by 4.42's own review, owned by no open task:**
