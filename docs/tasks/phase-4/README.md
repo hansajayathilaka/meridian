@@ -4,10 +4,12 @@
 # Phase 4 — Verification & Trust + Terminal TUI Client
 
 **Kind:** build · **Status:** in progress — 50/50 previously-planned tasks done (4.1–4.50); the sixth
-exit-gate attempt (4.50) found a sixth genuine defect. `/plan-phase` is now scoping the sixth
-gap-closure wave: a fix task (working number **4.51**) for the delivery-reliability defect, and a
-seventh exit-gate attempt hard-joined on it. Per the task-tracking skill's own §7 ("a build phase
-isn't done until its acceptance demo runs"), the phase is **still not closed**: task 4.28 found T17's
+exit-gate attempt (4.50) found a sixth genuine defect. `/plan-phase` has now scoped the sixth
+gap-closure wave: task **4.51** (root-cause and fix the file-backed responder's blocking-scrypt hazard
+behind the non-deterministic first-contact delivery failure — investigation-first, fix shape and any
+required consult decided in-task, see that task's own pre-code consult assessment) and task **4.52** (a
+seventh exit-gate attempt, hard-joined on 4.51 only). Per the task-tracking skill's own §7 ("a build
+phase isn't done until its acceptance demo runs"), the phase is **still not closed**: task 4.28 found T17's
 acceptance demo did not run end to end; 4.29–4.37 closed that gap, but 4.38 found the demo *still*
 doesn't pass, for two reasons; 4.39/4.40 closed both, confirmed live — but 4.41 found a third defect
 (Defect C), closed by the third gap-closure wave (4.42–4.44), whose own re-verification (4.45) found a
@@ -283,6 +285,19 @@ multi-document-write pattern with no new mechanism and no genuine design choice 
   runs + a reviewer consistency pass); the demo it verified still does **not** pass (a sixth defect —
   see Exit criteria below) — a sixth gap-closure wave is what's needed next, not a reopening of this one.
 
+**Sixth gap-closure wave (planned by `/plan-phase` against 4.50's findings)** — investigates and fixes
+the sixth defect (non-deterministic, sometimes multi-minute silent first-contact delivery to a
+file-backed responder from an OS-keystore initiator), then a seventh exit-gate attempt. Unlike every
+prior wave's fix task, **4.51's own pre-code consult determination is conditional, not fixed at plan
+time**: whether an architect + security-reviewer consult is mandatory depends on which fix shape its own
+in-task investigation lands on (recorded in that task's own file) — mirroring 4.35's/4.9's precedent for
+an in-task consult rather than a plan-time one, because the investigation genuinely has to run first.
+- [ ] **4.51** Root-cause and fix the file-backed responder's blocking-scrypt hazard (fix for 4.50's
+  sixth defect; opportunistically also closes the already-known `run_mark_verified`/`run_set_petname`
+  latency finding if it generalizes cleanly) — [file](./4.51-file-backed-inbound-blocking-fix.md)
+- [ ] **4.52** T17 acceptance-demo closure, seventh exit-gate attempt (hard join on 4.51 alone) —
+  [file](./4.52-t17-acceptance-demo-closure-attempt-7.md)
+
 **Findings with no task yet — surfaced by 4.42's own review, owned by no open task:**
 - **Shape B** (an `OpenChat`-style transition from `Screen::Requests` straight to Chat) was evaluated and
   deliberately severed from 4.42 — the `RequestsAction` enum it needs ripples through ~30 call sites in
@@ -385,6 +400,12 @@ everything ──► 4.28
 4.42,4.44 ──► 4.49 (intro-persistence fix — no open design question)
 4.49 ──► 4.50 (sixth exit-gate attempt — single-dependency hard join, unlike 4.45's/4.48's
                  two-dependency joins, since this wave has exactly one fix task)
+
+-- Sixth gap-closure wave (added post-4.50, planned via /plan-phase) --
+4.50 ──► 4.51 (blocking-scrypt root-cause + fix — investigation first, fix shape
+                and any required consult decided in-task, not at plan time)
+4.51 ──► 4.52 (seventh exit-gate attempt — single-dependency hard join, same
+                 shape as 4.49──►4.50)
 ```
 **Landing order (fourth wave).** 4.46 and 4.47 touch disjoint files (`apps/tui/src/app.rs` + its tests
 vs. `docs/architecture/features/17-terminal-tui-client.md`), so either may land first — no
@@ -393,6 +414,13 @@ simultaneous-diff conflict risk like the third wave's shared `worker.rs` had. 4.
 **Fifth wave.** Single fix task (4.49), joined straight to its own verification task (4.50) — mirroring
 the third wave's 4.43 (single fix, no open design question) rather than the fourth wave's two-fix
 bundle, since 4.48's finding was single-cause and already traced to exact lines with a clear fix shape.
+
+**Sixth wave.** Single fix task (4.51), joined straight to its own verification task (4.52) — same
+shape as the fifth wave's 4.49→4.50. Unlike every prior single-fix wave, 4.51's own scope is
+investigation-first: 4.50's reviewer corroborated the leading hypothesis as plausible but explicitly did
+not close the root cause, so 4.51 cannot be scoped as a mechanical "apply the known fix" task the way
+4.43 or 4.49 were — its own file gates the fix shape (and any consult) on what its investigation phase
+actually finds.
 
 **Numbering vs. landing order (third wave).** Files are numbered 4.42–4.45 (4.42 = Defect C, as already
 pre-announced by 4.41's Status, this README, and the master tracker), but the recommended *landing* order
@@ -629,11 +657,22 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   `contacts.json` still reports `"trust": "pinned"` after live verification, since `run_mark_verified`
   never updates `contacts.json`'s own `trust` field and `export_json` never exports `trust.bin`'s
   content — verification state is invisible in an exported dump; owned by no task yet, listed below in
-  "Findings with no task yet." This box stays `[ ]` until a future attempt confirms a genuine pass.
+  "Findings with no task yet." `/plan-phase` has now scoped the sixth gap-closure wave:
+  **[4.51](./4.51-file-backed-inbound-blocking-fix.md)** (an investigation-first task, not a mechanical
+  "apply the known fix" — its own planning pass, tracing `run_inbound_loop` directly, found a **third**
+  synchronous `decrypt_seed()` call site the 4.50 reviewer's own trace hadn't named:
+  `SignalingClient::handshake`'s `sign()` call, paid on every connect *and* every reconnect attempt, not
+  just the two call sites inside `process_inbound_delivery`. 4.51 must remeasure `decrypt_seed()`'s wall
+  time in-sandbox, rule the reconnect-storm hypothesis in or out with live instrumented evidence, and
+  produce a reconciled accounting for the observed 70–260s range before choosing a fix shape — and
+  whether that fix needs an architect + security-reviewer consult is decided in-task, against a binding
+  rule recorded in that task's own file, since a `spawn_blocking`-only fix needs none but a
+  session-lifetime seed cache would trip the exact residency question 4.43's own "boundary" reserved for
+  a future task) and **[4.52](./4.52-t17-acceptance-demo-closure-attempt-7.md)** (the seventh exit-gate
+  attempt, hard-joined on 4.51 alone). This box stays `[ ]` until 4.52 confirms a genuine pass.
 - [x] The envelope-v2 obligation above was re-deferred with a concrete, mechanical trigger (see
   [above](#envelope-v2-re-deferred--the-concrete-trigger)) — not silently dropped.
 - Then: **not yet** `/start-review-phase` for Phase 5 — the task-tracking skill's own §7 still applies
-  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. `/plan-phase` is
-  scoping the sixth gap-closure wave now (a fix task and a seventh exit-gate attempt); `/next-task` is
-  the correct next command once it lands; see [docs/tasks/README.md](../README.md)'s carry-forward
-  section.
+  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. `/plan-phase` has
+  now scoped the sixth gap-closure wave (4.51, 4.52); `/next-task` is the correct next command; see
+  [docs/tasks/README.md](../README.md)'s carry-forward section.

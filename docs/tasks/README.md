@@ -30,12 +30,16 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   runtime every I/O in this crate depends on — the same underlying mechanism as an already-known,
   twice-confirmed latency finding (`run_mark_verified` ≈3.4s, `run_set_petname` ≈6.9s on file-backed
   accounts), worth scoping as one shared fix. Not fixed by 4.50 itself, per its own explicit scope.
-  `/plan-phase` is now scoping the sixth gap-closure wave. Full lineage of all six exit-gate attempts in
+  `/plan-phase` has now scoped the sixth gap-closure wave: task **4.51** (an investigation-first fix
+  task — its own planning pass traced a third synchronous `decrypt_seed()` call site the reviewer's
+  trace hadn't named, `SignalingClient::handshake`'s `sign()` call on every connect/reconnect, and must
+  remeasure `decrypt_seed()`'s wall time in-sandbox and rule the reconnect-storm hypothesis in or out
+  before choosing a fix shape; whether an architect + security-reviewer consult is required is decided
+  in-task against a binding rule recorded in that task's own file) and task **4.52** (a seventh
+  exit-gate attempt, hard-joined on 4.51 alone). Full lineage of all six exit-gate attempts in
   [Phase 4's README](./phase-4/README.md#exit-criteria).
-- **NEXT:** `/plan-phase` output for the sixth gap-closure wave (a fix task, working number **4.51**,
-  and a seventh exit-gate attempt hard-joined on it), then `/next-task` to drive them. Only once an
-  exit-gate attempt confirms a genuine pass does `/start-review-phase` for Phase 5 become the correct
-  next command — not before.
+- **NEXT:** `/next-task` for **4.51**, then **4.52**. Only once an exit-gate attempt confirms a genuine
+  pass does `/start-review-phase` for Phase 5 become the correct next command — not before.
 
 
 **Why this keeps extending Phase 4 rather than opening a new phase or a review phase**: the task-tracking
@@ -305,7 +309,11 @@ pre-announced.
 - [x] **4.47** Fix `--export-json` demo-script/spec wording (doc-only) — [file](./phase-4/4.47-export-json-doc-fix.md)
 - [x] **4.48** T17 acceptance-demo closure, fifth exit-gate attempt — [file](./phase-4/4.48-t17-acceptance-demo-closure-attempt-5.md)
 - [x] **4.49** Persist the accepted sender's intro into `history.jsonl` (fix for 4.48's fifth defect) — [file](./phase-4/4.49-persist-accepted-intro-history.md)
-- [~] **4.50** T17 acceptance-demo closure, sixth exit-gate attempt — [file](./phase-4/4.50-t17-acceptance-demo-closure-attempt-6.md)
+- [x] **4.50** T17 acceptance-demo closure, sixth exit-gate attempt (verdict FAIL — sixth defect found;
+  closed by the sixth gap-closure wave, 4.51/4.52) — [file](./phase-4/4.50-t17-acceptance-demo-closure-attempt-6.md)
+- [ ] **4.51** Root-cause and fix the file-backed responder's blocking-scrypt hazard (fix for 4.50's
+  sixth defect) — [file](./phase-4/4.51-file-backed-inbound-blocking-fix.md)
+- [ ] **4.52** T17 acceptance-demo closure, seventh exit-gate attempt — [file](./phase-4/4.52-t17-acceptance-demo-closure-attempt-7.md)
 
 ---
 
