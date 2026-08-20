@@ -64,6 +64,43 @@ impl SignalingClient {
         Self::handshake(ws, store, handle, account_pub, invite, max_bundle_v).await
     }
 
+    /// Like [`Self::connect`], but takes an owned, cheaply-`clone()`-able `Arc<dyn SecretStore>`
+    /// instead of a borrow, and performs the handshake's one signature
+    /// (`sign(store, handle, &to_sign)`) inside [`tokio::task::spawn_blocking`] rather than
+    /// synchronously on the calling task.
+    ///
+    /// **Why this exists (task 4.51).** `apps/tui/src/worker.rs::run_inbound_loop` calls
+    /// [`Self::connect`] on every initial connect *and every reconnect attempt*, on
+    /// `apps/cli/src/main.rs`'s single-threaded `current_thread` runtime. For a file-backed
+    /// account, `sign()` there runs `FileSecretStore::use_key`, which performs a full, synchronous
+    /// age/scrypt unwrap on every single call (~1.3 s measured — see that task's own Status
+    /// section) — run directly on the calling task, that freezes *every* other task in the process
+    /// (rendering, every other in-flight effect, this very loop's own message receipt) for the
+    /// whole unwrap. `tokio::task::block_in_place` is not a legal alternative (it panics on a
+    /// `current_thread` runtime); `spawn_blocking`'s closure must be `'static + Send`, which a
+    /// borrowed `&dyn SecretStore` cannot satisfy — hence the owned `Arc` here rather than changing
+    /// [`Self::connect`]'s own signature (every other caller — `cmd_register`, `cmd_chat`,
+    /// `session_connect`, `republish_bundle`, … — keeps using the borrow-based [`Self::connect`]
+    /// unchanged; this method is additive, not a replacement).
+    ///
+    /// **No new caching, no new residency.** This performs the exact same `sign()` call, against
+    /// the exact same store, the exact same number of times per (re)connect as
+    /// [`Self::connect`]/[`Self::handshake`] always did — only the thread it runs on changed.
+    pub async fn connect_owned(
+        url: &str,
+        store: std::sync::Arc<dyn SecretStore>,
+        handle: KeyHandle,
+        account_pub: [u8; 32],
+        invite: Option<String>,
+        max_bundle_v: u16,
+    ) -> Result<Self> {
+        install_crypto_provider();
+        let (ws, _resp) = connect_async(url)
+            .await
+            .map_err(|e| SignalError::Ws(e.to_string()))?;
+        Self::handshake_owned(ws, store, handle, account_pub, invite, max_bundle_v).await
+    }
+
     /// Same as [`Self::connect`], but trusting `ca_cert_pem` (one or more PEM certificates) as the
     /// **exclusive** TLS root instead of the OS/native trust store — for tests that stand up a
     /// self-signed `wss://` listener rather than reaching a real WebPKI-trusted host. Only built
@@ -160,6 +197,58 @@ impl SignalingClient {
         let mut to_sign = challenge.nonce.to_vec();
         to_sign.extend_from_slice(challenge.server_domain.as_bytes());
         let sig = sign(store, handle, &to_sign)?;
+
+        let auth = Auth {
+            account_pub,
+            sig: *sig.as_bytes(),
+            invite,
+            max_bundle_v,
+        };
+        let reply = client
+            .request(Op::Auth, &auth, Op::AuthOk, "auth_ok")
+            .await?;
+        let _ok: AuthOk = reply.decode()?;
+        Ok(client)
+    }
+
+    /// The [`Self::connect_owned`]-only counterpart of [`Self::handshake`] — identical wire
+    /// behavior and framing, differing only in running the one `sign()` call inside
+    /// [`tokio::task::spawn_blocking`] against an owned `Arc<dyn SecretStore>` instead of
+    /// synchronously against a borrow. See [`Self::connect_owned`]'s own doc comment for why.
+    async fn handshake_owned(
+        ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        store: std::sync::Arc<dyn SecretStore>,
+        handle: KeyHandle,
+        account_pub: [u8; 32],
+        invite: Option<String>,
+        max_bundle_v: u16,
+    ) -> Result<Self> {
+        let mut client = Self {
+            ws,
+            next_id: 1,
+            account_pub,
+            server_domain: String::new(),
+            pending_delivers: VecDeque::new(),
+        };
+
+        // The server speaks first with a single-use challenge.
+        let frame = client.recv_frame().await?;
+        if frame.op != Op::Challenge {
+            return Err(SignalError::Unexpected {
+                got: frame.op,
+                expected: "challenge",
+            });
+        }
+        let challenge: Challenge = frame.decode()?;
+        client.server_domain = challenge.server_domain.clone();
+
+        // Sign nonce ‖ server_domain (domain binding defeats cross-server challenge replay) —
+        // off the calling task; see this method's own doc comment.
+        let mut to_sign = challenge.nonce.to_vec();
+        to_sign.extend_from_slice(challenge.server_domain.as_bytes());
+        let sig = tokio::task::spawn_blocking(move || sign(store.as_ref(), &handle, &to_sign))
+            .await
+            .map_err(|e| SignalError::Ws(format!("signing task panicked: {e}")))??;
 
         let auth = Auth {
             account_pub,

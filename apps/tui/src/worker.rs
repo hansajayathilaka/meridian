@@ -384,7 +384,7 @@ async fn handle_register(request: RegisterRequest, session: &mut OnboardingSessi
     // the exact `MemorySecretStore` `handle_publish_bundle` will go on to sign the bundle's 1 +
     // `otk_count` signatures with, cached below alongside the connection so that second step never
     // re-unwraps the same keyfile a second time — see `OnboardingSession`'s own doc comment.
-    let store = match open_store_for_bulk_signing(&request.store, &request.label) {
+    let store = match open_store_for_bulk_signing(&request.store, &request.label).await {
         Ok(store) => store,
         Err(message) => return WorkerEvent::Failed(Effect::Register(request), message),
     };
@@ -510,7 +510,7 @@ async fn handle_publish_bundle(
 /// failing closed — see that function's own doc comment for the full design.
 async fn handle_unlock(effect: UnlockEffect, session: &mut OnboardingSession) -> WorkerEvent {
     let UnlockEffect { request, .. } = effect;
-    match run_unlock(&request) {
+    match run_unlock(&request).await {
         Ok((live_session, store, handle)) => {
             session.set_live_store(store, handle);
             WorkerEvent::Completed(Effect::Unlock(Box::new(UnlockEffect {
@@ -532,7 +532,19 @@ async fn handle_unlock(effect: UnlockEffect, session: &mut OnboardingSession) ->
 /// loaded it — task 4.40 widened this return shape (previously just `Result<LiveSession, String>`)
 /// so [`handle_unlock`] can cache that exact pair on [`OnboardingSession`] without paying a second,
 /// redundant passphrase unwrap to reconstruct it.
-fn run_unlock(
+///
+/// **`async fn` since task 4.51**, purely to run the passphrase-verification unwrap below inside
+/// [`tokio::task::spawn_blocking`] — a full, synchronous age/scrypt unwrap (~1.3 s measured — see
+/// this task's own Status section) that would otherwise run directly on `apps/cli/src/main.rs`'s
+/// single `current_thread` runtime, freezing every other task (rendering, every other effect) for
+/// its whole duration on every single unlock. **No new caching, no new residency**: still exactly
+/// one `export_seed()` call, same as before this task — [`load_live_session`] below (and the
+/// `fs`/`store` this function returns) is untouched, still fully synchronous, and still only ever
+/// calls `decrypt_seed()` again if `trust.bin`/`sessions.bin` already exist (a restart, not a fresh
+/// account) — a residual not itemized in this task's own six-call accounting because it did not
+/// fire in any of this task's own fresh-account live trials; named here rather than silently
+/// assumed away.
+async fn run_unlock(
     request: &UnlockRequest,
 ) -> Result<(LiveSession, Box<dyn SecretStore>, KeyHandle), String> {
     // Review fix (task 4.29, Finding 4): the symmetric guard to `run_load_session`'s own
@@ -552,10 +564,24 @@ fn run_unlock(
                 .to_string(),
         );
     }
-    let fs = FileSecretStore::new(&request.keyfile, request.passphrase.clone());
     // Verify the passphrase first, exactly as task 4.30 already did — a wrong passphrase must
-    // surface as *that*, not as a confusing "corrupt trust.bin" error from the loads below.
-    fs.export_seed().map_err(|e| e.to_string())?;
+    // surface as *that*, not as a confusing "corrupt trust.bin" error from the loads below. Task
+    // 4.51: off this task via `spawn_blocking` (see this function's own doc comment) — a throwaway
+    // `FileSecretStore` built inside the closure from cloned, owned `keyfile`/`passphrase` (the
+    // borrows this function receives can't satisfy `spawn_blocking`'s `'static + Send` bound); the
+    // real `fs` used below is a second, cheap (no I/O) construction, not a second unwrap.
+    let keyfile = request.keyfile.clone();
+    let passphrase = request.passphrase.clone();
+    tokio::task::spawn_blocking(move || {
+        FileSecretStore::new(&keyfile, passphrase)
+            .export_seed()
+            .map(|_| ())
+    })
+    .await
+    .map_err(|e| format!("passphrase-verification task panicked: {e}"))?
+    .map_err(|e| e.to_string())?;
+
+    let fs = FileSecretStore::new(&request.keyfile, request.passphrase.clone());
     let handle = KeyHandle::from_label(&descriptor.label);
     let live_session = load_live_session(descriptor, &fs, &handle)?;
     Ok((live_session, Box::new(fs), handle))
@@ -1966,8 +1992,16 @@ pub struct InboundHandoff {
     /// process's life. For a file-backed account this is the raw `FileSecretStore` — one age/scrypt
     /// unwrap per `use_key`/`derive_key`, which is the right trade for a loop that signs once per
     /// received envelope and would otherwise hold a raw seed resident forever. Unchanged by task
-    /// 4.43: `run_inbound_loop`'s behavior is byte-for-byte as task 4.35 shipped it.
-    pub store: Box<dyn SecretStore>,
+    /// 4.43: which concrete store this holds, and how many times it decrypts the seed, is
+    /// byte-for-byte as task 4.35 shipped it.
+    ///
+    /// **`Arc`, not `Box` (task 4.51).** [`run_inbound_loop`] now runs this store's synchronous
+    /// `use_key`/`derive_key` calls inside [`tokio::task::spawn_blocking`], whose closure must be
+    /// `'static + Send` — a `Box<dyn SecretStore>` borrowed as `&dyn SecretStore` cannot satisfy
+    /// that, but a cloned `Arc<dyn SecretStore>` can (`SecretStore: Send + Sync` already). This is a
+    /// pure execution-context change: the same store, decrypted the same number of times at the
+    /// same call sites — see [`run_inbound_loop`]'s own doc comment.
+    pub store: std::sync::Arc<dyn SecretStore>,
     /// The **bulk-signing** store [`crate::run_worker`] hands to [`republish_bundle`] — the one
     /// call in this path that signs 101 times (1 SPK + `DEFAULT_OTK_COUNT` OTKs) plus the
     /// connect-time auth signature and `load_chat`/`save_chat`'s at-rest `derive_key`.
@@ -2035,7 +2069,12 @@ pub struct InboundHandoff {
 /// loop silently never starts rather than surfacing an error anywhere the user can see — no design
 /// doc this task read specifies whether that should instead be a visible, named failure (e.g. a
 /// dedicated `WorkerEvent`); flagged, not resolved, here.
-pub fn inbound_handoff(event: &WorkerEvent) -> Option<InboundHandoff> {
+///
+/// **`async fn` since task 4.51**, purely to `.await` [`unwrap_keyfile_for_bulk_signing`]'s own
+/// `spawn_blocking` wrap on the `Effect::Unlock` arm — no network I/O was added; see
+/// [`republish_bundle`]'s own doc comment for why that (a real network round trip) still stays a
+/// separate function rather than folding into this one.
+pub async fn inbound_handoff(event: &WorkerEvent) -> Option<InboundHandoff> {
     match event {
         WorkerEvent::Completed(Effect::LoadSession(LoadSessionEffect {
             outcome: Some(LoadSessionOutcome::Loaded(boxed)),
@@ -2054,7 +2093,7 @@ pub fn inbound_handoff(event: &WorkerEvent) -> Option<InboundHandoff> {
             let account_pub = account_pub_bytes(&descriptor).ok()?;
             let server = resolve_server(&descriptor).ok()?;
             Some(InboundHandoff {
-                store: Box::new(OsSecretStore::new(&service)),
+                store: std::sync::Arc::new(OsSecretStore::new(&service)),
                 // Task 4.43: a second, independent `OsSecretStore` for `republish_bundle`'s own
                 // bulk signing. Free (no KDF, no passphrase held), so this branch needs no
                 // unwrap-once treatment and is otherwise byte-for-byte unchanged.
@@ -2087,11 +2126,12 @@ pub fn inbound_handoff(event: &WorkerEvent) -> Option<InboundHandoff> {
                 &boxed.request.passphrase,
                 &descriptor.label,
             )
+            .await
             .ok()?;
             let account_pub = account_pub_bytes(&descriptor).ok()?;
             let server = resolve_server(&descriptor).ok()?;
             Some(InboundHandoff {
-                store: Box::new(fs),
+                store: std::sync::Arc::new(fs),
                 bulk_signing_store,
                 handle,
                 account_pub,
@@ -2120,10 +2160,13 @@ pub fn inbound_handoff(event: &WorkerEvent) -> Option<InboundHandoff> {
 /// once, immediately before `tokio::spawn(run_inbound_loop(..))`, guarded by the same one-shot
 /// `inbound_started` flag that already ensures `run_inbound_loop` itself only spawns once per
 /// session — so this also runs exactly once per session. It is its own async function, never
-/// folded into [`inbound_handoff`], because that function is synchronous and documented as "never
-/// a new round trip" (task 4.35) — widening its contract to cover a network round trip would break
-/// that invariant for every other caller of `inbound_handoff` (today, only `crate::run_worker`,
-/// but the doc comment's promise is about the function's own contract, not just its one caller).
+/// folded into [`inbound_handoff`], because this function does a **real network round trip**
+/// (`connect` + `publish_bundle`), categorically different from [`inbound_handoff`]'s own contract
+/// of "never a new round trip" (task 4.35) — widening `inbound_handoff`'s contract to cover network
+/// I/O would break that invariant for every caller. **[`inbound_handoff`] itself became `async fn`
+/// under task 4.51**, but only to run its own local `spawn_blocking` seed-unwrap off this task's
+/// thread — that is not a network round trip and does not touch this distinction; the "never a new
+/// round trip" promise is about *what kind of I/O*, not about sync-vs-async as a keyword.
 ///
 /// Takes `store`/`handle`/`account_pub`/`server` by reference/value directly (the same shape
 /// [`InboundHandoff`] carries) rather than an `&InboundHandoff`, so `crate::run_worker` can borrow
@@ -2220,8 +2263,24 @@ pub async fn republish_bundle(
 /// when `replies` itself fails to send (the app side hung up, e.g. `meridian tui` exited) — every
 /// other failure just reconnects, forever, at the last configured backoff step once `backoff_ms` is
 /// exhausted.
+///
+/// **Task 4.51: `store` is `Arc`, not `Box`.** Both this loop's own per-(re)connect
+/// `SignalingClient::connect_owned` call and [`process_inbound_delivery`]'s per-envelope crypto now
+/// run their synchronous, potentially-scrypt-costly `SecretStore` calls inside
+/// [`tokio::task::spawn_blocking`] rather than directly on this task — `apps/cli/src/main.rs`'s
+/// `current_thread` runtime means a long synchronous call (a file-backed account's
+/// `FileSecretStore::use_key`/`derive_key`, each a full age/scrypt unwrap, ~1.3 s measured) would
+/// otherwise freeze *every* other task on the process (rendering, other effects, this very loop's
+/// own next envelope) for its whole duration — see this task's own Status section for the measured
+/// accounting. `spawn_blocking`'s closure must be `'static + Send`; a `Box<dyn SecretStore>`
+/// borrowed as `&dyn SecretStore` cannot satisfy that (the borrow's lifetime is tied to this
+/// function's own stack frame), so `store` is an `Arc<dyn SecretStore>` here — cheap to `clone()`
+/// per (re)connect/per envelope, and `SecretStore: Send + Sync` already (`apps/store/src/lib.rs`),
+/// so `Arc<dyn SecretStore>` is itself `Send + Sync + 'static`. **No new caching, no new
+/// residency**: the exact same store object is decrypted/signed the same number of times at the
+/// same call sites as before this task — only the thread it runs on changed.
 pub async fn run_inbound_loop(
-    store: Box<dyn SecretStore>,
+    store: std::sync::Arc<dyn SecretStore>,
     handle: KeyHandle,
     account_pub: [u8; 32],
     server: String,
@@ -2239,7 +2298,15 @@ pub async fn run_inbound_loop(
     let mut attempt: u32 = 0;
 
     loop {
-        match SignalingClient::connect(&server, store.as_ref(), &handle, account_pub, None, 1).await
+        match SignalingClient::connect_owned(
+            &server,
+            store.clone(),
+            handle.clone(),
+            account_pub,
+            None,
+            1,
+        )
+        .await
         {
             Ok(mut client) => {
                 attempt = 0;
@@ -2254,11 +2321,11 @@ pub async fn run_inbound_loop(
                 // — never crashes this loop, mirrors every other network call site in this module.
                 while let Ok(deliver) = client.next_deliver().await {
                     if let Some(event) = process_inbound_delivery(
-                        store.as_ref(),
-                        &handle,
-                        &account_pub,
+                        store.clone(),
+                        handle.clone(),
+                        account_pub,
                         &mut client,
-                        &deliver,
+                        deliver,
                     )
                     .await
                     {
@@ -2297,95 +2364,151 @@ pub async fn run_inbound_loop(
 /// (`open_inbound`/`open_inbound_gated` installing a session, consuming a one-time prekey, queuing a
 /// message request, advancing a ratchet chain) must survive even when the specific content is
 /// ultimately not forwarded to `App` (e.g. a `ChatError::RequestPending` re-send, or a `Receipt`).
+///
+/// **Task 4.51: the load/open/ack-seal/save sequence runs inside [`tokio::task::spawn_blocking`].**
+/// For a file-backed account, `load_chat`'s `derive_key`, `open_inbound`'s X3DH `use_key`, the
+/// auto-ack's `seal_outbound` `use_key`, and `save_chat`'s `derive_key` are each a full,
+/// synchronous age/scrypt unwrap (~1.3 s measured in this task's own Status section) — run directly
+/// on this task (as before this task's fix), that freezes `apps/cli/src/main.rs`'s single
+/// `current_thread` runtime (rendering, every other effect, this very loop's next envelope) for the
+/// whole sequence.
+/// `chat_state_lock`'s guard (`_chat_guard` below) is still held across *all* of it, spanning both
+/// the blocking closure and the network route after it — the lock discipline this function's own
+/// doc comment requires is unchanged; only the execution context moved.
+///
+/// **Ordering note.** [`save_chat`] now runs *before* the auto-ack's best-effort
+/// `client.route_with_hint` (previously it ran after, inside the `Text` match arm). This is a
+/// strictly safer order, not a weaker one: the route was already best-effort
+/// (`let _ = client.route_with_hint(...)`, its failure already silently swallowed both before and
+/// after this task), so persisting the durable `sessions.bin` mutation before attempting that
+/// already-best-effort network send is preferable to the reverse. `client: &mut SignalingClient`
+/// itself never moves into the blocking closure (it isn't a `SecretStore` operation and
+/// `SignalingClient` has no need to be `Send`-safe for this) — only the store/handle/account/deliver
+/// inputs the blocking crypto work actually needs do.
 async fn process_inbound_delivery(
-    store: &dyn SecretStore,
-    handle: &KeyHandle,
-    account_pub: &[u8; 32],
+    store: std::sync::Arc<dyn SecretStore>,
+    handle: KeyHandle,
+    account_pub: [u8; 32],
     client: &mut SignalingClient,
-    deliver: &meridian_core::proto::Deliver,
+    deliver: meridian_core::proto::Deliver,
 ) -> Option<crate::app::InboundEvent> {
     use crate::app::InboundEvent;
     use crate::store::history::{Direction as HistDirection, HistoryEntry, MessageState};
 
     let _chat_guard = chat_state_lock().lock().await;
 
-    // A `sessions.bin` that fails to load (corrupt, wrong key) is a hard local problem, not
-    // something this envelope caused — drop this one delivery rather than crash the loop; the next
-    // successful delivery gets exactly the same chance. Mirrors every other handler's fail-closed
-    // `load_chat`/`load_trust` contract in this module.
-    let mut chat = match load_chat(store, handle) {
-        Ok(chat) => chat,
-        Err(e) => {
-            eprintln!("meridian tui: could not load sessions.bin for an inbound envelope: {e}");
-            return None;
-        }
-    };
-    chat.expire_previous_generation(now_unix());
+    type Ack = ([u8; 32], Option<String>, Vec<u8>);
+    let (event, ack): (Option<InboundEvent>, Option<Ack>) =
+        tokio::task::spawn_blocking(move || {
+            let store: &dyn SecretStore = store.as_ref();
+            let handle = &handle;
 
-    let event = match chat.open_inbound(
-        store,
-        handle,
-        account_pub,
-        &deliver.from,
-        deliver.blob.as_bytes(),
-    ) {
-        Ok(ChatContent::Text { id, body }) => {
-            // Auto-ack (never gated by `SendGate` — see this section's own module doc). Best-effort:
-            // a failed seal or a failed route must not stop the message itself from being delivered
-            // to the user, so neither is treated as fatal to this whole delivery.
-            if let Ok(receipt_blob) = chat.seal_outbound(
+            // A `sessions.bin` that fails to load (corrupt, wrong key) is a hard local problem,
+            // not something this envelope caused — drop this one delivery rather than crash the
+            // loop; the next successful delivery gets exactly the same chance. Mirrors every
+            // other handler's fail-closed `load_chat`/`load_trust` contract in this module.
+            let mut chat = match load_chat(store, handle) {
+                Ok(chat) => chat,
+                Err(e) => {
+                    eprintln!(
+                        "meridian tui: could not load sessions.bin for an inbound envelope: {e}"
+                    );
+                    return (None, None);
+                }
+            };
+            chat.expire_previous_generation(now_unix());
+
+            let (event, ack) = match chat.open_inbound(
                 store,
                 handle,
-                account_pub,
+                &account_pub,
                 &deliver.from,
-                &ChatContent::Receipt { ack: id },
+                deliver.blob.as_bytes(),
             ) {
-                // Runs the looked-up hint through the same [`sanitize_routing_hint`] every other
-                // routing-hint call site uses — see that function's own doc comment for why an
-                // empty-but-present hint must never be forwarded verbatim.
-                let hint = load_trust(store, handle)
-                    .ok()
-                    .and_then(|t| t.contact(&deliver.from).map(|c| c.hint.clone()))
-                    .and_then(|h| sanitize_routing_hint(&h));
-                let _ = client
-                    .route_with_hint(deliver.from, hint, receipt_blob)
-                    .await;
-            }
-            Some(InboundEvent::Message {
-                peer_pubkey: deliver.from,
-                entry: HistoryEntry {
-                    v: crate::store::history::CURRENT_VERSION,
-                    mid: hex::encode(id),
-                    dir: HistDirection::In,
-                    ts: now_unix(),
-                    stream: "mrd.chat/1".to_string(),
-                    body,
-                    state: MessageState::Received,
-                },
-            })
-        }
-        Ok(ChatContent::Receipt { ack }) => Some(InboundEvent::Receipt {
-            peer_pubkey: deliver.from,
-            ack: hex::encode(ack),
-        }),
-        // First contact (task 2.10, §3.5) — gated, never auto-delivered. `open_inbound` already
-        // installed the pending request into `chat` itself; read it back to build the display copy.
-        Err(ChatError::MessageRequest) => chat.pending_request(&deliver.from).map(|req| {
-            InboundEvent::MessageRequest(crate::screens::requests::RequestEntry::from(req))
-        }),
-        // Everything else — `RequestPending`, `Desync`, `BadSignature`, `SenderMismatch`,
-        // `UnknownPrekey`, `NoSession`, a codec/crypto/store error — dropped, logged, never trusted.
-        // Mirrors `apps/cli/src/chat.rs::handle_inbound`'s own reject-loudly-never-trust catch-all
-        // exactly (this section's own module doc). Automatic desync recovery is deliberately not
-        // wired into this loop — out of this task's scope.
-        Err(e) => {
-            eprintln!("meridian tui: dropped an inbound envelope: {e}");
-            None
-        }
-    };
+                Ok(ChatContent::Text { id, body }) => {
+                    // Auto-ack (never gated by `SendGate` — see this section's own module doc).
+                    // Best-effort: a failed seal must not stop the message itself from being
+                    // delivered to the user — never treated as fatal to this whole delivery.
+                    let ack = chat
+                        .seal_outbound(
+                            store,
+                            handle,
+                            &account_pub,
+                            &deliver.from,
+                            &ChatContent::Receipt { ack: id },
+                        )
+                        .ok()
+                        .map(|receipt_blob| {
+                            // Runs the looked-up hint through the same [`sanitize_routing_hint`]
+                            // every other routing-hint call site uses — see that function's own
+                            // doc comment for why an empty-but-present hint must never be
+                            // forwarded verbatim.
+                            let hint = load_trust(store, handle)
+                                .ok()
+                                .and_then(|t| t.contact(&deliver.from).map(|c| c.hint.clone()))
+                                .and_then(|h| sanitize_routing_hint(&h));
+                            (deliver.from, hint, receipt_blob)
+                        });
+                    let event = Some(InboundEvent::Message {
+                        peer_pubkey: deliver.from,
+                        entry: HistoryEntry {
+                            v: crate::store::history::CURRENT_VERSION,
+                            mid: hex::encode(id),
+                            dir: HistDirection::In,
+                            ts: now_unix(),
+                            stream: "mrd.chat/1".to_string(),
+                            body,
+                            state: MessageState::Received,
+                        },
+                    });
+                    (event, ack)
+                }
+                Ok(ChatContent::Receipt { ack }) => (
+                    Some(InboundEvent::Receipt {
+                        peer_pubkey: deliver.from,
+                        ack: hex::encode(ack),
+                    }),
+                    None,
+                ),
+                // First contact (task 2.10, §3.5) — gated, never auto-delivered. `open_inbound`
+                // already installed the pending request into `chat` itself; read it back to build
+                // the display copy.
+                Err(ChatError::MessageRequest) => (
+                    chat.pending_request(&deliver.from).map(|req| {
+                        InboundEvent::MessageRequest(crate::screens::requests::RequestEntry::from(
+                            req,
+                        ))
+                    }),
+                    None,
+                ),
+                // Everything else — `RequestPending`, `Desync`, `BadSignature`, `SenderMismatch`,
+                // `UnknownPrekey`, `NoSession`, a codec/crypto/store error — dropped, logged,
+                // never trusted. Mirrors `apps/cli/src/chat.rs::handle_inbound`'s own
+                // reject-loudly-never-trust catch-all exactly (this section's own module doc).
+                // Automatic desync recovery is deliberately not wired into this loop — out of
+                // this task's scope.
+                Err(e) => {
+                    eprintln!("meridian tui: dropped an inbound envelope: {e}");
+                    (None, None)
+                }
+            };
 
-    if let Err(e) = save_chat(&chat, store, handle) {
-        eprintln!("meridian tui: could not persist sessions.bin after an inbound envelope: {e}");
+            if let Err(e) = save_chat(&chat, store, handle) {
+                eprintln!(
+                    "meridian tui: could not persist sessions.bin after an inbound envelope: {e}"
+                );
+            }
+
+            (event, ack)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("meridian tui: inbound-delivery blocking task panicked: {e}");
+            (None, None)
+        });
+
+    if let Some((from, hint, receipt_blob)) = ack {
+        let _ = client.route_with_hint(from, hint, receipt_blob).await;
     }
 
     event
@@ -2538,7 +2661,7 @@ fn open_store(store: &StoreChoice) -> Result<Box<dyn SecretStore>, String> {
 /// once via `load_store` and reuses that one object for both the connect signature and every
 /// `publish_bundle` signature), rather than this worker paying a second, redundant scrypt unwrap for
 /// the same keyfile across its two separately-dispatched effects.
-fn open_store_for_bulk_signing(
+async fn open_store_for_bulk_signing(
     store: &StoreChoice,
     label: &str,
 ) -> Result<Box<dyn SecretStore>, String> {
@@ -2549,7 +2672,7 @@ fn open_store_for_bulk_signing(
         // the unwrap-once dance, shared with `inbound_handoff`, never two copies that could drift.
         StoreChoice::File { passphrase } => {
             let keyfile = default_keyfile_path()?;
-            unwrap_keyfile_for_bulk_signing(&keyfile, passphrase, label)
+            unwrap_keyfile_for_bulk_signing(&keyfile, passphrase, label).await
         }
     }
 }
@@ -2576,17 +2699,34 @@ fn open_store_for_bulk_signing(
 /// `label` must be the same label the caller's [`KeyHandle`] carries: `MemorySecretStore::store`
 /// keys by label, and its `use_key`/`derive_key` look up by `h.label` — a mismatch fails closed
 /// with `StoreError::NotFound`, never a wrong-key signature.
-fn unwrap_keyfile_for_bulk_signing(
+///
+/// **Task 4.51: the one `export_seed()` unwrap runs inside [`tokio::task::spawn_blocking`].** This
+/// is called from [`inbound_handoff`] (on the hot session-start path, before `run_inbound_loop`
+/// spawns) and, via [`open_store_for_bulk_signing`], from [`handle_register`] — both run on
+/// `apps/cli/src/main.rs`'s single `current_thread` runtime, where a full, synchronous age/scrypt
+/// unwrap (~1.3 s measured — see this task's own Status section) would otherwise freeze every other
+/// task in the process for its whole duration, exactly the hazard this task exists to close.
+/// `keyfile`/`passphrase`/`label` are cloned into the blocking closure (`spawn_blocking` requires
+/// `'static + Send`, which the borrows this function receives cannot satisfy) — **no new caching, no
+/// new residency**: the exact same one unwrap, same call site, just on a different thread.
+async fn unwrap_keyfile_for_bulk_signing(
     keyfile: &Path,
     passphrase: &str,
     label: &str,
 ) -> Result<Box<dyn SecretStore>, String> {
-    let fs = FileSecretStore::new(keyfile, passphrase);
-    let seed = fs.export_seed().map_err(|e| e.to_string())?;
-    let mem = MemorySecretStore::new();
-    mem.store(label, seed.as_slice())
-        .map_err(|e| e.to_string())?;
-    Ok(Box::new(mem))
+    let keyfile = keyfile.to_path_buf();
+    let passphrase = passphrase.to_string();
+    let label = label.to_string();
+    tokio::task::spawn_blocking(move || {
+        let fs = FileSecretStore::new(&keyfile, passphrase);
+        let seed = fs.export_seed().map_err(|e| e.to_string())?;
+        let mem = MemorySecretStore::new();
+        mem.store(&label, seed.as_slice())
+            .map_err(|e| e.to_string())?;
+        Ok::<Box<dyn SecretStore>, String>(Box::new(mem))
+    })
+    .await
+    .map_err(|e| format!("seed-unwrap task panicked: {e}"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -2951,8 +3091,10 @@ mod tests {
     /// the_os_keystore`) exactly, just for the opposite direction — an OS-keystore `account.json`
     /// must never unlock through `Effect::Unlock`, and the failure must name the actual fix
     /// (`Effect::LoadSession`), not surface as a confusing keyfile/AEAD error.
-    #[test]
-    fn run_unlock_fails_closed_for_an_os_keystore_account_never_touching_the_keyfile() {
+    // Task 4.51 made `run_unlock` `async fn` (a `spawn_blocking` wrap), so this test needs a real
+    // runtime — `#[tokio::test]` rather than plain `#[test]`, the only change from before.
+    #[tokio::test]
+    async fn run_unlock_fails_closed_for_an_os_keystore_account_never_touching_the_keyfile() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _env = EnvGuard::set(tmp.path());
         dummy_descriptor().save().expect("save account.json");
@@ -2968,9 +3110,114 @@ mod tests {
         // all (see `OnboardingSession`'s own hand-rolled `Debug` impl for why) — no longer
         // implements `Debug` itself, so `Result::expect_err` (which requires `T: Debug`) no longer
         // compiles here. A plain `match` proves the same thing without that bound.
-        match run_unlock(&request) {
+        match run_unlock(&request).await {
             Err(err) => assert!(err.contains("LoadSession")),
             Ok(_) => panic!("an OS-keystore account.json must never unlock through Effect::Unlock"),
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Task 4.51 (reviewer follow-up) — the two remaining synchronous `decrypt_seed()` call
+    // sites Deliverable 2's own table named ("session start" window) but the first landing of
+    // this task left un-wrapped: `run_unlock`'s own passphrase-verification `export_seed()` and
+    // `unwrap_keyfile_for_bulk_signing`'s `export_seed()` (reached via `inbound_handoff`'s
+    // `Effect::Unlock` arm). Both now run inside `tokio::task::spawn_blocking` too. Unlike
+    // `apps/tui/tests/inbound_delivery.rs`'s own `SlowStore` double, no synthetic delay is
+    // needed here: both functions build their own concrete `FileSecretStore` internally (they
+    // take a keyfile path/passphrase, not an injectable `&dyn SecretStore`), so this uses a
+    // real, freshly-written age/scrypt keyfile — the real unwrap already costs ~1.3s (this
+    // task's own Status section), plenty of window for a 10ms heartbeat to prove the
+    // `current_thread` runtime stayed free.
+    // -----------------------------------------------------------------------------------------
+
+    /// Spawns a lightweight heartbeat task ticking every 10ms for up to two seconds and returns
+    /// its live tick counter plus a handle to stop it — shared by both tests below.
+    fn spawn_heartbeat() -> (
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticks_writer = ticks.clone();
+        let handle = tokio::spawn(async move {
+            for _ in 0..200 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                ticks_writer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        (ticks, handle)
+    }
+
+    /// Writes a real age/scrypt-wrapped keyfile (via a real `FileSecretStore::store`, exactly
+    /// what `meridian id new --store file` performs) and returns its path plus the passphrase
+    /// that unlocks it.
+    fn write_real_file_backed_keyfile(dir: &Path) -> (std::path::PathBuf, &'static str) {
+        let keyfile = dir.join("account.key");
+        let passphrase = "correct horse battery staple 451";
+        let fs = FileSecretStore::new(&keyfile, passphrase);
+        generate_account(&fs, "example.org").expect("generate_account against a real keyfile");
+        (keyfile, passphrase)
+    }
+
+    #[tokio::test]
+    async fn run_unlocks_passphrase_verification_never_freezes_a_concurrently_scheduled_task() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(tmp.path());
+        let (keyfile, passphrase) = write_real_file_backed_keyfile(tmp.path());
+        dummy_file_descriptor(&keyfile)
+            .save()
+            .expect("save account.json");
+
+        let (ticks, heartbeat) = spawn_heartbeat();
+
+        let request = UnlockRequest {
+            keyfile: keyfile.clone(),
+            passphrase: passphrase.to_string(),
+        };
+        let result = run_unlock(&request).await;
+        assert!(
+            result.is_ok(),
+            "run_unlock must succeed against its own freshly-written keyfile: {:?}",
+            result.err()
+        );
+
+        let observed = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        heartbeat.abort();
+        assert!(
+            observed >= 8,
+            "expected the concurrently-scheduled heartbeat task to have ticked at least ~8 \
+             times while run_unlock's own passphrase-verification unwrap (~1.3s of real scrypt) \
+             was in flight — observed {observed}. A near-zero count here is what running that \
+             unwrap synchronously on this `current_thread` runtime would produce — the exact \
+             regression this test exists to catch."
+        );
+    }
+
+    #[tokio::test]
+    async fn unwrap_keyfile_for_bulk_signings_export_seed_never_freezes_a_concurrently_scheduled_task(
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(tmp.path());
+        let (keyfile, passphrase) = write_real_file_backed_keyfile(tmp.path());
+
+        let (ticks, heartbeat) = spawn_heartbeat();
+
+        let result = unwrap_keyfile_for_bulk_signing(&keyfile, passphrase, "some-label").await;
+        assert!(
+            result.is_ok(),
+            "unwrap_keyfile_for_bulk_signing must succeed against its own freshly-written \
+             keyfile: {:?}",
+            result.err()
+        );
+
+        let observed = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        heartbeat.abort();
+        assert!(
+            observed >= 8,
+            "expected the concurrently-scheduled heartbeat task to have ticked at least ~8 \
+             times while unwrap_keyfile_for_bulk_signing's own export_seed() unwrap (~1.3s of \
+             real scrypt) was in flight — observed {observed}. A near-zero count here is what \
+             running that unwrap synchronously on this `current_thread` runtime would produce — \
+             the exact regression this test exists to catch."
+        );
     }
 }

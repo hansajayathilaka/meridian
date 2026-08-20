@@ -240,6 +240,7 @@ fn republished_secrets_are_resolvable_by_chat_state_open_inbound() {
             "expected a completed LoadSession, got {outcome:?}"
         );
         let handoff = inbound_handoff(&outcome)
+            .await
             .expect("a successful OS-keystore LoadSession must produce an inbound handoff");
         (generated, handoff)
     });
@@ -399,7 +400,7 @@ fn republish_only_fires_once_per_session_via_the_inbound_started_guard() {
 
         for outcome in [&load_outcome, &publish_outcome, &second_load_outcome] {
             if !inbound_started {
-                if let Some(handoff) = inbound_handoff(outcome) {
+                if let Some(handoff) = inbound_handoff(outcome).await {
                     inbound_started = true;
                     republish_bundle(
                         handoff.store.as_ref(),
@@ -417,7 +418,7 @@ fn republish_only_fires_once_per_session_via_the_inbound_started_guard() {
         // Sanity: the middle, unrelated `PublishBundle` dispatch on its own never produces a
         // handoff at all — the guard above isn't doing the only work here.
         assert!(
-            inbound_handoff(&publish_outcome).is_none(),
+            inbound_handoff(&publish_outcome).await.is_none(),
             "inbound_handoff must never produce a handoff for an unrelated PublishBundle outcome"
         );
     });
@@ -472,7 +473,7 @@ fn inbound_handoff_also_produces_a_working_handoff_for_a_file_backed_account() {
         "expected a completed Unlock, got {outcome:?}"
     );
 
-    let handoff = inbound_handoff(&outcome)
+    let handoff = block_on(inbound_handoff(&outcome))
         .expect("a successful file-backed Unlock must produce an inbound handoff too");
     assert_eq!(handoff.account_pub, *account.public_key().as_bytes());
     assert_eq!(handoff.server, "ws://127.0.0.1:1");
@@ -513,6 +514,7 @@ fn republish_bundle_fails_cleanly_without_panicking_on_an_unreachable_server() {
         let generated = onboard_os_account(&server, &mut session, "self-org.test").await;
         let outcome = dispatch(load_session_effect(), &mut session).await;
         let handoff = inbound_handoff(&outcome)
+            .await
             .expect("a successful OS-keystore LoadSession must produce an inbound handoff");
         (generated, handoff)
     });
@@ -615,7 +617,9 @@ async fn unlock_and_hand_off(
         matches!(outcome, WorkerEvent::Completed(Effect::Unlock(_))),
         "expected a completed Unlock, got {outcome:?}"
     );
-    inbound_handoff(&outcome).expect("a successful file-backed Unlock must produce a handoff")
+    inbound_handoff(&outcome)
+        .await
+        .expect("a successful file-backed Unlock must produce a handoff")
 }
 
 /// A fresh, unrelated peer identity that fetches `our_pub`'s currently-published bundle from

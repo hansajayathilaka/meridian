@@ -783,7 +783,7 @@ fn spawn_inbound(
     handle: &KeyHandle,
 ) -> tokio::sync::mpsc::UnboundedReceiver<AppEvent> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let store: Box<dyn SecretStore> = Box::new(OsSecretStore::new(service));
+    let store: std::sync::Arc<dyn SecretStore> = std::sync::Arc::new(OsSecretStore::new(service));
     tokio::spawn(run_inbound_loop(
         store,
         handle.clone(),

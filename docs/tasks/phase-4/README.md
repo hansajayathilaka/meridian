@@ -3,12 +3,13 @@
 
 # Phase 4 — Verification & Trust + Terminal TUI Client
 
-**Kind:** build · **Status:** in progress — 50/50 previously-planned tasks done (4.1–4.50); the sixth
-exit-gate attempt (4.50) found a sixth genuine defect. `/plan-phase` has now scoped the sixth
-gap-closure wave: task **4.51** (root-cause and fix the file-backed responder's blocking-scrypt hazard
-behind the non-deterministic first-contact delivery failure — investigation-first, fix shape and any
-required consult decided in-task, see that task's own pre-code consult assessment) and task **4.52** (a
-seventh exit-gate attempt, hard-joined on 4.51 only). Per the task-tracking skill's own §7 ("a build
+**Kind:** build · **Status:** in progress — 51/52 planned tasks done (4.1–4.51); the sixth exit-gate
+attempt (4.50) found a sixth genuine defect, now closed by task **4.51** (root-cause and fix the
+file-backed responder's blocking-scrypt hazard — all six synchronous `decrypt_seed()` call sites this
+task's own investigation named now run off the single-threaded tokio runtime, `spawn_blocking`-only, no
+consult required per that task's own binding rule). Only task **4.52** (a seventh exit-gate attempt,
+hard-joined on 4.51 alone) remains before the sixth gap-closure wave closes. Per the task-tracking
+skill's own §7 ("a build
 phase isn't done until its acceptance demo runs"), the phase is **still not closed**: task 4.28 found T17's
 acceptance demo did not run end to end; 4.29–4.37 closed that gap, but 4.38 found the demo *still*
 doesn't pass, for two reasons; 4.39/4.40 closed both, confirmed live — but 4.41 found a third defect
@@ -292,9 +293,9 @@ prior wave's fix task, **4.51's own pre-code consult determination is conditiona
 time**: whether an architect + security-reviewer consult is mandatory depends on which fix shape its own
 in-task investigation lands on (recorded in that task's own file) — mirroring 4.35's/4.9's precedent for
 an in-task consult rather than a plan-time one, because the investigation genuinely has to run first.
-- [~] **4.51** Root-cause and fix the file-backed responder's blocking-scrypt hazard (fix for 4.50's
-  sixth defect; opportunistically also closes the already-known `run_mark_verified`/`run_set_petname`
-  latency finding if it generalizes cleanly) — [file](./4.51-file-backed-inbound-blocking-fix.md)
+- [x] **4.51** Root-cause and fix the file-backed responder's blocking-scrypt hazard (fix for 4.50's
+  sixth defect; the `run_mark_verified`/`run_set_petname` latency finding was evaluated and split off
+  rather than forced — see its own Status section) — [file](./4.51-file-backed-inbound-blocking-fix.md)
 - [ ] **4.52** T17 acceptance-demo closure, seventh exit-gate attempt (hard join on 4.51 alone) —
   [file](./4.52-t17-acceptance-demo-closure-attempt-7.md)
 
@@ -338,6 +339,27 @@ an in-task consult rather than a plan-time one, because the investigation genuin
   reproducible functional defect, not a doc nit) to be pre-named as its own task, **4.51**, rather
   than parked in this list. See the [exit criteria](#exit-criteria) writeup and
   [4.50's own Status section](./4.50-t17-acceptance-demo-closure-attempt-6.md) for the full trace.
+
+**Findings with no task yet — surfaced by 4.51, owned by no open task:**
+- **The `run_mark_verified`/`run_set_petname` file-backed latency finding (4.43's own recorded,
+  deliberately-deferred `live_store`-widening follow-up; independently re-confirmed by both of 4.50's
+  runs) is split off rather than fixed here.** 4.51 evaluated generalizing its own `Arc<dyn
+  SecretStore>` + `spawn_blocking` shape to `OnboardingSession::live_store` and concluded it does not
+  cleanly generalize: `live_store` is read through `open_account_store` by **thirteen** separate
+  handlers (`run_add_contact`, `run_set_petname`, `run_set_user_blocked`, `run_delete_contact`,
+  `run_send_message`, `run_persist_history`, `run_mark_verified`, `run_acknowledge_key_change`, and
+  others), so wrapping all of them would be a disproportionately wider diff than 4.51's own six named
+  call sites — named explicitly here rather than silently forced or dropped, per this project's own
+  "split rather than force a one-size-fits-all shape" discipline (4.40's own precedent). Not yet
+  scoped as its own task.
+- **A pre-existing, unrelated `Effect::PersistHistory` drain-window flake, found by 4.51's own
+  independent `test-engineer` review pass during restart probing.** A message that just rendered live
+  sometimes does not survive a restart if the process is killed within ~2s of it appearing, because
+  `Effect::PersistHistory`'s async write to `history.jsonl` has not yet landed on disk. Confirmed **not**
+  caused by 4.51 — it goes through `OnboardingSession::live_store`, a completely different code path from
+  the three (now six) call sites this task touches. A possible future task: give history-persist effects
+  a drain window (or an explicit flush-on-shutdown hook) before process exit. Not yet scoped as its own
+  task.
 
 ### Dependency order
 ```
@@ -670,6 +692,31 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   session-lifetime seed cache would trip the exact residency question 4.43's own "boundary" reserved for
   a future task) and **[4.52](./4.52-t17-acceptance-demo-closure-attempt-7.md)** (the seventh exit-gate
   attempt, hard-joined on 4.51 alone). This box stays `[ ]` until 4.52 confirms a genuine pass.
+  **4.51 landed**: remeasured `decrypt_seed()` at ~1.25–1.35s/call in this sandbox (not reused from 4.43's
+  figure); built the complete **six**-call-site accounting — `run_unlock`'s own passphrase-verification
+  `export_seed()`, `inbound_handoff`'s `unwrap_keyfile_for_bulk_signing` `export_seed()` (the ~2.6s
+  "session start" pair), the third `handshake` `sign()` site (per (re)connect), and
+  `process_inbound_delivery`'s own three (`load_chat`/`open_inbound`/`save_chat` — not the reviewer's
+  carried-forward "exactly two"; `load_chat`'s own `derive_key` fires too, since `sessions.bin` already
+  exists by first-envelope time); ruled the reconnect-storm hypothesis out with live evidence — zero
+  `ConnectionState::Reconnecting` events across 12 fresh two-peer trials — but could not itself reproduce
+  the full 70s–260s tail in this sandbox (a driver-methodology bug in the investigation's own first repro
+  attempt produced a false-positive 260s stall, traced to and distinguished from the real product path —
+  see 4.51's own Status). Fix shape: `spawn_blocking`-only, no consult required per the binding rule —
+  `InboundHandoff::store`/`run_inbound_loop`'s own store widened `Box` → `Arc<dyn SecretStore>` (the
+  mechanical widening `spawn_blocking`'s `'static + Send` bound forces), `process_inbound_delivery`'s whole
+  crypto sequence, a new additive `SignalingClient::connect_owned`/`handshake_owned` pair (every other
+  caller unchanged), and `run_unlock`/`unwrap_keyfile_for_bulk_signing` (both widened to `async fn`, purely
+  to `.await` their own `spawn_blocking` wrap) — all six call sites now move their unwrap off the
+  `current_thread` runtime. **A first landing of this fix wrapped only four of the six** (missing
+  `run_unlock`'s and `unwrap_keyfile_for_bulk_signing`'s own calls) — the `reviewer` pass caught the
+  resulting overclaim in Deliverable 4's prose before this task closed, and the fix (plus two more
+  falsifiable concurrency tests) landed to close the gap for real; four falsifiable concurrency tests in
+  total now confirm the mechanism, each independently verified to fail when its own `spawn_blocking` wrap
+  is reverted. The same-class `run_mark_verified`/`run_set_petname` finding was evaluated and **split off,
+  not forced** — `live_store` is read by thirteen separate handlers, a disproportionately wider diff than
+  this task's own six call sites — tracked below in "Findings with no task yet." Full writeup:
+  [4.51's own Status section](./4.51-file-backed-inbound-blocking-fix.md).
 - [x] The envelope-v2 obligation above was re-deferred with a concrete, mechanical trigger (see
   [above](#envelope-v2-re-deferred--the-concrete-trigger)) — not silently dropped.
 - Then: **not yet** `/start-review-phase` for Phase 5 — the task-tracking skill's own §7 still applies

@@ -737,3 +737,60 @@ hand-rolled workaround `apps/tui/tests/live_session_e2e.rs` previously used to c
 its own two-process demo scenario is now removed as redundant, since production performs the equivalent
 write; that file's own module doc records the remaining precise-content coverage now lives in the two
 files above.
+
+**Update (task 4.51): the sixth defect 4.50's own T17 exit-gate attempt found — non-deterministic or
+very slow (4.50 Run 2 measured 70 s–260 s) first-contact delivery to a file-backed responder from an
+OS-keystore initiator — is closed for its confirmed mechanism.** Investigation (this task's own Status
+section carries the full evidentiary write-up) built a complete call-site accounting, live-instrumented
+with a temporary probe (reverted before landing): a file-backed responder's session-start-to-first-
+envelope path runs **six** synchronous `FileSecretStore::decrypt_seed()` calls before this task's fix —
+`run_unlock`'s own passphrase-verification `export_seed()`, `inbound_handoff`'s
+`unwrap_keyfile_for_bulk_signing` `export_seed()` (the "session start" window, ~2.6 s), `run_inbound_loop`'s
+(re)connect handshake `sign()` (the third call site 4.50's own reviewer had not yet named), and
+`process_inbound_delivery`'s `load_chat`/`open_inbound`/`save_chat` sequence (three more, not the
+reviewer's carried-forward "exactly two" — `load_chat`'s own `derive_key` fires too, since `sessions.bin`
+already exists by the time a first envelope arrives, written by the session-start republish) — each
+~1.25–1.35 s in this sandbox (remeasured directly, not reused from task 4.43's own ~1.4–1.6 s figure). A
+first landing of this fix wrapped only four of the six (missing `run_unlock`'s and
+`unwrap_keyfile_for_bulk_signing`'s own `export_seed()` calls, both still fully synchronous); a reviewer
+caught the resulting overclaim and this task's own Status section records the correction — **all six are
+now wrapped**. None of that synchronous work was originally wrapped in `tokio::task::spawn_blocking`, so
+it ran directly on `apps/cli/src/main.rs`'s single `current_thread` runtime, freezing every other task
+(rendering, every other effect, this very loop's own next envelope) for its whole duration — a genuine
+reliability hazard independent of whether it explains the full reported range. Live reconnect-storm
+instrumentation across 12 fresh two-peer trials (properly configured — see this task's own Status section
+for a driver-methodology correction along the way) observed **zero** `ConnectionState::Reconnecting`
+events; the reconciled accounting can affirmatively close the confirmed ~7.7 s aggregate blocking-runtime
+mechanism, but — mirroring 4.50's own reviewer's "root cause not fully closed" honesty — could not itself
+reproduce the full 70 s–260 s tail in this sandbox, so that residual is named, not claimed closed.
+
+**The fix**, applying the binding decision rule this task's own file recorded at plan time: a pure
+`spawn_blocking` execution-context change, no new caching, no new residency — the same seed decrypted the
+same number of times at the same call sites, so no consult was required (confirmed and recorded again for
+the two additional call sites the reviewer found — the same rule applies unchanged). `InboundHandoff::store`
+and `run_inbound_loop`'s own `store` parameter changed from `Box<dyn SecretStore>` to `Arc<dyn
+SecretStore>` (the mechanical widening `spawn_blocking`'s `'static + Send` closure bound forces — named
+explicitly per this task's own risk note, not quietly narrowed away): `process_inbound_delivery`'s whole
+load/open/ack-seal/save sequence now runs inside one `spawn_blocking` call (the network route for the
+auto-ack moved outside it, after — `chat_state_lock`'s guard still spans the entire sequence);
+`meridian-signaling` gained an additive `SignalingClient::connect_owned`/`handshake_owned` pair (every
+other caller — `cmd_register`, `cmd_chat`, `session_connect`, `republish_bundle` — keeps using the
+original borrow-based `connect`/`handshake`, byte-for-byte unchanged) that runs the handshake's one
+`sign()` call inside `spawn_blocking` too, which `run_inbound_loop` now calls on every (re)connect; and
+`run_unlock`/`unwrap_keyfile_for_bulk_signing` (both now `async fn`, purely to `.await` their own
+`spawn_blocking` wrap — no network I/O was added to either, `inbound_handoff`'s own "never a new round
+trip" contract is unaffected) close the remaining two. Four falsifiable concurrency tests (two in
+`apps/tui/tests/inbound_delivery.rs` using a `SlowStore` double, two inside `apps/tui/src/worker.rs`'s own
+test module against a real freshly-written keyfile's genuine scrypt cost — `run_unlock`/
+`unwrap_keyfile_for_bulk_signing` build their own concrete `FileSecretStore` internally, so no injectable
+double is available there) prove the mechanism with a concurrently-scheduled heartbeat task, under the
+same `current_thread` runtime flavor production uses — all four independently confirmed to fail (observed
+tick count collapses to ~1) when their respective `spawn_blocking` wrap is reverted.
+
+The same-class, already-known `run_mark_verified`/`run_set_petname` latency finding (4.43's own recorded,
+deliberately-deferred `live_store`-widening follow-up) was evaluated for the same fix but **split off
+rather than forced**: `OnboardingSession::live_store` is read through `open_account_store` by thirteen
+separate handlers, so generalizing this same `Arc` + `spawn_blocking` shape to it would be a
+disproportionately wider diff than this task's own six named call sites — recorded as a named follow-up
+rather than silently dropped or force-fit (see this task's own Status section and
+`docs/tasks/phase-4/README.md`'s "Findings with no task yet").
