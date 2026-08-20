@@ -276,7 +276,7 @@ pre-code consult needed — the planning pass, reading `run_accept_request`, `Me
 `ChatContent` and `history::append` directly, found the fix reuses the crate's existing
 multi-document-write pattern with no new mechanism and no genuine design choice to make (recorded in
 4.49's own file).
-- [ ] **4.49** Persist the accepted sender's intro into `history.jsonl` (fix for 4.48's fifth defect) —
+- [~] **4.49** Persist the accepted sender's intro into `history.jsonl` (fix for 4.48's fifth defect) —
   [file](./4.49-persist-accepted-intro-history.md)
 - [ ] **4.50** T17 acceptance-demo closure, sixth exit-gate attempt (hard join on 4.49) —
   [file](./4.50-t17-acceptance-demo-closure-attempt-6.md)
