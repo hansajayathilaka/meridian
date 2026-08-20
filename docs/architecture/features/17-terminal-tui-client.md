@@ -104,7 +104,7 @@ $ meridian tui                                # no account on disk → onboardin
   — accept → both sides chat; ^V shows the same 60-digit safety number on both → mark verified —
 $ pkill meridian-tui && meridian tui          # restart
   — contact list, petnames, full history, and the ratchet session all restored, no re-handshake —
-$ meridian tui --export-json /tmp/dump.json && jq '.contacts[0].petname' /tmp/dump.json
+$ meridian tui --export-json /tmp/dump && jq '.contacts[0].petname' /tmp/dump/contacts.json
   "bob"
 $ ci: screen snapshots green, at-rest audit green, key-change block test green ✔
 ```
