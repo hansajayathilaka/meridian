@@ -794,3 +794,27 @@ separate handlers, so generalizing this same `Arc` + `spawn_blocking` shape to i
 disproportionately wider diff than this task's own six named call sites — recorded as a named follow-up
 rather than silently dropped or force-fit (see this task's own Status section and
 `docs/tasks/phase-4/README.md`'s "Findings with no task yet").
+
+**Update (task 4.52 — the phase's seventh, and closing, exit-gate attempt): PASS.** Two fully
+independent live-PTY runs (implementer + `test-engineer`), plus a `reviewer` consistency pass, all
+re-ran the full demo end to end against a real, owner-operated rendezvous server
+(`wss://rendezvous.hansajayathilaka.com`, replacing the local in-process server every prior attempt
+used — an explicitly authorized deviation for this attempt only). 4.51's fix is confirmed holding: 24
+total fresh two-peer first-contact trials (16 forward OS-keystore-initiator → file-backed-responder, the
+exact direction 4.50 found broken, plus 8 reverse) across the two runs all completed in single-digit-to-
+low-teens seconds, zero silent or stalled trials, nothing near the original 70 s–260 s range. Every other
+Scope point (onboarding both account types, message-request accept, intro-history no-duplicate, safety-
+number match, restart-with-no-re-handshake, `--export-json`) also passed in both runs. The one finding
+both runs reported — `run_mark_verified`'s real backend latency for a file-backed account, ~3.7–4.1 s,
+measured by timing input-loop responsiveness rather than trusting the optimistic in-memory UI flip — is
+the *same*, already-known, already-named `live_store`-routed hazard this section's own prior update just
+described as split off, not a new regression; `reviewer` independently re-read `run_mark_verified` and
+confirmed it is unchanged by 4.51's diff. Full evidence, per-trial timing tables, and the reviewer
+sign-off: [4.52's own Status section](../tasks/phase-4/4.52-t17-acceptance-demo-closure-attempt-7.md#status).
+**This closes Phase 4's T17 exit gate** — see
+[docs/tasks/phase-4/README.md](../tasks/phase-4/README.md)'s exit criteria for the closure record.
+
+(Numbering note: this update lands as a continuation of §11 rather than a new §12/§13 heading, matching
+the convention every attempt since 4.41 actually used in this file — one running section, sequential
+`**Update (task N):**` paragraphs — rather than the per-attempt new-heading pattern 4.52's own task file
+text anticipated but which was never actually followed here.)

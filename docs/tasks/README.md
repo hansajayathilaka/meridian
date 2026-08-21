@@ -16,43 +16,29 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 4 (T08 + T17) is 51/52 tasks attempted, still NOT closed** — **4.51 is now done**,
-  closing the sixth exit-gate defect (4.50's finding). A genuine two-phase task: investigation first
-  (remeasured `FileSecretStore::decrypt_seed()` at ~1.29s/call in-sandbox; found a live-instrumented
-  six-call accounting, correcting the 4.50 reviewer's own carried-forward "exactly two/three" count;
-  ruled out the reconnect-storm hypothesis across 12 live trials with zero `Reconnecting` events;
-  honestly could not reproduce the full originally-reported 70s–260s range once a driver-methodology
-  artifact was found and fixed, naming that residual rather than claiming false closure), then a fix
-  gated by the task's own binding consult rule — the investigation pointed to a pure `spawn_blocking`
-  execution-context change (no new caching/residency), so no architect/security-reviewer consult was
-  required. All six synchronous `decrypt_seed()` call sites now run off the single-threaded tokio
-  runtime, proven by four falsifiable concurrency tests (each independently confirmed to fail when its
-  `spawn_blocking` wrap is reverted) plus a 10-trial live two-peer regression (3.34s–6.55s, zero
-  reconnects). Review round found and closed one genuine should-fix: the task's own first landing
-  wrapped only four of the six call sites while its own Status section claimed all six were closed —
-  caught by the `reviewer` pass, fixed by wrapping the remaining two (`run_unlock`,
-  `unwrap_keyfile_for_bulk_signing`), re-verified clean. The already-known `run_mark_verified`/
-  `run_set_petname` latency finding was evaluated and split off, not forced (13 call sites through
-  `OnboardingSession::live_store` — a disproportionately wider diff), recorded as a named follow-up.
-  Full lineage of all six exit-gate attempts in [Phase 4's README](./phase-4/README.md#exit-criteria).
-- **NEXT:** `/next-task` for **4.52** — the seventh exit-gate attempt, hard-joined on 4.51 alone. Only
-  once it confirms a genuine pass does `/start-review-phase` for Phase 5 become the correct next
-  command — not before.
-
-
-**Why this keeps extending Phase 4 rather than opening a new phase or a review phase**: the task-tracking
-skill's own phase-lifecycle rule is that a build phase isn't done until its acceptance demo runs, so
-Phase 4 was never actually finished — these are legitimately still Phase 4 build tasks, closing gaps
-Phase 4 itself created, not new scope. A review phase (`/start-review-phase`) was considered and rejected
-for this specific gap, repeatedly: review phases turn *discovered* findings into fix-tasks, but each
-exit-gate attempt already does the discovery and diagnosis work in full — routing that through a
-review-phase sweep would re-derive conclusions already on record, not add anything. Phase 5 remains the
-right venue for whatever *new* findings a full sweep of this phase's diff turns up once a genuine pass
-actually closes it.
+- **NOW:** **Phase 4 (T08 + T17) is closed — 52/52 tasks done.** **4.52, the seventh exit-gate attempt,
+  genuinely passed**, re-verifying 4.51's fix for the sixth defect (4.50's finding). Held to the same
+  two-independent-live-runs-plus-reviewer discipline as every prior attempt, with one deliberate,
+  explicitly authorized deviation: both live runs (implementer + `test-engineer`) drove the full T17
+  demo — both account types, a ≥10-trial (24 total, both directions) first-contact delivery-reliability
+  check, message-request accept, intro-history no-duplicate, safety-number verify, restart-with-no-
+  re-handshake, `--export-json` — against a real, owner-operated rendezvous server
+  (`wss://rendezvous.hansajayathilaka.com`) instead of a local in-process one. Both runs agreed on every
+  Scope point: 4.51's fix holds (nothing near the original 70s–260s range across 24 fresh trials), and
+  the one residual finding — `run_mark_verified`'s real backend latency for a file-backed account
+  (~3.7–4.1s) — is the same, already-known, already-named `live_store`-routed hazard 4.51 itself split
+  off, not a new regression, independently re-confirmed against source by the `reviewer` pass. Full
+  lineage of all seven exit-gate attempts in [Phase 4's README](./phase-4/README.md#exit-criteria); full
+  evidence in [4.52's own Status section](./phase-4/4.52-t17-acceptance-demo-closure-attempt-7.md).
+- **NEXT:** `/start-review-phase` for **Phase 5** — a full sweep of everything built since the Phase-3
+  review (Phase 4's T08 + T17, plus 4.29–4.52's gap-closure waves) is now the correct next command.
 
 
 ### Live carry-forwards (not owned by any open task)
-Everything else is owned by a Phase-4 task; these are the exceptions that would otherwise evaporate:
+Phase 4 is now closed; its own unowned findings live in
+[phase-4/README.md](./phase-4/README.md#exit-criteria)'s "Findings with no task yet" sections, for
+`/plan-phase` to pick up in a future build phase. These are the standing exceptions that would otherwise
+evaporate:
 - **Envelope v2 is now a standing, mechanically-checked dependency gate**, not prose. See
   [roadmap.md](../architecture/roadmap.md) (T07's deps row + the note beneath the table) and
   [Phase 4's README](./phase-4/README.md#envelope-v2-re-deferred--the-concrete-trigger). It must still carry the
@@ -229,7 +215,7 @@ phase.
 - [x] **3.23** Bound `serve_link`'s idle read (no idle-read deadline; in WebPKI mode exploitable by
   any public-CA cert-holder, not gated by federation policy) — [file](./phase-3/3.23-serve-link-idle-read-deadline.md)
 
-### Phase 4 — Verification & Trust + Terminal TUI Client · **in progress** · [details](./phase-4/README.md)
+### Phase 4 — Verification & Trust + Terminal TUI Client · **done** · [details](./phase-4/README.md)
 Build phase. **[T08 — Verification & Contact Trust](../architecture/features/08-verification-trust.md)**
 + **[T17 — Terminal TUI Client](../architecture/features/17-terminal-tui-client.md)**, bundled: T08's
 core trust module (safety-number compare, TOFU→pinned→verified states, un-softenable key-change
@@ -311,7 +297,8 @@ pre-announced.
   closed by the sixth gap-closure wave, 4.51/4.52) — [file](./phase-4/4.50-t17-acceptance-demo-closure-attempt-6.md)
 - [x] **4.51** Root-cause and fix the file-backed responder's blocking-scrypt hazard (fix for 4.50's
   sixth defect) — [file](./phase-4/4.51-file-backed-inbound-blocking-fix.md)
-- [~] **4.52** T17 acceptance-demo closure, seventh exit-gate attempt — [file](./phase-4/4.52-t17-acceptance-demo-closure-attempt-7.md)
+- [x] **4.52** T17 acceptance-demo closure, seventh exit-gate attempt — verdict PASS, Phase 4 exit gate
+  closed — [file](./phase-4/4.52-t17-acceptance-demo-closure-attempt-7.md)
 
 ---
 

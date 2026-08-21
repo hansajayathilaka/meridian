@@ -3,21 +3,21 @@
 
 # Phase 4 — Verification & Trust + Terminal TUI Client
 
-**Kind:** build · **Status:** in progress — 51/52 planned tasks done (4.1–4.51); the sixth exit-gate
-attempt (4.50) found a sixth genuine defect, now closed by task **4.51** (root-cause and fix the
+**Kind:** build · **Status:** **done — 52/52 planned tasks done (4.1–4.52).** The sixth exit-gate
+attempt (4.50) found a sixth genuine defect, closed by task **4.51** (root-cause and fix the
 file-backed responder's blocking-scrypt hazard — all six synchronous `decrypt_seed()` call sites this
 task's own investigation named now run off the single-threaded tokio runtime, `spawn_blocking`-only, no
-consult required per that task's own binding rule). Only task **4.52** (a seventh exit-gate attempt,
-hard-joined on 4.51 alone) remains before the sixth gap-closure wave closes. Per the task-tracking
-skill's own §7 ("a build
-phase isn't done until its acceptance demo runs"), the phase is **still not closed**: task 4.28 found T17's
-acceptance demo did not run end to end; 4.29–4.37 closed that gap, but 4.38 found the demo *still*
-doesn't pass, for two reasons; 4.39/4.40 closed both, confirmed live — but 4.41 found a third defect
-(Defect C), closed by the third gap-closure wave (4.42–4.44), whose own re-verification (4.45) found a
-fourth defect, closed by the fourth gap-closure wave (4.46–4.47), whose own re-verification (4.48)
-found a fifth defect, closed by the fifth gap-closure wave (4.49), whose own re-verification (4.50)
-found the sixth defect above (see [exit criteria](#exit-criteria) for the full writeup) · **Reviews
-phase(s):** n/a (build phase; Phase 5 will review it, once it's actually closeable)
+consult required per that task's own binding rule); task **4.52** (the seventh exit-gate attempt,
+hard-joined on 4.51 alone) then **genuinely passed**, closing the phase. Per the task-tracking skill's
+own §7 ("a build phase isn't done until its acceptance demo runs"), the phase went through a long chain
+before closing: task 4.28 found T17's acceptance demo did not run end to end; 4.29–4.37 closed that gap,
+but 4.38 found the demo *still* doesn't pass, for two reasons; 4.39/4.40 closed both, confirmed live —
+but 4.41 found a third defect (Defect C), closed by the third gap-closure wave (4.42–4.44), whose own
+re-verification (4.45) found a fourth defect, closed by the fourth gap-closure wave (4.46–4.47), whose
+own re-verification (4.48) found a fifth defect, closed by the fifth gap-closure wave (4.49), whose own
+re-verification (4.50) found a sixth defect, closed by the sixth gap-closure wave (4.51), whose own
+re-verification (4.52) finally passed (see [exit criteria](#exit-criteria) for the full writeup) ·
+**Reviews phase(s):** n/a (build phase; Phase 5 reviews it next, via `/start-review-phase`)
 
 ## Goal
 Ship **Feature 08 — Verification & Contact Trust** and **Feature 17 — Terminal TUI Client** together,
@@ -296,7 +296,8 @@ an in-task consult rather than a plan-time one, because the investigation genuin
 - [x] **4.51** Root-cause and fix the file-backed responder's blocking-scrypt hazard (fix for 4.50's
   sixth defect; the `run_mark_verified`/`run_set_petname` latency finding was evaluated and split off
   rather than forced — see its own Status section) — [file](./4.51-file-backed-inbound-blocking-fix.md)
-- [~] **4.52** T17 acceptance-demo closure, seventh exit-gate attempt (hard join on 4.51 alone) —
+- [x] **4.52** T17 acceptance-demo closure, seventh exit-gate attempt (hard join on 4.51 alone) —
+  verdict PASS, phase exit gate closed —
   [file](./4.52-t17-acceptance-demo-closure-attempt-7.md)
 
 **Findings with no task yet — surfaced by 4.42's own review, owned by no open task:**
@@ -507,8 +508,8 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   is illustrative shorthand for this harness (there is no standalone `meridian-mitm-sim` binary with
   those flags — see task [4.10](./4.10-mitm-sim-trust-matrix.md)'s own Status section, which already
   recorded this); the harness itself is what actually ships and actually runs.
-- [ ] **T17's acceptance demo still does NOT run end to end — re-confirmed empirically by 4.41, not
-  assumed.** 4.29–4.37 genuinely closed 4.28's own hang. 4.39 and 4.40 genuinely closed the two defects
+- [x] **T17's acceptance demo now runs end to end — confirmed by 4.52, the seventh exit-gate attempt,
+  the first to genuinely pass.** 4.29–4.37 genuinely closed 4.28's own hang. 4.39 and 4.40 genuinely closed the two defects
   4.38 found — **both confirmed live by 4.41's own two-peer PTY runs, for both account types**: Defect A
   (no prekey republish) is closed — a responder genuinely receives and correctly decrypts a real
   first-contact message, byte-for-byte, over the real wire. Defect B (file-backed accounts failing
@@ -691,7 +692,7 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   rule recorded in that task's own file, since a `spawn_blocking`-only fix needs none but a
   session-lifetime seed cache would trip the exact residency question 4.43's own "boundary" reserved for
   a future task) and **[4.52](./4.52-t17-acceptance-demo-closure-attempt-7.md)** (the seventh exit-gate
-  attempt, hard-joined on 4.51 alone). This box stays `[ ]` until 4.52 confirms a genuine pass.
+  attempt, hard-joined on 4.51 alone).
   **4.51 landed**: remeasured `decrypt_seed()` at ~1.25–1.35s/call in this sandbox (not reused from 4.43's
   figure); built the complete **six**-call-site accounting — `run_unlock`'s own passphrase-verification
   `export_seed()`, `inbound_handoff`'s `unwrap_keyfile_for_bulk_signing` `export_seed()` (the ~2.6s
@@ -717,9 +718,29 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   not forced** — `live_store` is read by thirteen separate handlers, a disproportionately wider diff than
   this task's own six call sites — tracked below in "Findings with no task yet." Full writeup:
   [4.51's own Status section](./4.51-file-backed-inbound-blocking-fix.md).
+  **[4.52](./4.52-t17-acceptance-demo-closure-attempt-7.md) (the seventh exit-gate attempt, hard-joined
+  on 4.51 alone) — run, verdict PASS, held to the same two-independent-live-runs-plus-reviewer
+  discipline as every prior attempt, with one deliberate methodology change explicitly authorized for
+  this attempt: both live runs and the CLI-level pre-check ran against a real, owner-operated rendezvous
+  server (`wss://rendezvous.hansajayathilaka.com`) instead of a local in-process one.** Both the
+  implementer's run and the independent second (`test-engineer`) run reported the same result on every
+  Scope point: 4.51's fix holds — 24 total fresh two-peer first-contact trials across the two runs (16
+  forward OS-keystore-initiator → file-backed-responder, the exact direction 4.50 found broken, plus 8
+  reverse) all completed in single-digit-to-low-teens seconds, zero silent or stalled trials, nothing
+  approaching the original 70s–260s range. The one finding both runs reported — `run_mark_verified`'s
+  real backend latency for a file-backed account (~3.7–4.1s, measured via input-loop responsiveness
+  rather than the optimistic in-memory UI flip, which both runs independently caught reads as instant
+  regardless of store type) — is the same, already-known, already-named `live_store`-routed hazard 4.51
+  itself split off above, not a new regression; `reviewer` independently re-read `run_mark_verified` from
+  source and confirmed it unchanged by 4.51's diff. `reviewer` also re-ran the phase-diff consistency
+  pass since 4.50 and confirmed all six `decrypt_seed()` call sites are genuinely wrapped, the consult-gate
+  call was correctly made (no consult exists in history for 4.51, matching its own binding
+  self-assessment), and the working tree is clean. Full writeup, per-trial timing tables, and the reviewer
+  sign-off: [4.52's own Status section](./4.52-t17-acceptance-demo-closure-attempt-7.md). **Phase 4's T17
+  exit gate is closed.**
 - [x] The envelope-v2 obligation above was re-deferred with a concrete, mechanical trigger (see
   [above](#envelope-v2-re-deferred--the-concrete-trigger)) — not silently dropped.
-- Then: **not yet** `/start-review-phase` for Phase 5 — the task-tracking skill's own §7 still applies
-  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. `/plan-phase` has
-  now scoped the sixth gap-closure wave (4.51, 4.52); `/next-task` is the correct next command; see
-  [docs/tasks/README.md](../README.md)'s carry-forward section.
+- Then: **`/start-review-phase` for Phase 5 is now the correct next command.** The task-tracking
+  skill's own §7 rule ("a build phase isn't done until its acceptance demo runs") is now satisfied — both
+  T08's (task 4.28) and T17's (task 4.52) acceptance demos have run and passed. See
+  [docs/tasks/README.md](../README.md)'s ▶ NOW/NEXT for the phase-closure record.
