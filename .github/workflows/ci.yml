@@ -49,10 +49,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build
-        run: cargo build --workspace
-      - name: Unit + integration tests
-        run: cargo test --workspace
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # Coverage (task 1.21 / F22) is measured off THIS build+test run rather than a separate job
+      # that repeats it under instrumentation. `show-env` is sourced only inside these two steps
+      # (not exported job-wide via $GITHUB_ENV), so every later step — tamper-hook feature
+      # variants, the adversarial harnesses (relay_rewrite.rs's timing margins in particular),
+      # NAT matrix, conformance vectors — stays uninstrumented and unaffected. If this build or the
+      # test run below fails, the job stops here and the coverage-report steps at the bottom never
+      # run, so a failed run never gets a coverage number either.
+      - name: Build (instrumented for coverage)
+        run: |
+          cargo llvm-cov clean --workspace
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo build --workspace
+      - name: Unit + integration tests (instrumented for coverage)
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo test --workspace
       # REQUIRED for F17, and not redundant with --workspace above. Resolver-2 feature unification
       # turns `test-tamper-hook` ON workspace-wide whenever dev targets are built, because
       # apps/cli's dev-dependency pins that feature — so every #[cfg(not(feature =
@@ -158,6 +173,27 @@ jobs:
             exit 1
           }
           cargo test -p meridian-crypto --test conformance
+      # Reports region/line/function coverage from the instrumented Build + Unit/integration steps
+      # above so the number is visible in CI (task 1.21 / F22) instead of asserted in a spec.
+      # Deliberately non-blocking (continue-on-error): no threshold is enforced here — gating is a
+      # separate, later decision. Note that Rust on stable emits no branch coverage, so a "branch
+      # coverage" target is not measurable here.
+      - name: Coverage summary
+        continue-on-error: true
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo llvm-cov report --summary-only
+      - name: Coverage report (lcov artifact)
+        continue-on-error: true
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo llvm-cov report --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@v4
+        if: hashFiles('lcov.info') != ''
+        continue-on-error: true
+        with:
+          name: coverage-lcov
+          path: lcov.info
 
   build:
     name: Build (release)
@@ -212,30 +248,6 @@ jobs:
         run: |
           docker rm -f rendezvous-smoke >/dev/null 2>&1 || true
           docker volume rm rendezvous-smoke-data >/dev/null 2>&1 || true
-
-  coverage:
-    name: Coverage (measurement only, non-blocking)
-    needs: test
-    runs-on: ubuntu-latest
-    # Reports region/line/function coverage so the number is visible in CI instead of asserted in a
-    # spec (task 1.21 / F22). Deliberately NOT a gate: it does not block the merge queue, and no
-    # threshold is enforced — gating is a separate, later decision. Note that Rust on stable emits no
-    # branch coverage, so a "branch coverage" target is not measurable here.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Coverage summary
-        run: cargo llvm-cov --workspace --summary-only
-      - name: Coverage report (lcov artifact)
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
-      - uses: actions/upload-artifact@v4
-        with:
-          name: coverage-lcov
-          path: lcov.info
 
   supply-chain:
     name: License / advisory gate
