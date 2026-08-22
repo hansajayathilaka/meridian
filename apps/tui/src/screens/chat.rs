@@ -700,8 +700,16 @@ pub fn handle_worker(state: &mut ChatState, event: WorkerEvent) -> Vec<Effect> {
 
 fn complete_send(state: &mut ChatState, body: String, sent: SentMessage) -> Vec<Effect> {
     state.sending = None;
+    // `sent.delivered` is `route_tolerant`'s own "was the peer reachable right now" outcome — a
+    // transport-level handoff, not proof the peer has actually seen the message. That real
+    // confirmation is a separate, later `ChatContent::Receipt` (the worker's inbound loop
+    // auto-acks every received text — see the module doc's "Receive-path wiring" section), applied
+    // in-memory by `apply_receipt` as a `Sent` → `Delivered` transition. So a successful handoff
+    // lands here as `Sent` (single tick), never jumped straight to `Delivered` (double tick) —
+    // conflating the two used to mean this screen never actually showed the "sent, not yet seen"
+    // state the design (tui-client.md's mockup, `✓` vs `✓✓`) always called for.
     let entry_state = if sent.delivered {
-        MessageState::Delivered
+        MessageState::Sent
     } else {
         MessageState::Failed
     };
@@ -842,7 +850,7 @@ fn render_transcript(state: &ChatState, frame: &mut Frame<'_>, area: Rect, ctx: 
 }
 
 fn transcript_lines(state: &ChatState, ctx: &RenderCtx) -> Vec<Line<'static>> {
-    if state.entries.is_empty() {
+    if state.entries.is_empty() && state.sending.is_none() {
         return vec![Line::from(Span::styled(
             "(no messages yet)",
             Style::default().add_modifier(Modifier::DIM),
@@ -880,7 +888,35 @@ fn transcript_lines(state: &ChatState, ctx: &RenderCtx) -> Vec<Line<'static>> {
             lines.push(Line::from(Span::styled(format!("      {copy}"), style)));
         }
     }
+    if let Some(body) = &state.sending {
+        lines.extend(registry.render(&provisional_sending_entry(body.clone())));
+    }
     lines
+}
+
+/// A transient, **never-persisted** stand-in for `state.sending`'s in-flight body — rendered as the
+/// transcript's last row for exactly as long as an `Effect::SendMessage` is outstanding, so the
+/// message is visible the instant `Enter` is pressed rather than waiting for the full send round
+/// trip (`complete_send`) to insert the real, worker-minted-`mid` [`HistoryEntry`] into
+/// `state.entries`. Built fresh on every render call, exactly like [`transcript_registry`] — nothing
+/// here is stored on [`ChatState`] beyond the plain `body` string `state.sending` already held.
+///
+/// **Deliberately [`MessageState::Composing`], not [`MessageState::Pending`].** tui-client.md §5
+/// documents `pending` with a specific, narrower meaning for a *persisted* entry — "this client will
+/// retry while it is running" (the offline/retry case) — which this transient row is not; it never
+/// reaches disk at all; `complete_send` replaces it with a real, persisted entry (`Sent` or `Failed`)
+/// the moment the effect resolves. `Composing`'s already-defined " …" marker ([`state_marker`]) reads
+/// correctly for "in flight, not yet confirmed" without borrowing `pending`'s documented meaning.
+fn provisional_sending_entry(body: String) -> HistoryEntry {
+    HistoryEntry {
+        v: CURRENT_VERSION,
+        mid: String::new(),
+        dir: MsgDirection::Out,
+        ts: 0,
+        stream: "mrd.chat/1".to_string(),
+        body,
+        state: MessageState::Composing,
+    }
 }
 
 fn render_composer(state: &ChatState, frame: &mut Frame<'_>, area: Rect, ctx: &RenderCtx) {
