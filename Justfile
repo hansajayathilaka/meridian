@@ -84,6 +84,13 @@ vectors:
 two-orgs mode="static":
     bash demo/two-orgs/run-walkthrough.sh {{mode}}
 
+# Docker-based wire-level proof of the core P2P claim: a packet capture across rendezvous +
+# coturn + two clients shows a chat message crossing client-to-client, never through the server —
+# both under the default direct policy and under a forced relay-only/TURN path. See
+# demo/p2p-wire-proof/README.md. Tears itself down on exit; set KEEP_UP=1 to leave it up.
+p2p-wire-proof:
+    bash demo/p2p-wire-proof/run-wire-proof.sh
+
 # Validate docs: mermaid syntax + relative links.
 check-docs:
     bash tools/check-docs.sh

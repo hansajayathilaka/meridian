@@ -1,0 +1,26 @@
+# demo/p2p-wire-proof rendezvous config — one plain, single-org signaling server for the
+# Docker-based P2P wire-level verification demo (see README.md for what this proves).
+#
+# Deliberately minimal: no federation, no TLS (plain ws:// inside a single docker-compose
+# network — see demo/two-orgs for the multi-org wss:// case), in-memory sqlite (this demo is
+# ephemeral per run, nothing needs to survive a restart).
+
+[server]
+domain = "p2pdemo.local"
+bind = "0.0.0.0:8443"
+admission = "open"
+database_url = "sqlite::memory:"
+
+[limits]
+auth_per_ip_per_min = 120
+fetch_per_account_per_min = 240
+route_per_account_per_min = 1200
+turn_per_account_per_min = 120
+
+[turn]
+# secret comes from MERIDIAN_RENDEZVOUS_TURN__SECRET (docker-compose.yml `environment:`) — must
+# equal coturn's `--static-auth-secret`. Generated fresh per run by run-wire-proof.sh, never
+# committed (infra/CLAUDE.md: no secrets in the repo).
+realm = "turn.p2pdemo.local"
+urls = ["turn:coturn:3478?transport=udp", "turn:coturn:3478?transport=tcp"]
+ttl_secs = 120
