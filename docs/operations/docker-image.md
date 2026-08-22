@@ -5,7 +5,8 @@
 > [rendezvous-protocol-v1 §5 (full config surface)](../api/rendezvous-protocol-v1.md#5-config-surface-the-92-subset) ·
 > [ADR 0018 (figment config loading)](../adr/0018-rendezvous-config-loading.md) ·
 > [ADR 0019 (image distribution + signing)](../adr/0019-container-image-distribution.md) ·
-> [native executables (Linux + Windows)](./release-binaries.md) — companion channel, same trigger
+> [`meridian` CLI/TUI native executables](./release-binaries.md) — the unrelated **client**
+> distribution channel (this page is the server)
 
 ## 1. What publishes it
 

@@ -1,17 +1,21 @@
-# Builds native meridian-rendezvous executables for Linux and Windows and publishes them to a
-# rolling GitHub Release, on the same trigger (paths + push-to-main) as docker-publish.yml — see
-# ADR 0022 and docs/operations/release-binaries.md for the "why" and the rolling-release policy.
+# Builds native `meridian` (meridian-cli, TUI included by default per ADR 0020) executables for
+# Linux and Windows and publishes them to a rolling GitHub Release, so anyone can download a client
+# binary and run `meridian tui` locally without building from source. See ADR 0023 (supersedes 0022
+# — the original version of this pipeline built the meridian-rendezvous SERVER, not the client) and
+# docs/operations/release-binaries.md for the "why".
 name: release-binaries
 
 on:
   push:
     branches: [main]
-    # Same input set as docker-publish.yml (rendezvous depends only on meridian-proto, enforced by
-    # tools/lint-server-no-core.sh) plus this workflow file itself — a docs-only or other-crate-only
-    # merge to main does not rebuild identical binaries.
+    # meridian-cli's own dependency graph (apps/cli + everything it pulls in transitively: core,
+    # tui, identity, store, crypto, transport, signaling, proto, envelope) minus meridian-rendezvous,
+    # which meridian-cli does not link into its release binary (only a dev-dependency, for tests).
+    # Deliberately decoupled from docker-publish.yml's trigger — that pipeline ships the SERVER
+    # image, this one ships the CLIENT binary; the two have no shared inputs worth coupling on.
     paths:
-      - "apps/rendezvous/**"
-      - "apps/proto/**"
+      - "apps/**"
+      - "!apps/rendezvous/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/release-binaries.yml"
@@ -44,8 +48,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # ring (pulled in via rustls, task 2.4's s2s mTLS link) compiles x86_64 assembly on Windows
-      # via nasm; windows-latest does not carry nasm preinstalled.
+      # ring (pulled in via meridian-signaling's wss:// client, always on — not behind the `tui`
+      # feature) compiles x86_64 assembly on Windows via nasm; windows-latest does not carry nasm
+      # preinstalled.
       - name: Install nasm (Windows only, ring's asm build step)
         if: matrix.os == 'windows-latest'
         uses: ilammy/setup-nasm@v1
@@ -59,19 +64,21 @@ jobs:
         shell: bash
         run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
+      # Default features (`tui` is default-on, ADR 0020) — the same shape as `cargo install
+      # --path apps/cli` or a plain `cargo build -p meridian-cli` gives a user; this is what makes
+      # `meridian tui` exist in the resulting binary.
       - name: cargo build --release
-        run: cargo build --release -p meridian-rendezvous --features sqlite --target ${{ matrix.target }}
+        run: cargo build --release -p meridian-cli --target ${{ matrix.target }}
 
       - name: Package (Linux)
         if: matrix.asset_os == 'linux'
         shell: bash
         run: |
           set -euo pipefail
-          stage="stage/meridian-rendezvous-${{ matrix.asset_os }}-x86_64"
+          stage="stage/meridian-${{ matrix.asset_os }}-x86_64"
           mkdir -p "$stage"
-          cp "target/${{ matrix.target }}/release/meridian-rendezvous" "$stage/"
-          cp apps/rendezvous/rendezvous.example.toml "$stage/"
-          name="meridian-rendezvous-${{ matrix.asset_os }}-x86_64-${{ steps.sha.outputs.short }}.tar.gz"
+          cp "target/${{ matrix.target }}/release/meridian" "$stage/"
+          name="meridian-${{ matrix.asset_os }}-x86_64-${{ steps.sha.outputs.short }}.tar.gz"
           tar -C stage -czf "$name" "$(basename "$stage")"
           echo "asset=$name" >> "$GITHUB_ENV"
 
@@ -79,12 +86,11 @@ jobs:
         if: matrix.asset_os == 'windows'
         shell: pwsh
         run: |
-          $stageName = "meridian-rendezvous-${{ matrix.asset_os }}-x86_64"
+          $stageName = "meridian-${{ matrix.asset_os }}-x86_64"
           $stage = "stage/$stageName"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/meridian-rendezvous.exe" -Destination $stage
-          Copy-Item "apps/rendezvous/rendezvous.example.toml" -Destination $stage
-          $name = "meridian-rendezvous-${{ matrix.asset_os }}-x86_64-${{ steps.sha.outputs.short }}.zip"
+          Copy-Item "target/${{ matrix.target }}/release/meridian.exe" -Destination $stage
+          $name = "meridian-${{ matrix.asset_os }}-x86_64-${{ steps.sha.outputs.short }}.zip"
           Compress-Archive -Path $stage -DestinationPath $name
           echo "asset=$name" >> $env:GITHUB_ENV
 
@@ -94,7 +100,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: meridian-rendezvous-${{ matrix.asset_os }}
+          name: meridian-cli-${{ matrix.asset_os }}
           path: |
             ${{ env.asset }}
             ${{ env.asset }}.sha256
@@ -116,23 +122,20 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Compute short sha
-        id: sha
-        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-
-      # Rolling release, same policy as docker-publish.yml's `:latest` tag: `rendezvous-latest`
+      # Rolling release, same policy as docker-publish.yml's `:latest` image tag: `cli-latest`
       # always points at the assets from the most recent qualifying push to main. The short-sha
-      # baked into each asset's filename (and the release notes below) is what gives a specific
-      # download commit-level traceability, mirroring the image's `:latest` + `:<short-sha>` split.
-      - name: Create/update rendezvous-latest release
+      # baked into each asset's filename is what gives a specific download commit-level
+      # traceability.
+      - name: Create/update cli-latest release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: rendezvous-latest
-          name: meridian-rendezvous (latest)
+          tag_name: cli-latest
+          name: meridian CLI/TUI (latest)
           body: |
             Automatically built from commit `${{ github.sha }}` by the `release-binaries` workflow.
             This release is rolling — its assets are replaced on every qualifying push to `main`.
-            Verify a download against its `.sha256` file before trusting it (see
+            Contains the `meridian` client binary (Linux + Windows), including the `meridian tui`
+            subcommand. Verify a download against its `.sha256` file before trusting it (see
             `docs/operations/release-binaries.md`).
           prerelease: true
           make_latest: false

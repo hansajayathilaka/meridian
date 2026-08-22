@@ -4,6 +4,15 @@
 
 # ADR 0022: Native executable release channel for `meridian-rendezvous`
 
+**Status:** **Superseded by [0023](./0023-cli-tui-binary-distribution.md).** The task that opened
+this ADR was clarified, shortly after this landed, to want the **`meridian` CLI/TUI client**
+binary, not the `meridian-rendezvous` **server** binary this ADR describes — the two are unrelated
+distribution channels (client vs. server) that happened to get conflated in the original ask. The
+platform/build/release-policy/signing *reasoning* below (Linux+Windows x86_64, native Windows build
++ nasm, rolling release, checksums-not-signatures) carries over unchanged to 0023; only the *subject*
+(which binary, which trigger) changes. This ADR is kept for the record rather than deleted — nothing
+in `release-binaries.yml` builds `meridian-rendezvous` anymore as of 0023.
+
 **Context:** [ADR 0019](./0019-container-image-distribution.md) covers the `ghcr.io` container
 image, but an operator who doesn't want Docker (a bare VM, a Windows host, an air-gapped box with no
 container runtime) has had no way to get a `meridian-rendezvous` binary except building from source.
