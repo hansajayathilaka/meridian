@@ -238,6 +238,34 @@ fn a_second_enter_while_a_send_is_already_in_flight_is_a_no_op() {
     );
 }
 
+/// The bug this covers: the transcript used to stay empty (or stuck on "(no messages yet)") for the
+/// *entire* `Effect::SendMessage` round trip — a message a user just sent was invisible until the
+/// worker's completion event landed, seconds later on a real network. The composer already clears
+/// and `state.sending` is already set the instant `Enter` is pressed (see the test above); this
+/// proves the transcript actually renders that in-flight body right away, not just the internal
+/// state field — a provisional row (never persisted into `state.entries`, see
+/// `chat::complete_send`'s own doc comment) rather than nothing at all.
+#[test]
+fn a_send_in_flight_is_visible_in_the_transcript_immediately_not_only_after_it_completes() {
+    let mut state = pinned_state([1u8; 32]);
+    type_str(&mut state, "hey there");
+    chat::handle_key(&mut state, key(KeyCode::Enter));
+    assert!(
+        state.entries.is_empty(),
+        "not persisted yet — still in flight"
+    );
+
+    let text = render_chat_to_text(&state, 80, 24);
+    assert!(
+        text.contains("hey there"),
+        "the just-sent body must render immediately, before the send completes:\n{text}"
+    );
+    assert!(
+        !text.contains("no messages yet"),
+        "must not still show the empty-transcript placeholder while a send is in flight:\n{text}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Send-gate wiring — Blocked (this task's named security deliverable)
 // ---------------------------------------------------------------------------
@@ -365,7 +393,7 @@ fn esc_while_awaiting_ack_cancels_without_exiting_the_screen() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn completed_send_with_delivered_true_inserts_a_delivered_entry_and_persists_it() {
+fn completed_send_with_delivered_true_inserts_a_sent_entry_and_persists_it() {
     let mut state = pinned_state([1u8; 32]);
     type_str(&mut state, "hi");
     let effects = chat::handle_key(&mut state, key(KeyCode::Enter)).0;
@@ -388,7 +416,10 @@ fn completed_send_with_delivered_true_inserts_a_delivered_entry_and_persists_it(
     );
     assert!(state.sending.is_none());
     assert_eq!(state.entries.len(), 1);
-    assert_eq!(state.entries[0].state, MessageState::Delivered);
+    // Transport handoff alone only ever earns the single-tick `Sent` state — see
+    // `chat::complete_send`'s own doc comment. `Delivered` (double tick) is reserved for a real,
+    // later `ChatContent::Receipt`, applied by `chat::apply_receipt` — covered separately below.
+    assert_eq!(state.entries[0].state, MessageState::Sent);
     assert_eq!(state.entries[0].mid, "aaaa");
     assert_eq!(effects.len(), 1);
     match &effects[0] {
@@ -397,6 +428,49 @@ fn completed_send_with_delivered_true_inserts_a_delivered_entry_and_persists_it(
         }
         other => panic!("expected Effect::PersistHistory, got {other:?}"),
     }
+}
+
+/// The real delivery receipt (`InboundEvent::Receipt`, auto-acked by the peer's own inbound loop)
+/// is the only thing that ever earns the double-tick `Delivered` state — `chat::apply_receipt`'s own
+/// "`Sent` → `Delivered`" transition, exercised here directly against the row `complete_send` just
+/// inserted as `Sent`.
+#[test]
+fn apply_receipt_transitions_a_sent_entry_to_delivered() {
+    let mut state = pinned_state([1u8; 32]);
+    type_str(&mut state, "hi");
+    let effects = chat::handle_key(&mut state, key(KeyCode::Enter)).0;
+    let request = match effects.into_iter().next().unwrap() {
+        Effect::SendMessage(SendMessageEffect { request, .. }) => request,
+        other => panic!("expected Effect::SendMessage, got {other:?}"),
+    };
+    chat::handle_worker(
+        &mut state,
+        WorkerEvent::Completed(Effect::SendMessage(SendMessageEffect {
+            request,
+            outcome: Some(SentMessage {
+                mid: "aaaa".into(),
+                ts: 9_000,
+                delivered: true,
+            }),
+        })),
+    );
+    assert_eq!(state.entries[0].state, MessageState::Sent);
+
+    chat::apply_receipt(&mut state, "aaaa");
+    assert_eq!(state.entries[0].state, MessageState::Delivered);
+}
+
+/// A no-op if no matching `Out`/`Sent` row is loaded — never a panic (mirrors every other
+/// screen's tolerant `handle_worker`/`handle_inbound` shape in this crate, per `apply_receipt`'s own
+/// doc comment).
+#[test]
+fn apply_receipt_for_an_unknown_mid_is_a_no_op() {
+    let mut state = pinned_state([1u8; 32]);
+    state
+        .entries
+        .push(out_entry("aaaa", "hi", MessageState::Sent));
+    chat::apply_receipt(&mut state, "not-the-right-mid");
+    assert_eq!(state.entries[0].state, MessageState::Sent);
 }
 
 #[test]
