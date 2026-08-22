@@ -176,7 +176,15 @@ fn spawn_input_thread(tx: mpsc::UnboundedSender<AppEvent>) {
 
 fn translate_event(event: crossterm::event::Event) -> Option<AppEvent> {
     match event {
-        crossterm::event::Event::Key(key) => Some(AppEvent::Key(key)),
+        // Windows' console backend reports both key-down and key-up as separate `Event::Key`
+        // values; Unix ttys only ever emit key-down (there's no key-up without the Kitty
+        // keyboard protocol, which this crate doesn't enable). Forwarding `Release`/`Repeat`
+        // unfiltered double-fires every keystroke on Windows only — each press types twice, each
+        // backspace deletes two — while looking correct on Linux, where they never occur.
+        crossterm::event::Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
+            Some(AppEvent::Key(key))
+        }
+        crossterm::event::Event::Key(_) => None,
         crossterm::event::Event::Resize(w, h) => Some(AppEvent::Resize(w, h)),
         crossterm::event::Event::Paste(text) => Some(AppEvent::Paste(text)),
         _ => None,
@@ -316,5 +324,30 @@ async fn run_worker(
         if replies.send(AppEvent::Worker(Box::new(outcome))).is_err() {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::translate_event;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    fn key_event(kind: KeyEventKind) -> Event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::NONE,
+            kind,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    /// Windows' console backend reports a `Release` (and, with enhanced keyboard support, a
+    /// `Repeat`) event alongside every `Press`; Unix ttys never emit either. Forwarding them
+    /// unfiltered double-fires each keystroke on Windows only — the bug this test guards against.
+    #[test]
+    fn only_key_press_events_are_forwarded() {
+        assert!(translate_event(key_event(KeyEventKind::Press)).is_some());
+        assert!(translate_event(key_event(KeyEventKind::Release)).is_none());
+        assert!(translate_event(key_event(KeyEventKind::Repeat)).is_none());
     }
 }
