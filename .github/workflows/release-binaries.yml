@@ -1,0 +1,139 @@
+# Builds native meridian-rendezvous executables for Linux and Windows and publishes them to a
+# rolling GitHub Release, on the same trigger (paths + push-to-main) as docker-publish.yml — see
+# ADR 0022 and docs/operations/release-binaries.md for the "why" and the rolling-release policy.
+name: release-binaries
+
+on:
+  push:
+    branches: [main]
+    # Same input set as docker-publish.yml (rendezvous depends only on meridian-proto, enforced by
+    # tools/lint-server-no-core.sh) plus this workflow file itself — a docs-only or other-crate-only
+    # merge to main does not rebuild identical binaries.
+    paths:
+      - "apps/rendezvous/**"
+      - "apps/proto/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/release-binaries.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: release-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_os: linux
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_os: windows
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # ring (pulled in via rustls, task 2.4's s2s mTLS link) compiles x86_64 assembly on Windows
+      # via nasm; windows-latest does not carry nasm preinstalled.
+      - name: Install nasm (Windows only, ring's asm build step)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-binaries-${{ matrix.target }}
+
+      - name: Compute short sha
+        id: sha
+        shell: bash
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: cargo build --release
+        run: cargo build --release -p meridian-rendezvous --features sqlite --target ${{ matrix.target }}
+
+      - name: Package (Linux)
+        if: matrix.asset_os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="stage/meridian-rendezvous-${{ matrix.asset_os }}-x86_64"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/meridian-rendezvous" "$stage/"
+          cp apps/rendezvous/rendezvous.example.toml "$stage/"
+          name="meridian-rendezvous-${{ matrix.asset_os }}-x86_64-${{ steps.sha.outputs.short }}.tar.gz"
+          tar -C stage -czf "$name" "$(basename "$stage")"
+          echo "asset=$name" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: matrix.asset_os == 'windows'
+        shell: pwsh
+        run: |
+          $stageName = "meridian-rendezvous-${{ matrix.asset_os }}-x86_64"
+          $stage = "stage/$stageName"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/meridian-rendezvous.exe" -Destination $stage
+          Copy-Item "apps/rendezvous/rendezvous.example.toml" -Destination $stage
+          $name = "meridian-rendezvous-${{ matrix.asset_os }}-x86_64-${{ steps.sha.outputs.short }}.zip"
+          Compress-Archive -Path $stage -DestinationPath $name
+          echo "asset=$name" >> $env:GITHUB_ENV
+
+      - name: sha256sum
+        shell: bash
+        run: sha256sum "${{ env.asset }}" > "${{ env.asset }}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meridian-rendezvous-${{ matrix.asset_os }}
+          path: |
+            ${{ env.asset }}
+            ${{ env.asset }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish rolling GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute short sha
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      # Rolling release, same policy as docker-publish.yml's `:latest` tag: `rendezvous-latest`
+      # always points at the assets from the most recent qualifying push to main. The short-sha
+      # baked into each asset's filename (and the release notes below) is what gives a specific
+      # download commit-level traceability, mirroring the image's `:latest` + `:<short-sha>` split.
+      - name: Create/update rendezvous-latest release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: rendezvous-latest
+          name: meridian-rendezvous (latest)
+          body: |
+            Automatically built from commit `${{ github.sha }}` by the `release-binaries` workflow.
+            This release is rolling — its assets are replaced on every qualifying push to `main`.
+            Verify a download against its `.sha256` file before trusting it (see
+            `docs/operations/release-binaries.md`).
+          prerelease: true
+          make_latest: false
+          files: dist/*
