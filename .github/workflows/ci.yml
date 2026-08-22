@@ -235,6 +235,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # tools/netns-nat-matrix.sh's wire-level rig shells out to this example (the real
+      # TurnReq/TurnGrant wire flow) but never builds it — it only checks that
+      # ./target/debug/examples/fetch_turn_credentials already exists and errors if not. In the
+      # former single `test` job this came for free: `cargo test --workspace` compiles every
+      # example as part of its default target set (to compile-check them, even though it doesn't
+      # run them), so an earlier step in that same job left the binary sitting in the job's shared
+      # target/ dir by the time this ran. Split onto its own runner, this job starts from an empty
+      # target/ dir and needs its own explicit build.
+      - name: Build fetch_turn_credentials example (needed by the netns rig)
+        run: cargo build -p meridian-rendezvous --example fetch_turn_credentials
       - name: NAT matrix + relay policy (T05; netns rig skips without NET_ADMIN)
         run: bash harnesses/nat-matrix/run.sh
 
