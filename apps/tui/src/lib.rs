@@ -263,7 +263,7 @@ async fn run_worker(
         let outcome = worker::dispatch(effect, &mut session).await;
 
         if !inbound_started {
-            if let Some(handoff) = worker::inbound_handoff(&outcome) {
+            if let Some(handoff) = worker::inbound_handoff(&outcome).await {
                 inbound_started = true;
                 // Destructured (task 4.43) rather than field-accessed, so `bulk_signing_store` is a
                 // local this function can drop at a precise point — see the `drop` below.

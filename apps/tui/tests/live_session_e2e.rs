@@ -87,6 +87,23 @@
 //! does not apply — see the removed section this replaced) is gone: this test now runs unconditionally
 //! under plain `cargo test -p meridian-tui --test live_session_e2e`.
 //!
+//! ## Update (task 4.49): the responder's hand-rolled intro persist is gone
+//! `run_responder` used to call a manual `persist_entry(...)` right after `Effect::AcceptRequest`
+//! completed, to work around `worker::run_accept_request` never writing the accepted sender's intro
+//! into `history.jsonl` itself (task 4.48's fifth defect). Task 4.49 fixed that at the source —
+//! `run_accept_request` now performs the write inline, as a fourth sealed document alongside
+//! `sessions.bin`/`trust.bin`/`contacts.json` — so the manual call here would now double-write the
+//! same entry; it is removed. This file's own job (real two-process worker/network integration) never
+//! needed to duplicate the precise-content/dedup coverage that workaround incidentally provided —
+//! that now lives in `tests/run_worker_trust.rs` (the raw `history.jsonl` write, off disk) and
+//! `tests/accept_to_chat.rs` (the same write, round-tripped through a real `Screen::Chat` open and
+//! `Effect::LoadHistory`, and through a restart) instead. The other `persist_entry(...)` call site in
+//! this file (`run_initiator`, persisting the *reply* it receives back over the ordinary live-inbound
+//! path) is unrelated to this fix and stays: that path is not written by
+//! `run_accept_request` at all, and mirrors what `App::handle_inbound`'s `InboundEvent::Message` arm
+//! would dispatch in the real, non-bypassed `App`/`update` flow this file intentionally does not drive
+//! (see this module doc's own "why `worker::dispatch`/`run_inbound_loop` directly" section above).
+//!
 //! ## Simplifications, stated plainly
 //! - Petname is the generic `"peer"`, not the demo script's cosmetic `"bob"` — which of the two roles
 //!   below acts as the X3DH *initiator* is decided at runtime (`run_send_message`'s own
@@ -620,8 +637,8 @@ async fn run_responder(
         None => return Err("timed out waiting for the initiator's message request".into()),
     };
     let sender = request.sender_ik;
-    let (mid_hex, intro_body) = match &request.intro {
-        ChatContent::Text { id, body } => (hex::encode(id), body.clone()),
+    let intro_body = match &request.intro {
+        ChatContent::Text { body, .. } => body.clone(),
         other => return Err(format!("expected a Text intro, got {other:?}")),
     };
     println!(
@@ -629,6 +646,13 @@ async fn run_responder(
         hex::encode(sender)
     );
 
+    // Task 4.49: `worker::run_accept_request` itself now appends the intro into `sender`'s
+    // `history.jsonl` as part of accepting (the same writer `persist`/`persist_entry` below call by
+    // hand for every *other* history entry this file drives manually, since this test dispatches
+    // `worker::dispatch` directly rather than through `App`'s reconciliation). A manual
+    // `persist_entry(...)` call here would now double-write the same entry — removed; precise
+    // content/dedup coverage for this write lives in
+    // `tests/run_worker_trust.rs`/`tests/accept_to_chat.rs` instead.
     match dispatch(
         Effect::AcceptRequest(AcceptRequestEffect {
             request: AcceptRequestRequest { sender_ik: sender },
@@ -641,14 +665,6 @@ async fn run_responder(
         WorkerEvent::Completed(Effect::AcceptRequest(_)) => {}
         other => return Err(format!("AcceptRequest failed: {other:?}")),
     }
-    persist_entry(
-        sender,
-        HistDirection::In,
-        &mid_hex,
-        &intro_body,
-        MessageState::Received,
-    )
-    .await?;
 
     println!("[peer {tag}] replying…");
     let reply_body = "hello from the responder — this is the reply";
@@ -767,7 +783,7 @@ fn spawn_inbound(
     handle: &KeyHandle,
 ) -> tokio::sync::mpsc::UnboundedReceiver<AppEvent> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let store: Box<dyn SecretStore> = Box::new(OsSecretStore::new(service));
+    let store: std::sync::Arc<dyn SecretStore> = std::sync::Arc::new(OsSecretStore::new(service));
     tokio::spawn(run_inbound_loop(
         store,
         handle.clone(),

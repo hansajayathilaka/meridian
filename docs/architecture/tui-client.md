@@ -656,3 +656,165 @@ Screen-level coverage for this lives in `apps/tui/tests/accept_to_chat.rs` (real
 `App`, real `worker::dispatch` against a real sealed `$MERIDIAN_HOME`, plus a restart rebuilt from
 disk only) — the layer `live_session_e2e.rs` structurally cannot reach, which is why three exit-gate
 attempts passed while this was broken.
+
+**Update (task 4.46): the fourth defect 4.45's own T17 exit-gate attempt found — `Effect::AddContact`
+never reconciled into the live in-memory `TrustStore` — is now closed.** This is the initiator-side
+mirror of 4.42's Defect C immediately above: an initiator who added a contact via the plain `n`-add
+flow could send them a first-contact message and still get `TrustError::UnknownContact` pressing
+`v`→`v`→`y`, because `worker::run_add_contact`'s real `trust.bin`/`contacts.json` writes never synced
+into `MainState::trust`/`main.contacts` for the rest of that session — only a restart picked them up
+(`MainState::from_session` rebuilds `trust` fresh from `trust.bin` at boot, so the bug was a pure
+live-session staleness gap, never a persistence one). `App::apply_added_contact` (`apps/tui/src/app.rs`)
+closes it, reusing `App::apply_accepted_request`'s exact `live_trust_idx` stack-walk verbatim in
+structure: locate `Screen::Main`, scan above it for a `Screen::Chat`/`Screen::Verify` frame (where
+`MainState::trust` would have been `std::mem::take`n), and route `trust.observe(added.pubkey, "",
+added.added_at)` there if one exists, else directly onto `Screen::Main`. No new trust decision is
+made anywhere in this fix — it replays exactly what the worker already wrote, mirroring 4.42's own
+"TOFU is not verification" guardrail.
+
+A second, closely related interleaving gap was traced during this task's planning pass and fixed in
+the same diff, not deferred: unlike `AcceptRequest` (dispatched from a separately-pushed
+`Screen::Requests`), `Effect::AddContact` is dispatched from `Screen::Main`'s own embedded
+`ContactsState.add` sub-flow — and `Ctrl-R` is a genuinely global, unconditional binding, checked in
+`App::handle_key` before any screen-specific key interception, reachable even mid `AddContactState::
+Adding`. Pressing it there pushes `Screen::Requests` on top of `Screen::Main` while the effect is still
+in flight; without a fix, the completion would then route through the per-screen fallback dispatch to
+`Screen::Requests` (whose own `requests::handle_worker` forwards nothing) instead of `Screen::Main`, so
+`contacts::handle_worker`'s `AddContactState::Adding` arm — the only place that closes the sub-flow and
+upserts the display row — would never run: the add-contact form would be stuck in `Adding` forever, and
+the new contact would never appear in the live Contacts list for the rest of the session. `App::
+apply_added_contact` therefore also calls `contacts::apply_update` and resets `main.contacts.add` to
+`None` **unconditionally**, on whichever `Screen::Main` frame exists, regardless of what is on top of
+the stack — and runs strictly before the per-screen fallback dispatch, so resetting `add` to `None`
+here pre-empts the per-screen `Adding` arm rather than racing it: `contacts::apply_update` runs
+exactly once, from `App::apply_added_contact`, in both the ordinary and interleaved cases
+(`contacts::apply_update` is in fact an idempotent upsert-by-pubkey and would tolerate a genuine
+double call too, but no such double call actually occurs — guaranteed by construction (the
+reset-before-dispatch ordering above), confirmed during review by instrumenting the per-screen
+`Adding` arm and observing it never runs in either of this task's regression tests).
+
+Screen-level coverage for both properties lives in `apps/tui/tests/accept_to_chat.rs`:
+`add_contact_makes_the_added_peer_reachable_for_verify` (same-session add-then-verify, no restart) and
+`a_ctrl_r_interleaved_while_add_contact_is_in_flight_still_reconciles_the_live_contacts_list` (the
+interleaving-gap regression) — reusing that file's existing real-key-event/real-worker/real-sealed-
+`$MERIDIAN_HOME` harness rather than duplicating it into a new file.
+
+**Update (task 4.49): the fifth defect 4.48's own T17 exit-gate attempt found — an accepted sender's
+intro message was silently, permanently absent from the responder's own transcript, live and after
+restart — is now closed.** `worker::run_accept_request` wrote `sessions.bin`/`trust.bin`/`contacts.json`
+on accept but never `history.jsonl`, so `crate::store::history::append` was never called for the
+`meridian_core::chat::MessageRequest::intro` an accept had already taken out of `pending_requests` (and
+could therefore never recover afterward). The fix is a fourth write inside `run_accept_request` itself,
+not a follow-up `Effect`: on the genuine, fresh-accept branch only (never the `pin_still_owed`-only
+retry branch, which has no `MessageRequest` to source content from), after the existing
+`trust.bin`/`contacts.json` writes succeed, a `HistoryEntry` mirroring
+`process_inbound_delivery`'s own ordinary-inbound-Text construction field-for-field (`ts` is accept-time,
+reusing the same `now` already computed for `trust.observe` — `MessageRequest` carries no original
+arrival timestamp, so this is a deliberate, stated approximation) is appended into the sender's
+`history.jsonl`. A `ChatContent::Receipt` intro (reachable only from a degenerate first envelope) is
+skipped, never invented into a history entry — mirroring `screens/requests.rs::intro_summary`'s
+existing "not a text message" precedent. A narrower partial-failure window survives, named rather than
+fixed, the same "do not resurrect a case that should not self-heal automatically" discipline
+`run_accept_request`'s own doc comment already applies to the analogous missing-`contacts.json`-row
+case: if `history::append` itself fails after the trust/contacts writes already succeeded, a client
+retry finds `accepted == false && pin_still_owed == false` and never re-attempts the history write —
+the peer stays durably trusted and reachable, but the intro is then permanently missing.
+
+Coverage spans three levels: `apps/tui/tests/run_worker_trust.rs`
+(`accept_request_delivers_the_session_and_tofu_pins_the_sender_with_an_empty_hint`, extended) asserts
+the raw `history.jsonl` write directly off disk, and that the `pin_still_owed`-only retry branch
+correctly writes nothing; `apps/tui/tests/accept_to_chat.rs`
+(`the_accepted_senders_intro_appears_exactly_once_in_the_opened_chat_transcript`, new) races a live,
+in-memory duplicate of the same intro (same `mid`) into `ChatState::entries` *before* completing the
+`Effect::LoadHistory` round trip — a fresh `Screen::Chat` opens with `entries: Vec::new()`, so without
+this seeded race there would be nothing for the disk-loaded entry to coalesce against and
+`chat::insert_deduped` would never actually run — then asserts the intro still appears exactly once in
+the real, rendered transcript, proving 4.44's dedup-by-`mid` genuinely coalesces the two rather than
+merely asserting the file is correct in isolation; and that same file's
+`the_accepted_sender_is_still_reachable_after_a_restart` (extended) asserts restart parity — the intro
+survives a restart in the correct position relative to a reply persisted after it. The `persist_entry`
+hand-rolled workaround `apps/tui/tests/live_session_e2e.rs` previously used to cover this same gap for
+its own two-process demo scenario is now removed as redundant, since production performs the equivalent
+write; that file's own module doc records the remaining precise-content coverage now lives in the two
+files above.
+
+**Update (task 4.51): the sixth defect 4.50's own T17 exit-gate attempt found — non-deterministic or
+very slow (4.50 Run 2 measured 70 s–260 s) first-contact delivery to a file-backed responder from an
+OS-keystore initiator — is closed for its confirmed mechanism.** Investigation (this task's own Status
+section carries the full evidentiary write-up) built a complete call-site accounting, live-instrumented
+with a temporary probe (reverted before landing): a file-backed responder's session-start-to-first-
+envelope path runs **six** synchronous `FileSecretStore::decrypt_seed()` calls before this task's fix —
+`run_unlock`'s own passphrase-verification `export_seed()`, `inbound_handoff`'s
+`unwrap_keyfile_for_bulk_signing` `export_seed()` (the "session start" window, ~2.6 s), `run_inbound_loop`'s
+(re)connect handshake `sign()` (the third call site 4.50's own reviewer had not yet named), and
+`process_inbound_delivery`'s `load_chat`/`open_inbound`/`save_chat` sequence (three more, not the
+reviewer's carried-forward "exactly two" — `load_chat`'s own `derive_key` fires too, since `sessions.bin`
+already exists by the time a first envelope arrives, written by the session-start republish) — each
+~1.25–1.35 s in this sandbox (remeasured directly, not reused from task 4.43's own ~1.4–1.6 s figure). A
+first landing of this fix wrapped only four of the six (missing `run_unlock`'s and
+`unwrap_keyfile_for_bulk_signing`'s own `export_seed()` calls, both still fully synchronous); a reviewer
+caught the resulting overclaim and this task's own Status section records the correction — **all six are
+now wrapped**. None of that synchronous work was originally wrapped in `tokio::task::spawn_blocking`, so
+it ran directly on `apps/cli/src/main.rs`'s single `current_thread` runtime, freezing every other task
+(rendering, every other effect, this very loop's own next envelope) for its whole duration — a genuine
+reliability hazard independent of whether it explains the full reported range. Live reconnect-storm
+instrumentation across 12 fresh two-peer trials (properly configured — see this task's own Status section
+for a driver-methodology correction along the way) observed **zero** `ConnectionState::Reconnecting`
+events; the reconciled accounting can affirmatively close the confirmed ~7.7 s aggregate blocking-runtime
+mechanism, but — mirroring 4.50's own reviewer's "root cause not fully closed" honesty — could not itself
+reproduce the full 70 s–260 s tail in this sandbox, so that residual is named, not claimed closed.
+
+**The fix**, applying the binding decision rule this task's own file recorded at plan time: a pure
+`spawn_blocking` execution-context change, no new caching, no new residency — the same seed decrypted the
+same number of times at the same call sites, so no consult was required (confirmed and recorded again for
+the two additional call sites the reviewer found — the same rule applies unchanged). `InboundHandoff::store`
+and `run_inbound_loop`'s own `store` parameter changed from `Box<dyn SecretStore>` to `Arc<dyn
+SecretStore>` (the mechanical widening `spawn_blocking`'s `'static + Send` closure bound forces — named
+explicitly per this task's own risk note, not quietly narrowed away): `process_inbound_delivery`'s whole
+load/open/ack-seal/save sequence now runs inside one `spawn_blocking` call (the network route for the
+auto-ack moved outside it, after — `chat_state_lock`'s guard still spans the entire sequence);
+`meridian-signaling` gained an additive `SignalingClient::connect_owned`/`handshake_owned` pair (every
+other caller — `cmd_register`, `cmd_chat`, `session_connect`, `republish_bundle` — keeps using the
+original borrow-based `connect`/`handshake`, byte-for-byte unchanged) that runs the handshake's one
+`sign()` call inside `spawn_blocking` too, which `run_inbound_loop` now calls on every (re)connect; and
+`run_unlock`/`unwrap_keyfile_for_bulk_signing` (both now `async fn`, purely to `.await` their own
+`spawn_blocking` wrap — no network I/O was added to either, `inbound_handoff`'s own "never a new round
+trip" contract is unaffected) close the remaining two. Four falsifiable concurrency tests (two in
+`apps/tui/tests/inbound_delivery.rs` using a `SlowStore` double, two inside `apps/tui/src/worker.rs`'s own
+test module against a real freshly-written keyfile's genuine scrypt cost — `run_unlock`/
+`unwrap_keyfile_for_bulk_signing` build their own concrete `FileSecretStore` internally, so no injectable
+double is available there) prove the mechanism with a concurrently-scheduled heartbeat task, under the
+same `current_thread` runtime flavor production uses — all four independently confirmed to fail (observed
+tick count collapses to ~1) when their respective `spawn_blocking` wrap is reverted.
+
+The same-class, already-known `run_mark_verified`/`run_set_petname` latency finding (4.43's own recorded,
+deliberately-deferred `live_store`-widening follow-up) was evaluated for the same fix but **split off
+rather than forced**: `OnboardingSession::live_store` is read through `open_account_store` by thirteen
+separate handlers, so generalizing this same `Arc` + `spawn_blocking` shape to it would be a
+disproportionately wider diff than this task's own six named call sites — recorded as a named follow-up
+rather than silently dropped or force-fit (see this task's own Status section and
+`docs/tasks/phase-4/README.md`'s "Findings with no task yet").
+
+**Update (task 4.52 — the phase's seventh, and closing, exit-gate attempt): PASS.** Two fully
+independent live-PTY runs (implementer + `test-engineer`), plus a `reviewer` consistency pass, all
+re-ran the full demo end to end against a real, owner-operated rendezvous server
+(`wss://rendezvous.hansajayathilaka.com`, replacing the local in-process server every prior attempt
+used — an explicitly authorized deviation for this attempt only). 4.51's fix is confirmed holding: 24
+total fresh two-peer first-contact trials (16 forward OS-keystore-initiator → file-backed-responder, the
+exact direction 4.50 found broken, plus 8 reverse) across the two runs all completed in single-digit-to-
+low-teens seconds, zero silent or stalled trials, nothing near the original 70 s–260 s range. Every other
+Scope point (onboarding both account types, message-request accept, intro-history no-duplicate, safety-
+number match, restart-with-no-re-handshake, `--export-json`) also passed in both runs. The one finding
+both runs reported — `run_mark_verified`'s real backend latency for a file-backed account, ~3.7–4.1 s,
+measured by timing input-loop responsiveness rather than trusting the optimistic in-memory UI flip — is
+the *same*, already-known, already-named `live_store`-routed hazard this section's own prior update just
+described as split off, not a new regression; `reviewer` independently re-read `run_mark_verified` and
+confirmed it is unchanged by 4.51's diff. Full evidence, per-trial timing tables, and the reviewer
+sign-off: [4.52's own Status section](../tasks/phase-4/4.52-t17-acceptance-demo-closure-attempt-7.md#status).
+**This closes Phase 4's T17 exit gate** — see
+[docs/tasks/phase-4/README.md](../tasks/phase-4/README.md)'s exit criteria for the closure record.
+
+(Numbering note: this update lands as a continuation of §11 rather than a new §12/§13 heading, matching
+the convention every attempt since 4.41 actually used in this file — one running section, sequential
+`**Update (task N):**` paragraphs — rather than the per-attempt new-heading pattern 4.52's own task file
+text anticipated but which was never actually followed here.)

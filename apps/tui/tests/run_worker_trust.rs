@@ -53,6 +53,7 @@ use meridian_tui::app::{
     RejectRequestEffect, RejectRequestRequest, WorkerEvent,
 };
 use meridian_tui::store::contacts::{self as contacts_store, ContactsDocument};
+use meridian_tui::store::history::{self, Direction as HistDirection, MessageState};
 use meridian_tui::worker::{dispatch, OnboardingSession};
 
 const NOW: u64 = 1_760_000_000;
@@ -138,6 +139,15 @@ fn read_chat(bob: &AccountId) -> ChatState {
 fn read_contacts(bob: &AccountId) -> ContactsDocument {
     let os = OsSecretStore::new(SERVICE);
     contacts_store::load_or_default(&os, bob.handle()).expect("load contacts.json")
+}
+
+/// The real, sealed `history/<sender>.jsonl` for `sender_ik`, as it stands on disk — read back
+/// through the same `crate::store::history` loader the TUI itself uses (task 4.49:
+/// `run_accept_request` now writes the accepted sender's intro here too).
+fn read_history(bob: &AccountId, sender_ik: &[u8; 32]) -> Vec<history::HistoryEntry> {
+    let os = OsSecretStore::new(SERVICE);
+    history::load_or_default(&hex::encode(sender_ik), &os, bob.handle())
+        .expect("load history.jsonl")
 }
 
 fn write_chat(bob: &AccountId, chat: &ChatState) {
@@ -363,6 +373,29 @@ async fn accept_request_delivers_the_session_and_tofu_pins_the_sender_with_an_em
         "the outcome must be read back off the real post-observe Contact, never an assumed \
          fresh-TOFU shape (task 4.19 Finding 1's rule, applied to the accept path)"
     );
+
+    // --- Task 4.49: the intro this accept must also have appended into history.jsonl ------------
+    let history = read_history(&bob, &alice_ik);
+    assert_eq!(
+        history.len(),
+        1,
+        "accept must append exactly one history.jsonl entry for the sender's intro — without it \
+         the very first message of every accepted conversation is silently, permanently absent \
+         (task 4.48's fifth defect)"
+    );
+    let entry = &history[0];
+    assert_eq!(entry.v, meridian_tui::store::history::CURRENT_VERSION);
+    assert_eq!(
+        entry.mid,
+        hex::encode([1u8; 16]),
+        "mid must come from the intro's own sender-minted id (Alice::opening_envelope's \
+         ChatContent::Text {{ id: [1u8; 16], .. }}), the same field the ordinary inbound-Text \
+         handler mints its own HistoryEntry.mid from"
+    );
+    assert_eq!(entry.dir, HistDirection::In);
+    assert_eq!(entry.stream, "mrd.chat/1");
+    assert_eq!(entry.body, "hi bob, it's alice");
+    assert_eq!(entry.state, MessageState::Received);
 }
 
 /// End-state property 4's worker half (task 4.42, Deliverable 5): dispatching the **same**
@@ -543,6 +576,14 @@ async fn accept_request_retry_after_a_partial_failure_still_completes_the_pin() 
     assert_eq!(doc.contacts.len(), 1);
     assert_eq!(doc.contacts[0].pubkey, hex::encode(alice_ik));
     assert_eq!(doc.contacts[0].id, "");
+    // Task 4.49: the `pin_still_owed`-only retry branch has no `MessageRequest` to source an intro
+    // from (`chat.accept_request` already returned `None` here, consumed by the simulated first
+    // attempt above) — the retry must not fabricate a history entry it has no real content for.
+    assert!(
+        read_history(&bob, &alice_ik).is_empty(),
+        "a pin_still_owed-only retry must not write a history.jsonl entry it has no \
+         MessageRequest to source content from"
+    );
 }
 
 // ---------------------------------------------------------------------------

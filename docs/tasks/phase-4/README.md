@@ -3,18 +3,21 @@
 
 # Phase 4 — Verification & Trust + Terminal TUI Client
 
-**Kind:** build · **Status:** in progress — 45/45 tasks done (4.1–4.45), but per the task-tracking
-skill's own §7 ("a build phase isn't done until its acceptance demo runs"), the phase is **still not
-closed**: task 4.28 found T17's acceptance demo did not run end to end; 4.29–4.37 closed that specific
-gap, but 4.38 — the second exit-gate attempt — found the demo *still* doesn't pass, for two reasons.
-Fix tasks 4.39/4.40 closed both of those, genuinely, confirmed live — but 4.41, the third exit-gate
-attempt, found a third defect (Defect C). The third gap-closure wave, 4.42–4.45, fixed Defect C, the
-188 s republish defect, and the predicted history-load gap — but **4.45, the fourth exit-gate attempt,
-found a fourth, new, independently-confirmed defect**: `Effect::AddContact` never reconciles into the
-live in-memory `TrustStore`, so an initiator can't mark their own plainly-added contact verified in the
-same session (see [exit criteria](#exit-criteria) for the full writeup). `/plan-phase` needs to run
-again against this finding to scope a fourth gap-closure wave (task **4.46**) · **Reviews phase(s):** n/a
-(build phase; Phase 5 will review it, once it's actually closeable)
+**Kind:** build · **Status:** **done — 52/52 planned tasks done (4.1–4.52).** The sixth exit-gate
+attempt (4.50) found a sixth genuine defect, closed by task **4.51** (root-cause and fix the
+file-backed responder's blocking-scrypt hazard — all six synchronous `decrypt_seed()` call sites this
+task's own investigation named now run off the single-threaded tokio runtime, `spawn_blocking`-only, no
+consult required per that task's own binding rule); task **4.52** (the seventh exit-gate attempt,
+hard-joined on 4.51 alone) then **genuinely passed**, closing the phase. Per the task-tracking skill's
+own §7 ("a build phase isn't done until its acceptance demo runs"), the phase went through a long chain
+before closing: task 4.28 found T17's acceptance demo did not run end to end; 4.29–4.37 closed that gap,
+but 4.38 found the demo *still* doesn't pass, for two reasons; 4.39/4.40 closed both, confirmed live —
+but 4.41 found a third defect (Defect C), closed by the third gap-closure wave (4.42–4.44), whose own
+re-verification (4.45) found a fourth defect, closed by the fourth gap-closure wave (4.46–4.47), whose
+own re-verification (4.48) found a fifth defect, closed by the fifth gap-closure wave (4.49), whose own
+re-verification (4.50) found a sixth defect, closed by the sixth gap-closure wave (4.51), whose own
+re-verification (4.52) finally passed (see [exit criteria](#exit-criteria) for the full writeup) ·
+**Reviews phase(s):** n/a (build phase; Phase 5 reviews it next, via `/start-review-phase`)
 
 ## Goal
 Ship **Feature 08 — Verification & Contact Trust** and **Feature 17 — Terminal TUI Client** together,
@@ -254,7 +257,48 @@ pre-code consult, and neither needs a new ADR.
   recorded and left open, measured live by 4.41; **land first**) — [file](./4.43-file-backed-republish-performance.md)
 - [x] **4.44** Load a chat's persisted transcript when the chat screen opens (predicted "Defect D",
   traced in source at plan time — **verify first, then fix**) — [file](./4.44-chat-history-load-on-open.md)
-- [~] **4.45** T17 acceptance-demo closure, fourth exit-gate attempt (hard join on 4.42, 4.43, 4.44) — [file](./4.45-t17-acceptance-demo-closure-attempt-4.md)
+- [x] **4.45** T17 acceptance-demo closure, fourth exit-gate attempt (hard join on 4.42, 4.43, 4.44) — [file](./4.45-t17-acceptance-demo-closure-attempt-4.md)
+
+**Fourth gap-closure wave (planned by `/plan-phase` against 4.45's findings)** — fixes the fourth
+defect (`Effect::AddContact` never reconciling into the live `MainState::trust`, plus a second,
+closely related interleaving gap traced during this planning pass), the doc-only `--export-json`
+mismatch 4.45 also recorded, then a fifth exit-gate attempt. Neither fix task needs a pre-code
+consult or a new ADR — unlike the third wave's 4.40/4.42, neither has a genuine design choice to make
+(recorded in each task file's own text).
+- [x] **4.46** Reconcile `Effect::AddContact` into the live `MainState::trust` (fix for 4.45's fourth
+  defect — the initiator-verify-in-session gap) — [file](./4.46-add-contact-trust-reconciliation.md)
+- [x] **4.47** Fix `--export-json` demo-script/spec wording (directory layout, not a flat file;
+  doc-only, pre-existing since task 4.15) — [file](./4.47-export-json-doc-fix.md)
+- [x] **4.48** T17 acceptance-demo closure, fifth exit-gate attempt (hard join on 4.46, 4.47) —
+  [file](./4.48-t17-acceptance-demo-closure-attempt-5.md)
+
+**Fifth gap-closure wave (planned by `/plan-phase` against 4.48's findings)** — fixes the fifth defect
+(the accepted sender's intro never persisted to `history.jsonl`), then a sixth exit-gate attempt. No
+pre-code consult needed — the planning pass, reading `run_accept_request`, `MessageRequest`,
+`ChatContent` and `history::append` directly, found the fix reuses the crate's existing
+multi-document-write pattern with no new mechanism and no genuine design choice to make (recorded in
+4.49's own file).
+- [x] **4.49** Persist the accepted sender's intro into `history.jsonl` (fix for 4.48's fifth defect) —
+  [file](./4.49-persist-accepted-intro-history.md)
+- [x] **4.50** T17 acceptance-demo closure, sixth exit-gate attempt (hard join on 4.49) —
+  [file](./4.50-t17-acceptance-demo-closure-attempt-6.md) — **done in the sense 4.28/4.38/4.41/4.45/4.48
+  were done**: its own verification-only scope is fully executed and independently confirmed (two live
+  runs + a reviewer consistency pass); the demo it verified still does **not** pass (a sixth defect —
+  see Exit criteria below) — a sixth gap-closure wave is what's needed next, not a reopening of this one.
+
+**Sixth gap-closure wave (planned by `/plan-phase` against 4.50's findings)** — investigates and fixes
+the sixth defect (non-deterministic, sometimes multi-minute silent first-contact delivery to a
+file-backed responder from an OS-keystore initiator), then a seventh exit-gate attempt. Unlike every
+prior wave's fix task, **4.51's own pre-code consult determination is conditional, not fixed at plan
+time**: whether an architect + security-reviewer consult is mandatory depends on which fix shape its own
+in-task investigation lands on (recorded in that task's own file) — mirroring 4.35's/4.9's precedent for
+an in-task consult rather than a plan-time one, because the investigation genuinely has to run first.
+- [x] **4.51** Root-cause and fix the file-backed responder's blocking-scrypt hazard (fix for 4.50's
+  sixth defect; the `run_mark_verified`/`run_set_petname` latency finding was evaluated and split off
+  rather than forced — see its own Status section) — [file](./4.51-file-backed-inbound-blocking-fix.md)
+- [x] **4.52** T17 acceptance-demo closure, seventh exit-gate attempt (hard join on 4.51 alone) —
+  verdict PASS, phase exit gate closed —
+  [file](./4.52-t17-acceptance-demo-closure-attempt-7.md)
 
 **Findings with no task yet — surfaced by 4.42's own review, owned by no open task:**
 - **Shape B** (an `OpenChat`-style transition from `Screen::Requests` straight to Chat) was evaluated and
@@ -266,6 +310,57 @@ pre-code consult, and neither needs a new ADR.
   on-screen affordance, since ADR 0001 also forbids a hint-less manual re-add). `apps/tui/src/worker.rs`
   carries the design direction inline (a diagnostics-surfaced action rebuilding only rows missing for an
   existing `trust.bin` contact, explicitly distinct from the delete-tombstone case) but no task exists yet.
+
+**Findings with no task yet — surfaced by 4.48's fifth exit-gate attempt, owned by no open task:**
+- **A stale keybinding notation in the T17 feature spec's demo script.**
+  `docs/architecture/features/17-terminal-tui-client.md`'s "Working output" section writes `^N`/`^V`, but
+  the real, correctly-implemented bindings are plain `n`/`v` (`docs/architecture/tui-client.md`'s own
+  reference table gets this right). Half of this (`^V`) was already flagged in
+  [4.42's own Risks/notes](./4.42-post-accept-chat-affordance.md) ("route through `/doc-sync`, do not
+  change the keybinding to match the spec prose") but never actually fixed; the `^N` half was never named
+  before 4.48's review round. Non-blocking — every live run across five exit-gate attempts has typed the
+  correct literal key and succeeded — but genuinely missed by every prior sweep including 4.47's own
+  demo-script fix pass over the same file. A tiny doc-only fix, mirroring 4.47's shape.
+- **The intro-message-persistence gap itself is not listed here** — it is significant enough (a real
+  functional defect, not a doc nit) to be pre-named as its own task, **4.49**, rather than parked in this
+  list. See the [exit criteria](#exit-criteria) writeup and [4.48's own Status section](./4.48-t17-acceptance-demo-closure-attempt-5.md)
+  for the full trace.
+
+**Findings with no task yet — surfaced by 4.50's sixth exit-gate attempt, owned by no open task:**
+- **`contacts.json`'s own `trust` field is stale after live verification.** `run_mark_verified` only
+  updates `trust.bin`; it never touches the matching row's `trust` field in `contacts.json`, and
+  `apps/tui/src/store/export.rs::export_json` never exports `trust.bin`'s content at all — so a
+  `--export-json` dump shows `"trust": "pinned"` for a contact the live TUI correctly displays as
+  "verified" (sourced from the in-memory join in `screens/main.rs::build_contact_entries`).
+  Non-blocking (doesn't affect the live UI or the demo's own `.petname` check) but a real gap in
+  exported state; a small, well-understood fix (either write-through on `run_mark_verified`, or have
+  `export_json` join `trust.bin` the same way `build_contact_entries` does) — not yet scoped as its
+  own task.
+- **The delivery-reliability defect itself is not listed here** — it is significant enough (a real,
+  reproducible functional defect, not a doc nit) to be pre-named as its own task, **4.51**, rather
+  than parked in this list. See the [exit criteria](#exit-criteria) writeup and
+  [4.50's own Status section](./4.50-t17-acceptance-demo-closure-attempt-6.md) for the full trace.
+
+**Findings with no task yet — surfaced by 4.51, owned by no open task:**
+- **The `run_mark_verified`/`run_set_petname` file-backed latency finding (4.43's own recorded,
+  deliberately-deferred `live_store`-widening follow-up; independently re-confirmed by both of 4.50's
+  runs) is split off rather than fixed here.** 4.51 evaluated generalizing its own `Arc<dyn
+  SecretStore>` + `spawn_blocking` shape to `OnboardingSession::live_store` and concluded it does not
+  cleanly generalize: `live_store` is read through `open_account_store` by **thirteen** separate
+  handlers (`run_add_contact`, `run_set_petname`, `run_set_user_blocked`, `run_delete_contact`,
+  `run_send_message`, `run_persist_history`, `run_mark_verified`, `run_acknowledge_key_change`, and
+  others), so wrapping all of them would be a disproportionately wider diff than 4.51's own six named
+  call sites — named explicitly here rather than silently forced or dropped, per this project's own
+  "split rather than force a one-size-fits-all shape" discipline (4.40's own precedent). Not yet
+  scoped as its own task.
+- **A pre-existing, unrelated `Effect::PersistHistory` drain-window flake, found by 4.51's own
+  independent `test-engineer` review pass during restart probing.** A message that just rendered live
+  sometimes does not survive a restart if the process is killed within ~2s of it appearing, because
+  `Effect::PersistHistory`'s async write to `history.jsonl` has not yet landed on disk. Confirmed **not**
+  caused by 4.51 — it goes through `OnboardingSession::live_store`, a completely different code path from
+  the three (now six) call sites this task touches. A possible future task: give history-persist effects
+  a drain window (or an explicit flush-on-shutdown hook) before process exit. Not yet scoped as its own
+  task.
 
 ### Dependency order
 ```
@@ -318,7 +413,38 @@ everything ──► 4.28
 4.42 ──► 4.44 (chat-history load; logically independent, land after 4.42 to avoid a
                  simultaneous diff on ChatState construction + App's screen stack)
 4.42,4.43,4.44 ──► 4.45 (fourth exit-gate attempt — hard join, no partial credit)
+
+-- Fourth gap-closure wave (added post-4.45, planned via /plan-phase) --
+4.19,4.36,4.42 ──► 4.46 (AddContact trust reconciliation — no open design question)
+(no deps, doc-only) ──► 4.47 (export-json doc fix — disjoint files from 4.46, land in either order)
+4.46,4.47 ──► 4.48 (fifth exit-gate attempt — hard join, no partial credit)
+
+-- Fifth gap-closure wave (added post-4.48, planned via /plan-phase) --
+4.42,4.44 ──► 4.49 (intro-persistence fix — no open design question)
+4.49 ──► 4.50 (sixth exit-gate attempt — single-dependency hard join, unlike 4.45's/4.48's
+                 two-dependency joins, since this wave has exactly one fix task)
+
+-- Sixth gap-closure wave (added post-4.50, planned via /plan-phase) --
+4.50 ──► 4.51 (blocking-scrypt root-cause + fix — investigation first, fix shape
+                and any required consult decided in-task, not at plan time)
+4.51 ──► 4.52 (seventh exit-gate attempt — single-dependency hard join, same
+                 shape as 4.49──►4.50)
 ```
+**Landing order (fourth wave).** 4.46 and 4.47 touch disjoint files (`apps/tui/src/app.rs` + its tests
+vs. `docs/architecture/features/17-terminal-tui-client.md`), so either may land first — no
+simultaneous-diff conflict risk like the third wave's shared `worker.rs` had. 4.48 hard-joins both.
+
+**Fifth wave.** Single fix task (4.49), joined straight to its own verification task (4.50) — mirroring
+the third wave's 4.43 (single fix, no open design question) rather than the fourth wave's two-fix
+bundle, since 4.48's finding was single-cause and already traced to exact lines with a clear fix shape.
+
+**Sixth wave.** Single fix task (4.51), joined straight to its own verification task (4.52) — same
+shape as the fifth wave's 4.49→4.50. Unlike every prior single-fix wave, 4.51's own scope is
+investigation-first: 4.50's reviewer corroborated the leading hypothesis as plausible but explicitly did
+not close the root cause, so 4.51 cannot be scoped as a mechanical "apply the known fix" task the way
+4.43 or 4.49 were — its own file gates the fix shape (and any consult) on what its investigation phase
+actually finds.
+
 **Numbering vs. landing order (third wave).** Files are numbered 4.42–4.45 (4.42 = Defect C, as already
 pre-announced by 4.41's Status, this README, and the master tracker), but the recommended *landing* order
 is **4.43 → 4.42 → 4.44 → 4.45**, mirroring the 4.39-before-4.40 precedent: 4.43 has no open design
@@ -382,8 +508,8 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   is illustrative shorthand for this harness (there is no standalone `meridian-mitm-sim` binary with
   those flags — see task [4.10](./4.10-mitm-sim-trust-matrix.md)'s own Status section, which already
   recorded this); the harness itself is what actually ships and actually runs.
-- [ ] **T17's acceptance demo still does NOT run end to end — re-confirmed empirically by 4.41, not
-  assumed.** 4.29–4.37 genuinely closed 4.28's own hang. 4.39 and 4.40 genuinely closed the two defects
+- [x] **T17's acceptance demo now runs end to end — confirmed by 4.52, the seventh exit-gate attempt,
+  the first to genuinely pass.** 4.29–4.37 genuinely closed 4.28's own hang. 4.39 and 4.40 genuinely closed the two defects
   4.38 found — **both confirmed live by 4.41's own two-peer PTY runs, for both account types**: Defect A
   (no prekey republish) is closed — a responder genuinely receives and correctly decrypts a real
   first-contact message, byte-for-byte, over the real wire. Defect B (file-backed accounts failing
@@ -455,14 +581,166 @@ exit-gate attempt) — see the [dependency order](#dependency-order) above for h
   OS-keystore restart methodology reasoning (kill only the app process, not the surrounding D-Bus/keyring
   session) was independently endorsed from source but only live-confirmed by one of the two runs. Full
   writeup: [4.45's own Status section](./4.45-t17-acceptance-demo-closure-attempt-4.md). **Not fixed by
-  4.45 itself**, per its own explicit scope — needs a new task, working number **4.46**, whose shape is
-  already sketched in 4.45's Status section (mirror `App::apply_accepted_request`'s pattern for
-  `AddContact`, plus the missing screen-level regression test 4.42's review round flagged as a gap). This
-  box stays `[ ]` until a fourth gap-closure wave closes 4.46 and a fifth exit-gate attempt confirms a
-  genuine pass.
+  4.45 itself**, per its own explicit scope. `/plan-phase` has now scoped that fourth gap-closure wave:
+  **[4.46](./4.46-add-contact-trust-reconciliation.md)** (the `Effect::AddContact` reconciliation fix,
+  mirroring `App::apply_accepted_request`'s own precedent, plus a second interleaving gap traced during
+  planning; **landed — the fourth defect closed**: a new `WorkerEvent::Completed(Effect::AddContact(_))`
+  arm in `App::handle_worker`'s event-first match, alongside `AcceptRequest`/`RejectRequest`/
+  `LoadHistory`, calls `App::apply_added_contact`, which reuses `apply_accepted_request`'s exact
+  `live_trust_idx` stack-walk verbatim in structure to replay `trust.observe(added.pubkey, "",
+  added.added_at)` into whichever `TrustStore` is actually live (`Screen::Main`, or a `Screen::Chat`/
+  `Screen::Verify` frame above it if `MainState::trust` was `mem::take`n) — closing the initiator-side
+  half of T17's own acceptance criterion, the responder-side half already closed by 4.42. A second,
+  closely related interleaving gap traced during planning was also confirmed reachable and fixed in the
+  same diff, not deferred: `Ctrl-R` is a global, unconditional binding reachable even mid
+  `AddContactState::Adding` (the add-contact sub-flow is embedded in `Screen::Main` itself, unlike
+  `AcceptRequest`'s separately-pushed `Screen::Requests`), so a completion could otherwise land with
+  `Screen::Requests` on top and never reach `contacts::handle_worker`'s `Adding`-closing arm, leaving the
+  add-contact form stuck forever and the new contact absent from the live Contacts list;
+  `App::apply_added_contact` now also calls `contacts::apply_update` and resets `main.contacts.add` to
+  `None` unconditionally, which runs strictly before the per-screen fallback dispatch and so pre-empts
+  the untouched per-screen path's own `Adding` arm rather than racing it — `contacts::apply_update` runs
+  exactly once, confirmed by review-round instrumentation, not a tolerated double call as first
+  documented. Proven at the screen level by two new tests in `apps/tui/tests/accept_to_chat.rs` —
+  `add_contact_makes_the_added_peer_reachable_for_verify` (same-session add-then-verify, no restart) and
+  `a_ctrl_r_interleaved_while_add_contact_is_in_flight_still_reconciles_the_live_contacts_list` (the
+  interleaving-gap regression) — reusing that file's existing real-key-event/real-worker/real-sealed-
+  `$MERIDIAN_HOME` harness. This checkbox still stays `[ ]`, since 4.48 is the only task permitted to
+  flip it), **[4.47](./4.47-export-json-doc-fix.md)** (the doc-only `--export-json` demo-script fix,
+  split out as its own task since it is unrelated in root cause), and
+  **[4.48](./4.48-t17-acceptance-demo-closure-attempt-5.md)** (the fifth exit-gate attempt, hard-joined
+  on both) — **run, verdict FAIL, a fifth new defect found and independently confirmed twice over**: of
+  the two required independent live runs, the first (implementer's) reported PASS, but the second,
+  genuinely independent run found the intro-message-persistence defect below — the disagreement itself
+  is exactly what the two-run discipline exists to catch, and a third, source-level confirmation pass
+  verified the finding rather than trusting either transcript. `worker::run_accept_request` writes
+  `sessions.bin`/`trust.bin`/`contacts.json` but never persists the accepted sender's intro message into
+  the responder's `history.jsonl`, even though the intro is fully in hand at the point it's discarded —
+  so the very first message of every accepted conversation is silently, permanently absent from the
+  responder's own transcript, both live and after restart, confirmed by direct decrypted on-disk proof
+  for both account types. Narrow in scope (every other message, before and after, persists correctly).
+  **Already flagged and deliberately deferred once** by [4.42's own Status section](./4.42-post-accept-chat-affordance.md#status)
+  ("reader-before-second-writer... [4.44] owns the reader half") — [4.44](./4.44-chat-history-load-on-open.md)
+  built only the reader, no task ever built the writer, and the gap fell out of the tracker between being
+  named and now (not listed in "Findings with no task yet" below, until this entry). Full writeup:
+  [4.48's own Status section](./4.48-t17-acceptance-demo-closure-attempt-5.md). **Not fixed by 4.48
+  itself**, per its own explicit scope. `/plan-phase` has now scoped the fifth gap-closure wave:
+  **[4.49](./4.49-persist-accepted-intro-history.md)** (persist `MessageRequest.intro` via
+  `history::append`, reusing the same `mid` so 4.44's existing dedup picks it up cleanly — no pre-code
+  consult required, per that task's own recorded assessment; **landed — the fifth defect closed**:
+  `worker::run_accept_request` now captures the real `Option<MessageRequest>` `chat.accept_request`
+  returns (not just its presence) and, on the genuine fresh-accept branch only — never the
+  `pin_still_owed`-only retry branch, which has no `MessageRequest` to source content from — appends a
+  fourth sealed document after the existing `trust.bin`/`contacts.json` writes succeed: a `HistoryEntry`
+  mirroring `process_inbound_delivery`'s own ordinary-inbound-Text construction field-for-field (`ts`
+  reuses the same accept-time `now` already computed for `trust.observe`, a deliberate approximation —
+  `MessageRequest` carries no original arrival timestamp), skipping a `ChatContent::Receipt` intro
+  entirely rather than inventing a history entry for it. A narrower partial-failure window survives,
+  named rather than fixed (if `history::append` itself fails after the trust/contacts writes already
+  succeeded, a retry finds both guard disjuncts false and never re-attempts the write), the same
+  "do not resurrect a case that should not self-heal automatically" discipline the function's own doc
+  comment already applies to the analogous missing-`contacts.json`-row case. Proven at three levels:
+  `apps/tui/tests/run_worker_trust.rs` (extended) asserts the raw `history.jsonl` write off disk and
+  that the retry branch writes nothing; `apps/tui/tests/accept_to_chat.rs` proves the intro appears
+  exactly once in a real, rendered `Screen::Chat` transcript after a real `Effect::LoadHistory` round
+  trip (screen-level dedup-by-`mid` coverage, task 4.44's own contract), plus a restart-parity extension
+  asserting the intro survives in the correct position relative to a reply persisted after it. The
+  `persist_entry` hand-rolled workaround `apps/tui/tests/live_session_e2e.rs` previously needed for this
+  same gap is now removed as redundant. This checkbox still stays `[ ]`, since 4.50 is the only task
+  permitted to flip it) and
+  **[4.50](./4.50-t17-acceptance-demo-closure-attempt-6.md)** (the sixth exit-gate attempt, hard-joined
+  on 4.49 alone) — **run, verdict FAIL, a sixth new defect found, held to the same
+  two-independent-live-runs-plus-reviewer discipline as every prior attempt**: the first live run
+  reported PASS (4.49's fix and every earlier-wave fix all re-confirmed live, including the intro
+  appearing in the responder's transcript for the first time under this discipline, plus 4.46's
+  same-session initiator-verify), but the second, genuinely independent run — its own PTY driver
+  built from scratch, its own re-derived environment setup — found a real, reproducible defect
+  through its own adversarial probing, outside the demo script's literal steps: **first-contact
+  message delivery is non-deterministically silent or very slow (70s–260s) when the X3DH initiator is
+  OS-keystore-backed and the responder is file-backed**, reproduced across ~15 fresh two-peer trials
+  (9/9 reliable in the reverse direction), even though the sender receives a genuine
+  server-acknowledged delivery confirmation within ~1–11s. A third, independent `reviewer` pass traced
+  the implicated code from source and corroborated the mechanism as plausible and directionally
+  correct but not fully root-caused: `apps/store/src/file.rs::FileSecretStore`'s uncached, per-call
+  `decrypt_seed()` scrypt unwrap runs synchronously and non-yielding on the single-threaded
+  `tokio::runtime::Builder::new_current_thread()` runtime every I/O in this crate depends on
+  (`apps/cli/src/main.rs`), costing a file-backed responder's first-contact path exactly two such
+  unwraps (~2.8–3.2s) — enough to explain the directional asymmetry but not the full observed range,
+  so a reconnect-storm compounding factor and an in-sandbox remeasurement of `decrypt_seed()`'s actual
+  cost remain open questions for the fix task to close. This is the same underlying mechanism as an
+  already-known, twice-independently-confirmed latency finding (File-backed `run_mark_verified` ≈
+  3.4s, `run_set_petname` ≈ 6.9s, both from the same uncached-unwrap pattern task 4.43 fixed only for
+  the bulk-signing path) — worth scoping as one shared fix rather than two patches, per the reviewer's
+  own recommendation. Full writeup: [4.50's own Status section](./4.50-t17-acceptance-demo-closure-attempt-6.md).
+  **Not fixed by 4.50 itself**, per its own explicit scope. A second, non-blocking finding also
+  recorded: `docs/architecture/features/17-terminal-tui-client.md`'s demo script still says `^N`/`^V`
+  where the real bindings are plain `n`/`v` (half of this was flagged back in 4.42's own Risks/notes
+  and never fixed) — tracked earlier in this file, in "Findings with no task yet," not silently
+  dropped a second time. A third, non-blocking finding newly recorded by 4.50's Run 2: `--export-json`'s
+  `contacts.json` still reports `"trust": "pinned"` after live verification, since `run_mark_verified`
+  never updates `contacts.json`'s own `trust` field and `export_json` never exports `trust.bin`'s
+  content — verification state is invisible in an exported dump; owned by no task yet, listed below in
+  "Findings with no task yet." `/plan-phase` has now scoped the sixth gap-closure wave:
+  **[4.51](./4.51-file-backed-inbound-blocking-fix.md)** (an investigation-first task, not a mechanical
+  "apply the known fix" — its own planning pass, tracing `run_inbound_loop` directly, found a **third**
+  synchronous `decrypt_seed()` call site the 4.50 reviewer's own trace hadn't named:
+  `SignalingClient::handshake`'s `sign()` call, paid on every connect *and* every reconnect attempt, not
+  just the two call sites inside `process_inbound_delivery`. 4.51 must remeasure `decrypt_seed()`'s wall
+  time in-sandbox, rule the reconnect-storm hypothesis in or out with live instrumented evidence, and
+  produce a reconciled accounting for the observed 70–260s range before choosing a fix shape — and
+  whether that fix needs an architect + security-reviewer consult is decided in-task, against a binding
+  rule recorded in that task's own file, since a `spawn_blocking`-only fix needs none but a
+  session-lifetime seed cache would trip the exact residency question 4.43's own "boundary" reserved for
+  a future task) and **[4.52](./4.52-t17-acceptance-demo-closure-attempt-7.md)** (the seventh exit-gate
+  attempt, hard-joined on 4.51 alone).
+  **4.51 landed**: remeasured `decrypt_seed()` at ~1.25–1.35s/call in this sandbox (not reused from 4.43's
+  figure); built the complete **six**-call-site accounting — `run_unlock`'s own passphrase-verification
+  `export_seed()`, `inbound_handoff`'s `unwrap_keyfile_for_bulk_signing` `export_seed()` (the ~2.6s
+  "session start" pair), the third `handshake` `sign()` site (per (re)connect), and
+  `process_inbound_delivery`'s own three (`load_chat`/`open_inbound`/`save_chat` — not the reviewer's
+  carried-forward "exactly two"; `load_chat`'s own `derive_key` fires too, since `sessions.bin` already
+  exists by first-envelope time); ruled the reconnect-storm hypothesis out with live evidence — zero
+  `ConnectionState::Reconnecting` events across 12 fresh two-peer trials — but could not itself reproduce
+  the full 70s–260s tail in this sandbox (a driver-methodology bug in the investigation's own first repro
+  attempt produced a false-positive 260s stall, traced to and distinguished from the real product path —
+  see 4.51's own Status). Fix shape: `spawn_blocking`-only, no consult required per the binding rule —
+  `InboundHandoff::store`/`run_inbound_loop`'s own store widened `Box` → `Arc<dyn SecretStore>` (the
+  mechanical widening `spawn_blocking`'s `'static + Send` bound forces), `process_inbound_delivery`'s whole
+  crypto sequence, a new additive `SignalingClient::connect_owned`/`handshake_owned` pair (every other
+  caller unchanged), and `run_unlock`/`unwrap_keyfile_for_bulk_signing` (both widened to `async fn`, purely
+  to `.await` their own `spawn_blocking` wrap) — all six call sites now move their unwrap off the
+  `current_thread` runtime. **A first landing of this fix wrapped only four of the six** (missing
+  `run_unlock`'s and `unwrap_keyfile_for_bulk_signing`'s own calls) — the `reviewer` pass caught the
+  resulting overclaim in Deliverable 4's prose before this task closed, and the fix (plus two more
+  falsifiable concurrency tests) landed to close the gap for real; four falsifiable concurrency tests in
+  total now confirm the mechanism, each independently verified to fail when its own `spawn_blocking` wrap
+  is reverted. The same-class `run_mark_verified`/`run_set_petname` finding was evaluated and **split off,
+  not forced** — `live_store` is read by thirteen separate handlers, a disproportionately wider diff than
+  this task's own six call sites — tracked below in "Findings with no task yet." Full writeup:
+  [4.51's own Status section](./4.51-file-backed-inbound-blocking-fix.md).
+  **[4.52](./4.52-t17-acceptance-demo-closure-attempt-7.md) (the seventh exit-gate attempt, hard-joined
+  on 4.51 alone) — run, verdict PASS, held to the same two-independent-live-runs-plus-reviewer
+  discipline as every prior attempt, with one deliberate methodology change explicitly authorized for
+  this attempt: both live runs and the CLI-level pre-check ran against a real, owner-operated rendezvous
+  server (`wss://rendezvous.hansajayathilaka.com`) instead of a local in-process one.** Both the
+  implementer's run and the independent second (`test-engineer`) run reported the same result on every
+  Scope point: 4.51's fix holds — 24 total fresh two-peer first-contact trials across the two runs (16
+  forward OS-keystore-initiator → file-backed-responder, the exact direction 4.50 found broken, plus 8
+  reverse) all completed in single-digit-to-low-teens seconds, zero silent or stalled trials, nothing
+  approaching the original 70s–260s range. The one finding both runs reported — `run_mark_verified`'s
+  real backend latency for a file-backed account (~3.7–4.1s, measured via input-loop responsiveness
+  rather than the optimistic in-memory UI flip, which both runs independently caught reads as instant
+  regardless of store type) — is the same, already-known, already-named `live_store`-routed hazard 4.51
+  itself split off above, not a new regression; `reviewer` independently re-read `run_mark_verified` from
+  source and confirmed it unchanged by 4.51's diff. `reviewer` also re-ran the phase-diff consistency
+  pass since 4.50 and confirmed all six `decrypt_seed()` call sites are genuinely wrapped, the consult-gate
+  call was correctly made (no consult exists in history for 4.51, matching its own binding
+  self-assessment), and the working tree is clean. Full writeup, per-trial timing tables, and the reviewer
+  sign-off: [4.52's own Status section](./4.52-t17-acceptance-demo-closure-attempt-7.md). **Phase 4's T17
+  exit gate is closed.**
 - [x] The envelope-v2 obligation above was re-deferred with a concrete, mechanical trigger (see
   [above](#envelope-v2-re-deferred--the-concrete-trigger)) — not silently dropped.
-- Then: **not yet** `/start-review-phase` for Phase 5 — the task-tracking skill's own §7 still applies
-  ("a build phase isn't done until its acceptance demo runs"), and it still doesn't. `/plan-phase` needs
-  to run again against 4.45's finding to scope task 4.46 (a fourth gap-closure wave) before the next
-  exit-gate attempt; see [docs/tasks/README.md](../README.md)'s carry-forward section.
+- Then: **`/start-review-phase` for Phase 5 is now the correct next command.** The task-tracking
+  skill's own §7 rule ("a build phase isn't done until its acceptance demo runs") is now satisfied — both
+  T08's (task 4.28) and T17's (task 4.52) acceptance demos have run and passed. See
+  [docs/tasks/README.md](../README.md)'s ▶ NOW/NEXT for the phase-closure record.

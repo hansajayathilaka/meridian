@@ -361,7 +361,8 @@ fn spawn_inbound_loop(
     server: &str,
 ) -> tokio::sync::mpsc::UnboundedReceiver<AppEvent> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let os: Box<dyn meridian_core::identity::SecretStore> = Box::new(OsSecretStore::new(SERVICE));
+    let os: std::sync::Arc<dyn meridian_core::identity::SecretStore> =
+        std::sync::Arc::new(OsSecretStore::new(SERVICE));
     tokio::spawn(run_inbound_loop(
         os,
         handle,
@@ -671,9 +672,19 @@ async fn inbound_text_message_while_chat_open_appends_live_and_persists() {
     let os = OsSecretStore::new(SERVICE);
     let saved = meridian_tui::store::history::load_or_default(&peer_pub_hex, &os, &handle)
         .expect("load history");
-    assert_eq!(saved.len(), 1);
-    assert_eq!(saved[0].mid, entry.mid);
-    assert_eq!(saved[0].body, entry.body);
+    // Task 4.49: `establish_accepted_conversation`'s own `Effect::AcceptRequest` now also persists
+    // the peer's first-contact intro ("hi, it's me") into this same `history.jsonl` — a real,
+    // separate write this test's own fixture triggers, not something this test drives itself. So
+    // this second, live-appended message lands as entry index 1, not 0; `saved.len()` is 2, not 1.
+    assert_eq!(
+        saved.len(),
+        2,
+        "expected the accepted intro plus this second message"
+    );
+    assert_eq!(saved[0].dir, MsgDirection::In);
+    assert_eq!(saved[0].body, "hi, it's me");
+    assert_eq!(saved[1].mid, entry.mid);
+    assert_eq!(saved[1].body, entry.body);
 }
 
 /// Deliverable (b)'s own dedup requirement: an inbound message racing a *already-applied* outbound
@@ -1028,4 +1039,185 @@ async fn reconnect_with_backoff_escalates_then_recovers_and_resumes_forwarding_i
         InboundEvent::MessageRequest(entry) => assert_eq!(entry.sender_ik, peer_pub),
         other => panic!("expected InboundEvent::MessageRequest, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// (task 4.51) spawn_blocking concurrency proof: a slow `SecretStore` must not freeze this
+// current-thread runtime's other tasks while `run_inbound_loop` signs its handshake.
+// ---------------------------------------------------------------------------
+
+/// Wraps any [`meridian_core::identity::SecretStore`] and adds a fixed, real
+/// (`std::thread::sleep`, not `tokio::time::sleep` — this must actually occupy a thread, mirroring
+/// `FileSecretStore::decrypt_seed`'s own real synchronous scrypt cost) delay to every
+/// `use_key`/`derive_key` call — a controllable stand-in for a passphrase-wrapped keyfile's
+/// age/scrypt unwrap, without needing a real one (this task's own Status section separately
+/// measures the real `FileSecretStore` cost directly).
+struct SlowStore {
+    inner: OsSecretStore,
+    delay: Duration,
+}
+
+impl SlowStore {
+    fn new(inner: OsSecretStore, delay: Duration) -> Self {
+        Self { inner, delay }
+    }
+}
+
+impl meridian_core::identity::SecretStore for SlowStore {
+    fn store(
+        &self,
+        label: &str,
+        secret: &[u8],
+    ) -> Result<KeyHandle, meridian_core::identity::StoreError> {
+        self.inner.store(label, secret)
+    }
+
+    fn use_key(
+        &self,
+        h: &KeyHandle,
+        op: meridian_core::identity::SignOrDh,
+        input: &[u8],
+    ) -> Result<Vec<u8>, meridian_core::identity::StoreError> {
+        std::thread::sleep(self.delay);
+        self.inner.use_key(h, op, input)
+    }
+
+    fn nonextractable(&self) -> bool {
+        self.inner.nonextractable()
+    }
+
+    fn derive_key(
+        &self,
+        h: &KeyHandle,
+        info: &[u8],
+    ) -> Result<[u8; 32], meridian_core::identity::StoreError> {
+        std::thread::sleep(self.delay);
+        self.inner.derive_key(h, info)
+    }
+}
+
+/// **Falsifiable concurrency proof (task 4.51 Deliverable 6).** Before this task,
+/// `run_inbound_loop` called `SignalingClient::connect`'s handshake `sign()` directly on its own
+/// task — under `apps/cli/src/main.rs`'s real `current_thread` runtime (this test uses the same
+/// flavor: `#[tokio::test]`'s default), that synchronous call would occupy the *only* OS thread the
+/// whole runtime has, so a concurrently spawned lightweight task could make **no** progress at all
+/// for the call's whole duration. After this task, the same signing call runs inside
+/// `tokio::task::spawn_blocking` (`SignalingClient::connect_owned`/`handshake_owned`) —
+/// `spawn_blocking` hands the work to Tokio's separate blocking-thread pool, freeing this runtime's
+/// own thread to keep polling other tasks. This test proves that concretely: with a [`SlowStore`]
+/// sleeping for 300ms on every `use_key` call, a concurrently spawned "heartbeat" task ticking every
+/// 10ms must accumulate several ticks *during* `run_inbound_loop`'s own connect+handshake — not zero,
+/// and not only after it completes. Reverting the fix (calling `sign()` synchronously again) makes
+/// this test fail with an observed tick count of 0 or 1 — falsified, not vacuous.
+#[tokio::test]
+async fn run_inbound_loops_handshake_never_freezes_a_concurrently_scheduled_task() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let server = spawn_server();
+    let (handle, us_pub) = setup_us_account();
+    publish_own_bundle(&server, &handle, us_pub).await;
+
+    let slow = SlowStore::new(OsSecretStore::new(SERVICE), Duration::from_millis(300));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(run_inbound_loop(
+        std::sync::Arc::new(slow),
+        handle,
+        us_pub,
+        server,
+        vec![50, 100],
+        tx,
+    ));
+
+    let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ticks_writer = ticks.clone();
+    let heartbeat = tokio::spawn(async move {
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ticks_writer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+
+    // Wait for the loop to actually connect (which, even fixed, still takes at least the ~300ms
+    // the slow store's one handshake `use_key` call sleeps for).
+    let connected = recv_connected(&mut rx, Duration::from_secs(5)).await;
+    assert!(
+        connected,
+        "the loop must still reach Connected, just not synchronously"
+    );
+
+    let observed = ticks.load(std::sync::atomic::Ordering::SeqCst);
+    heartbeat.abort();
+    assert!(
+        observed >= 8,
+        "expected the concurrently-scheduled heartbeat task to have ticked at least ~8 times \
+         (out of up to 30 possible in the ~300ms slow-store window) while run_inbound_loop's own \
+         handshake sign() was in flight — observed {observed}. A near-zero count here is exactly \
+         what an un-`spawn_blocking`'d synchronous sign() call would produce on this \
+         `current_thread` runtime: this is the falsifiable regression this task's fix must prevent."
+    );
+}
+
+/// The same falsifiable shape as
+/// [`run_inbound_loops_handshake_never_freezes_a_concurrently_scheduled_task`], targeting
+/// `process_inbound_delivery`'s own blocking crypto (`load_chat`'s `derive_key`, `open_inbound`'s
+/// X3DH `use_key`, `save_chat`'s `derive_key` — three [`SlowStore`] calls, not one) instead of the
+/// handshake — the exact defect this task exists to fix: a genuine first-contact envelope's decrypt
+/// work must not freeze the runtime a concurrently-scheduled task depends on.
+#[tokio::test]
+async fn process_inbound_deliverys_crypto_never_freezes_a_concurrently_scheduled_task() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let server = spawn_server();
+    let (handle, us_pub) = setup_us_account();
+    publish_own_bundle(&server, &handle, us_pub).await;
+
+    let slow = SlowStore::new(OsSecretStore::new(SERVICE), Duration::from_millis(200));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(run_inbound_loop(
+        std::sync::Arc::new(slow),
+        handle,
+        us_pub,
+        server.clone(),
+        vec![50, 100],
+        tx,
+    ));
+    assert!(
+        recv_connected(&mut rx, Duration::from_secs(5)).await,
+        "loop must connect before the peer can deliver anything"
+    );
+
+    let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ticks_writer = ticks.clone();
+    let heartbeat = tokio::spawn(async move {
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ticks_writer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+
+    let (peer_store, peer_account) = generate_peer();
+    let _peer = peer_send_first_contact(
+        &server,
+        &peer_store,
+        &peer_account,
+        us_pub,
+        "task-4.51 concurrency probe",
+    )
+    .await;
+
+    let event = recv_inbound(&mut rx, Duration::from_secs(5))
+        .await
+        .expect("the first-contact request must still arrive with a slow store");
+    assert!(matches!(event, InboundEvent::MessageRequest(_)));
+
+    let observed = ticks.load(std::sync::atomic::Ordering::SeqCst);
+    heartbeat.abort();
+    assert!(
+        observed >= 20,
+        "expected the concurrently-scheduled heartbeat task to have ticked at least ~20 times \
+         (out of up to 60 possible across the ~600ms three-call slow-store window: load_chat + \
+         open_inbound + save_chat) while process_inbound_delivery's own blocking crypto was in \
+         flight — observed {observed}. A near-zero count here is what running that crypto \
+         synchronously on this `current_thread` runtime would produce."
+    );
 }
