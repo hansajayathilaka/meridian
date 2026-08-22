@@ -1,4 +1,5 @@
-# Meridian CI: lint (incl. invariants) -> test (incl. harnesses) -> build. Mirrors the `just` recipes.
+# Meridian CI: lint (incl. invariants) -> test-* (parallel: build+unit/coverage, tamper-hook,
+# webrtc, harnesses+conformance, NAT matrix) -> build. Mirrors the `just` recipes.
 name: ci
 
 on:
@@ -42,23 +43,76 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-  test:
-    name: Test + adversarial harnesses
+  # The former single `test` job ran everything below sequentially on one runner (~25.5 minutes:
+  # see the per-job durations noted next to each job here, measured from the last run when this
+  # was one job). Split into independent jobs — each already an independent `cargo`/`bash`
+  # invocation with its own feature resolution, unaffected by which job runs it — so they run
+  # concurrently and the test *stage*'s wall-clock drops to its longest single piece (~10.5 min,
+  # `test-core`) instead of the sum of all of them. `build` (release) below now `needs` every job
+  # here, preserving the original all-must-pass gate. NOTE: this changes the CI check names —
+  # if branch protection on `main` requires the old "Test + adversarial harnesses" check by name,
+  # it must be updated to require these instead (see docs/operations/docker-image.md §1's existing
+  # TODO on this — no agent-accessible tool can read or fix branch-protection config directly).
+  test-core:
+    name: "Test: build + unit/integration + coverage (~10.5min)"
     needs: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build
-        run: cargo build --workspace
-      - name: Unit + integration tests
-        run: cargo test --workspace
-      # REQUIRED for F17, and not redundant with --workspace above. Resolver-2 feature unification
-      # turns `test-tamper-hook` ON workspace-wide whenever dev targets are built, because
-      # apps/cli's dev-dependency pins that feature — so every #[cfg(not(feature =
-      # "test-tamper-hook"))] guard in apps/rendezvous/tests is compiled OUT under --workspace.
-      # This package-scoped run with default features is the only invocation under which the
-      # tamper-hook inertness guards execute at all. Before it existed,
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # Coverage (task 1.21 / F22) is measured off THIS build+test run rather than a separate job
+      # that repeats it under instrumentation. `show-env` is sourced only inside these two steps
+      # (not exported job-wide via $GITHUB_ENV), so this job's instrumentation can't leak into any
+      # other parallel test-* job. If this build or the test run below fails, the job stops here
+      # and the coverage-report steps at the bottom never run, so a failed run never gets a
+      # coverage number either.
+      - name: Build (instrumented for coverage)
+        run: |
+          cargo llvm-cov clean --workspace
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo build --workspace
+      - name: Unit + integration tests (instrumented for coverage)
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo test --workspace
+      # Reports region/line/function coverage from the instrumented Build + Unit/integration steps
+      # above so the number is visible in CI (task 1.21 / F22) instead of asserted in a spec.
+      # Deliberately non-blocking (continue-on-error): no threshold is enforced here — gating is a
+      # separate, later decision. Note that Rust on stable emits no branch coverage, so a "branch
+      # coverage" target is not measurable here.
+      - name: Coverage summary
+        continue-on-error: true
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo llvm-cov report --summary-only
+      - name: Coverage report (lcov artifact)
+        continue-on-error: true
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo llvm-cov report --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@v4
+        if: hashFiles('lcov.info') != ''
+        continue-on-error: true
+        with:
+          name: coverage-lcov
+          path: lcov.info
+
+  test-tamper-hook:
+    name: "Test: tamper-hook feature gate (~1.5min)"
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # REQUIRED for F17. Resolver-2 feature unification turns `test-tamper-hook` ON
+      # workspace-wide whenever dev targets are built, because apps/cli's dev-dependency pins that
+      # feature — so every #[cfg(not(feature = "test-tamper-hook"))] guard in
+      # apps/rendezvous/tests is compiled OUT under a workspace-wide build/test (as run in
+      # test-core). This package-scoped run with default features is the only invocation under
+      # which the tamper-hook inertness guards execute at all. Before it existed,
       # `tamper_flag_is_inert_without_feature` (task 1.12) had never run in CI.
       # NOTE: this step needs no change as guards are added — it is package-scoped and runs the whole
       # default-feature test binary, so task 1.32's per-mode inertness tests
@@ -74,15 +128,16 @@ jobs:
       # `route_tamper_requires_its_own_flag_not_just_allow_test_tamper` — are all
       # #[cfg(feature = "test-tamper-hook")], so they are compiled OUT of the default-features step
       # above. Without this step they would execute only as a SIDE EFFECT of resolver-2 unification
-      # under `cargo test --workspace`, via apps/cli's dev-dependency feature pin. That is the same
-      # accidental coupling task 1.28's review flagged as a hazard, load-bearing in the other
-      # direction: dropping that pin (the hygienic thing to do) would silently stop running every
-      # runtime-gate test everywhere — `-p` with default features compiles them out, `--workspace`
-      # runs them TODAY only via that dev-dep accident, and mitm-sim's filtered invocation skips
-      # them. (Stated precisely because it is checkable: right now `cargo test --workspace` does run
-      # them. A reader who checks a sloppier claim, finds it false, and concludes this step is stale
-      # might delete it — which is exactly the regression it exists to prevent.) Feature-on coverage
-      # must not depend on a dev-dep. Also runs task 2.12's federated A2×2 cell
+      # under a workspace-wide `cargo test --workspace` (as run in test-core), via apps/cli's
+      # dev-dependency feature pin. That is the same accidental coupling task 1.28's review flagged
+      # as a hazard, load-bearing in the other direction: dropping that pin (the hygienic thing to
+      # do) would silently stop running every runtime-gate test everywhere — `-p` with default
+      # features compiles them out, `--workspace` runs them TODAY only via that dev-dep accident,
+      # and mitm-sim's filtered invocation skips them. (Stated precisely because it is checkable:
+      # right now `cargo test --workspace` does run them. A reader who checks a sloppier claim,
+      # finds it false, and concludes this step is stale might delete it — which is exactly the
+      # regression it exists to prevent.) Feature-on coverage must not depend on a dev-dep. Also
+      # runs task 2.12's federated A2×2 cell
       # (`federation_abuse.rs::cross_org_malicious_server_bundle_substitution_is_rejected_by_the_client`)
       # for the same reason: package-scoped, feature ON, no `--test` filter.
       - name: Tamper-hook runtime-gate tests (feature ON — see comment)
@@ -115,11 +170,27 @@ jobs:
             exit 1
           fi
           echo "OK: normal build does not activate test-tamper-hook."
+
+  test-webrtc:
+    name: "Test: real webrtc-rs transport backend (~7min)"
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: Real webrtc-rs transport backend (1.15; real ICE/SCTP/DTLS on localhost, no NET_ADMIN needed)
         run: |
           cargo test -p meridian-transport --features webrtc
           cargo test -p meridian-core --features webrtc
           cargo test -p meridian-cli --features webrtc
+
+  test-harnesses:
+    name: "Test: build-shape check + adversarial/cross-org harnesses + conformance (~3min)"
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       # ADR 0020 condition 2 / task 4.12: --no-default-features must still build (and must not pull
       # in ratatui/crossterm via the default-on `tui` feature) — the lean build shape demo/CI
       # scripts rely on. Not a one-time local check: this is the ongoing CI enforcement the ADR's
@@ -140,15 +211,13 @@ jobs:
           bash harnesses/mitm-sim/run.sh
           bash harnesses/ghost-device/run.sh
       # Task 2.12 (phase-2 exit gate): the cross-org abuse + acceptance suite. Already covered by
-      # `cargo test --workspace` above too (no feature-gating on this file), but named explicitly
-      # here — same convention as the harness invocations above — so the phase exit gate is
-      # discoverable as its own CI line rather than buried in a workspace-wide run.
+      # test-core's workspace-wide test run too (no feature-gating on this file), but named
+      # explicitly here — same convention as the harness invocations above — so the phase exit gate
+      # is discoverable as its own CI line rather than buried in a workspace-wide run.
       - name: Cross-org abuse + acceptance suite (2.12)
         run: |
           cargo test -p meridian-rendezvous --features test-tamper-hook --test federation_abuse
           cargo test -p meridian-cli --test two_orgs_walkthrough
-      - name: NAT matrix + relay policy (T05; netns rig skips without NET_ADMIN)
-        run: bash harnesses/nat-matrix/run.sh
       # TODO: migrate to cargo nextest run --workspace
       - name: Conformance vectors (byte-identical across CLI/WASM/mobile) — docs/testing/strategy.md §1
         run: |
@@ -159,9 +228,29 @@ jobs:
           }
           cargo test -p meridian-crypto --test conformance
 
+  test-nat-matrix:
+    name: "Test: NAT matrix + relay policy (~3.5min)"
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # tools/netns-nat-matrix.sh's wire-level rig shells out to this example (the real
+      # TurnReq/TurnGrant wire flow) but never builds it — it only checks that
+      # ./target/debug/examples/fetch_turn_credentials already exists and errors if not. In the
+      # former single `test` job this came for free: `cargo test --workspace` compiles every
+      # example as part of its default target set (to compile-check them, even though it doesn't
+      # run them), so an earlier step in that same job left the binary sitting in the job's shared
+      # target/ dir by the time this ran. Split onto its own runner, this job starts from an empty
+      # target/ dir and needs its own explicit build.
+      - name: Build fetch_turn_credentials example (needed by the netns rig)
+        run: cargo build -p meridian-rendezvous --example fetch_turn_credentials
+      - name: NAT matrix + relay policy (T05; netns rig skips without NET_ADMIN)
+        run: bash harnesses/nat-matrix/run.sh
+
   build:
     name: Build (release)
-    needs: test
+    needs: [test-core, test-tamper-hook, test-webrtc, test-harnesses, test-nat-matrix]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -212,30 +301,6 @@ jobs:
         run: |
           docker rm -f rendezvous-smoke >/dev/null 2>&1 || true
           docker volume rm rendezvous-smoke-data >/dev/null 2>&1 || true
-
-  coverage:
-    name: Coverage (measurement only, non-blocking)
-    needs: test
-    runs-on: ubuntu-latest
-    # Reports region/line/function coverage so the number is visible in CI instead of asserted in a
-    # spec (task 1.21 / F22). Deliberately NOT a gate: it does not block the merge queue, and no
-    # threshold is enforced — gating is a separate, later decision. Note that Rust on stable emits no
-    # branch coverage, so a "branch coverage" target is not measurable here.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Coverage summary
-        run: cargo llvm-cov --workspace --summary-only
-      - name: Coverage report (lcov artifact)
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
-      - uses: actions/upload-artifact@v4
-        with:
-          name: coverage-lcov
-          path: lcov.info
 
   supply-chain:
     name: License / advisory gate
