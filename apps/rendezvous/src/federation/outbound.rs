@@ -46,11 +46,15 @@ pub enum FetchForeignError {
     #[error("federation is not enabled on this server")]
     NotConfigured,
     /// [`crate::federation::Discovery::resolve`] failed: the hint domain has no known endpoint.
+    /// `source` is boxed: `DiscoveryError` is large enough on its own (several `String`-carrying
+    /// variants, one holding a `toml::de::Error`) that embedding it by value pushed this enum's
+    /// `Err`-variant size over clippy's `result_large_err` threshold (`-D warnings` in CI) —
+    /// boxing here costs nothing in the error path, which is never hot.
     #[error("resolving {domain:?}: {source}")]
     Discovery {
         domain: String,
         #[source]
-        source: DiscoveryError,
+        source: Box<DiscoveryError>,
     },
     /// Turning a resolved [`Endpoint`]'s `host:port` into a socket address failed (DNS failure for
     /// the *dial* target — distinct from discovery's own domain-to-endpoint resolution).
@@ -189,11 +193,13 @@ pub enum RouteForeignError {
     #[error("federation is not enabled on this server")]
     NotConfigured,
     /// [`crate::federation::Discovery::resolve`] failed: the hint domain has no known endpoint.
+    /// `source` is boxed for the same `result_large_err` reason as
+    /// [`FetchForeignError::Discovery`].
     #[error("resolving {domain:?}: {source}")]
     Discovery {
         domain: String,
         #[source]
-        source: DiscoveryError,
+        source: Box<DiscoveryError>,
     },
     /// Turning a resolved [`Endpoint`]'s `host:port` into a socket address failed.
     #[error("resolving dial address {host}:{port}: {source}")]
@@ -391,7 +397,7 @@ async fn dial_foreign(
             .await
             .map_err(|source| RouteForeignError::Discovery {
                 domain: hint_domain.to_string(),
-                source,
+                source: Box::new(source),
             })?;
 
     // Task 3.7 (F10): the outbound `ClientConfig` is built once at startup
@@ -457,7 +463,7 @@ async fn dial_foreign(
 
     Err(last_err.unwrap_or_else(|| RouteForeignError::Discovery {
         domain: hint_domain.to_string(),
-        source: DiscoveryError::NotFound(hint_domain.to_string()),
+        source: Box::new(DiscoveryError::NotFound(hint_domain.to_string())),
     }))
 }
 
