@@ -91,6 +91,13 @@ two-orgs mode="static":
 p2p-wire-proof:
     bash demo/p2p-wire-proof/run-wire-proof.sh
 
+# Same wire-level proof as `just p2p-wire-proof`, but against a real, already-deployed rendezvous
+# server instead of a local Docker stack — no Docker needed, just the host's own tcpdump. Defaults
+# to wss://rendezvous.hansajayathilaka.com; override with `RENDEZVOUS_URL=wss://... just
+# p2p-wire-proof-live`. See demo/p2p-wire-proof/LIVE-SERVER-PROOF.md for a recorded run.
+p2p-wire-proof-live:
+    bash demo/p2p-wire-proof/run-live-server-proof.sh
+
 # Validate docs: mermaid syntax + relative links.
 check-docs:
     bash tools/check-docs.sh

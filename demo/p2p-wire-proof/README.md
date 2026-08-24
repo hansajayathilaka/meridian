@@ -40,6 +40,17 @@ capture, exactly which flows carried the session and which never saw a byte of t
   role is bootstrapping (ICE/SDP signaling for a session that doesn't exist yet) — this demo never
   claims "the server is needed for nothing at all", only that it never carries message content.
 
+## Also: proof against a real, already-deployed server
+
+Everything above runs a local Docker stack. [`run-live-server-proof.sh`](./run-live-server-proof.sh)
+runs the same core proof — real `session connect`, a real packet capture, the same
+known-plaintext-oracle assertions — against an **already-deployed, real rendezvous server** instead
+(no Docker needed, just two client processes + the host's own `tcpdump`). See
+[`LIVE-SERVER-PROOF.md`](./LIVE-SERVER-PROOF.md) for a recorded run against
+`wss://rendezvous.hansajayathilaka.com`, including the detailed breakdown of every flow the
+capture showed (signaling, TURN candidate probing, and the actual P2P data channel) and an honest
+note on that run's same-host topology.
+
 ## Relationship to `tools/netns-nat-matrix.sh`
 
 The project already has a CI-wired, wire-level pcap proof of nearly the same properties — see
