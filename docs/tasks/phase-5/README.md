@@ -2,7 +2,7 @@
 
 # Phase 5 — Review of Phase 4
 
-**Kind:** review · **Status:** sweep done, findings triaged next via `/plan-review-phase` · **Reviews
+**Kind:** review · **Status:** planned — 13 fix-tasks broken out, ready for `/next-task` · **Reviews
 phase(s):** Phase 4 (T08 — Verification & Contact Trust + T17 — Terminal TUI Client, tasks 4.1–4.52)
 plus the untracked out-of-band work merged alongside/after it (PRs #66–#73: a clippy `result_large_err`
 fix, CI job-split + fixes, the Windows/Linux release-binary pipeline (ADR 0022, superseded same-window
@@ -70,8 +70,41 @@ Review phases alternate with build phases, so Phase 5 is unblocked by definition
 
 ## Tasks (todo)
 <!-- Filled by /plan-review-phase from review-report.md. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
-Not yet broken down — `/plan-review-phase` turns [review-report.md](./review-report.md)'s F1–F9
-should-fix findings (F10, N1–N8 optional) into numbered fix-tasks next.
+13 fix-tasks cover all 18 findings. N8 is deliberately not its own task — folded into 5.5 as a stated,
+deferred stretch-goal, since the interleaving it names isn't reachable until 5.5's own receive-side
+wiring lands (a standalone task today would have nothing to test against).
+
+**Should-fix findings (F1–F9), plus F10**
+- [ ] **5.1** Persist and always-reconcile Sent→Delivered receipts (F1) — [file](./5.1-persist-reconcile-delivery-receipts.md)
+- [ ] **5.2** Diagnostics-surfaced repair action for `run_accept_request`'s partial-failure window (F2) — [file](./5.2-accept-request-repair-action.md)
+- [ ] **5.4** `spawn_blocking`-wrap `run_mark_verified`/`run_set_petname` (F4; **land before 5.3**) — [file](./5.4-spawn-blocking-mark-verified-set-petname.md)
+- [ ] **5.3** Fix `contacts.json` trust staleness + cover `export_json` (F3; depends on 5.4) — [file](./5.3-fix-contacts-trust-staleness-export.md)
+- [ ] **5.5** Wire receive-side key-change detection into the TUI inbound loop + `session.rs` (F5 + N8 deferred) — [file](./5.5-wire-receive-side-key-change-detection.md)
+- [ ] **5.6** Federated mitm-sim cell: verified-contact key-change block (F6; depends on 5.5) — [file](./5.6-federated-verified-key-change-mitm-cell.md)
+- [ ] **5.7** App-level reconciliation tests for Settings/Diagnostics (F7) — [file](./5.7-settings-diagnostics-app-level-tests.md)
+- [ ] **5.8** App-level end-to-end tests for onboarding/unlock (F8) — [file](./5.8-onboarding-unlock-app-level-tests.md)
+- [ ] **5.9** Scheduled CI workflow for `demo/p2p-wire-proof` (F9) — [file](./5.9-schedule-p2p-wire-proof-ci.md)
+- [ ] **5.10** Drain/flush-on-shutdown hook for `Effect::PersistHistory` (F10) — [file](./5.10-persist-history-drain-on-shutdown.md)
+
+**Nits taken up (N1, N7 as their own tasks; N2–N6 bundled)**
+- [ ] **5.11** Extract shared `observe_into_live_trust` helper (N1) — [file](./5.11-extract-observe-into-live-trust-helper.md)
+- [ ] **5.12** Pin `find_binding`'s keybinding-collision tie-break contract (N7) — [file](./5.12-pin-keybinding-collision-tiebreak.md)
+- [ ] **5.13** Nit sweep: doc/comment/mechanical fixes (N2, N3, N4, N5, N6) — [file](./5.13-phase-5-nit-sweep.md)
+
+### Landing order
+```
+Wave 1 — fully parallel, no shared file/function conflicts:
+  5.1, 5.2, 5.4, 5.5, 5.7, 5.8, 5.9, 5.10, 5.11, 5.12, 5.13
+
+Wave 2 — gated on a Wave-1 sibling landing first:
+  5.4 ──► 5.3   (both touch run_mark_verified; 5.4's spawn_blocking shape change
+                  has no open design question — land first, mirrors 4.43-before-4.42)
+  5.5 ──► 5.6   (both append cells to harnesses/mitm-sim/run.sh; 5.5 is the actual
+                  receive-path fix, 5.6 is a new adversarial cell layered on top)
+```
+5.1 (app.rs `handle_inbound`) and 5.11 (app.rs `apply_accepted_request`/`apply_added_contact`) share a
+file but touch disjoint functions — safe to parallelize. Same for 5.2 (worker.rs
+`run_accept_request`) vs. 5.3/5.4 (worker.rs `run_mark_verified`/`run_set_petname`).
 
 ## Exit criteria
 All findings from the [review report](./review-report.md) triaged into fix-tasks (or explicitly waived

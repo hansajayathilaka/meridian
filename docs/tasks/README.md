@@ -46,8 +46,18 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   feature, the exact reconciliation-gap class T17's own six-wave closure spent the whole phase fixing.
   No ADR drift, no unratified on-the-fly decisions, no trust-state-machine bypass, no sealed-store leak.
   Full findings: [phase-5/review-report.md](./phase-5/review-report.md).
-- **NEXT:** `/plan-review-phase` — turn the review report's 9 should-fix findings (F1–F9; F10 and the
-  N1–N8 nits are optional/lower-priority) into numbered fix-tasks.
+- **NOW:** **Phase 5 planned — 13 fix-tasks broken out** from the review report's 18 findings (F1–F10,
+  N1–N8). Delegated to the **planner** agent; grounded against current source before finalizing scope.
+  All 9 should-fix findings (F1–F9) plus F10 got their own task; N1 (a trust-reconciliation helper
+  extraction with real defect history) and N7 (a genuine extension-registry policy decision) each got
+  their own task; N2–N6 (doc/comment/mechanical) bundled into one nit sweep (5.13), mirroring Phase 3's
+  3.21 precedent; N8 folded into 5.5 as a deferred stretch-goal since it isn't independently reachable
+  until 5.5's own fix lands. Two same-function/same-file conflicts required explicit sequencing: **5.4
+  before 5.3** (both touch `run_mark_verified`) and **5.5 before 5.6** (both append to
+  `harnesses/mitm-sim/run.sh`); everything else runs in parallel. Full breakdown:
+  [phase-5/README.md](./phase-5/README.md#tasks-todo).
+- **NEXT:** `/next-task` — start landing Phase 5's 13 fix-tasks (Wave 1 first: 5.1, 5.2, 5.4, 5.5, 5.7,
+  5.8, 5.9, 5.10, 5.11, 5.12, 5.13; then 5.3 after 5.4, and 5.6 after 5.5).
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -321,7 +331,25 @@ Review phase. Sweeps everything built since the Phase-3 review: Phase 4 (T08 + T
 the untracked out-of-band PRs #66–#73 that landed alongside/after it. [Report](./phase-5/review-report.md):
 18 findings — **0 blocking**, 9 should-fix, 9 nits (F1 combines a duplicate correctness+coverage finding
 from two lenses, numbered once). Verdict: **green to proceed**, no blocker for the next build phase
-(envelope-v2). Task breakdown pending `/plan-review-phase`.
+(envelope-v2). 13 fix-tasks cover all 18 findings (N8 folded into 5.5 rather than its own task — see
+[phase-5/README.md](./phase-5/README.md#tasks-todo)).
+
+**Wave 1 — fully parallel**
+- [ ] **5.1** Persist and always-reconcile Sent→Delivered receipts (F1) — [file](./phase-5/5.1-persist-reconcile-delivery-receipts.md)
+- [ ] **5.2** Diagnostics-surfaced repair action for `run_accept_request`'s partial-failure window (F2) — [file](./phase-5/5.2-accept-request-repair-action.md)
+- [ ] **5.4** `spawn_blocking`-wrap `run_mark_verified`/`run_set_petname` (F4) — [file](./phase-5/5.4-spawn-blocking-mark-verified-set-petname.md)
+- [ ] **5.5** Wire receive-side key-change detection into the TUI inbound loop + `session.rs` (F5 + N8 deferred) — [file](./phase-5/5.5-wire-receive-side-key-change-detection.md)
+- [ ] **5.7** App-level reconciliation tests for Settings/Diagnostics (F7) — [file](./phase-5/5.7-settings-diagnostics-app-level-tests.md)
+- [ ] **5.8** App-level end-to-end tests for onboarding/unlock (F8) — [file](./phase-5/5.8-onboarding-unlock-app-level-tests.md)
+- [ ] **5.9** Scheduled CI workflow for `demo/p2p-wire-proof` (F9) — [file](./phase-5/5.9-schedule-p2p-wire-proof-ci.md)
+- [ ] **5.10** Drain/flush-on-shutdown hook for `Effect::PersistHistory` (F10) — [file](./phase-5/5.10-persist-history-drain-on-shutdown.md)
+- [ ] **5.11** Extract shared `observe_into_live_trust` helper (N1) — [file](./phase-5/5.11-extract-observe-into-live-trust-helper.md)
+- [ ] **5.12** Pin `find_binding`'s keybinding-collision tie-break contract (N7) — [file](./phase-5/5.12-pin-keybinding-collision-tiebreak.md)
+- [ ] **5.13** Nit sweep: doc/comment/mechanical fixes (N2, N3, N4, N5, N6) — [file](./phase-5/5.13-phase-5-nit-sweep.md)
+
+**Wave 2 — sequenced (same-function/same-file conflicts)**
+- [ ] **5.3** Fix `contacts.json` trust staleness + cover `export_json` (F3; depends on 5.4) — [file](./phase-5/5.3-fix-contacts-trust-staleness-export.md)
+- [ ] **5.6** Federated mitm-sim cell: verified-contact key-change block (F6; depends on 5.5) — [file](./phase-5/5.6-federated-verified-key-change-mitm-cell.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
