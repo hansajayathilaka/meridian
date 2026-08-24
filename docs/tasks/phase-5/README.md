@@ -77,8 +77,8 @@ wiring lands (a standalone task today would have nothing to test against).
 **Should-fix findings (F1–F9), plus F10**
 - [x] **5.1** Persist and always-reconcile Sent→Delivered receipts (F1) — [file](./5.1-persist-reconcile-delivery-receipts.md)
 - [x] **5.2** Diagnostics-surfaced repair action for `run_accept_request`'s partial-failure window (F2) — [file](./5.2-accept-request-repair-action.md)
-- [~] **5.4** `spawn_blocking`-wrap `run_mark_verified`/`run_set_petname` (F4; **land before 5.3**) — [file](./5.4-spawn-blocking-mark-verified-set-petname.md)
-- [ ] **5.3** Fix `contacts.json` trust staleness + cover `export_json` (F3; depends on 5.4) — [file](./5.3-fix-contacts-trust-staleness-export.md)
+- [x] **5.4** `spawn_blocking`-wrap `run_mark_verified`/`run_set_petname` (F4; **land before 5.3**) — [file](./5.4-spawn-blocking-mark-verified-set-petname.md)
+- [~] **5.3** Fix `contacts.json` trust staleness + cover `export_json` (F3; depends on 5.4) — [file](./5.3-fix-contacts-trust-staleness-export.md)
 - [ ] **5.5** Wire receive-side key-change detection into the TUI inbound loop + `session.rs` (F5 + N8 deferred) — [file](./5.5-wire-receive-side-key-change-detection.md)
 - [ ] **5.6** Federated mitm-sim cell: verified-contact key-change block (F6; depends on 5.5) — [file](./5.6-federated-verified-key-change-mitm-cell.md)
 - [ ] **5.7** App-level reconciliation tests for Settings/Diagnostics (F7) — [file](./5.7-settings-diagnostics-app-level-tests.md)

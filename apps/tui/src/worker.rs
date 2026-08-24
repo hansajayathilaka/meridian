@@ -139,8 +139,10 @@ pub struct OnboardingSession {
     /// object [`handle_unlock`]'s success path constructs, cloned (an `Arc` clone is an atomic
     /// refcount bump, never a re-unwrap) rather than moved — [`OnboardingSession::live_store`]'s own
     /// read accessor is unchanged (`Arc<dyn SecretStore>` derefs to `&dyn SecretStore` exactly like
-    /// `Box` did), so the other eleven `open_account_store`-routed handlers (task 4.51's own
-    /// Deliverable 7 residual, still unowned) see no behavior change at all from this widening.
+    /// `Box` did), so the other `open_account_store`-routed handlers (task 4.51's own Deliverable 7
+    /// residual, still unowned — its count has grown since 4.51's own snapshot and should be
+    /// re-measured against current source, not assumed, by whichever task closes more of them) see
+    /// no behavior change at all from this widening.
     live_store: Option<(std::sync::Arc<dyn SecretStore>, KeyHandle)>,
 }
 
@@ -796,8 +798,9 @@ fn open_account_store(session: &OnboardingSession) -> Result<AccountStore<'_>, S
 /// `(Arc<dyn SecretStore>, KeyHandle)` pair instead of [`AccountStore`]'s borrow-shaped `.parts()`,
 /// for callers that need to move the store into [`tokio::task::spawn_blocking`]'s `'static + Send`
 /// closure. Currently only [`run_mark_verified`]/[`run_set_petname`] call this — every other caller
-/// of [`open_account_store`]/[`AccountStore`] (the remaining eleven `live_store`-routed handlers,
-/// task 4.51's own named-but-unowned residual) is untouched by this function's existence.
+/// of [`open_account_store`]/[`AccountStore`] (the remaining `live_store`-routed handlers, task
+/// 4.51's own named-but-unowned residual — its count has grown since 4.51's own snapshot and should
+/// be re-measured against current source, not assumed) is untouched by this function's existence.
 ///
 /// Same resolution logic as [`open_account_store`], just returning owned rather than borrowed data:
 /// **`StoreKind::Os`** re-constructs a fresh, free-to-construct [`OsSecretStore`] (no KDF, so no
@@ -3653,9 +3656,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
-    // Task 5.4 — `run_mark_verified`/`run_set_petname`, the two highest-impact of the eleven
-    // remaining `live_store`-routed handlers task 4.51's own Deliverable 7 named and split off
-    // (not the whole thirteen — the other eleven stay a named, unowned residual, untouched here).
+    // Task 5.4 — `run_mark_verified`/`run_set_petname`, the two highest-impact of the
+    // `live_store`-routed handlers task 4.51's own Deliverable 7 named and split off (that
+    // residual's count has grown since 4.51's own snapshot — re-measure against current source
+    // rather than reusing a cached figure; the remaining handlers stay a named, unowned residual,
+    // untouched here).
     //
     // Unlike `run_unlock`/`unwrap_keyfile_for_bulk_signing` above, both functions take an
     // injectable `&dyn SecretStore` (via `OnboardingSession::live_store`/`open_account_store_owned`
