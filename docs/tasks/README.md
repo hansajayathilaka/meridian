@@ -30,8 +30,24 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   off, not a new regression, independently re-confirmed against source by the `reviewer` pass. Full
   lineage of all seven exit-gate attempts in [Phase 4's README](./phase-4/README.md#exit-criteria); full
   evidence in [4.52's own Status section](./phase-4/4.52-t17-acceptance-demo-closure-attempt-7.md).
-- **NEXT:** `/start-review-phase` for **Phase 5** — a full sweep of everything built since the Phase-3
-  review (Phase 4's T08 + T17, plus 4.29–4.52's gap-closure waves) is now the correct next command.
+- **NOW:** **Phase 5 (review of Phase 4) swept.** Four parallel lenses (code-reviewer, security-reviewer,
+  architect, test-engineer) reviewed the full diff since the Phase-3 review — Phase 4's T08+T17
+  (4.1–4.52) plus 19 untracked out-of-band commits (PRs #66–#73: CI job-split, the release-binary
+  pipeline + ADR 0022→0023 self-correction, a Windows TUI input fix, message-status indicators, and the
+  `demo/p2p-wire-proof` demo). **Verdict: green, zero blocking findings** — an unusually clean result
+  given the diff's size, consistent with Phase 4's own heavy internal review discipline (seven exit-gate
+  attempts, six defects caught and fixed before this sweep even started). 9 should-fix + 8 nit findings,
+  none newly regressing anything already shipped: six are re-confirmations of residuals Phase 4's own
+  README already named and left unowned (partial-failure repair action, stale `^N`/`^V` doc, stale
+  `contacts.json.trust`/`export_json` gap, file-backed `run_mark_verified`/`run_set_petname` latency,
+  `PersistHistory` drain-window flake); the rest are freshly found, the most notable being that the
+  out-of-band Sent/Delivered message-status feature (landed outside the tracked-task pipeline) has an
+  unreachable/unpersisted "Delivered" state and zero App-level test — reproducing, on a brand-new
+  feature, the exact reconciliation-gap class T17's own six-wave closure spent the whole phase fixing.
+  No ADR drift, no unratified on-the-fly decisions, no trust-state-machine bypass, no sealed-store leak.
+  Full findings: [phase-5/review-report.md](./phase-5/review-report.md).
+- **NEXT:** `/plan-review-phase` — turn the review report's 9 should-fix findings (F1–F9; F10 and the
+  N1–N8 nits are optional/lower-priority) into numbered fix-tasks.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -300,7 +316,12 @@ pre-announced.
 - [x] **4.52** T17 acceptance-demo closure, seventh exit-gate attempt — verdict PASS, Phase 4 exit gate
   closed — [file](./phase-4/4.52-t17-acceptance-demo-closure-attempt-7.md)
 
----
+### Phase 5 — Review of Phase 4 · **in progress** · [details](./phase-5/README.md)
+Review phase. Sweeps everything built since the Phase-3 review: Phase 4 (T08 + T17, tasks 4.1–4.52) and
+the untracked out-of-band PRs #66–#73 that landed alongside/after it. [Report](./phase-5/review-report.md):
+18 findings — **0 blocking**, 9 should-fix, 9 nits (F1 combines a duplicate correctness+coverage finding
+from two lenses, numbered once). Verdict: **green to proceed**, no blocker for the next build phase
+(envelope-v2). Task breakdown pending `/plan-review-phase`.
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
