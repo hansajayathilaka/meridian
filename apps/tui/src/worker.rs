@@ -128,7 +128,20 @@ pub struct OnboardingSession {
     /// only one copy of the passphrase-derived key material resident. `TODO: confirm`: unifying the
     /// two (e.g. behind one shared `Arc<dyn SecretStore>`) is a larger refactor than this task's own
     /// scope — left for a future task to decide, not implemented here.
-    live_store: Option<(Box<dyn SecretStore>, KeyHandle)>,
+    ///
+    /// **`Arc`, not `Box` (task 5.4).** [`run_mark_verified`]/[`run_set_petname`] now run their
+    /// `load_trust`/`save_trust`(/`contacts.json`)-driving `decrypt_seed()` unwraps inside
+    /// [`tokio::task::spawn_blocking`], whose closure must be `'static + Send` — a
+    /// `Box<dyn SecretStore>` borrowed as `&dyn SecretStore` cannot satisfy that, but a cloned
+    /// `Arc<dyn SecretStore>` can (`SecretStore: Send + Sync` already), exactly the reasoning
+    /// [`InboundHandoff::store`]'s own doc comment already gives for the same widening (task 4.51).
+    /// **Pure execution-context change, not a residency extension:** this is still the *same* store
+    /// object [`handle_unlock`]'s success path constructs, cloned (an `Arc` clone is an atomic
+    /// refcount bump, never a re-unwrap) rather than moved — [`OnboardingSession::live_store`]'s own
+    /// read accessor is unchanged (`Arc<dyn SecretStore>` derefs to `&dyn SecretStore` exactly like
+    /// `Box` did), so the other eleven `open_account_store`-routed handlers (task 4.51's own
+    /// Deliverable 7 residual, still unowned) see no behavior change at all from this widening.
+    live_store: Option<(std::sync::Arc<dyn SecretStore>, KeyHandle)>,
 }
 
 struct PendingConnection {
@@ -194,8 +207,14 @@ impl OnboardingSession {
     /// [`run_unlock`]'s own guard, which rejects an OS-keystore `account.json` before this is ever
     /// reached). Every other handler in this module only ever reads the cache back via
     /// [`OnboardingSession::live_store`] — never writes it.
+    ///
+    /// Still takes an owned `Box<dyn SecretStore>` (unchanged signature — every existing caller,
+    /// including this module's own tests, keeps building a `Box` exactly as before); task 5.4's
+    /// `Arc`-widening of the field itself happens internally, via `Arc::from` (`Box<dyn Trait> ->
+    /// Arc<dyn Trait>` is a stable, allocation-cheap conversion — the box's existing heap allocation
+    /// is reused, not copied), so this is not a second construction of the store.
     fn set_live_store(&mut self, store: Box<dyn SecretStore>, handle: KeyHandle) {
-        self.live_store = Some((store, handle));
+        self.live_store = Some((std::sync::Arc::from(store), handle));
     }
 
     /// **Task 4.40, binding modification 4:** borrows (never consumes) the cached file-backed
@@ -209,6 +228,18 @@ impl OnboardingSession {
         self.live_store
             .as_ref()
             .map(|(store, handle)| (store.as_ref(), handle))
+    }
+
+    /// **Task 5.4.** The owned counterpart to [`OnboardingSession::live_store`] above, for callers
+    /// that need to move the store into [`tokio::task::spawn_blocking`]'s `'static + Send` closure
+    /// rather than merely borrow it — currently only [`open_account_store_owned`]. Clones the cached
+    /// `Arc<dyn SecretStore>` (an atomic refcount bump, never a re-unwrap — see the field's own doc
+    /// comment) and the cheap, `Clone`-cheap [`KeyHandle`]. `None` under the same conditions as
+    /// [`OnboardingSession::live_store`].
+    fn live_store_arc(&self) -> Option<(std::sync::Arc<dyn SecretStore>, KeyHandle)> {
+        self.live_store
+            .as_ref()
+            .map(|(store, handle)| (store.clone(), handle.clone()))
     }
 
     /// Borrows (never consumes) the cached client + store for `account_pub`, so a fallible operation
@@ -759,6 +790,43 @@ fn open_account_store(session: &OnboardingSession) -> Result<AccountStore<'_>, S
     }
 }
 
+/// **Task 5.4.** Additive to [`open_account_store`] — mirrors task 4.51's own
+/// `SignalingClient::connect_owned`/`handshake_owned` precedent (a second, parallel entry point
+/// rather than a widened signature for the existing one) — returns an **owned**
+/// `(Arc<dyn SecretStore>, KeyHandle)` pair instead of [`AccountStore`]'s borrow-shaped `.parts()`,
+/// for callers that need to move the store into [`tokio::task::spawn_blocking`]'s `'static + Send`
+/// closure. Currently only [`run_mark_verified`]/[`run_set_petname`] call this — every other caller
+/// of [`open_account_store`]/[`AccountStore`] (the remaining eleven `live_store`-routed handlers,
+/// task 4.51's own named-but-unowned residual) is untouched by this function's existence.
+///
+/// Same resolution logic as [`open_account_store`], just returning owned rather than borrowed data:
+/// **`StoreKind::Os`** re-constructs a fresh, free-to-construct [`OsSecretStore`] (no KDF, so no
+/// residency cost either way — see [`open_account_store`]'s own doc comment); **`StoreKind::File`**
+/// clones [`OnboardingSession::live_store_arc`]'s already-cached `Arc` (an atomic refcount bump, not
+/// a re-unwrap) rather than re-deriving anything, and fails closed with the same message
+/// [`open_account_store`] uses when nothing is cached yet.
+fn open_account_store_owned(
+    session: &OnboardingSession,
+) -> Result<(std::sync::Arc<dyn SecretStore>, KeyHandle), String> {
+    let descriptor = AccountDescriptor::load()?;
+    match descriptor.store {
+        StoreKind::Os => {
+            init_os_keystore()?;
+            let service = descriptor
+                .service
+                .clone()
+                .unwrap_or_else(|| OS_KEYSTORE_SERVICE.to_string());
+            let handle = KeyHandle::from_label(&descriptor.label);
+            Ok((std::sync::Arc::new(OsSecretStore::new(&service)), handle))
+        }
+        StoreKind::File => session.live_store_arc().ok_or_else(|| {
+            "this account is passphrase-protected and has not been unlocked in this session \
+             yet — send Effect::Unlock first"
+                .to_string()
+        }),
+    }
+}
+
 /// [`AccountDescriptor::pubkey`] as raw bytes — mirrors `apps/cli/src/main.rs::account_pub_bytes`
 /// exactly. [`open_account_store`] resolves the `SecretStore`/`KeyHandle` pair from the same
 /// descriptor but has no reason to also decode `pubkey`; [`run_send_message`] is the one caller in
@@ -970,7 +1038,7 @@ fn run_import_contact_qr(request: &ImportContactQrRequest) -> Result<String, Str
 
 async fn handle_set_petname(effect: SetPetnameEffect, session: &OnboardingSession) -> WorkerEvent {
     let SetPetnameEffect { request, .. } = effect;
-    match run_set_petname(&request, session) {
+    match run_set_petname(&request, session).await {
         Ok(()) => WorkerEvent::Completed(Effect::SetPetname(SetPetnameEffect {
             request,
             outcome: Some(()),
@@ -988,29 +1056,52 @@ async fn handle_set_petname(effect: SetPetnameEffect, session: &OnboardingSessio
 /// Mirrors `apps/cli/src/contact.rs::cmd_rename`'s write path: `TrustStore::set_petname`, then the
 /// matching `contacts.json` `ContactRecord.petname` — both writes, per [`SetPetnameEffect`]'s own
 /// doc comment in `crate::app`, unlike [`SetUserBlockedEffect`] (`trust.bin` only).
-fn run_set_petname(request: &SetPetnameRequest, session: &OnboardingSession) -> Result<(), String> {
-    let account_store = open_account_store(session)?;
-    let (store, handle) = account_store.parts();
+///
+/// **Task 5.4: the whole load-mutate-save sequence runs inside [`tokio::task::spawn_blocking`].**
+/// `load_trust`'s `derive_key`, `save_trust`'s `derive_key`, and (when a matching `contacts.json`
+/// row exists) `load_or_default`'s/`save`'s own `derive_key` calls are each a full, synchronous
+/// age/scrypt unwrap for a file-backed account — run directly on this task, as before this task's
+/// fix, that freezes `apps/cli/src/main.rs`'s single `current_thread` runtime (rendering, every
+/// other effect) for the whole sequence. Mirrors task 4.51's own `process_inbound_delivery` shape
+/// exactly: one `spawn_blocking` call wrapping the entire synchronous sequence, not one per call, so
+/// intermediate values (`trust`, `petname`, `doc`) never have to cross the closure boundary
+/// individually. **No new caching, no new residency** — [`open_account_store_owned`] hands this an
+/// `Arc` clone of the *same* store [`open_account_store`] would have borrowed, never a second
+/// construction (see that function's own doc comment); the same `decrypt_seed()` calls, at the same
+/// call sites, the same number of times as before this task.
+async fn run_set_petname(
+    request: &SetPetnameRequest,
+    session: &OnboardingSession,
+) -> Result<(), String> {
+    let (store, handle) = open_account_store_owned(session)?;
+    let pubkey = request.pubkey;
+    let petname_input = request.petname.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let store: &dyn SecretStore = store.as_ref();
+        let handle = &handle;
 
-    let mut trust = load_trust(store, handle)?;
-    trust
-        .set_petname(&request.pubkey, request.petname.clone())
-        .map_err(|e| e.to_string())?;
-    let petname = trust
-        .contact(&request.pubkey)
-        .expect("set_petname succeeded — contact exists")
-        .petname
-        .clone();
-    save_trust(&trust, store, handle)?;
+        let mut trust = load_trust(store, handle)?;
+        trust
+            .set_petname(&pubkey, petname_input)
+            .map_err(|e| e.to_string())?;
+        let petname = trust
+            .contact(&pubkey)
+            .expect("set_petname succeeded — contact exists")
+            .petname
+            .clone();
+        save_trust(&trust, store, handle)?;
 
-    let mut doc =
-        crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
-    let pubkey_hex = hex::encode(request.pubkey);
-    if let Some(record) = doc.contacts.iter_mut().find(|c| c.pubkey == pubkey_hex) {
-        record.petname = petname;
-        crate::store::contacts::save(&doc, store, handle).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+        let mut doc =
+            crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
+        let pubkey_hex = hex::encode(pubkey);
+        if let Some(record) = doc.contacts.iter_mut().find(|c| c.pubkey == pubkey_hex) {
+            record.petname = petname;
+            crate::store::contacts::save(&doc, store, handle).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("set-petname task panicked: {e}"))?
 }
 
 // --- SetUserBlocked --------------------------------------------------------------------------------
@@ -1710,7 +1801,7 @@ async fn handle_mark_verified(
     session: &OnboardingSession,
 ) -> WorkerEvent {
     let MarkVerifiedEffect { request, .. } = effect;
-    match run_mark_verified(&request, session) {
+    match run_mark_verified(&request, session).await {
         Ok(()) => WorkerEvent::Completed(Effect::MarkVerified(MarkVerifiedEffect {
             request,
             outcome: Some(()),
@@ -1731,17 +1822,28 @@ async fn handle_mark_verified(
 /// screen dispatched this effect). Faithfully propagates [`TrustError::UnknownContact`] (e.g. a
 /// concurrently-deleted contact) as a real [`WorkerEvent::Failed`], never swallowed into a silent
 /// success.
-fn run_mark_verified(
+///
+/// **Task 5.4: `load_trust`/`save_trust`'s two `derive_key` unwraps run inside
+/// [`tokio::task::spawn_blocking`]**, in one call spanning both — the same shape
+/// [`run_set_petname`]'s own doc comment describes in full (this function is the other of the two
+/// highest-impact `live_store`-routed handlers task 4.51's own Deliverable 7 named and split off,
+/// not the whole thirteen). **No new caching, no new residency** — same store, same call sites, same
+/// unwrap count as before this task.
+async fn run_mark_verified(
     request: &MarkVerifiedRequest,
     session: &OnboardingSession,
 ) -> Result<(), String> {
-    let account_store = open_account_store(session)?;
-    let (store, handle) = account_store.parts();
-    let mut trust = load_trust(store, handle)?;
-    trust
-        .mark_verified(&request.pubkey)
-        .map_err(|e| e.to_string())?;
-    save_trust(&trust, store, handle)
+    let (store, handle) = open_account_store_owned(session)?;
+    let pubkey = request.pubkey;
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let store: &dyn SecretStore = store.as_ref();
+        let handle = &handle;
+        let mut trust = load_trust(store, handle)?;
+        trust.mark_verified(&pubkey).map_err(|e| e.to_string())?;
+        save_trust(&trust, store, handle)
+    })
+    .await
+    .map_err(|e| format!("mark-verified task panicked: {e}"))?
 }
 
 // --- AcknowledgeKeyChange -------------------------------------------------------------------------
@@ -3240,8 +3342,12 @@ mod tests {
     /// therefore could never observe this) and drives two *different* handler dispatches
     /// (`run_add_contact` then `run_set_petname`) against the same `session` — both must succeed,
     /// and [`CountingStore::new`] must never have run a second time.
-    #[test]
-    fn open_account_store_reuses_the_cached_file_backed_store_never_rebuilding_it() {
+    ///
+    /// Task 5.4 made `run_set_petname` `async fn` (a `spawn_blocking` wrap), so this test needs a
+    /// real runtime — `#[tokio::test]` rather than plain `#[test]`, mirroring task 4.51's own
+    /// identical `#[test]` -> `#[tokio::test]` precedent for `run_unlock`'s equivalent test.
+    #[tokio::test]
+    async fn open_account_store_reuses_the_cached_file_backed_store_never_rebuilding_it() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _env = EnvGuard::set(tmp.path());
         let keyfile = tmp.path().join("account.key");
@@ -3279,6 +3385,7 @@ mod tests {
             petname: Some("bff".to_string()),
         };
         run_set_petname(&petname_request, &session)
+            .await
             .expect("run_set_petname against the same cached store");
         assert_eq!(
             constructions.load(std::sync::atomic::Ordering::SeqCst),
@@ -3542,6 +3649,179 @@ mod tests {
              real scrypt) was in flight — observed {observed}. A near-zero count here is what \
              running that unwrap synchronously on this `current_thread` runtime would produce — \
              the exact regression this test exists to catch."
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Task 5.4 — `run_mark_verified`/`run_set_petname`, the two highest-impact of the eleven
+    // remaining `live_store`-routed handlers task 4.51's own Deliverable 7 named and split off
+    // (not the whole thirteen — the other eleven stay a named, unowned residual, untouched here).
+    //
+    // Unlike `run_unlock`/`unwrap_keyfile_for_bulk_signing` above, both functions take an
+    // injectable `&dyn SecretStore` (via `OnboardingSession::live_store`/`open_account_store_owned`
+    // — see `open_account_store_reuses_the_cached_file_backed_store_never_rebuilding_it`'s own
+    // `CountingStore` double, just above), so — mirroring `apps/tui/tests/inbound_delivery.rs`'s
+    // own `SlowStore` double for `process_inbound_delivery`'s equivalent tests — a synthetic,
+    // controllable delay is used instead of a real keyfile's genuine (but slower, less
+    // deterministic) scrypt cost.
+    // -----------------------------------------------------------------------------------------
+
+    /// A `SecretStore` double that sleeps a fixed, controllable duration on every `use_key`/
+    /// `derive_key` call — a stand-in for a real `FileSecretStore::decrypt_seed()` unwrap, same
+    /// technique and same reasoning as `apps/tui/tests/inbound_delivery.rs`'s own `SlowStore`.
+    /// `std::thread::sleep`, not `tokio::time::sleep`: this delegate runs inside
+    /// `spawn_blocking`'s own dedicated blocking thread, so a real, thread-blocking sleep is the
+    /// correct stand-in for a real, thread-blocking scrypt unwrap — an async sleep would not
+    /// reproduce the hazard these tests exist to catch at all. Delegates every real trait method to
+    /// a wrapped `MemorySecretStore` (like `CountingStore` above) so a session built around this
+    /// double can still do genuine, successful sealed-store round trips.
+    struct SlowStore {
+        inner: MemorySecretStore,
+        delay: std::time::Duration,
+    }
+
+    impl SlowStore {
+        fn new(inner: MemorySecretStore, delay: std::time::Duration) -> Self {
+            Self { inner, delay }
+        }
+    }
+
+    impl SecretStore for SlowStore {
+        fn store(
+            &self,
+            label: &str,
+            secret: &[u8],
+        ) -> std::result::Result<KeyHandle, meridian_core::identity::StoreError> {
+            self.inner.store(label, secret)
+        }
+
+        fn use_key(
+            &self,
+            h: &KeyHandle,
+            op: meridian_core::identity::SignOrDh,
+            input: &[u8],
+        ) -> std::result::Result<Vec<u8>, meridian_core::identity::StoreError> {
+            std::thread::sleep(self.delay);
+            self.inner.use_key(h, op, input)
+        }
+
+        fn nonextractable(&self) -> bool {
+            self.inner.nonextractable()
+        }
+
+        fn derive_key(
+            &self,
+            h: &KeyHandle,
+            info: &[u8],
+        ) -> std::result::Result<[u8; 32], meridian_core::identity::StoreError> {
+            std::thread::sleep(self.delay);
+            self.inner.derive_key(h, info)
+        }
+    }
+
+    const SLOW_STORE_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
+    /// [`run_mark_verified`] falsifiable concurrency proof: `load_trust`/`save_trust` inside the
+    /// same [`tokio::task::spawn_blocking`] call cost 2 x [`SLOW_STORE_DELAY`] = 300ms; the
+    /// concurrently-scheduled heartbeat must accumulate a real fraction of that, not near-zero.
+    /// **Independently falsified** (not just asserted to pass): reverting `run_mark_verified`'s own
+    /// `spawn_blocking` wrap back to a direct synchronous call (applied, tested, and reverted in
+    /// this session, not left in the diff) drops the observed count to 0 — the whole
+    /// `current_thread` runtime is frozen for the full 300ms before the heartbeat's first tick can
+    /// even be scheduled, and this test's own assertion reads the tick count immediately afterward
+    /// with no further `.await` point in between to let it catch up.
+    #[tokio::test]
+    async fn run_mark_verifieds_trust_store_load_and_save_never_freezes_a_concurrently_scheduled_task(
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(tmp.path());
+        dummy_file_descriptor(&tmp.path().join("account.key"))
+            .save()
+            .expect("save account.json");
+
+        let inner = MemorySecretStore::new();
+        let account = generate_account(&inner, "example.org").expect("generate_account");
+        let handle = account.handle().clone();
+        let peer = [7u8; 32];
+        let mut trust = TrustStore::default();
+        trust.observe(peer, "peer.example", 0);
+        save_trust(&trust, &inner, &handle).expect("seed trust.bin under the slow store's inner");
+
+        let mut session = OnboardingSession::default();
+        session.set_live_store(Box::new(SlowStore::new(inner, SLOW_STORE_DELAY)), handle);
+
+        let (ticks, heartbeat) = spawn_heartbeat();
+
+        let request = MarkVerifiedRequest { pubkey: peer };
+        let result = run_mark_verified(&request, &session).await;
+        assert!(
+            result.is_ok(),
+            "run_mark_verified must succeed against its own seeded trust.bin: {:?}",
+            result.err()
+        );
+
+        let observed = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        heartbeat.abort();
+        assert!(
+            observed >= 8,
+            "expected the concurrently-scheduled heartbeat task to have ticked at least ~8 \
+             times while run_mark_verified's load_trust/save_trust unwraps (2 x {SLOW_STORE_DELAY:?} \
+             SlowStore delay) were in flight — observed {observed}. A near-zero count here is what \
+             running that whole sequence synchronously on this `current_thread` runtime would \
+             produce — the exact regression this test exists to catch."
+        );
+    }
+
+    /// [`run_set_petname`] falsifiable concurrency proof — same shape as the `run_mark_verified`
+    /// test just above. No `contacts.json` exists in this fixture, so `load_or_default` returns its
+    /// default without an extra `SlowStore` call (see that function's own "file absent -> default,
+    /// no store call" contract) and `save` is never reached either — `load_trust`/`save_trust`'s
+    /// own 2 x [`SLOW_STORE_DELAY`] = 300ms is still the load-bearing window this test proves stays
+    /// non-blocking, the same two calls [`run_mark_verified`]'s own test above exercises.
+    /// **Independently falsified**, same method as above: reverting `run_set_petname`'s own
+    /// `spawn_blocking` wrap drops the observed count to 0.
+    #[tokio::test]
+    async fn run_set_petnames_trust_store_load_and_save_never_freezes_a_concurrently_scheduled_task(
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(tmp.path());
+        dummy_file_descriptor(&tmp.path().join("account.key"))
+            .save()
+            .expect("save account.json");
+
+        let inner = MemorySecretStore::new();
+        let account = generate_account(&inner, "example.org").expect("generate_account");
+        let handle = account.handle().clone();
+        let peer = [8u8; 32];
+        let mut trust = TrustStore::default();
+        trust.observe(peer, "peer.example", 0);
+        save_trust(&trust, &inner, &handle).expect("seed trust.bin under the slow store's inner");
+
+        let mut session = OnboardingSession::default();
+        session.set_live_store(Box::new(SlowStore::new(inner, SLOW_STORE_DELAY)), handle);
+
+        let (ticks, heartbeat) = spawn_heartbeat();
+
+        let request = SetPetnameRequest {
+            pubkey: peer,
+            petname: Some("bff".to_string()),
+        };
+        let result = run_set_petname(&request, &session).await;
+        assert!(
+            result.is_ok(),
+            "run_set_petname must succeed against its own seeded trust.bin: {:?}",
+            result.err()
+        );
+
+        let observed = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        heartbeat.abort();
+        assert!(
+            observed >= 8,
+            "expected the concurrently-scheduled heartbeat task to have ticked at least ~8 \
+             times while run_set_petname's load_trust/save_trust unwraps (2 x {SLOW_STORE_DELAY:?} \
+             SlowStore delay) were in flight — observed {observed}. A near-zero count here is what \
+             running that whole sequence synchronously on this `current_thread` runtime would \
+             produce — the exact regression this test exists to catch."
         );
     }
 }
