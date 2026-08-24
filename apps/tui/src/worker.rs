@@ -1826,12 +1826,28 @@ async fn handle_mark_verified(
 /// concurrently-deleted contact) as a real [`WorkerEvent::Failed`], never swallowed into a silent
 /// success.
 ///
+/// **Task 5.3 (review fix F3): also write-throughs the new `trust` state into `contacts.json`'s own
+/// [`ContactRecord::trust`] field**, mirroring [`run_set_petname`]'s own "reload the doc, patch the
+/// matching row, save" shape exactly (same `load_or_default` -> find-by-pubkey-hex -> save
+/// sequence, same "row absent — nothing to patch" no-op when `contacts.json` and `trust.bin` have
+/// drifted). Before this fix, `trust.bin` alone recorded a `Verified` contact — `contacts.json`'s
+/// own `trust` field stayed at whatever [`upsert_contact_record`] last wrote (typically `Pinned`),
+/// so `apps/tui/src/store/export.rs::export_json`, which mirrors `contacts.json` verbatim and never
+/// reads `trust.bin` at all, exported a stale `"trust": "pinned"` for a contact the live UI already
+/// showed as `"verified"` (the live UI never had this bug — `crate::screens::main::
+/// build_contact_entries` joins `trust.bin` fresh on every render, `contacts.json`'s own `trust`
+/// field is only ever a fallback there for a row with no matching `trust.bin` entry). This is a
+/// write-through fix, not an export-time join: `export_json` itself is untouched by this task,
+/// `contacts.json`'s own `trust` field is simply kept live instead of going stale.
+///
 /// **Task 5.4: `load_trust`/`save_trust`'s two `derive_key` unwraps run inside
 /// [`tokio::task::spawn_blocking`]**, in one call spanning both — the same shape
 /// [`run_set_petname`]'s own doc comment describes in full (this function is the other of the two
 /// highest-impact `live_store`-routed handlers task 4.51's own Deliverable 7 named and split off,
 /// not the whole thirteen). **No new caching, no new residency** — same store, same call sites, same
-/// unwrap count as before this task.
+/// unwrap count as before this task; task 5.3's `contacts.json` write-through above reuses the same
+/// already-open `store`/`handle` inside this same `spawn_blocking` closure rather than paying a
+/// second, redundant unwrap for a second blocking call.
 async fn run_mark_verified(
     request: &MarkVerifiedRequest,
     session: &OnboardingSession,
@@ -1843,7 +1859,20 @@ async fn run_mark_verified(
         let handle = &handle;
         let mut trust = load_trust(store, handle)?;
         trust.mark_verified(&pubkey).map_err(|e| e.to_string())?;
-        save_trust(&trust, store, handle)
+        let state = trust
+            .contact(&pubkey)
+            .expect("mark_verified succeeded — contact exists")
+            .state;
+        save_trust(&trust, store, handle)?;
+
+        let mut doc =
+            crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
+        let pubkey_hex = hex::encode(pubkey);
+        if let Some(record) = doc.contacts.iter_mut().find(|c| c.pubkey == pubkey_hex) {
+            record.trust = to_trust_label(state);
+            crate::store::contacts::save(&doc, store, handle).map_err(|e| e.to_string())?;
+        }
+        Ok(())
     })
     .await
     .map_err(|e| format!("mark-verified task panicked: {e}"))?

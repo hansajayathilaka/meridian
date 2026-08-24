@@ -1126,6 +1126,106 @@ async fn mark_verified_persists_through_a_fresh_trust_store_reload() {
     );
 }
 
+/// **Task 5.3 (review finding F3): the `contacts.json` trust-staleness bug this task exists to
+/// fix.** Before this task, [`run_mark_verified`](meridian_tui::worker) wrote only `trust.bin` —
+/// `contacts.json`'s own [`ContactRecord::trust`](meridian_tui::store::contacts::ContactRecord)
+/// field, last written by [`Effect::AddContact`]'s own
+/// [`upsert_contact_record`](meridian_tui::worker) at `Pinned`, was never touched again. The live
+/// UI never showed this bug — `crate::screens::main::build_contact_entries` joins `trust.bin`
+/// fresh on every render — but `meridian tui --export-json`, which mirrors `contacts.json`
+/// verbatim and never reads `trust.bin` at all (`apps/tui/src/store/export.rs::export_json`),
+/// reported a stale `"trust": "pinned"` for a contact the operator had just verified.
+///
+/// This test drives the real bug fixture — `AddContact` (stamps `contacts.json`'s row at
+/// `Pinned`, exactly `upsert_contact_record`'s documented behavior) then `MarkVerified` (the
+/// effect the review finding names) — and asserts the **post-fix** value: a fresh,
+/// independent reload of `contacts.json` must show `Verified`, matching the equally-fresh
+/// `trust.bin` reload, not the stale `Pinned` `AddContact` alone would have left behind.
+/// Reverting this task's `run_mark_verified` write-through (restoring the pre-fix body — see this
+/// task's own PR diff) makes this exact assertion fail with `TrustLabel::Pinned`, byte-for-byte
+/// the wrong value the bug report describes — confirmed by hand against the pre-fix commit while
+/// authoring this test, not merely asserted here.
+#[tokio::test]
+async fn mark_verified_write_through_keeps_contacts_json_trust_field_from_going_stale() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let bob = setup_os_account();
+    let peer_ik = [0x12u8; 32];
+
+    // --- AddContact: contacts.json's own `trust` field is stamped `Pinned`, exactly like a real
+    //     TOFU-added contact prior to any out-of-band verification. ---------------------------
+    match dispatch_effect(Effect::AddContact(AddContactEffect {
+        request: AddContactRequest {
+            id: format!("mrd1:{}@peer.example", hex::encode(peer_ik)),
+            pubkey: peer_ik,
+            hint: "peer.example".to_string(),
+            petname: None,
+        },
+        outcome: None,
+    }))
+    .await
+    {
+        WorkerEvent::Completed(Effect::AddContact(AddContactEffect {
+            outcome: Some(_), ..
+        })) => {}
+        other => panic!("expected AddContact to complete, got {other:?}"),
+    }
+    let doc_before = read_contacts(&bob);
+    assert_eq!(doc_before.contacts.len(), 1, "fixture sanity");
+    assert_eq!(
+        doc_before.contacts[0].trust,
+        meridian_tui::store::contacts::TrustLabel::Pinned,
+        "fixture sanity: a freshly-added contact's contacts.json row starts Pinned, same as \
+         trust.bin"
+    );
+
+    // --- Act: verify the contact — the effect the bug report names. ----------------------------
+    match dispatch_effect(Effect::MarkVerified(MarkVerifiedEffect {
+        request: MarkVerifiedRequest { pubkey: peer_ik },
+        outcome: None,
+    }))
+    .await
+    {
+        WorkerEvent::Completed(Effect::MarkVerified(MarkVerifiedEffect {
+            outcome: Some(()),
+            ..
+        })) => {}
+        other => panic!("expected MarkVerified to complete, got {other:?}"),
+    }
+
+    // --- Assert: both stores agree on Verified, on a fresh, independent reload of each ---------
+    let trust_after = read_trust(&bob);
+    assert_eq!(
+        trust_after.contact(&peer_ik).unwrap().state,
+        TrustState::Verified,
+        "fixture sanity: trust.bin itself was never the buggy side"
+    );
+    let doc_after = read_contacts(&bob);
+    assert_eq!(doc_after.contacts.len(), 1, "no row duplicated or dropped");
+    assert_eq!(doc_after.contacts[0].pubkey, hex::encode(peer_ik));
+    assert_eq!(
+        doc_after.contacts[0].trust,
+        meridian_tui::store::contacts::TrustLabel::Verified,
+        "the load-bearing assertion this task exists for: contacts.json's own `trust` field — \
+         the exact field `--export-json` mirrors verbatim — must reflect the verification, not \
+         stay stuck at the Pinned value AddContact left behind. Before task 5.3's write-through \
+         fix this was TrustLabel::Pinned here — a stale export a verified contact's operator \
+         would read as 'never verified'."
+    );
+    // Every other field on the row is untouched by the verify — same conservative-update
+    // discipline `upsert_contact_record`'s own doc comment documents for a re-observe.
+    assert_eq!(doc_after.contacts[0].id, doc_before.contacts[0].id);
+    assert_eq!(doc_after.contacts[0].hint, doc_before.contacts[0].hint);
+    assert_eq!(
+        doc_after.contacts[0].petname,
+        doc_before.contacts[0].petname
+    );
+    assert_eq!(
+        doc_after.contacts[0].added_at,
+        doc_before.contacts[0].added_at
+    );
+}
+
 #[tokio::test]
 async fn mark_verified_clears_a_real_blocked_state_through_the_same_persist_round_trip() {
     let tmp = tempfile::tempdir().expect("tempdir");
