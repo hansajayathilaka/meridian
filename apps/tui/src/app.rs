@@ -627,6 +627,43 @@ pub struct PersistHistoryEffect {
     pub outcome: Option<()>,
 }
 
+/// Inputs for [`Effect::PersistReceipt`] (task 5.1, `crate::app::App::handle_inbound`): mark the
+/// outbound entry matching `ack` (a [`HistoryEntry::mid`]) `Delivered` in `peer_pubkey`'s sealed
+/// transcript — `crate::store::history::mark_delivered`/`mark_delivered_at`.
+///
+/// **Deliberately carries only `peer_pubkey`/`ack`, never the whole updated `Vec<HistoryEntry>`.**
+/// `App::handle_inbound`'s `InboundEvent::Receipt` arm already applies the in-memory `Sent` →
+/// `Delivered` transition synchronously, via [`chat::apply_receipt`](crate::screens::chat::apply_receipt),
+/// against whichever `Screen::Chat` (if any) matches `peer_pubkey` — this request's own job is purely
+/// the durability side of that same transition, a small "find-and-flip-one-field" update-in-place
+/// write, not a full history rewrite driven by re-threading this crate's already-mutated in-memory
+/// `entries` back out over the effect boundary (review fix, task 5.1's own Finding — see that task's
+/// file for the full reconciliation-bug writeup this closes).
+///
+/// **Dispatched unconditionally**, exactly like [`PersistHistoryRequest`]'s own append for a live
+/// [`InboundEvent::Message`] — a receipt for a peer with no `Screen::Chat` currently open must still
+/// update `history.jsonl` so the next `Effect::LoadHistory` (or a restart) reflects `Delivered`
+/// rather than reverting to `Sent`; [`crate::store::history::mark_delivered_at`]'s own no-op-if-
+/// absent contract makes this always safe to dispatch even when no matching `Out`/`Sent` row is
+/// on disk to update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistReceiptRequest {
+    pub peer_pubkey: [u8; 32],
+    /// The acknowledged message's `mid` (hex) — same shape [`InboundEvent::Receipt::ack`] already
+    /// carries.
+    pub ack: String,
+}
+
+/// [`Effect::PersistReceipt`]'s payload. No separate outcome data — same contract as
+/// [`PersistHistoryEffect`]: the mere fact of `WorkerEvent::Completed` vs. `WorkerEvent::Failed`
+/// arriving is everything a caller needs (`crate::screens::chat::handle_worker`'s own
+/// `Effect::PersistHistory` failure-notice arm is mirrored for this effect too).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistReceiptEffect {
+    pub request: PersistReceiptRequest,
+    pub outcome: Option<()>,
+}
+
 /// Inputs for [`Effect::LoadHistory`] (task 4.44, `crate::screens::main`): read `peer_pubkey`'s whole
 /// sealed transcript — `crate::store::history::load_or_default` (task 4.15), the **same** reader
 /// [`crate::store::export`] already uses, never a second, divergent one — off disk, the "no I/O in
@@ -947,6 +984,8 @@ pub struct RunDoctorEffect {
 /// `PersistHistory`'s write, dispatched whenever `Screen::Chat` opens (first time or a same-session
 /// re-open) so the transcript reflects `crate::store::history`'s real, sealed on-disk state rather
 /// than starting empty — see [`LoadHistoryEffect`] and `crate::app::App::apply_loaded_history`.
+/// `PersistReceipt` is task 5.1's own new one — the persisted counterpart to `apply_receipt`'s
+/// in-memory-only `Sent` → `Delivered` transition — see [`PersistReceiptEffect`].
 ///
 /// **Does not derive `PartialEq`/`Eq`** (unlike most of the payload structs above): `Unlock`/
 /// `LoadSession` carry a [`SessionOutcome`], and the [`crate::session::LiveSession`] it wraps
@@ -971,6 +1010,9 @@ pub enum Effect {
     FetchBundle,
     PublishBundle(PublishBundleEffect),
     PersistHistory(PersistHistoryEffect),
+    /// Task 5.1: the persisted half of an inbound delivery receipt's `Sent` → `Delivered`
+    /// transition — see [`PersistReceiptEffect`]/[`PersistReceiptRequest`]'s own doc comments.
+    PersistReceipt(PersistReceiptEffect),
     LoadHistory(LoadHistoryEffect),
     /// Boxed: `clippy::large_enum_variant` flags the size gap against the smaller variants
     /// otherwise, once [`UnlockEffect::outcome`] can carry a whole [`LiveSession`] — the same
@@ -1426,10 +1468,18 @@ impl App {
     ///   double-lists); otherwise it joins [`App::pending_inbound_requests`], drained into the next
     ///   `Screen::Requests` that opens (`Ctrl+R`/Contacts' own `r`) — this task's own named
     ///   deliverable.
-    /// - [`InboundEvent::Receipt`]: an open `Screen::Chat` for that peer updates the matching `Sent`
-    ///   row to `Delivered` in memory; otherwise dropped (out of this task's scope — see
-    ///   [`chat::apply_receipt`]'s own doc comment for why there is no disk-persistence effect for an
-    ///   in-place delivery-state update today).
+    /// - [`InboundEvent::Receipt`] (task 5.1 review fix): walks the **whole** screen stack — not
+    ///   only `self.screens.last_mut()` — for a `Screen::Chat` matching `peer_pubkey`, exactly like
+    ///   [`App::apply_accepted_request`]/[`App::apply_added_contact`] already do for their own
+    ///   inbound-reconciliation events, and applies [`chat::apply_receipt`]'s in-memory `Sent` →
+    ///   `Delivered` transition there if found. Before this fix, a receipt for a chat that was open
+    ///   but not the topmost screen (e.g. `Ctrl-R` pushed `Screen::Requests` on top of it) was
+    ///   silently dropped — never reconciled, and the sender's own transcript stayed stuck on `Sent`
+    ///   until a full reload happened to relayout it correctly. Also dispatches
+    ///   [`Effect::PersistReceipt`] **unconditionally**, mirroring `InboundEvent::Message`'s own
+    ///   "persist regardless of what's on top" discipline above: the durable `history.jsonl` state
+    ///   must reflect `Delivered` even when no matching `Screen::Chat` is open right now, so a later
+    ///   `Effect::LoadHistory` (same session or after a restart) never reverts it back to `Sent`.
     fn handle_inbound(&mut self, event: InboundEvent) -> Vec<Effect> {
         match event {
             InboundEvent::Message { peer_pubkey, entry } => {
@@ -1458,12 +1508,18 @@ impl App {
                 Vec::new()
             }
             InboundEvent::Receipt { peer_pubkey, ack } => {
-                if let Some(Screen::Chat(state)) = self.screens.last_mut() {
-                    if state.peer_pubkey == peer_pubkey {
-                        chat::apply_receipt(state, &ack);
+                for screen in &mut self.screens {
+                    if let Screen::Chat(state) = screen {
+                        if state.peer_pubkey == peer_pubkey {
+                            chat::apply_receipt(state, &ack);
+                            break;
+                        }
                     }
                 }
-                Vec::new()
+                vec![Effect::PersistReceipt(PersistReceiptEffect {
+                    request: PersistReceiptRequest { peer_pubkey, ack },
+                    outcome: None,
+                })]
             }
         }
     }

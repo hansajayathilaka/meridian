@@ -207,6 +207,53 @@ pub fn append_at(
     write_all_at(path, peer_pubkey_hex, &entries, store, handle)
 }
 
+/// Marks the outbound entry with `mid == ack_mid` `Delivered` in `peer_pubkey_hex`'s transcript at
+/// the default path (task 5.1) — the persisted counterpart to
+/// `crate::screens::chat::apply_receipt`'s in-memory-only `Sent` → `Delivered` transition. A no-op
+/// (`Ok(())`, no write at all) if no `Out`/`mid == ack_mid` entry is present — mirrors
+/// `apply_receipt`'s own tolerant "no matching row loaded" contract, never a hard error.
+///
+/// **Same read-modify-reseal-write shape [`append`] already has** (unavoidable under this module's
+/// whole-document sealing — see the module doc's "The consequence: append is not O(1)" section), but
+/// touches only the one matching entry's `state` field — every other entry's content, and the file's
+/// own [`HistoryHeader`], round-trip byte-for-byte unchanged. This is the "small update-in-place
+/// write, not a full history rewrite" task 5.1 calls for at the `Effect`/`App` boundary:
+/// [`crate::app::PersistReceiptRequest`] carries only `peer_pubkey`/`ack`, never a whole
+/// `Vec<HistoryEntry>` re-threaded out of `App`'s own already-mutated in-memory copy.
+pub fn mark_delivered(
+    peer_pubkey_hex: &str,
+    ack_mid: &str,
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+) -> Result<(), StoreError> {
+    mark_delivered_at(
+        &super::history_path(peer_pubkey_hex)?,
+        peer_pubkey_hex,
+        ack_mid,
+        store,
+        handle,
+    )
+}
+
+/// [`mark_delivered`], but against an explicit path (test seam).
+pub fn mark_delivered_at(
+    path: &Path,
+    peer_pubkey_hex: &str,
+    ack_mid: &str,
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+) -> Result<(), StoreError> {
+    let mut entries = load_or_default_at(path, peer_pubkey_hex, store, handle)?;
+    let Some(entry) = entries
+        .iter_mut()
+        .find(|e| e.dir == Direction::Out && e.mid == ack_mid)
+    else {
+        return Ok(());
+    };
+    entry.state = MessageState::Delivered;
+    write_all_at(path, peer_pubkey_hex, &entries, store, handle)
+}
+
 /// Overwrites `path` with the sealed, whole-document encoding of `entries`, headed by a
 /// [`HistoryHeader`] naming `peer_pubkey_hex` — the shared write path [`append_at`] and
 /// [`load_or_default_at`]'s migration-rewrite both build on.

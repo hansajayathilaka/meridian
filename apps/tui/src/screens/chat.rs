@@ -99,10 +99,18 @@
 //! a racing outbound completion (`complete_send`) can never both land the same `mid` twice, no
 //! matter which one this screen sees first. [`apply_receipt`] is the same task's much smaller
 //! counterpart for a live [`crate::app::InboundEvent::Receipt`]: an in-memory-only `Sent` →
-//! `Delivered` transition (there is no disk-persistence effect for updating an already-written
-//! `HistoryEntry` in place — [`retry_last_failed`]'s own doc comment already made this exact
-//! "no history-mutation effect in this task's scope" judgment call for the outbound retry case; this
-//! is the same call, just for an inbound receipt).
+//! `Delivered` transition, applied directly against a `Screen::Chat` found on the stack.
+//!
+//! **Task 5.1 review fix:** the transition's *durability* is not this function's job — `apply_receipt`
+//! itself stays in-memory-only, unchanged, exactly like [`retry_last_failed`]'s own "no
+//! history-mutation effect in this task's scope" judgment call for the outbound retry case. What
+//! changed is that `App::handle_inbound`'s `InboundEvent::Receipt` arm now (a) walks the *whole*
+//! screen stack for a matching `Screen::Chat` rather than only `self.screens.last_mut()`, so a
+//! receipt for a chat that is open but not topmost is no longer silently dropped, and (b)
+//! unconditionally dispatches `Effect::PersistReceipt` — a small, targeted update-in-place write
+//! (`crate::store::history::mark_delivered`/`mark_delivered_at`) — so the `Delivered` state survives
+//! a restart instead of reverting to `Sent` on the next `Effect::LoadHistory`. See that arm's own
+//! doc comment in `crate::app` for the full before/after.
 //!
 //! **The worker's own persistent receive loop (`crate::worker::run_inbound_loop`) auto-acknowledges
 //! every inbound `ChatContent::Text` with a `ChatContent::Receipt` before this screen ever sees the
@@ -127,8 +135,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use meridian_core::trust::{SendGate, TrustStore};
 
 use crate::app::{
-    Effect, PersistHistoryEffect, PersistHistoryRequest, SendMessageEffect, SendMessageRequest,
-    SentMessage, WorkerEvent,
+    Effect, PersistHistoryEffect, PersistHistoryRequest, PersistReceiptEffect, SendMessageEffect,
+    SendMessageRequest, SentMessage, WorkerEvent,
 };
 use crate::screens::contacts::{short_pubkey, trust_glyph_and_label};
 use crate::store::history::{
@@ -694,6 +702,17 @@ pub fn handle_worker(state: &mut ChatState, event: WorkerEvent) -> Vec<Effect> {
             state.notice = Some(format!("could not save message history: {message}"));
             Vec::new()
         }
+        // Task 5.1: mirrors the `PersistHistory` failure arm immediately above, for the receipt-
+        // persistence effect `crate::app::App::handle_inbound`'s `InboundEvent::Receipt` arm now
+        // dispatches unconditionally. Matched by peer (like `SendMessage`'s own arms above) since
+        // this event can arrive for a *different* conversation than whatever is topmost now.
+        WorkerEvent::Failed(
+            Effect::PersistReceipt(PersistReceiptEffect { request, .. }),
+            message,
+        ) if request.peer_pubkey == state.peer_pubkey => {
+            state.notice = Some(format!("could not save delivery receipt: {message}"));
+            Vec::new()
+        }
         _ => Vec::new(),
     }
 }
@@ -784,11 +803,13 @@ pub fn handle_inbound_message(state: &mut ChatState, entry: HistoryEntry) -> Vec
 }
 
 /// Applies a live delivery receipt to this open conversation — marks the matching outbound `Sent`
-/// row `Delivered`, in memory only. See the module doc's "Receive-path wiring" section for why there
-/// is no disk-persistence effect for this (yet): a no-op if no entry with `dir == Out` and
-/// `mid == ack_mid` is currently loaded (e.g. the acknowledged send happened in an earlier session
-/// and its `Sent` row was never re-loaded as such) — never a panic, mirrors every other screen's
-/// tolerant `handle_worker`/`handle_inbound` shape in this crate.
+/// row `Delivered`, in memory only. See the module doc's "Receive-path wiring" section: this
+/// function's own contract is unchanged by task 5.1 — the persisted counterpart
+/// (`Effect::PersistReceipt`) is dispatched separately, by `crate::app::App::handle_inbound` itself,
+/// never from in here. A no-op if no entry with `dir == Out` and `mid == ack_mid` is currently loaded
+/// (e.g. the acknowledged send happened in an earlier session and its `Sent` row was never re-loaded
+/// as such) — never a panic, mirrors every other screen's tolerant `handle_worker`/`handle_inbound`
+/// shape in this crate.
 pub fn apply_receipt(state: &mut ChatState, ack_mid: &str) {
     if let Some(entry) = state
         .entries

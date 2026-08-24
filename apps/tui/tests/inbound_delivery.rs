@@ -27,6 +27,20 @@
 //!    reconnect-with-backoff logic itself (attempt counting, clamping, `AppEvent::ConnectionStatus`
 //!    emission, and resumed forwarding after a real reconnect), previously exercised only by
 //!    `statusbar.rs`'s pure rendering-primitive test, never by `run_inbound_loop` itself.
+//!
+//! And, task 5.1's own review-fix coverage (the actual deliverable of that task — see its own file,
+//! `docs/tasks/phase-5/5.1-persist-reconcile-delivery-receipts.md`): `App::handle_inbound`'s
+//! `InboundEvent::Receipt` arm used to reconcile the `Sent` → `Delivered` transition only when the
+//! exact matching `Screen::Chat` happened to be `self.screens.last_mut()`, and never persisted the
+//! transition at all (so a restart reverted it back to `Sent`).
+//! 7. [`receipt_reconciles_into_a_chat_screen_that_is_not_topmost`] — the routing-bug half: a receipt
+//!    for a `Screen::Chat` buried under another screen on the stack must still reconcile, exactly
+//!    like [`crate::app::App::apply_accepted_request`]/`apply_added_contact` already do for their own
+//!    inbound events.
+//! 8. [`receipt_delivered_state_survives_a_restart_via_load_history`] — the persistence half: the
+//!    resulting `Delivered` state must survive a real `Effect::PersistReceipt` round trip and still
+//!    read back `Delivered` (not `Sent`) via a fresh `Effect::LoadHistory`-equivalent read, simulating
+//!    a restart.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -47,9 +61,13 @@ use meridian_tui::app::{
     AcceptRequestEffect, AcceptRequestRequest, App, AppEvent, Effect, InboundEvent, Screen,
     SendMessageEffect, SendMessageRequest, SetUserBlockedEffect, SetUserBlockedRequest,
 };
-use meridian_tui::screens::chat::ChatState as TuiChatState;
+use meridian_tui::screens::chat::{self, ChatState as TuiChatState};
+use meridian_tui::screens::requests::RequestsState;
 use meridian_tui::store::history::{Direction as MsgDirection, HistoryEntry, MessageState};
 use meridian_tui::worker::{dispatch, run_inbound_loop, OnboardingSession};
+
+use ratatui::backend::TestBackend;
+use ratatui::Terminal;
 
 // ---------------------------------------------------------------------------
 // `$MERIDIAN_HOME` + mock-keystore environment guard — mirrors
@@ -1219,5 +1237,180 @@ async fn process_inbound_deliverys_crypto_never_freezes_a_concurrently_scheduled
          open_inbound + save_chat) while process_inbound_delivery's own blocking crypto was in \
          flight — observed {observed}. A near-zero count here is what running that crypto \
          synchronously on this `current_thread` runtime would produce."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (task 5.1) Review fix: `InboundEvent::Receipt` reconciliation + persistence
+// ---------------------------------------------------------------------------
+//
+// Neither test below needs the real network/inbound-loop plumbing the rest of this file drives —
+// mirrors `a_racing_outbound_persist_history_dedups_against_a_same_mid_inbound_message`'s own
+// lighter-weight shape: a real `App`, fed a real, hand-constructed `AppEvent::Inbound(InboundEvent::
+// Receipt { .. })` directly, exactly as `App::update` would receive it off the worker→App channel in
+// production (`worker::process_inbound_delivery` builds the identical `InboundEvent::Receipt` shape
+// from a real auto-ack — see deliverable (d) above for that half already being covered).
+
+/// Renders `state` at 80x24 through the same `chat::render` entry point the real TUI draws with, and
+/// returns the plain-text buffer contents — mirrors `tests/screens_chat.rs::render_chat_to_text`
+/// exactly (not imported from there since integration test binaries in this crate are each their own
+/// compilation unit with no shared `tests/common` module today).
+fn render_chat_to_text(state: &TuiChatState) -> String {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).expect("test backend");
+    terminal
+        .draw(|frame| chat::render(state, frame))
+        .expect("draw");
+    format!("{}", terminal.backend())
+}
+
+fn out_entry(mid: &str, body: &str, state: MessageState) -> HistoryEntry {
+    HistoryEntry {
+        v: meridian_tui::store::history::CURRENT_VERSION,
+        mid: mid.to_string(),
+        dir: MsgDirection::Out,
+        ts: 1_760_000_000,
+        stream: "mrd.chat/1".to_string(),
+        body: body.to_string(),
+        state,
+    }
+}
+
+/// **Deliverable 7 — the routing-bug fix.** Opens `Screen::Chat` for a peer with an already-`Sent`
+/// outbound entry, navigates away (`Ctrl-R`'s own real effect: pushing `Screen::Requests` on top,
+/// exactly like `message_request_surfaces_via_ctrl_r_when_requests_screen_is_not_open` above drives),
+/// dispatches a real `AppEvent::Inbound(InboundEvent::Receipt { .. })` while `Screen::Chat` is
+/// **not** topmost, then navigates back (`Esc`'s own real effect: popping `Screen::Requests` back
+/// off) and asserts the double-tick `Delivered` marker actually renders.
+///
+/// Before this task's fix, `App::handle_inbound`'s `InboundEvent::Receipt` arm only ever checked
+/// `self.screens.last_mut()`; with `Screen::Requests` on top, the receipt would have been silently
+/// dropped and this test would still observe `MessageState::Sent` (a single tick) after navigating
+/// back — falsifying the fix if it regresses.
+#[test]
+fn receipt_reconciles_into_a_chat_screen_that_is_not_topmost() {
+    let peer_pub = [42u8; 32];
+    let mid = "cccccccccccccccccccccccccccccc".to_string();
+
+    let mut app = App::new();
+    app.push_screen(Screen::Chat(Box::new(TuiChatState::new(
+        peer_pub,
+        "peer.example".to_string(),
+        TrustStore::default(),
+        vec![out_entry(&mid, "hi", MessageState::Sent)],
+        0,
+    ))));
+
+    // Navigate away: Screen::Chat is no longer `self.screens.last_mut()`.
+    app.push_screen(Screen::Requests(Box::new(RequestsState::new(Vec::new()))));
+    assert!(matches!(app.current_screen(), Screen::Requests(_)));
+
+    let effects = app.update(AppEvent::Inbound(Box::new(InboundEvent::Receipt {
+        peer_pubkey: peer_pub,
+        ack: mid.clone(),
+    })));
+
+    // Deliverable 8's own precondition: persistence is dispatched unconditionally, regardless of
+    // what's currently on top of the stack — checked in isolation by the next test, just asserted
+    // present here too so this test alone would already catch a regression that drops it.
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistReceipt(p) if p.request.peer_pubkey == peer_pub && p.request.ack == mid)),
+        "a receipt must dispatch Effect::PersistReceipt even when Screen::Chat isn't topmost, got {effects:?}"
+    );
+
+    // Navigate back.
+    app.pop_screen();
+    match app.current_screen() {
+        Screen::Chat(state) => {
+            assert_eq!(
+                state.entries[0].state,
+                MessageState::Delivered,
+                "the Sent row must have transitioned to Delivered even though Screen::Chat was not \
+                 topmost when the receipt arrived"
+            );
+            let text = render_chat_to_text(state);
+            assert!(
+                text.contains("✓✓") || text.contains("vv"),
+                "expected the double-tick Delivered marker to render, got:\n{text}"
+            );
+        }
+        other => panic!("expected Screen::Chat, got {other:?}"),
+    }
+}
+
+/// **Deliverable 8 — the persistence fix.** Drives the exact `Effect::PersistReceipt` a real
+/// `InboundEvent::Receipt` dispatches through a real worker round trip
+/// (`meridian_tui::worker::dispatch`), then reloads the peer's `history.jsonl` from scratch — the
+/// same reader `Effect::LoadHistory`'s own execution uses — and confirms the reloaded entry still
+/// reads `Delivered`, not `Sent`. Before this task's fix there was no persistence effect at all: a
+/// freshly reloaded transcript would always show `Sent`, silently reverting whatever the live
+/// in-memory transition had shown a moment before, exactly the restart-durability gap this task's own
+/// file names.
+#[tokio::test]
+async fn receipt_delivered_state_survives_a_restart_via_load_history() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let (handle, _us_pub) = setup_us_account();
+
+    let peer_pub = [43u8; 32];
+    let peer_pub_hex = hex::encode(peer_pub);
+    let mid = "dddddddddddddddddddddddddddddd".to_string();
+
+    // Seed history.jsonl with an already-persisted Sent entry — mirrors what a real
+    // Effect::PersistHistory (complete_send's own dispatch) would already have written before any
+    // receipt could plausibly arrive.
+    let os = OsSecretStore::new(SERVICE);
+    meridian_tui::store::history::append(
+        &peer_pub_hex,
+        &out_entry(&mid, "hi", MessageState::Sent),
+        &os,
+        &handle,
+    )
+    .expect("seed a Sent entry into history.jsonl");
+
+    // Drive the App exactly as production does: a real App with Screen::Chat open, a real
+    // AppEvent::Inbound(InboundEvent::Receipt) dispatch, and the real Effect::PersistReceipt it
+    // returns, executed through the real worker.
+    let mut app = App::new();
+    app.push_screen(Screen::Chat(Box::new(TuiChatState::new(
+        peer_pub,
+        "peer.example".to_string(),
+        TrustStore::default(),
+        vec![out_entry(&mid, "hi", MessageState::Sent)],
+        0,
+    ))));
+    let effects = app.update(AppEvent::Inbound(Box::new(InboundEvent::Receipt {
+        peer_pubkey: peer_pub,
+        ack: mid.clone(),
+    })));
+    let persist = effects
+        .into_iter()
+        .find_map(|e| match e {
+            Effect::PersistReceipt(p) => Some(p),
+            _ => None,
+        })
+        .expect("a receipt must dispatch Effect::PersistReceipt");
+
+    let outcome = dispatch_effect(Effect::PersistReceipt(persist)).await;
+    assert!(
+        matches!(
+            outcome,
+            meridian_tui::app::WorkerEvent::Completed(Effect::PersistReceipt(_))
+        ),
+        "expected the real worker to complete Effect::PersistReceipt, got {outcome:?}"
+    );
+
+    // Simulate a restart: reload straight off disk with a fresh reader, exactly like
+    // Effect::LoadHistory's own execution (worker::run_load_history) does.
+    let reloaded = meridian_tui::store::history::load_or_default(&peer_pub_hex, &os, &handle)
+        .expect("load history after the simulated restart");
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(reloaded[0].mid, mid);
+    assert_eq!(
+        reloaded[0].state,
+        MessageState::Delivered,
+        "the Delivered transition must survive a restart, not revert to Sent"
     );
 }

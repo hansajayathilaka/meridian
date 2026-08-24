@@ -37,11 +37,11 @@ use crate::app::{
     GenerateAccountRequest, GeneratedAccount, ImportContactQrEffect, ImportContactQrRequest,
     LoadHistoryEffect, LoadHistoryRequest, LoadSessionEffect, LoadSessionOutcome,
     MarkVerifiedEffect, MarkVerifiedRequest, PersistHistoryEffect, PersistHistoryRequest,
-    PublishBundleEffect, PublishedBundle, RegisterRequest, RejectRequestEffect,
-    RejectRequestRequest, RunDoctorEffect, SaveSettingEffect, SendMessageEffect,
-    SendMessageRequest, SentMessage, SessionOutcome, SetPetnameEffect, SetPetnameRequest,
-    SetPolicyOverrideEffect, SetPolicyOverrideRequest, SetUserBlockedEffect, SetUserBlockedRequest,
-    StoreChoice, UnlockEffect, UnlockRequest, WorkerEvent,
+    PersistReceiptEffect, PersistReceiptRequest, PublishBundleEffect, PublishedBundle,
+    RegisterRequest, RejectRequestEffect, RejectRequestRequest, RunDoctorEffect, SaveSettingEffect,
+    SendMessageEffect, SendMessageRequest, SentMessage, SessionOutcome, SetPetnameEffect,
+    SetPetnameRequest, SetPolicyOverrideEffect, SetPolicyOverrideRequest, SetUserBlockedEffect,
+    SetUserBlockedRequest, StoreChoice, UnlockEffect, UnlockRequest, WorkerEvent,
 };
 use crate::session::LiveSession;
 use crate::store::contacts::{ContactRecord, ContactsDocument, PinnedKeyRecord, TrustLabel};
@@ -270,6 +270,9 @@ pub async fn dispatch(effect: Effect, session: &mut OnboardingSession) -> Worker
         // Task 4.33: outbound chat (the send half of the T17 demo's "both sides chat" step).
         Effect::SendMessage(effect) => handle_send_message(effect, session).await,
         Effect::PersistHistory(effect) => handle_persist_history(effect, session).await,
+        // Task 5.1: the persisted half of an inbound delivery receipt's `Sent` → `Delivered`
+        // transition — see `crate::app::App::handle_inbound`'s `InboundEvent::Receipt` arm.
+        Effect::PersistReceipt(effect) => handle_persist_receipt(effect, session).await,
         // Task 4.44: the read half of `PersistHistory` above — dispatched whenever `Screen::Chat`
         // opens (`crate::screens::main::handle_key`'s `OpenChat` arm), so the transcript reflects
         // this exact same `crate::store::history` file rather than starting empty.
@@ -1863,6 +1866,45 @@ fn run_persist_history(
     let (store, handle) = account_store.parts();
     let peer_pubkey_hex = hex::encode(request.peer_pubkey);
     crate::store::history::append(&peer_pubkey_hex, &request.entry, store, handle)
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// PersistReceipt (task 5.1)
+// ---------------------------------------------------------------------------
+
+async fn handle_persist_receipt(
+    effect: PersistReceiptEffect,
+    session: &OnboardingSession,
+) -> WorkerEvent {
+    let PersistReceiptEffect { request, .. } = effect;
+    match run_persist_receipt(&request, session) {
+        Ok(()) => WorkerEvent::Completed(Effect::PersistReceipt(PersistReceiptEffect {
+            request,
+            outcome: Some(()),
+        })),
+        Err(message) => WorkerEvent::Failed(
+            Effect::PersistReceipt(PersistReceiptEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Marks `request.peer_pubkey`'s `history.jsonl` entry with `mid == request.ack` `Delivered` —
+/// `crate::store::history::mark_delivered` (task 5.1), fresh `SecretStore`/`KeyHandle` via
+/// [`open_account_store`] like every other handler in this module. A no-op, not an error, if no
+/// matching `Out`/`Sent` row is on disk — `mark_delivered`'s own tolerant contract.
+fn run_persist_receipt(
+    request: &PersistReceiptRequest,
+    session: &OnboardingSession,
+) -> Result<(), String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
+    let peer_pubkey_hex = hex::encode(request.peer_pubkey);
+    crate::store::history::mark_delivered(&peer_pubkey_hex, &request.ack, store, handle)
         .map_err(|e| e.to_string())
 }
 
