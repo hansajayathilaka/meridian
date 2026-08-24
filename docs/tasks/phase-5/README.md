@@ -2,11 +2,20 @@
 
 # Phase 5 — Review of Phase 4
 
-**Kind:** review · **Status:** in progress · **Reviews phase(s):** Phase 4 (T08 — Verification &
-Contact Trust + T17 — Terminal TUI Client, tasks 4.1–4.52) plus the untracked out-of-band work merged
-alongside/after it (PRs #66–#73: a clippy `result_large_err` fix, CI job-split + fixes, the Windows/Linux
-release-binary pipeline (ADR 0022, superseded same-window by ADR 0023), a Windows TUI double-input bug
-fix, TUI message-status-indicator UX (Sent vs. Delivered), and a Docker-based P2P wire-level proof demo).
+**Kind:** review · **Status:** sweep done, findings triaged next via `/plan-review-phase` · **Reviews
+phase(s):** Phase 4 (T08 — Verification & Contact Trust + T17 — Terminal TUI Client, tasks 4.1–4.52)
+plus the untracked out-of-band work merged alongside/after it (PRs #66–#73: a clippy `result_large_err`
+fix, CI job-split + fixes, the Windows/Linux release-binary pipeline (ADR 0022, superseded same-window
+by ADR 0023), a Windows TUI double-input bug fix, TUI message-status-indicator UX (Sent vs. Delivered),
+and a Docker-based P2P wire-level proof demo).
+
+**Sweep result:** [review-report.md](./review-report.md) — 18 findings, **0 blocking**, 9 should-fix,
+9 nits. Verdict: green to proceed; no blocker for the next build phase. The headline is that Phase 4's
+own unusually heavy internal review discipline (seven T17 exit-gate attempts, six defects caught
+pre-close) left nothing blocking here, but six already-named residual findings from Phase 4's README
+remain unowned, and the out-of-band Sent/Delivered message-status feature (landed outside the
+tracked-task pipeline) reproduces the same reconciliation-gap class T17's own closure chain spent six
+waves fixing.
 
 ## Goal
 Sweep everything built since the Phase-3 review report for bugs, gaps, loopholes, dead ends, missing
@@ -61,7 +70,8 @@ Review phases alternate with build phases, so Phase 5 is unblocked by definition
 
 ## Tasks (todo)
 <!-- Filled by /plan-review-phase from review-report.md. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
-(to be filled by `/plan-review-phase` once the sweep below is written up)
+Not yet broken down — `/plan-review-phase` turns [review-report.md](./review-report.md)'s F1–F9
+should-fix findings (F10, N1–N8 optional) into numbered fix-tasks next.
 
 ## Exit criteria
 All findings from the [review report](./review-report.md) triaged into fix-tasks (or explicitly waived
