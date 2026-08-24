@@ -977,20 +977,24 @@ pub struct RunDoctorEffect {
 /// [`DeleteContactRequest`]'s own doc comment establishes that deleting a contact removes *only*
 /// its `contacts.json` row, leaving the `trust.bin` record (and, transitively, its `history.jsonl`
 /// transcript) untouched — so a **tombstoned** contact and a **partial-failure** contact can look
-/// identical on the one axis of "row missing." The second axis, `history.jsonl` non-emptiness,
-/// is what actually separates them: a `contacts.json` row can only ever go missing for an
-/// accept-shaped contact in exactly two ways — (a) `run_accept_request`'s own `contacts::save` call
-/// never ran or failed (a genuine partial failure — at that point the history write, which is placed
-/// *after* it, was never reached either, so `history.jsonl` is provably still empty), or (b) the row
-/// existed and was later removed by an explicit, user-initiated [`Effect::DeleteContact`] (a
-/// tombstone — which never touches `history.jsonl`, so a contact that ever completed a genuine
-/// accept has a non-empty transcript forever after, deletion or not). A contact scanned here is
-/// therefore only ever surfaced as repairable when its `history.jsonl` is completely empty — the one
-/// state a tombstone can never produce. See `crate::worker::run_scan_repairable_contacts`'s own doc
-/// comment for the exact predicate and the one further, honestly-flagged ambiguity it cannot resolve
-/// (a legitimate [`meridian_core::envelope::ChatContent::Receipt`] first-contact intro, which 4.49's
-/// own scope also skips writing, produces the identical empty-history fingerprint as a genuinely lost
-/// text intro).
+/// identical on the one axis of "row missing." The second axis, `history.jsonl` emptiness, is what
+/// mostly separates them, but not perfectly: `history.jsonl` **empty** with the row missing is
+/// unambiguous (only a genuine partial failure produces it — at the moment `run_accept_request`'s
+/// `contacts::save` call never ran or failed, the history write placed strictly after it was never
+/// reached either), so that shape alone is what this scan surfaces as repairable. `history.jsonl`
+/// **non-empty** with the row missing is *not* unambiguous, though: it is the real tombstone shape
+/// (a completed accept's row later removed by [`Effect::DeleteContact`], which never touches
+/// `history.jsonl`) **and** it is separately reachable by a still-unrepaired partial-failure contact
+/// that has simply received an ordinary inbound message since the original failure (inbound
+/// delivery appends to `history.jsonl` whenever a session exists, never gated on the
+/// `contacts.json` row) — so this scan conservatively treats row-missing-and-history-non-empty as
+/// never repairable, accepting some real repair candidates going unsurfaced rather than ever risking
+/// a tombstone resurrection. See `crate::worker::run_scan_repairable_contacts`'s own doc comment for
+/// the exact predicate and both of the further, honestly-flagged ambiguities it cannot resolve: the
+/// row-missing/history-non-empty one just described, and a legitimate
+/// [`meridian_core::envelope::ChatContent::Receipt`] first-contact intro (which 4.49's own scope
+/// also skips writing), which produces the identical empty-history fingerprint as a genuinely lost
+/// text intro on an otherwise-healthy contact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ScanRepairableContactsRequest;
 
@@ -1044,9 +1048,10 @@ pub struct RepairedContact {
 /// decided nothing" answer [`AcceptRequestEffect`]'s own no-op branches use — reached when `pubkey`
 /// turns out to have nothing missing (already healthy) by the time this actually runs, e.g. a stale
 /// scan result raced against a concurrent repair. A `pubkey` this dispatch refuses outright (no
-/// `trust.bin` record at all, not accept-shaped, or the tombstone case
-/// [`ScanRepairableContactsRequest`]'s own doc comment names) is a [`WorkerEvent::Failed`], not a
-/// silent `None` — see `crate::worker::run_repair_accepted_contact`'s own doc comment.
+/// `trust.bin` record at all, not accept-shaped, or the row-missing/history-non-empty shape
+/// [`ScanRepairableContactsRequest`]'s own doc comment names — real tombstone or not, see that doc
+/// comment for why this dispatch cannot tell) is a [`WorkerEvent::Failed`], not a silent `None` —
+/// see `crate::worker::run_repair_accepted_contact`'s own doc comment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepairAcceptedContactEffect {
     pub request: RepairAcceptedContactRequest,

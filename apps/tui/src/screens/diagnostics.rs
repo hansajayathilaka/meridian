@@ -1051,12 +1051,15 @@ mod tests {
                     request: RepairAcceptedContactRequest { pubkey },
                     outcome: None,
                 }),
-                "this contact's contacts.json row was explicitly deleted — refusing to resurrect it"
+                "this contact's contacts.json row is missing, but it has since exchanged further \
+                 messages — cannot safely repair the row: the contact may have been explicitly \
+                 deleted, or a message may simply have arrived before this repair ran; refusing \
+                 to resurrect it either way"
                     .to_string(),
             ),
         );
         match &state.repair {
-            RepairStatus::Error(message) => assert!(message.contains("explicitly deleted")),
+            RepairStatus::Error(message) => assert!(message.contains("refusing to resurrect")),
             other => panic!("expected Error, got {other:?}"),
         }
     }

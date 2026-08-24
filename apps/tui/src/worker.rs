@@ -1402,31 +1402,48 @@ async fn run_accept_request(
 // it as their eligibility gate before touching anything else.
 //
 // Within that gate, `history.jsonl` emptiness — not `contacts.json` row presence alone — is what
-// tells a genuine partial failure apart from [`DeleteContactRequest`]'s legitimate tombstone case.
-// [`DeleteContactRequest`]'s own doc comment in `crate::app` is explicit that deleting a contact
-// removes only its `contacts.json` row; it never touches `trust.bin` or `history.jsonl`. So a
-// `contacts.json` row can only ever be missing for an accept-shaped contact for one of two reasons:
-// (a) `run_accept_request`'s `contacts::save` call itself never ran or failed — at which point the
-// history write, sequenced strictly after it in that function, was never reached either, so
-// `history.jsonl` is provably still empty; or (b) the row existed, a real accept fully completed
-// (which necessarily wrote a history entry unless the intro was a degenerate `Receipt` — see below),
-// and a later, explicit [`DeleteContactRequest`] removed the row — in which case `history.jsonl` is
-// **not** empty. `history.jsonl` empty is therefore never producible by a tombstone, only by a
-// partial failure (or, honestly, one further case named below) — the safe signal these functions
-// gate the row-repair on, never row-presence alone.
+// tells a genuine partial failure apart from [`DeleteContactRequest`]'s legitimate tombstone case,
+// for the row-missing-and-history-empty shape these functions actually repair: at the moment
+// `run_accept_request`'s `contacts::save` call never ran or failed, the history write sequenced
+// strictly after it was never reached either, so `history.jsonl` is provably still empty right
+// then, and [`DeleteContactRequest`] (which never touches `trust.bin` or `history.jsonl`, only the
+// `contacts.json` row) cannot have produced that shape without a real accept having completed
+// first — which would have left a non-empty history. So row-missing-and-history-empty is repaired
+// freely; that half of the predicate is sound.
 //
-// **The one honestly-unresolved ambiguity.** Task 4.49 deliberately skips writing a history entry
-// for a first-contact intro that is a [`meridian_core::envelope::ChatContent::Receipt`] (a
-// degenerate, adversarial-shaped case — see that task's own doc comment) — a **legitimate**,
-// non-failure reason for `history.jsonl` to be empty even though `contacts.json`'s row is present
-// and healthy. Nothing persisted anywhere distinguishes that case from a genuine lost-text-intro
-// partial failure; both leave an identical on-disk fingerprint (accept-shaped contact, row present,
-// history empty). `TODO: confirm`: no design doc this task read resolves this — the considered
-// choice made here is that a repair action's job is to turn a *silent* dead end into a *surfaced*
-// one, not to guarantee perfect content recovery, so [`run_repair_accepted_contact`] still offers
-// the history repair in this case too, but writes an honest, clearly-marked placeholder (mirroring
-// `screens/requests.rs::intro_summary`'s own "(not a text message — a delivery receipt)"
-// precedent) rather than fabricating message content it cannot actually know.
+// **Two honestly-unresolved ambiguities — not one.** The row-missing-and-history-**non-empty**
+// shape ([`run_repair_accepted_contact`]'s refusal case) is where the predicate stops being able to
+// tell two very different situations apart, both of which produce the identical on-disk fingerprint:
+//
+// 1. Task 4.49's `Receipt`-vs-lost-intro ambiguity: a first-contact intro that is a
+//    [`meridian_core::envelope::ChatContent::Receipt`] (a degenerate, adversarial-shaped case — see
+//    that task's own doc comment) is deliberately never written to `history.jsonl` — a
+//    **legitimate**, non-failure reason for `history.jsonl` to be empty even though
+//    `contacts.json`'s row is present and healthy. Nothing persisted anywhere distinguishes that
+//    from a genuine lost-text-intro partial failure; both leave an identical fingerprint
+//    (accept-shaped contact, row present, history empty). `TODO: confirm`: no design doc this task
+//    read resolves this — the considered choice made here is that a repair action's job is to turn
+//    a *silent* dead end into a *surfaced* one, not to guarantee perfect content recovery, so
+//    [`run_repair_accepted_contact`] still offers the history repair in this case too, but writes an
+//    honest, clearly-marked placeholder (mirroring `screens/requests.rs::intro_summary`'s own "(not
+//    a text message — a delivery receipt)" precedent) rather than fabricating message content it
+//    cannot actually know.
+// 2. The tombstone-vs-still-unrepaired ambiguity this task's own review found: ordinary inbound
+//    `Text` delivery (`process_inbound_delivery`/`App::handle_inbound`'s `InboundEvent::Message`
+//    arm) appends to `history.jsonl` unconditionally once a session exists — gated on
+//    `sessions.bin` alone, never on `contacts.json` row presence. So a contact genuinely stuck in
+//    the row-missing partial-failure state (never deleted) can still receive further inbound
+//    messages *before* anyone repairs it, which flips `history.jsonl` from empty to non-empty while
+//    the row is still legitimately missing — producing exactly the same fingerprint a real
+//    [`DeleteContactRequest`] tombstone leaves (row missing, history non-empty).
+//    [`run_repair_accepted_contact`]'s refusal in this shape therefore fails safe in the direction
+//    that matters (it can never resurrect a real delete — the worse of the two possible mistakes)
+//    but is a genuine false-negative risk in the other direction: it can wrongly refuse a real
+//    repair candidate that has simply received a message since the original partial failure. Its
+//    error message says so honestly (naming both possibilities) rather than asserting the tombstone
+//    reading as fact. `TODO: confirm`: no design doc resolves how to recover this contact once
+//    stuck this way; nothing short of a second, independent signal (not yet designed) could break
+//    the tie safely.
 
 /// Read-only scan for `trust.bin` contacts eligible for [`run_repair_accepted_contact`] — see this
 /// section's own module-level doc comment for the full eligibility rule (`hint == ""`) and the
@@ -1454,8 +1471,11 @@ fn scan_repairable_contacts(session: &OnboardingSession) -> Result<Vec<Repairabl
         let history_empty = history.is_empty();
 
         if !row_present && !history_empty {
-            // The tombstone case: a genuine accept fully completed (history is not empty), and the
-            // row was later removed by an explicit `DeleteContactRequest`. Never surfaced here.
+            // Either the tombstone case (a genuine accept fully completed, and the row was later
+            // removed by an explicit `DeleteContactRequest`), or an unrepaired partial-failure
+            // contact that has since received an ordinary inbound message (see the module doc's
+            // second ambiguity) — this predicate cannot tell the two apart, so neither is ever
+            // surfaced here: never risk offering a "repair" that could resurrect a real delete.
             continue;
         }
         if row_present && !history_empty {
@@ -1532,10 +1552,15 @@ async fn handle_repair_accepted_contact(
 /// a triggered repair must still be caught here, not just by the scan that produced the UI's list).
 ///
 /// **Refuses outright (`Err`, a real [`WorkerEvent::Failed`], never a silent no-op) for exactly the
-/// three cases that would make this a resurrection rather than a repair:** no `trust.bin` record for
-/// `pubkey` at all (nothing to repair from); a record whose `hint` is not empty (not accept-shaped —
-/// see the module doc); and the tombstone shape itself (`contacts.json` row missing but
-/// `history.jsonl` non-empty) — the one case this whole task exists to stay distinct from.
+/// three cases that would risk resurrecting a real delete rather than repairing a real partial
+/// failure:** no `trust.bin` record for `pubkey` at all (nothing to repair from); a record whose
+/// `hint` is not empty (not accept-shaped — see the module doc); and the row-missing/history-
+/// non-empty shape (`contacts.json` row missing but `history.jsonl` non-empty) — which the module
+/// doc's second ambiguity above is explicit is *not* proof of a tombstone by itself (an unrepaired
+/// partial-failure contact can reach this same shape by receiving an ordinary inbound message before
+/// repair runs), only the one on-disk signal available to distinguish the two, so refusing is the
+/// only safe choice even though it is sometimes an over-refusal, never asserted as a certain
+/// tombstone.
 ///
 /// **`Ok(None)`** is the honest "nothing was missing" answer for a `pubkey` that turns out already
 /// fully healthy by the time this runs (row present, history non-empty) — mirrors
@@ -1578,8 +1603,19 @@ fn run_repair_accepted_contact(
     let history_empty = history.is_empty();
 
     if !row_present && !history_empty {
+        // See the module-level doc comment's second, honestly-named ambiguity: this shape
+        // (`contacts.json` row missing, `history.jsonl` non-empty) is produced by the real
+        // tombstone case, but is *also* producible by a genuine, still-unrepaired partial-failure
+        // contact that has since received an ordinary inbound message — `process_inbound_delivery`
+        // gates history writes on `sessions.bin` alone, never on `contacts.json` row presence, so
+        // this predicate cannot tell the two apart from on-disk state alone. Refusing either way is
+        // still the only safe choice (never risk resurrecting a real delete), but the message must
+        // not assert the tombstone reading as fact.
         return Err(
-            "this contact's contacts.json row was explicitly deleted — refusing to resurrect it"
+            "this contact's contacts.json row is missing, but it has since exchanged further \
+             messages — cannot safely repair the row: the contact may have been explicitly \
+             deleted, or a message may simply have arrived before this repair ran; refusing to \
+             resurrect it either way"
                 .to_string(),
         );
     }
