@@ -68,7 +68,7 @@ jobs:
       # --path apps/cli` or a plain `cargo build -p meridian-cli` gives a user; this is what makes
       # `meridian tui` exist in the resulting binary.
       - name: cargo build --release
-        run: cargo build --release -p meridian-cli --target ${{ matrix.target }}
+        run: cargo build --release -p meridian-cli --target ${{ matrix.target }} --feature webrtc
 
       - name: Package (Linux)
         if: matrix.asset_os == 'linux'
