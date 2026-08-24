@@ -75,7 +75,7 @@ deferred stretch-goal, since the interleaving it names isn't reachable until 5.5
 wiring lands (a standalone task today would have nothing to test against).
 
 **Should-fix findings (F1–F9), plus F10**
-- [ ] **5.1** Persist and always-reconcile Sent→Delivered receipts (F1) — [file](./5.1-persist-reconcile-delivery-receipts.md)
+- [~] **5.1** Persist and always-reconcile Sent→Delivered receipts (F1) — [file](./5.1-persist-reconcile-delivery-receipts.md)
 - [ ] **5.2** Diagnostics-surfaced repair action for `run_accept_request`'s partial-failure window (F2) — [file](./5.2-accept-request-repair-action.md)
 - [ ] **5.4** `spawn_blocking`-wrap `run_mark_verified`/`run_set_petname` (F4; **land before 5.3**) — [file](./5.4-spawn-blocking-mark-verified-set-petname.md)
 - [ ] **5.3** Fix `contacts.json` trust staleness + cover `export_json` (F3; depends on 5.4) — [file](./5.3-fix-contacts-trust-staleness-export.md)
