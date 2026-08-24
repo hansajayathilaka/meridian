@@ -1,0 +1,74 @@
+# demo/p2p-wire-proof — Docker-based wire-level proof of Meridian's core P2P claim: a message
+# between two clients crosses the network directly, client-to-client, and the rendezvous
+# (signaling) server never carries or logs its content. See README.md for the full write-up.
+#
+# Topology:
+#   rendezvous   meridian-rendezvous, plain ws:// (single internal network, no edge/TLS needed)
+#   coturn       TURN relay, ephemeral HMAC credentials only (same convention as demo/two-orgs)
+#   alice, bob   meridian CLI, idle on `sleep infinity`, driven via `docker compose exec` by
+#                run-wire-proof.sh
+#   monitor      packet capture sidecar — `network_mode: host` + NET_ADMIN/NET_RAW, running
+#                `tcpdump -i any` (scoped to this subnet) so it sees every container's traffic.
+#                NOT the compose network's bridge master device — verified experimentally that a
+#                bridge-device capture misses container-to-container unicast traffic in this
+#                environment; see run-wire-proof.sh's header for the full explanation.
+#
+# Static IPs (not DNS) for every service so the capture-analysis step can filter flows by address
+# without an extra `docker inspect` round trip per container.
+
+networks:
+  p2p-net:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+x-image: &image meridian-p2p-wire-proof:latest
+
+services:
+  rendezvous:
+    image: *image
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["/usr/local/bin/meridian-rendezvous", "--config", "/etc/meridian/rendezvous.toml"]
+    networks:
+      p2p-net:
+        ipv4_address: 172.30.0.10
+    volumes:
+      - ./rendezvous.toml:/etc/meridian/rendezvous.toml:ro
+    environment:
+      MERIDIAN_RENDEZVOUS_TURN__SECRET: ${TURN_SHARED_SECRET:?set TURN_SHARED_SECRET (run-wire-proof.sh generates this)}
+
+  coturn:
+    image: coturn/coturn:4.6.2
+    networks:
+      p2p-net:
+        ipv4_address: 172.30.0.11
+    command:
+      - "-c"
+      - "/etc/coturn/turnserver.conf"
+      - "--static-auth-secret=${TURN_SHARED_SECRET:?set TURN_SHARED_SECRET}"
+      - "--realm=turn.p2pdemo.local"
+      # This whole network is the demo's own RFC-1918 bridge subnet, so the reference conf's
+      # denied-peer-ip lines (aimed at an internet-facing coturn) would refuse every relay
+      # candidate here — same relaxation demo/two-orgs applies, via coturn's allow-list override
+      # rather than forking turnserver.conf.
+      - "--allowed-peer-ip=172.30.0.0-172.30.0.255"
+    volumes:
+      - ../../infra/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+
+  alice:
+    image: *image
+    command: ["sleep", "infinity"]
+    networks:
+      p2p-net:
+        ipv4_address: 172.30.0.21
+    depends_on: [rendezvous, coturn]
+
+  bob:
+    image: *image
+    command: ["sleep", "infinity"]
+    networks:
+      p2p-net:
+        ipv4_address: 172.30.0.22
+    depends_on: [rendezvous, coturn]
