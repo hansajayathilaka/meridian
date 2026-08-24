@@ -68,6 +68,18 @@
 //! `crate::app::App` holds no live `Transport`/session handle anywhere yet — see
 //! [`crate::statusbar`]'s own module doc for the same gap and why [`StatusBarInfo::default`] is the
 //! only constructor this screen calls today.
+//!
+//! ## Repairable-contacts affordance (task 5.2)
+//! A second, independent sub-panel on this same screen: `p` dispatches
+//! [`Effect::ScanRepairableContacts`], listing every `trust.bin` contact
+//! `crate::worker::run_accept_request`'s own twice-instantiated partial-failure window left
+//! durably trusted but missing a `contacts.json` display row and/or a `history.jsonl` accepted-intro
+//! entry — see `crate::worker`'s own "ScanRepairableContacts / RepairAcceptedContact" module section
+//! for the full repair-vs-tombstone eligibility rule this list is built from. `j`/`k` (or the arrow
+//! keys) move the selection; `Enter` dispatches [`Effect::RepairAcceptedContact`] for the selected
+//! entry. Independent of the `r`/doctor sub-panel above: neither key handler nor either `WorkerEvent`
+//! arm touches the other's state, and both can be mid-flight at once (nothing here serializes them
+//! against each other, mirroring how the two `Effect`s touch disjoint files).
 
 use std::process::Command;
 
@@ -81,7 +93,9 @@ use crossterm::event::{KeyCode, KeyEvent};
 use serde::Deserialize;
 
 use crate::app::{
-    DoctorCell, DoctorReport, Effect, RunDoctorEffect, RunDoctorRequest, WorkerEvent,
+    DoctorCell, DoctorReport, Effect, RepairAcceptedContactEffect, RepairAcceptedContactRequest,
+    RepairableContact, RunDoctorEffect, RunDoctorRequest, ScanRepairableContactsEffect,
+    ScanRepairableContactsRequest, WorkerEvent,
 };
 use crate::statusbar::{self, StatusBarInfo};
 use crate::surface::ExtensionPane;
@@ -108,11 +122,46 @@ pub enum DiagnosticsStatus {
     Error(String),
 }
 
+/// Task 5.2's own sub-panel state — see the module doc's "repairable-contacts affordance" section.
+/// Independent of [`DiagnosticsStatus`]: this screen tracks the doctor run and the repair scan as
+/// two unrelated things happening to land on the same pane, not one combined status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepairStatus {
+    /// Not yet scanned this session.
+    Idle,
+    /// [`Effect::ScanRepairableContacts`] dispatched, awaiting a [`WorkerEvent`].
+    Scanning,
+    /// The most recent scan succeeded. `selected` indexes into `contacts` — always in bounds for a
+    /// non-empty list (clamped by [`handle_key`]'s move-selection arms), meaningless (and never read
+    /// for an `Enter` dispatch) when `contacts` is empty.
+    Listed {
+        contacts: Vec<RepairableContact>,
+        selected: usize,
+    },
+    /// [`Effect::RepairAcceptedContact`] dispatched for `pubkey`, awaiting a [`WorkerEvent`].
+    Repairing { pubkey: [u8; 32] },
+    /// The most recent repair succeeded — `contact_row_repaired`/`history_repaired` are the real
+    /// [`RepairedContact`](crate::app::RepairedContact) flags read back from the worker, never
+    /// assumed from the request alone (mirrors [`AddedContact`](crate::app::AddedContact)'s own
+    /// "read back what really happened" discipline).
+    Repaired {
+        pubkey: [u8; 32],
+        contact_row_repaired: bool,
+        history_repaired: bool,
+    },
+    /// The most recent scan or repair failed — see `crate::worker::run_repair_accepted_contact`'s
+    /// own doc comment for the honest, specific refusal messages that land here (e.g. the tombstone
+    /// case).
+    Error(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticsState {
     pub status: DiagnosticsStatus,
     /// See the module doc's "no live connection state plumbed in" section.
     pub status_bar: StatusBarInfo,
+    /// See the module doc's "repairable-contacts affordance" section.
+    pub repair: RepairStatus,
 }
 
 impl DiagnosticsState {
@@ -120,6 +169,7 @@ impl DiagnosticsState {
         Self {
             status: DiagnosticsStatus::Idle,
             status_bar: StatusBarInfo::default(),
+            repair: RepairStatus::Idle,
         }
     }
 }
@@ -135,8 +185,10 @@ impl Default for DiagnosticsState {
 // ---------------------------------------------------------------------------
 
 /// Handles one key event. `r`/`R` runs (or re-runs) diagnostics unless a run is already in flight;
-/// `Esc` asks to close. Returns `(effects, exit)`, the same shape every other screen in this crate
-/// uses.
+/// `p`/`P` scans for repairable contacts (task 5.2) unless a scan or repair is already in flight;
+/// `j`/`k`/arrow-down/arrow-up move the repair-list selection; `Enter` triggers the repair for the
+/// selected entry; `Esc` asks to close. Returns `(effects, exit)`, the same shape every other screen
+/// in this crate uses.
 pub fn handle_key(state: &mut DiagnosticsState, key: KeyEvent) -> (Vec<Effect>, bool) {
     match key.code {
         KeyCode::Esc => (Vec::new(), true),
@@ -154,27 +206,117 @@ pub fn handle_key(state: &mut DiagnosticsState, key: KeyEvent) -> (Vec<Effect>, 
                 false,
             )
         }
+        KeyCode::Char('p') | KeyCode::Char('P')
+            if !matches!(
+                state.repair,
+                RepairStatus::Scanning | RepairStatus::Repairing { .. }
+            ) =>
+        {
+            state.repair = RepairStatus::Scanning;
+            (
+                vec![Effect::ScanRepairableContacts(
+                    ScanRepairableContactsEffect {
+                        request: ScanRepairableContactsRequest,
+                        outcome: None,
+                    },
+                )],
+                false,
+            )
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let RepairStatus::Listed { contacts, selected } = &mut state.repair {
+                if !contacts.is_empty() {
+                    *selected = (*selected + 1).min(contacts.len() - 1);
+                }
+            }
+            (Vec::new(), false)
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let RepairStatus::Listed { selected, .. } = &mut state.repair {
+                *selected = selected.saturating_sub(1);
+            }
+            (Vec::new(), false)
+        }
+        KeyCode::Enter => {
+            let Some(pubkey) = (match &state.repair {
+                RepairStatus::Listed { contacts, selected } => {
+                    contacts.get(*selected).map(|c| c.pubkey)
+                }
+                _ => None,
+            }) else {
+                return (Vec::new(), false);
+            };
+            state.repair = RepairStatus::Repairing { pubkey };
+            (
+                vec![Effect::RepairAcceptedContact(RepairAcceptedContactEffect {
+                    request: RepairAcceptedContactRequest { pubkey },
+                    outcome: None,
+                })],
+                false,
+            )
+        }
         _ => (Vec::new(), false),
     }
 }
 
 /// Handles a [`WorkerEvent`] arriving while this screen is current — see the module doc's "same
 /// worker-stub precedent" section for why `outcome: None` (today's actual stub behavior) is silently
-/// ignored rather than mistaken for a real result.
+/// ignored rather than mistaken for a real result. Each arm below is additionally guarded on this
+/// screen's own matching "awaiting a result" state (mirrors `crate::screens::onboarding::handle_
+/// worker`'s identical discipline) so a stale/duplicate event can never overwrite a newer, unrelated
+/// state.
 pub fn handle_worker(state: &mut DiagnosticsState, event: WorkerEvent) -> Vec<Effect> {
-    if matches!(state.status, DiagnosticsStatus::Running) {
-        match event {
-            WorkerEvent::Completed(Effect::RunDoctor(RunDoctorEffect {
-                outcome: Some(report),
-                ..
-            })) => {
-                state.status = DiagnosticsStatus::Ready(report);
-            }
-            WorkerEvent::Failed(Effect::RunDoctor(_), message) => {
-                state.status = DiagnosticsStatus::Error(message);
-            }
-            _ => {}
+    match event {
+        WorkerEvent::Completed(Effect::RunDoctor(RunDoctorEffect {
+            outcome: Some(report),
+            ..
+        })) if matches!(state.status, DiagnosticsStatus::Running) => {
+            state.status = DiagnosticsStatus::Ready(report);
         }
+        WorkerEvent::Failed(Effect::RunDoctor(_), message)
+            if matches!(state.status, DiagnosticsStatus::Running) =>
+        {
+            state.status = DiagnosticsStatus::Error(message);
+        }
+        WorkerEvent::Completed(Effect::ScanRepairableContacts(ScanRepairableContactsEffect {
+            outcome: Some(contacts),
+            ..
+        })) if matches!(state.repair, RepairStatus::Scanning) => {
+            state.repair = RepairStatus::Listed {
+                contacts,
+                selected: 0,
+            };
+        }
+        WorkerEvent::Failed(Effect::ScanRepairableContacts(_), message)
+            if matches!(state.repair, RepairStatus::Scanning) =>
+        {
+            state.repair = RepairStatus::Error(message);
+        }
+        WorkerEvent::Completed(Effect::RepairAcceptedContact(RepairAcceptedContactEffect {
+            outcome: Some(repaired),
+            ..
+        })) if matches!(state.repair, RepairStatus::Repairing { .. }) => {
+            state.repair = RepairStatus::Repaired {
+                pubkey: repaired.pubkey,
+                contact_row_repaired: repaired.contact_row_repaired,
+                history_repaired: repaired.history_repaired,
+            };
+        }
+        WorkerEvent::Completed(Effect::RepairAcceptedContact(RepairAcceptedContactEffect {
+            outcome: None,
+            ..
+        })) if matches!(state.repair, RepairStatus::Repairing { .. }) => {
+            // A genuine, honest no-op (`run_repair_accepted_contact`'s own `Ok(None)` branch —
+            // already healthy by the time this ran). Not an error: back to Idle, same as never
+            // having scanned, rather than fabricating a `Repaired` outcome nothing actually did.
+            state.repair = RepairStatus::Idle;
+        }
+        WorkerEvent::Failed(Effect::RepairAcceptedContact(_), message)
+            if matches!(state.repair, RepairStatus::Repairing { .. }) =>
+        {
+            state.repair = RepairStatus::Error(message);
+        }
+        _ => {}
     }
     Vec::new()
 }
@@ -250,7 +392,86 @@ fn body_lines(state: &DiagnosticsState) -> Vec<Line<'static>> {
             )));
         }
     }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "repairable contacts (task 5.2)",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    match &state.repair {
+        RepairStatus::Idle => {
+            lines.push(Line::from("press p to scan for repairable contacts"));
+        }
+        RepairStatus::Scanning => {
+            lines.push(Line::from("scanning…"));
+        }
+        RepairStatus::Listed { contacts, .. } if contacts.is_empty() => {
+            lines.push(Line::from("no repairable contacts found"));
+        }
+        RepairStatus::Listed { contacts, selected } => {
+            for (i, c) in contacts.iter().enumerate() {
+                let mut what = Vec::new();
+                if c.missing_contact_row {
+                    what.push("missing contacts.json row");
+                }
+                if c.missing_history_intro {
+                    what.push("missing history.jsonl intro");
+                }
+                let line = format!(
+                    "{} {}  ({})",
+                    if i == *selected { ">" } else { " " },
+                    short_label(&c.label),
+                    what.join(", "),
+                );
+                lines.push(Line::from(if i == *selected {
+                    Span::styled(line, Style::default().add_modifier(Modifier::BOLD))
+                } else {
+                    Span::raw(line)
+                }));
+            }
+        }
+        RepairStatus::Repairing { pubkey } => {
+            lines.push(Line::from(format!(
+                "repairing {}…",
+                short_label(&hex::encode(pubkey))
+            )));
+        }
+        RepairStatus::Repaired {
+            pubkey,
+            contact_row_repaired,
+            history_repaired,
+        } => {
+            lines.push(Line::from(format!(
+                "repaired {}: contacts.json row {}, history.jsonl intro {}",
+                short_label(&hex::encode(pubkey)),
+                if *contact_row_repaired {
+                    "rebuilt"
+                } else {
+                    "already present"
+                },
+                if *history_repaired {
+                    "rebuilt"
+                } else {
+                    "already present"
+                },
+            )));
+        }
+        RepairStatus::Error(message) => {
+            lines.push(Line::from(Span::styled(
+                format!("repair failed: {message}"),
+                Style::default().fg(Color::Red),
+            )));
+        }
+    }
     lines
+}
+
+/// A short, non-identifying-beyond-what's-already-shown display form of a hex pubkey — first 12
+/// hex chars, mirroring `crate::screens::contacts::ContactEntry::display_label`'s own
+/// short-pubkey fallback shape (the one every repairable contact here always falls back to, since
+/// eligibility requires `hint == ""` — see `crate::worker`'s own module doc).
+fn short_label(pubkey_hex: &str) -> String {
+    pubkey_hex.chars().take(12).collect()
 }
 
 fn mark(ok: bool) -> &'static str {
@@ -262,10 +483,16 @@ fn mark(ok: bool) -> &'static str {
 }
 
 fn footer_hint(state: &DiagnosticsState) -> String {
-    match state.status {
-        DiagnosticsStatus::Running => "running… · Esc back".to_string(),
-        _ => "r run/refresh · Esc back".to_string(),
-    }
+    let doctor = match state.status {
+        DiagnosticsStatus::Running => "running…",
+        _ => "r run/refresh",
+    };
+    let repair = match state.repair {
+        RepairStatus::Scanning | RepairStatus::Repairing { .. } => "working…",
+        RepairStatus::Listed { .. } => "p rescan · j/k select · Enter repair",
+        _ => "p scan repairable",
+    };
+    format!("{doctor} · {repair} · Esc back")
 }
 
 // ---------------------------------------------------------------------------
@@ -568,6 +795,281 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // handle_key / handle_worker — the task 5.2 repair sub-panel, independent of the doctor
+    // sub-panel above (mirrors that sub-panel's own test shape one-for-one).
+    // -----------------------------------------------------------------------
+
+    fn sample_pubkey() -> [u8; 32] {
+        [0x22u8; 32]
+    }
+
+    fn sample_repairable() -> RepairableContact {
+        RepairableContact {
+            pubkey: sample_pubkey(),
+            label: hex::encode(sample_pubkey()),
+            missing_contact_row: true,
+            missing_history_intro: false,
+        }
+    }
+
+    #[test]
+    fn p_dispatches_scan_repairable_contacts_and_enters_scanning() {
+        let mut state = DiagnosticsState::new();
+        let (effects, exit) = handle_key(&mut state, key(KeyCode::Char('p')));
+        assert!(!exit);
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(state.repair, RepairStatus::Scanning));
+    }
+
+    #[test]
+    fn p_while_already_scanning_does_not_dispatch_a_second_effect() {
+        let mut state = DiagnosticsState::new();
+        state.repair = RepairStatus::Scanning;
+        let (effects, _) = handle_key(&mut state, key(KeyCode::Char('p')));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn p_while_repairing_does_not_dispatch_a_second_effect() {
+        let mut state = DiagnosticsState::new();
+        state.repair = RepairStatus::Repairing {
+            pubkey: sample_pubkey(),
+        };
+        let (effects, _) = handle_key(&mut state, key(KeyCode::Char('p')));
+        assert!(effects.is_empty());
+    }
+
+    /// `r`/doctor and `p`/repair are independent sub-panels — driving one must never touch the
+    /// other's state (see the module doc's "repairable-contacts affordance" section).
+    #[test]
+    fn r_and_p_do_not_interfere_with_each_others_state() {
+        let mut state = DiagnosticsState::new();
+        handle_key(&mut state, key(KeyCode::Char('r')));
+        assert!(matches!(state.status, DiagnosticsStatus::Running));
+        assert!(matches!(state.repair, RepairStatus::Idle));
+
+        let mut state = DiagnosticsState::new();
+        handle_key(&mut state, key(KeyCode::Char('p')));
+        assert!(matches!(state.status, DiagnosticsStatus::Idle));
+        assert!(matches!(state.repair, RepairStatus::Scanning));
+    }
+
+    #[test]
+    fn scan_completed_moves_to_listed_with_the_real_contacts() {
+        let mut state = DiagnosticsState::new();
+        state.repair = RepairStatus::Scanning;
+        let contacts = vec![sample_repairable()];
+        let effects = handle_worker(
+            &mut state,
+            WorkerEvent::Completed(Effect::ScanRepairableContacts(
+                ScanRepairableContactsEffect {
+                    request: ScanRepairableContactsRequest,
+                    outcome: Some(contacts.clone()),
+                },
+            )),
+        );
+        assert!(effects.is_empty());
+        match &state.repair {
+            RepairStatus::Listed {
+                contacts: listed,
+                selected,
+            } => {
+                assert_eq!(*listed, contacts);
+                assert_eq!(*selected, 0);
+            }
+            other => panic!("expected Listed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_failed_moves_to_error_with_the_honest_message_verbatim() {
+        let mut state = DiagnosticsState::new();
+        state.repair = RepairStatus::Scanning;
+        handle_worker(
+            &mut state,
+            WorkerEvent::Failed(
+                Effect::ScanRepairableContacts(ScanRepairableContactsEffect {
+                    request: ScanRepairableContactsRequest,
+                    outcome: None,
+                }),
+                "could not open trust.bin".to_string(),
+            ),
+        );
+        match &state.repair {
+            RepairStatus::Error(message) => assert_eq!(message, "could not open trust.bin"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// A scan `WorkerEvent` arriving while not actually scanning (e.g. a stale/duplicate event)
+    /// must never overwrite a newer, unrelated state — same discipline as the doctor sub-panel's
+    /// own `worker_event_is_ignored_while_not_running`.
+    #[test]
+    fn scan_worker_event_is_ignored_while_not_scanning() {
+        let mut state = DiagnosticsState::new();
+        handle_worker(
+            &mut state,
+            WorkerEvent::Completed(Effect::ScanRepairableContacts(
+                ScanRepairableContactsEffect {
+                    request: ScanRepairableContactsRequest,
+                    outcome: Some(vec![sample_repairable()]),
+                },
+            )),
+        );
+        assert!(matches!(state.repair, RepairStatus::Idle));
+    }
+
+    #[test]
+    fn down_and_up_move_the_selection_and_clamp_at_both_ends() {
+        let mut state = DiagnosticsState::new();
+        state.repair = RepairStatus::Listed {
+            contacts: vec![sample_repairable(), sample_repairable()],
+            selected: 0,
+        };
+        handle_key(&mut state, key(KeyCode::Up));
+        assert_eq!(selected_of(&state), 0, "must not go below zero");
+        handle_key(&mut state, key(KeyCode::Down));
+        handle_key(&mut state, key(KeyCode::Down));
+        assert_eq!(selected_of(&state), 1, "must clamp at the last index");
+    }
+
+    #[test]
+    fn j_and_k_move_the_selection_the_same_as_the_arrow_keys() {
+        let mut state = DiagnosticsState::new();
+        state.repair = RepairStatus::Listed {
+            contacts: vec![sample_repairable(), sample_repairable()],
+            selected: 0,
+        };
+        handle_key(&mut state, key(KeyCode::Char('j')));
+        assert_eq!(selected_of(&state), 1);
+        handle_key(&mut state, key(KeyCode::Char('k')));
+        assert_eq!(selected_of(&state), 0);
+    }
+
+    fn selected_of(state: &DiagnosticsState) -> usize {
+        match &state.repair {
+            RepairStatus::Listed { selected, .. } => *selected,
+            other => panic!("expected Listed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_on_an_empty_list_dispatches_nothing() {
+        let mut state = DiagnosticsState::new();
+        state.repair = RepairStatus::Listed {
+            contacts: Vec::new(),
+            selected: 0,
+        };
+        let (effects, _) = handle_key(&mut state, key(KeyCode::Enter));
+        assert!(effects.is_empty());
+        assert!(matches!(state.repair, RepairStatus::Listed { .. }));
+    }
+
+    #[test]
+    fn enter_outside_the_listed_state_dispatches_nothing() {
+        let mut state = DiagnosticsState::new();
+        let (effects, _) = handle_key(&mut state, key(KeyCode::Enter));
+        assert!(effects.is_empty());
+        assert!(matches!(state.repair, RepairStatus::Idle));
+    }
+
+    #[test]
+    fn enter_on_the_selected_entry_dispatches_repair_and_enters_repairing() {
+        let mut state = DiagnosticsState::new();
+        let contact = sample_repairable();
+        state.repair = RepairStatus::Listed {
+            contacts: vec![contact.clone()],
+            selected: 0,
+        };
+        let (effects, exit) = handle_key(&mut state, key(KeyCode::Enter));
+        assert!(!exit);
+        assert_eq!(effects.len(), 1);
+        match &effects[0] {
+            Effect::RepairAcceptedContact(RepairAcceptedContactEffect { request, .. }) => {
+                assert_eq!(request.pubkey, contact.pubkey);
+            }
+            other => panic!("expected RepairAcceptedContact, got {other:?}"),
+        }
+        match &state.repair {
+            RepairStatus::Repairing { pubkey } => assert_eq!(*pubkey, contact.pubkey),
+            other => panic!("expected Repairing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repair_completed_with_a_real_outcome_moves_to_repaired() {
+        let mut state = DiagnosticsState::new();
+        let pubkey = sample_pubkey();
+        state.repair = RepairStatus::Repairing { pubkey };
+        handle_worker(
+            &mut state,
+            WorkerEvent::Completed(Effect::RepairAcceptedContact(RepairAcceptedContactEffect {
+                request: RepairAcceptedContactRequest { pubkey },
+                outcome: Some(sample_repaired_contact(pubkey)),
+            })),
+        );
+        match &state.repair {
+            RepairStatus::Repaired {
+                pubkey: p,
+                contact_row_repaired,
+                history_repaired,
+            } => {
+                assert_eq!(*p, pubkey);
+                assert!(*contact_row_repaired);
+                assert!(*history_repaired);
+            }
+            other => panic!("expected Repaired, got {other:?}"),
+        }
+    }
+
+    /// `run_repair_accepted_contact`'s own honest `Ok(None)` no-op (already healthy by the time it
+    /// ran) must not be fabricated into a `Repaired` outcome nothing actually did.
+    #[test]
+    fn repair_completed_with_no_outcome_returns_to_idle_not_fabricated_as_repaired() {
+        let mut state = DiagnosticsState::new();
+        let pubkey = sample_pubkey();
+        state.repair = RepairStatus::Repairing { pubkey };
+        handle_worker(
+            &mut state,
+            WorkerEvent::Completed(Effect::RepairAcceptedContact(RepairAcceptedContactEffect {
+                request: RepairAcceptedContactRequest { pubkey },
+                outcome: None,
+            })),
+        );
+        assert!(matches!(state.repair, RepairStatus::Idle));
+    }
+
+    #[test]
+    fn repair_failed_moves_to_error_with_the_honest_refusal_message_verbatim() {
+        let mut state = DiagnosticsState::new();
+        let pubkey = sample_pubkey();
+        state.repair = RepairStatus::Repairing { pubkey };
+        handle_worker(
+            &mut state,
+            WorkerEvent::Failed(
+                Effect::RepairAcceptedContact(RepairAcceptedContactEffect {
+                    request: RepairAcceptedContactRequest { pubkey },
+                    outcome: None,
+                }),
+                "this contact's contacts.json row was explicitly deleted — refusing to resurrect it"
+                    .to_string(),
+            ),
+        );
+        match &state.repair {
+            RepairStatus::Error(message) => assert!(message.contains("explicitly deleted")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    fn sample_repaired_contact(pubkey: [u8; 32]) -> crate::app::RepairedContact {
+        crate::app::RepairedContact {
+            pubkey,
+            contact_row_repaired: true,
+            history_repaired: true,
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // render — every status, against a real TestBackend
     // -----------------------------------------------------------------------
 
@@ -582,6 +1084,49 @@ mod tests {
             let state = DiagnosticsState {
                 status,
                 status_bar: StatusBarInfo::default(),
+                repair: RepairStatus::Idle,
+            };
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).expect("test backend");
+            terminal.draw(|f| render(&state, f)).expect("draw");
+        }
+    }
+
+    /// Every [`RepairStatus`] rendered too, independently of [`DiagnosticsStatus`] — mirrors the
+    /// test above, extended for task 5.2's own sub-panel.
+    #[test]
+    fn render_works_in_every_repair_status_against_test_backend() {
+        let sample_pubkey = [0x11u8; 32];
+        for repair in [
+            RepairStatus::Idle,
+            RepairStatus::Scanning,
+            RepairStatus::Listed {
+                contacts: Vec::new(),
+                selected: 0,
+            },
+            RepairStatus::Listed {
+                contacts: vec![RepairableContact {
+                    pubkey: sample_pubkey,
+                    label: hex::encode(sample_pubkey),
+                    missing_contact_row: true,
+                    missing_history_intro: true,
+                }],
+                selected: 0,
+            },
+            RepairStatus::Repairing {
+                pubkey: sample_pubkey,
+            },
+            RepairStatus::Repaired {
+                pubkey: sample_pubkey,
+                contact_row_repaired: true,
+                history_repaired: false,
+            },
+            RepairStatus::Error("boom".to_string()),
+        ] {
+            let state = DiagnosticsState {
+                status: DiagnosticsStatus::Idle,
+                status_bar: StatusBarInfo::default(),
+                repair,
             };
             let backend = TestBackend::new(80, 24);
             let mut terminal = Terminal::new(backend).expect("test backend");

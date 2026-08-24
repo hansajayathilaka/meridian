@@ -964,6 +964,95 @@ pub struct RunDoctorEffect {
     pub outcome: Option<DoctorReport>,
 }
 
+/// Inputs for [`Effect::ScanRepairableContacts`] (task 5.2, `crate::screens::diagnostics`):
+/// read-only scan of every `trust.bin` contact [`run_accept_request`](crate::worker) synthesized
+/// (`hint == ""` — see that function's own doc comment for why an empty hint is the durable marker
+/// of "this contact was created by an accept, not by [`Effect::AddContact`]") for the two
+/// partial-failure shapes that function's own doc comment names: a missing `contacts.json` display
+/// row, and/or a missing `history.jsonl` accepted-intro entry. Carries no fields — this is a scan of
+/// whatever is currently on disk for the signed-in account, not a query over a caller-supplied set.
+///
+/// **Crisp, load-bearing distinction this scan enforces (the reason this repair path exists at
+/// all): "repairable" is not "any contact missing a `contacts.json` row."**
+/// [`DeleteContactRequest`]'s own doc comment establishes that deleting a contact removes *only*
+/// its `contacts.json` row, leaving the `trust.bin` record (and, transitively, its `history.jsonl`
+/// transcript) untouched — so a **tombstoned** contact and a **partial-failure** contact can look
+/// identical on the one axis of "row missing." The second axis, `history.jsonl` non-emptiness,
+/// is what actually separates them: a `contacts.json` row can only ever go missing for an
+/// accept-shaped contact in exactly two ways — (a) `run_accept_request`'s own `contacts::save` call
+/// never ran or failed (a genuine partial failure — at that point the history write, which is placed
+/// *after* it, was never reached either, so `history.jsonl` is provably still empty), or (b) the row
+/// existed and was later removed by an explicit, user-initiated [`Effect::DeleteContact`] (a
+/// tombstone — which never touches `history.jsonl`, so a contact that ever completed a genuine
+/// accept has a non-empty transcript forever after, deletion or not). A contact scanned here is
+/// therefore only ever surfaced as repairable when its `history.jsonl` is completely empty — the one
+/// state a tombstone can never produce. See `crate::worker::run_scan_repairable_contacts`'s own doc
+/// comment for the exact predicate and the one further, honestly-flagged ambiguity it cannot resolve
+/// (a legitimate [`meridian_core::envelope::ChatContent::Receipt`] first-contact intro, which 4.49's
+/// own scope also skips writing, produces the identical empty-history fingerprint as a genuinely lost
+/// text intro).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScanRepairableContactsRequest;
+
+/// One `trust.bin` contact this scan found repairable, and exactly which of `run_accept_request`'s
+/// two later writes it is still missing. `label` is the same honest fallback
+/// `crate::screens::contacts::ContactEntry::display_label` would show for this contact (petname →
+/// hint → short pubkey) — repaired or not, this contact's `hint` is always `""` per the eligibility
+/// rule above, so in practice this is always the short-pubkey form, never a petname or hint (a
+/// petname requires an explicit local [`Effect::SetPetname`], and nothing about being repairable
+/// changes that).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairableContact {
+    pub pubkey: [u8; 32],
+    pub label: String,
+    pub missing_contact_row: bool,
+    pub missing_history_intro: bool,
+}
+
+/// [`Effect::ScanRepairableContacts`]'s payload — same request/outcome shape as
+/// [`RunDoctorEffect`], just with no meaningful request fields (see
+/// [`ScanRepairableContactsRequest`]'s own doc comment).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScanRepairableContactsEffect {
+    pub request: ScanRepairableContactsRequest,
+    pub outcome: Option<Vec<RepairableContact>>,
+}
+
+/// Inputs for [`Effect::RepairAcceptedContact`] (task 5.2): repair whichever of
+/// `run_accept_request`'s two later writes is missing for `pubkey` — rebuilding the `contacts.json`
+/// display row from `trust.bin`'s own [`meridian_core::trust::Contact`] (fully recoverable — that
+/// row is only ever a mirror of data `trust.bin` already has) and/or appending a placeholder
+/// `history.jsonl` entry (**not** fully recoverable — see
+/// `crate::worker::run_repair_accepted_contact`'s own doc comment for why the original intro's
+/// content cannot be reconstructed, and what this repairs instead).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairAcceptedContactRequest {
+    pub pubkey: [u8; 32],
+}
+
+/// What [`Effect::RepairAcceptedContact`] actually did — mirrors [`AddedContact`]'s "read back what
+/// really happened, never assume" discipline: both flags are `false` unless that specific write
+/// genuinely ran during this dispatch, never inferred from the request alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairedContact {
+    pub pubkey: [u8; 32],
+    pub contact_row_repaired: bool,
+    pub history_repaired: bool,
+}
+
+/// [`Effect::RepairAcceptedContact`]'s payload. `outcome: None` is the same honest "this dispatch
+/// decided nothing" answer [`AcceptRequestEffect`]'s own no-op branches use — reached when `pubkey`
+/// turns out to have nothing missing (already healthy) by the time this actually runs, e.g. a stale
+/// scan result raced against a concurrent repair. A `pubkey` this dispatch refuses outright (no
+/// `trust.bin` record at all, not accept-shaped, or the tombstone case
+/// [`ScanRepairableContactsRequest`]'s own doc comment names) is a [`WorkerEvent::Failed`], not a
+/// silent `None` — see `crate::worker::run_repair_accepted_contact`'s own doc comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairAcceptedContactEffect {
+    pub request: RepairAcceptedContactRequest,
+    pub outcome: Option<RepairedContact>,
+}
+
 /// The only path from `update` to the network, the keystore, or disk. A worker task executes these
 /// and reports the outcome back as [`WorkerEvent`] / [`AppEvent::Worker`], so a slow rendezvous can
 /// never freeze the UI. `FetchBundle` is still a placeholder (no task needs it yet);
@@ -986,6 +1075,9 @@ pub struct RunDoctorEffect {
 /// than starting empty — see [`LoadHistoryEffect`] and `crate::app::App::apply_loaded_history`.
 /// `PersistReceipt` is task 5.1's own new one — the persisted counterpart to `apply_receipt`'s
 /// in-memory-only `Sent` → `Delivered` transition — see [`PersistReceiptEffect`].
+/// `ScanRepairableContacts`/`RepairAcceptedContact` are task 5.2's own two new ones — the
+/// diagnostics-surfaced repair path for `run_accept_request`'s own twice-instantiated
+/// partial-failure window — see [`ScanRepairableContactsEffect`]/[`RepairAcceptedContactEffect`].
 ///
 /// **Does not derive `PartialEq`/`Eq`** (unlike most of the payload structs above): `Unlock`/
 /// `LoadSession` carry a [`SessionOutcome`], and the [`crate::session::LiveSession`] it wraps
@@ -1033,6 +1125,11 @@ pub enum Effect {
     AcknowledgeKeyChange(AcknowledgeKeyChangeEffect),
     SaveSetting(SaveSettingEffect),
     RunDoctor(RunDoctorEffect),
+    /// Task 5.2: the diagnostics screen's read-only scan for `run_accept_request`'s partial-failure
+    /// gap — see [`ScanRepairableContactsEffect`].
+    ScanRepairableContacts(ScanRepairableContactsEffect),
+    /// Task 5.2: the diagnostics screen's repair trigger — see [`RepairAcceptedContactEffect`].
+    RepairAcceptedContact(RepairAcceptedContactEffect),
 }
 
 /// The outcome of a worker task executing an [`Effect`], reported back as [`AppEvent::Worker`].

@@ -38,10 +38,12 @@ use crate::app::{
     LoadHistoryEffect, LoadHistoryRequest, LoadSessionEffect, LoadSessionOutcome,
     MarkVerifiedEffect, MarkVerifiedRequest, PersistHistoryEffect, PersistHistoryRequest,
     PersistReceiptEffect, PersistReceiptRequest, PublishBundleEffect, PublishedBundle,
-    RegisterRequest, RejectRequestEffect, RejectRequestRequest, RunDoctorEffect, SaveSettingEffect,
-    SendMessageEffect, SendMessageRequest, SentMessage, SessionOutcome, SetPetnameEffect,
-    SetPetnameRequest, SetPolicyOverrideEffect, SetPolicyOverrideRequest, SetUserBlockedEffect,
-    SetUserBlockedRequest, StoreChoice, UnlockEffect, UnlockRequest, WorkerEvent,
+    RegisterRequest, RejectRequestEffect, RejectRequestRequest, RepairAcceptedContactEffect,
+    RepairAcceptedContactRequest, RepairableContact, RepairedContact, RunDoctorEffect,
+    SaveSettingEffect, ScanRepairableContactsEffect, SendMessageEffect, SendMessageRequest,
+    SentMessage, SessionOutcome, SetPetnameEffect, SetPetnameRequest, SetPolicyOverrideEffect,
+    SetPolicyOverrideRequest, SetUserBlockedEffect, SetUserBlockedRequest, StoreChoice,
+    UnlockEffect, UnlockRequest, WorkerEvent,
 };
 use crate::session::LiveSession;
 use crate::store::contacts::{ContactRecord, ContactsDocument, PinnedKeyRecord, TrustLabel};
@@ -283,6 +285,15 @@ pub async fn dispatch(effect: Effect, session: &mut OnboardingSession) -> Worker
         // wiring, not new logic.
         Effect::SaveSetting(effect) => handle_save_setting(effect).await,
         Effect::RunDoctor(effect) => handle_run_doctor(effect).await,
+        // Task 5.2: the diagnostics screen's repair path for `run_accept_request`'s own
+        // twice-instantiated partial-failure window — see `run_scan_repairable_contacts`/
+        // `run_repair_accepted_contact`'s own doc comments.
+        Effect::ScanRepairableContacts(effect) => {
+            handle_scan_repairable_contacts(effect, session).await
+        }
+        Effect::RepairAcceptedContact(effect) => {
+            handle_repair_accepted_contact(effect, session).await
+        }
         // Effect::FetchBundle is the only variant still falling through here: a placeholder no task
         // has claimed yet (see `crate::app::Effect::FetchBundle`'s own doc comment). Task 4.35's
         // inbound-delivery work is a separate `AppEvent::Inbound` push path, not a `dispatch` arm, so
@@ -1372,6 +1383,241 @@ async fn run_accept_request(
         trust: contact.state,
         user_blocked: contact.user_blocked,
         pinned_key_history: contact.pinned_key_history,
+    }))
+}
+
+// --- ScanRepairableContacts / RepairAcceptedContact (task 5.2) -----------------------------------
+//
+// The diagnostics-surfaced repair path [`run_accept_request`]'s own doc comment (above) names twice
+// and defers both times: a `trust.bin` contact left durably trusted but missing its `contacts.json`
+// display row (the review fix's "residual, narrower-than-the-pin window"), and/or missing its
+// accepted-intro `history.jsonl` entry (task 4.49's "narrower, but real, partial-failure window").
+//
+// **The repair-vs-tombstone distinction, precisely.** `run_accept_request` synthesizes every
+// accept-created `trust.bin` `Contact` with `hint == ""` (see that function's own doc comment for
+// why: `MessageRequest` carries no hint, and no hint-less `mrd1:` id is ever invented). That empty
+// hint survives untouched unless a *later*, real [`AddContactRequest`] re-observes the same pubkey
+// with a genuine hint — so `hint == ""` is this crate's only durable, already-existing marker of "a
+// contact whose `trust.bin` record was created by an accept, not by add." Both functions below use
+// it as their eligibility gate before touching anything else.
+//
+// Within that gate, `history.jsonl` emptiness — not `contacts.json` row presence alone — is what
+// tells a genuine partial failure apart from [`DeleteContactRequest`]'s legitimate tombstone case.
+// [`DeleteContactRequest`]'s own doc comment in `crate::app` is explicit that deleting a contact
+// removes only its `contacts.json` row; it never touches `trust.bin` or `history.jsonl`. So a
+// `contacts.json` row can only ever be missing for an accept-shaped contact for one of two reasons:
+// (a) `run_accept_request`'s `contacts::save` call itself never ran or failed — at which point the
+// history write, sequenced strictly after it in that function, was never reached either, so
+// `history.jsonl` is provably still empty; or (b) the row existed, a real accept fully completed
+// (which necessarily wrote a history entry unless the intro was a degenerate `Receipt` — see below),
+// and a later, explicit [`DeleteContactRequest`] removed the row — in which case `history.jsonl` is
+// **not** empty. `history.jsonl` empty is therefore never producible by a tombstone, only by a
+// partial failure (or, honestly, one further case named below) — the safe signal these functions
+// gate the row-repair on, never row-presence alone.
+//
+// **The one honestly-unresolved ambiguity.** Task 4.49 deliberately skips writing a history entry
+// for a first-contact intro that is a [`meridian_core::envelope::ChatContent::Receipt`] (a
+// degenerate, adversarial-shaped case — see that task's own doc comment) — a **legitimate**,
+// non-failure reason for `history.jsonl` to be empty even though `contacts.json`'s row is present
+// and healthy. Nothing persisted anywhere distinguishes that case from a genuine lost-text-intro
+// partial failure; both leave an identical on-disk fingerprint (accept-shaped contact, row present,
+// history empty). `TODO: confirm`: no design doc this task read resolves this — the considered
+// choice made here is that a repair action's job is to turn a *silent* dead end into a *surfaced*
+// one, not to guarantee perfect content recovery, so [`run_repair_accepted_contact`] still offers
+// the history repair in this case too, but writes an honest, clearly-marked placeholder (mirroring
+// `screens/requests.rs::intro_summary`'s own "(not a text message — a delivery receipt)"
+// precedent) rather than fabricating message content it cannot actually know.
+
+/// Read-only scan for `trust.bin` contacts eligible for [`run_repair_accepted_contact`] — see this
+/// section's own module-level doc comment for the full eligibility rule (`hint == ""`) and the
+/// repair-vs-tombstone predicate (`history.jsonl` emptiness). Touches no file for writing; every
+/// contact this returns is exactly the set [`run_repair_accepted_contact`] would accept for the same
+/// `pubkey`, computed the same way, so the two can never silently disagree.
+fn scan_repairable_contacts(session: &OnboardingSession) -> Result<Vec<RepairableContact>, String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
+    let trust = load_trust(store, handle)?;
+    let contacts_doc =
+        crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
+
+    let mut out = Vec::new();
+    for contact in trust.contacts() {
+        if !contact.hint.is_empty() {
+            // Not accept-shaped (an `AddContact`-originated or re-observed-with-a-real-hint
+            // contact) — never a candidate for this repair path.
+            continue;
+        }
+        let pubkey_hex = hex::encode(contact.pubkey);
+        let row_present = contacts_doc.contacts.iter().any(|c| c.pubkey == pubkey_hex);
+        let history = crate::store::history::load_or_default(&pubkey_hex, store, handle)
+            .map_err(|e| e.to_string())?;
+        let history_empty = history.is_empty();
+
+        if !row_present && !history_empty {
+            // The tombstone case: a genuine accept fully completed (history is not empty), and the
+            // row was later removed by an explicit `DeleteContactRequest`. Never surfaced here.
+            continue;
+        }
+        if row_present && !history_empty {
+            // Fully healthy — nothing missing.
+            continue;
+        }
+        out.push(RepairableContact {
+            pubkey: contact.pubkey,
+            label: pubkey_hex,
+            missing_contact_row: !row_present,
+            missing_history_intro: history_empty,
+        });
+    }
+    Ok(out)
+}
+
+async fn handle_scan_repairable_contacts(
+    effect: ScanRepairableContactsEffect,
+    session: &OnboardingSession,
+) -> WorkerEvent {
+    match scan_repairable_contacts(session) {
+        Ok(contacts) => WorkerEvent::Completed(Effect::ScanRepairableContacts(
+            ScanRepairableContactsEffect {
+                request: effect.request,
+                outcome: Some(contacts),
+            },
+        )),
+        Err(message) => WorkerEvent::Failed(
+            Effect::ScanRepairableContacts(ScanRepairableContactsEffect {
+                request: effect.request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// A fixed, honestly-worded placeholder body for a history-repair entry whose real content is
+/// permanently unrecoverable (see this section's own module-level doc comment for exactly why:
+/// `MessageRequest`/its `intro` field are consumed and discarded the moment `chat.accept_request`
+/// first ran, live nowhere else, and cannot be reconstructed by any later repair). Mirrors
+/// `screens/requests.rs::intro_summary`'s own "(not a text message — a delivery receipt)"
+/// convention: parenthetical, factual, never claiming to be the peer's real words.
+const UNRECOVERABLE_INTRO_PLACEHOLDER: &str =
+    "(this conversation's first message could not be recovered locally — repaired from diagnostics \
+     after a partial accept failure; the sender's original text is not available)";
+
+async fn handle_repair_accepted_contact(
+    effect: RepairAcceptedContactEffect,
+    session: &OnboardingSession,
+) -> WorkerEvent {
+    let RepairAcceptedContactEffect { request, .. } = effect;
+    match run_repair_accepted_contact(&request, session) {
+        Ok(outcome) => {
+            WorkerEvent::Completed(Effect::RepairAcceptedContact(RepairAcceptedContactEffect {
+                request,
+                outcome,
+            }))
+        }
+        Err(message) => WorkerEvent::Failed(
+            Effect::RepairAcceptedContact(RepairAcceptedContactEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Repairs whichever of `run_accept_request`'s two later writes is missing for `request.pubkey` —
+/// see this section's own module-level doc comment for the full repair-vs-tombstone eligibility
+/// rule this re-derives and re-checks independently (never trusting a possibly-stale
+/// [`RepairableContact`] the UI is holding: a concurrent [`DeleteContactRequest`] between a scan and
+/// a triggered repair must still be caught here, not just by the scan that produced the UI's list).
+///
+/// **Refuses outright (`Err`, a real [`WorkerEvent::Failed`], never a silent no-op) for exactly the
+/// three cases that would make this a resurrection rather than a repair:** no `trust.bin` record for
+/// `pubkey` at all (nothing to repair from); a record whose `hint` is not empty (not accept-shaped —
+/// see the module doc); and the tombstone shape itself (`contacts.json` row missing but
+/// `history.jsonl` non-empty) — the one case this whole task exists to stay distinct from.
+///
+/// **`Ok(None)`** is the honest "nothing was missing" answer for a `pubkey` that turns out already
+/// fully healthy by the time this runs (row present, history non-empty) — mirrors
+/// [`run_accept_request`]'s own no-op convention.
+///
+/// **The two repairs, independently gated:**
+/// - `contacts.json` row missing → rebuilt via [`upsert_contact_record`], from `trust.bin`'s own
+///   already-real [`Contact`] — fully recoverable, since that row is only ever a mirror of data
+///   `trust.bin` already has (exactly the write [`run_accept_request`] itself performs).
+/// - `history.jsonl` empty → one placeholder [`crate::store::history::HistoryEntry`] appended
+///   ([`UNRECOVERABLE_INTRO_PLACEHOLDER`]), `mid` freshly minted via [`getrandom::fill`] (the
+///   original sender-minted id is gone along with the rest of the discarded `MessageRequest`, so
+///   there is no real id to reuse — inventing one for dedup purposes only, never claiming it is the
+///   sender's own).
+fn run_repair_accepted_contact(
+    request: &RepairAcceptedContactRequest,
+    session: &OnboardingSession,
+) -> Result<Option<RepairedContact>, String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
+    let pubkey = request.pubkey;
+
+    let trust = load_trust(store, handle)?;
+    let contact = trust.contact(&pubkey).cloned().ok_or_else(|| {
+        "no trust.bin record exists for this contact — nothing to repair".to_string()
+    })?;
+    if !contact.hint.is_empty() {
+        return Err(
+            "this contact was not created by accepting a message request — refusing to repair"
+                .to_string(),
+        );
+    }
+
+    let pubkey_hex = hex::encode(pubkey);
+    let mut contacts_doc =
+        crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
+    let row_present = contacts_doc.contacts.iter().any(|c| c.pubkey == pubkey_hex);
+    let history = crate::store::history::load_or_default(&pubkey_hex, store, handle)
+        .map_err(|e| e.to_string())?;
+    let history_empty = history.is_empty();
+
+    if !row_present && !history_empty {
+        return Err(
+            "this contact's contacts.json row was explicitly deleted — refusing to resurrect it"
+                .to_string(),
+        );
+    }
+    if row_present && !history_empty {
+        return Ok(None);
+    }
+
+    let now = now_unix();
+    let mut contact_row_repaired = false;
+    if !row_present {
+        let id = contact.id_string().unwrap_or_default();
+        upsert_contact_record(&mut contacts_doc, &id, &contact, now);
+        crate::store::contacts::save(&contacts_doc, store, handle).map_err(|e| e.to_string())?;
+        contact_row_repaired = true;
+    }
+
+    let mut history_repaired = false;
+    if history_empty {
+        let mut mid = [0u8; 16];
+        getrandom::fill(&mut mid).map_err(|e| e.to_string())?;
+        let entry = crate::store::history::HistoryEntry {
+            v: crate::store::history::CURRENT_VERSION,
+            mid: hex::encode(mid),
+            dir: crate::store::history::Direction::In,
+            ts: now,
+            stream: "mrd.chat/1".to_string(),
+            body: UNRECOVERABLE_INTRO_PLACEHOLDER.to_string(),
+            state: crate::store::history::MessageState::Received,
+        };
+        crate::store::history::append(&pubkey_hex, &entry, store, handle)
+            .map_err(|e| e.to_string())?;
+        history_repaired = true;
+    }
+
+    Ok(Some(RepairedContact {
+        pubkey,
+        contact_row_repaired,
+        history_repaired,
     }))
 }
 
