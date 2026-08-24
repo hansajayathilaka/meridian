@@ -51,6 +51,11 @@ known-plaintext-oracle assertions — against an **already-deployed, real rendez
 capture showed (signaling, TURN candidate probing, and the actual P2P data channel) and an honest
 note on that run's same-host topology.
 
+That same-host topology is the one gap even the live-server run has: both clients still ran on one
+machine, so the "direct" path was actually loopback. [`TWO-MACHINE-GUIDE.md`](./TWO-MACHINE-GUIDE.md) +
+[`two-machine-chat.sh`](./two-machine-chat.sh) close it — coordinating a real session between two
+genuinely separate machines on two different networks, with a real NAT hop in between.
+
 ## Relationship to `tools/netns-nat-matrix.sh`
 
 The project already has a CI-wired, wire-level pcap proof of nearly the same properties — see
