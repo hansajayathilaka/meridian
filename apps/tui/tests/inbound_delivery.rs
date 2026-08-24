@@ -41,6 +41,18 @@
 //!    resulting `Delivered` state must survive a real `Effect::PersistReceipt` round trip and still
 //!    read back `Delivered` (not `Sent`) via a fresh `Effect::LoadHistory`-equivalent read, simulating
 //!    a restart.
+//!
+//! And, closing two review/test-engineer-flagged coverage gaps left open by the two tests above:
+//! 9. [`receipt_for_a_peer_with_no_chat_screen_open_still_persists`] — `PersistReceiptRequest`'s own
+//!    doc comment claims "a receipt for a peer with no `Screen::Chat` currently open must still
+//!    update `history.jsonl`"; unlike deliverable 7 (a `Screen::Chat` buried under another screen),
+//!    this drives the zero-matching-screens case — no `Screen::Chat` pushed at all — and confirms
+//!    `Effect::PersistReceipt` still comes back and still lands `Delivered` on disk.
+//! 10. [`mark_delivered_for_an_unknown_mid_is_a_no_op_on_disk`] — the disk-level counterpart to
+//!     `tests/screens_chat.rs::apply_receipt_for_an_unknown_mid_is_a_no_op` (the in-memory half):
+//!     `store::history::mark_delivered_at`'s documented no-op-if-absent contract (`Ok(())`, no write
+//!     at all) for a receipt whose `ack.mid` never matches any `Out` entry on disk, proven by a
+//!     byte-for-byte-unchanged sealed file, not just an unchanged decoded `Vec<HistoryEntry>`.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -1412,5 +1424,170 @@ async fn receipt_delivered_state_survives_a_restart_via_load_history() {
         reloaded[0].state,
         MessageState::Delivered,
         "the Delivered transition must survive a restart, not revert to Sent"
+    );
+}
+
+/// **Deliverable 9 — the zero-matching-screens case.** Unlike
+/// [`receipt_reconciles_into_a_chat_screen_that_is_not_topmost`] (a `Screen::Chat` buried under
+/// another screen), this drives a receipt against an `App` with **no** `Screen::Chat` anywhere on the
+/// stack at all (the freshly constructed default: `Screen::Onboarding`) — the case
+/// [`meridian_tui::app::PersistReceiptRequest`]'s own doc comment names directly: "a receipt for a
+/// peer with no `Screen::Chat` currently open must still update `history.jsonl`". Confirms
+/// `Effect::PersistReceipt` still comes back (nothing to reconcile in memory, but persistence is
+/// unconditional) and, following [`receipt_delivered_state_survives_a_restart_via_load_history`]'s own
+/// pattern, that a real `worker::dispatch` round trip actually lands `Delivered` in `history.jsonl`.
+#[tokio::test]
+async fn receipt_for_a_peer_with_no_chat_screen_open_still_persists() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let (handle, _us_pub) = setup_us_account();
+
+    let peer_pub = [44u8; 32];
+    let peer_pub_hex = hex::encode(peer_pub);
+    let mid = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string();
+
+    // Seed history.jsonl with an already-persisted Sent entry, exactly like
+    // `receipt_delivered_state_survives_a_restart_via_load_history` does.
+    let os = OsSecretStore::new(SERVICE);
+    meridian_tui::store::history::append(
+        &peer_pub_hex,
+        &out_entry(&mid, "hi", MessageState::Sent),
+        &os,
+        &handle,
+    )
+    .expect("seed a Sent entry into history.jsonl");
+
+    // No Screen::Chat anywhere on the stack — App::new()'s own default (Screen::Onboarding), not
+    // even pushed over with Screen::Requests/Screen::Main like the not-topmost test does.
+    let mut app = App::new();
+    assert!(matches!(app.current_screen(), Screen::Onboarding(_)));
+
+    let effects = app.update(AppEvent::Inbound(Box::new(InboundEvent::Receipt {
+        peer_pubkey: peer_pub,
+        ack: mid.clone(),
+    })));
+    let persist = effects
+        .into_iter()
+        .find_map(|e| match e {
+            Effect::PersistReceipt(p) => Some(p),
+            _ => None,
+        })
+        .expect(
+            "a receipt must dispatch Effect::PersistReceipt even with zero Screen::Chat instances \
+             on the stack",
+        );
+    assert_eq!(persist.request.peer_pubkey, peer_pub);
+    assert_eq!(persist.request.ack, mid);
+
+    let outcome = dispatch_effect(Effect::PersistReceipt(persist)).await;
+    assert!(
+        matches!(
+            outcome,
+            meridian_tui::app::WorkerEvent::Completed(Effect::PersistReceipt(_))
+        ),
+        "expected the real worker to complete Effect::PersistReceipt, got {outcome:?}"
+    );
+
+    let reloaded = meridian_tui::store::history::load_or_default(&peer_pub_hex, &os, &handle)
+        .expect("load history after the round trip");
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(reloaded[0].mid, mid);
+    assert_eq!(
+        reloaded[0].state,
+        MessageState::Delivered,
+        "history.jsonl must reflect Delivered even though no Screen::Chat was ever open for this peer"
+    );
+}
+
+/// **Deliverable 10 — the disk-level unknown-`mid` no-op.** The in-memory equivalent
+/// (`tests/screens_chat.rs::apply_receipt_for_an_unknown_mid_is_a_no_op`) already covers
+/// `chat::apply_receipt` leaving a state's `entries` untouched; this covers
+/// `store::history::mark_delivered_at`'s own documented disk-level contract — "a no-op (`Ok(())`, no
+/// write at all)" — for a real `Effect::PersistReceipt` round trip whose `ack` never matches any `Out`
+/// entry on disk. Compares the sealed file's raw bytes before and after, not just the decoded
+/// `Vec<HistoryEntry>`: since [`meridian_tui::store::history::mark_delivered_at`] documents skipping
+/// the reseal-and-rewrite entirely (not merely reproducing an equivalent ciphertext) when no matching
+/// row is found, the file on disk must be byte-for-byte identical, nonce and all.
+#[tokio::test]
+async fn mark_delivered_for_an_unknown_mid_is_a_no_op_on_disk() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let (handle, _us_pub) = setup_us_account();
+
+    let peer_pub = [45u8; 32];
+    let peer_pub_hex = hex::encode(peer_pub);
+    let persisted_mid = "ffffffffffffffffffffffffffffff".to_string();
+    let unknown_mid = "11111111111111111111111111111111".to_string();
+
+    let os = OsSecretStore::new(SERVICE);
+    meridian_tui::store::history::append(
+        &peer_pub_hex,
+        &out_entry(&persisted_mid, "hi", MessageState::Sent),
+        &os,
+        &handle,
+    )
+    .expect("seed a Sent entry into history.jsonl");
+
+    let path = meridian_tui::store::history_path(&peer_pub_hex).expect("history_path");
+    let before = std::fs::read(&path).expect("read sealed history.jsonl before the receipt");
+
+    // Drive the exact real path: an App with a Screen::Chat open for this peer (so the in-memory
+    // half is exercised too, mirroring `apply_receipt_for_an_unknown_mid_is_a_no_op`'s own
+    // "state.entries[0].state stays Sent" assertion), a real InboundEvent::Receipt whose `ack` was
+    // never persisted, and the real Effect::PersistReceipt it dispatches, run through the real
+    // worker.
+    let mut app = App::new();
+    app.push_screen(Screen::Chat(Box::new(TuiChatState::new(
+        peer_pub,
+        "peer.example".to_string(),
+        TrustStore::default(),
+        vec![out_entry(&persisted_mid, "hi", MessageState::Sent)],
+        0,
+    ))));
+    let effects = app.update(AppEvent::Inbound(Box::new(InboundEvent::Receipt {
+        peer_pubkey: peer_pub,
+        ack: unknown_mid.clone(),
+    })));
+    match app.current_screen() {
+        Screen::Chat(state) => assert_eq!(
+            state.entries[0].state,
+            MessageState::Sent,
+            "an unknown mid must not flip the unrelated persisted entry's in-memory state"
+        ),
+        other => panic!("expected Screen::Chat, got {other:?}"),
+    }
+    let persist = effects
+        .into_iter()
+        .find_map(|e| match e {
+            Effect::PersistReceipt(p) => Some(p),
+            _ => None,
+        })
+        .expect("a receipt must dispatch Effect::PersistReceipt even for an unknown mid");
+    assert_eq!(persist.request.ack, unknown_mid);
+
+    let outcome = dispatch_effect(Effect::PersistReceipt(persist)).await;
+    assert!(
+        matches!(
+            outcome,
+            meridian_tui::app::WorkerEvent::Completed(Effect::PersistReceipt(_))
+        ),
+        "expected the real worker to complete Effect::PersistReceipt, got {outcome:?}"
+    );
+
+    let after = std::fs::read(&path).expect("read sealed history.jsonl after the receipt");
+    assert_eq!(
+        before, after,
+        "an unknown-mid receipt must not touch history.jsonl on disk at all, not even reseal an \
+         equivalent document"
+    );
+
+    let reloaded = meridian_tui::store::history::load_or_default(&peer_pub_hex, &os, &handle)
+        .expect("load history after the no-op");
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(reloaded[0].mid, persisted_mid);
+    assert_eq!(
+        reloaded[0].state,
+        MessageState::Sent,
+        "the unrelated persisted entry must remain Sent, never flipped by an unknown-mid receipt"
     );
 }

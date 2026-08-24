@@ -335,8 +335,8 @@ from two lenses, numbered once). Verdict: **green to proceed**, no blocker for t
 [phase-5/README.md](./phase-5/README.md#tasks-todo)).
 
 **Wave 1 — fully parallel**
-- [~] **5.1** Persist and always-reconcile Sent→Delivered receipts (F1) — [file](./phase-5/5.1-persist-reconcile-delivery-receipts.md)
-- [ ] **5.2** Diagnostics-surfaced repair action for `run_accept_request`'s partial-failure window (F2) — [file](./phase-5/5.2-accept-request-repair-action.md)
+- [x] **5.1** Persist and always-reconcile Sent→Delivered receipts (F1) — [file](./phase-5/5.1-persist-reconcile-delivery-receipts.md)
+- [~] **5.2** Diagnostics-surfaced repair action for `run_accept_request`'s partial-failure window (F2) — [file](./phase-5/5.2-accept-request-repair-action.md)
 - [ ] **5.4** `spawn_blocking`-wrap `run_mark_verified`/`run_set_petname` (F4) — [file](./phase-5/5.4-spawn-blocking-mark-verified-set-petname.md)
 - [ ] **5.5** Wire receive-side key-change detection into the TUI inbound loop + `session.rs` (F5 + N8 deferred) — [file](./phase-5/5.5-wire-receive-side-key-change-detection.md)
 - [ ] **5.7** App-level reconciliation tests for Settings/Diagnostics (F7) — [file](./phase-5/5.7-settings-diagnostics-app-level-tests.md)
