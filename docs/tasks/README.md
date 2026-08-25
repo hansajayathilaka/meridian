@@ -343,7 +343,7 @@ from two lenses, numbered once). Verdict: **green to proceed**, no blocker for t
 - [x] **5.8** App-level end-to-end tests for onboarding/unlock (F8) — [file](./phase-5/5.8-onboarding-unlock-app-level-tests.md)
 - [x] **5.9** Scheduled CI workflow for `demo/p2p-wire-proof` (F9) — [file](./phase-5/5.9-schedule-p2p-wire-proof-ci.md)
 - [x] **5.10** Drain/flush-on-shutdown hook for `Effect::PersistHistory` (F10) — [file](./phase-5/5.10-persist-history-drain-on-shutdown.md)
-- [~] **5.11** Extract shared `observe_into_live_trust` helper (N1) — [file](./phase-5/5.11-extract-observe-into-live-trust-helper.md)
+- [x] **5.11** Extract shared `observe_into_live_trust` helper (N1) — [file](./phase-5/5.11-extract-observe-into-live-trust-helper.md)
 - [~] **5.12** Pin `find_binding`'s keybinding-collision tie-break contract (N7) — [file](./phase-5/5.12-pin-keybinding-collision-tiebreak.md)
 - [ ] **5.13** Nit sweep: doc/comment/mechanical fixes (N2, N3, N4, N5, N6) — [file](./phase-5/5.13-phase-5-nit-sweep.md)
 - [ ] **5.14** `run_acknowledge_key_change` has the same `contacts.json` trust-staleness bug as F3 (found by 5.3's own review, depends on 5.3) — [file](./phase-5/5.14-acknowledge-key-change-trust-staleness.md)

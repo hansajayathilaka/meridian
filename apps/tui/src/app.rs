@@ -2324,6 +2324,52 @@ impl App {
         }
     }
 
+    /// Routes a `trust.observe(pubkey, hint, at)` call for the `Screen::Main` at `main_idx` into
+    /// whichever `TrustStore` is actually live for it right now (task 5.11 review fix, N1: this
+    /// exact stack-walk-and-dispatch was duplicated verbatim between
+    /// [`App::apply_accepted_request`] and [`App::apply_added_contact`] — the same duplicated
+    /// logic that let tasks 4.42/4.45/4.46 each independently trace and fix a defect in it before
+    /// this task collapsed the two copies into one place to stop a fourth from doing the same).
+    ///
+    /// **`Ctrl-R` is a global binding, reachable with a `Screen::Chat`/`Screen::Verify` already open
+    /// on top of `Screen::Main`** (open Chat with A, `Ctrl-R` pushes `Screen::Requests` on top of
+    /// that, accept/add a contact for B): `MainState::trust` is `std::mem::take`n by whichever of
+    /// those two screens is open (see `crate::screens::main`'s "moved, not borrowed" doc), leaving a
+    /// placeholder `TrustStore::default()` behind on the `Main` frame itself — an `observe` call
+    /// against *that* placeholder would be silently discarded when [`App::reclaim_trust`] later
+    /// overwrites `main.trust` wholesale with the popped screen's own (unrelated) store. So the
+    /// `observe` call is routed to wherever the live store for this `Screen::Main` actually is: the
+    /// first `Screen::Chat`/`Screen::Verify` frame **above** `main_idx` on the stack, if one exists
+    /// (there is at most one at a time — the whole point of "moved, not cloned"), else
+    /// `Screen::Main` itself.
+    ///
+    /// Callers pass their own freshly `position`-scanned `main_idx`, so the `Some(Screen::Main(_))`
+    /// check below (a no-op fallback rather than a panic if it ever fails) should never actually
+    /// miss in practice.
+    fn observe_into_live_trust(&mut self, main_idx: usize, pubkey: [u8; 32], hint: &str, at: u64) {
+        let live_trust_idx = self.screens[main_idx + 1..]
+            .iter()
+            .position(|s| matches!(s, Screen::Chat(_) | Screen::Verify(_)))
+            .map(|offset| main_idx + 1 + offset);
+        match live_trust_idx {
+            Some(idx) => match &mut self.screens[idx] {
+                Screen::Chat(chat) => {
+                    chat.trust.observe(pubkey, hint, at);
+                }
+                Screen::Verify(verify) => {
+                    verify.trust.observe(pubkey, hint, at);
+                }
+                _ => unreachable!("live_trust_idx only ever points at Chat|Verify"),
+            },
+            None => {
+                let Some(Screen::Main(main)) = self.screens.get_mut(main_idx) else {
+                    return;
+                };
+                main.trust.observe(pubkey, hint, at);
+            }
+        }
+    }
+
     /// Replays a completed [`Effect::AcceptRequest`]'s persisted mutations into whichever
     /// [`Screen::Main`] is on the stack (task 4.42, piece C) — the in-memory half of the fix for
     /// task 4.41's Defect C.
@@ -2357,19 +2403,13 @@ impl App {
     /// and is likewise a no-op when there is no `Screen::Main` at all (a `Screen::Requests` pushed
     /// standalone in a test, with no backing session to reconcile into).
     ///
-    /// **`Ctrl-R` is a global binding, reachable with a `Screen::Chat`/`Screen::Verify` already open
-    /// on top of `Screen::Main`** (open Chat with A, `Ctrl-R` pushes `Screen::Requests` on top of
-    /// that, accept a request from B): `MainState::trust` is `std::mem::take`n by whichever of those
-    /// two screens is open (see `crate::screens::main`'s "moved, not borrowed" doc), leaving a
-    /// placeholder `TrustStore::default()` behind on the `Main` frame itself — an `observe` call
-    /// against *that* placeholder would be silently discarded when [`App::reclaim_trust`] later
-    /// overwrites `main.trust` wholesale with the popped screen's own (unrelated) store. So the
-    /// `trust.observe` step below is routed to wherever the live store for this `Screen::Main`
-    /// actually is: the first `Screen::Chat`/`Screen::Verify` frame **above** it on the stack, if one
-    /// exists (there is at most one at a time — the whole point of "moved, not cloned"), else
-    /// `Screen::Main` itself. `main.chat`/`main.contacts` are never moved by that same `mem::take`
-    /// (only `trust` is — see `crate::screens::main`'s "moved" doc again), so those two steps always
-    /// land on the `Screen::Main` frame directly, regardless of what else is stacked above it.
+    /// Step 1's routing (where the live `TrustStore` for this `Screen::Main` actually is, given
+    /// `Ctrl-R` can reach this while `Screen::Chat`/`Screen::Verify` sits on top) is
+    /// [`App::observe_into_live_trust`]'s own concern, shared with [`App::apply_added_contact`] —
+    /// see that helper's doc for the full reasoning. `main.chat`/`main.contacts` (steps 2 and 3
+    /// below) are never moved by the same `mem::take` (only `trust` is — see
+    /// `crate::screens::main`'s "moved" doc), so those two steps always land on the `Screen::Main`
+    /// frame directly, regardless of what else is stacked above it.
     fn apply_accepted_request(&mut self, added: AddedContact) {
         let Some(main_idx) = self
             .screens
@@ -2378,27 +2418,7 @@ impl App {
         else {
             return;
         };
-        let live_trust_idx = self.screens[main_idx + 1..]
-            .iter()
-            .position(|s| matches!(s, Screen::Chat(_) | Screen::Verify(_)))
-            .map(|offset| main_idx + 1 + offset);
-        match live_trust_idx {
-            Some(idx) => match &mut self.screens[idx] {
-                Screen::Chat(chat) => {
-                    chat.trust.observe(added.pubkey, "", added.added_at);
-                }
-                Screen::Verify(verify) => {
-                    verify.trust.observe(added.pubkey, "", added.added_at);
-                }
-                _ => unreachable!("live_trust_idx only ever points at Chat|Verify"),
-            },
-            None => {
-                let Some(Screen::Main(main)) = self.screens.get_mut(main_idx) else {
-                    return;
-                };
-                main.trust.observe(added.pubkey, "", added.added_at);
-            }
-        }
+        self.observe_into_live_trust(main_idx, added.pubkey, "", added.added_at);
         let Some(Screen::Main(main)) = self.screens.get_mut(main_idx) else {
             return;
         };
@@ -2413,22 +2433,23 @@ impl App {
     /// `MainState::trust`). `worker::run_add_contact` has, by the time this runs, already
     /// TOFU-pinned the peer in the real `trust.bin` (and, if a petname was given, called
     /// `set_petname`) and written its `contacts.json` display row — same "replay durable state,
-    /// decide nothing" character as [`App::apply_accepted_request`], whose exact `live_trust_idx`
-    /// stack walk this reuses verbatim in structure (see that method's own doc comment for the
-    /// full "moved, not cloned" reasoning; not re-derived here): locate `Screen::Main`, then scan
-    /// above it for a `Screen::Chat`/`Screen::Verify` frame — if one exists, `MainState::trust` was
-    /// `std::mem::take`n into it, so `trust.observe(added.pubkey, "", added.added_at)` routes there
-    /// instead of the placeholder left on `Main`; else it routes to `Screen::Main` directly.
+    /// decide nothing" character as [`App::apply_accepted_request`], which shares this method's
+    /// trust-routing step via [`App::observe_into_live_trust`] (task 5.11 review fix, N1 — see that
+    /// helper's own doc comment for the full "moved, not cloned" reasoning; not re-derived here):
+    /// locate `Screen::Main`, then scan above it for a `Screen::Chat`/`Screen::Verify` frame — if
+    /// one exists, `MainState::trust` was `std::mem::take`n into it, so
+    /// `trust.observe(added.pubkey, "", added.added_at)` routes there instead of the placeholder
+    /// left on `Main`; else it routes to `Screen::Main` directly.
     ///
     /// This planning pass traced that `Screen::Chat`/`Screen::Verify` cannot actually be pushed on
     /// top of `Screen::Main` while an `Effect::AddContact` is in flight today (unlike the accepted-
     /// request case, the add-contact sub-flow is embedded in `Screen::Main` itself, not a
     /// separately pushed screen, so there is no navigation path that opens Chat/Verify while it is
-    /// running) — the stack walk is reused anyway, deliberately not hand-optimized to a bare
-    /// `Screen::Main`-only lookup, because reusing the general mechanism is cheap and forecloses a
-    /// future navigation feature silently reintroducing this exact defect class a third time
-    /// (`apply_accepted_request`'s own "not reachable today" claim already turned out false once,
-    /// under 4.42's own review).
+    /// running) — the shared helper's general stack walk is used anyway, deliberately not
+    /// hand-optimized to a bare `Screen::Main`-only lookup here, because reusing the general
+    /// mechanism is cheap and forecloses a future navigation feature silently reintroducing this
+    /// exact defect class a third time (`apply_accepted_request`'s own "not reachable today" claim
+    /// already turned out false once, under 4.42's own review).
     ///
     /// **A second, closely related interleaving gap** (traced during 4.46's planning pass, fixed
     /// here rather than deferred): `Effect::AddContact` is dispatched from `Screen::Main`'s own
@@ -2465,27 +2486,7 @@ impl App {
         else {
             return;
         };
-        let live_trust_idx = self.screens[main_idx + 1..]
-            .iter()
-            .position(|s| matches!(s, Screen::Chat(_) | Screen::Verify(_)))
-            .map(|offset| main_idx + 1 + offset);
-        match live_trust_idx {
-            Some(idx) => match &mut self.screens[idx] {
-                Screen::Chat(chat) => {
-                    chat.trust.observe(added.pubkey, "", added.added_at);
-                }
-                Screen::Verify(verify) => {
-                    verify.trust.observe(added.pubkey, "", added.added_at);
-                }
-                _ => unreachable!("live_trust_idx only ever points at Chat|Verify"),
-            },
-            None => {
-                let Some(Screen::Main(main)) = self.screens.get_mut(main_idx) else {
-                    return;
-                };
-                main.trust.observe(added.pubkey, "", added.added_at);
-            }
-        }
+        self.observe_into_live_trust(main_idx, added.pubkey, "", added.added_at);
         let Some(Screen::Main(main)) = self.screens.get_mut(main_idx) else {
             return;
         };

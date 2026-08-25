@@ -87,7 +87,7 @@ wiring lands (a standalone task today would have nothing to test against).
 - [x] **5.10** Drain/flush-on-shutdown hook for `Effect::PersistHistory` (F10) — [file](./5.10-persist-history-drain-on-shutdown.md)
 
 **Nits taken up (N1, N7 as their own tasks; N2–N6 bundled)**
-- [~] **5.11** Extract shared `observe_into_live_trust` helper (N1) — [file](./5.11-extract-observe-into-live-trust-helper.md)
+- [x] **5.11** Extract shared `observe_into_live_trust` helper (N1) — [file](./5.11-extract-observe-into-live-trust-helper.md)
 - [~] **5.12** Pin `find_binding`'s keybinding-collision tie-break contract (N7) — [file](./5.12-pin-keybinding-collision-tiebreak.md)
 - [ ] **5.13** Nit sweep: doc/comment/mechanical fixes (N2, N3, N4, N5, N6) — [file](./5.13-phase-5-nit-sweep.md)
 
