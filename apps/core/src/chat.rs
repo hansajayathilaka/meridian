@@ -121,6 +121,21 @@ pub enum ChatError {
 /// [`PrekeyVault::expire_previous_generation`]).
 pub const PREV_GENERATION_GRACE_SECS: u64 = 60;
 
+/// Target interval between signed-prekey (SPK) republishes, in seconds (task 6.1, ADR 0016 C1).
+///
+/// ADR 0016 requires enforced, monitored SPK rotation as envelope v2's compensating control for
+/// R1 (key-compromise impersonation on the opening message): the longer a single SPK generation
+/// stays published, the longer a single compromised SPK secret can be used to impersonate the
+/// account to a new correspondent. The ADR only specifies "~weekly, monitored" as a target with no
+/// numeric requirement, so this default is a `TODO: confirm`-flavored policy choice, not a wire or
+/// crypto constant: `7 * 24 * 3600` (one week) matches the ADR's own stated cadence directly, is
+/// short enough to bound the compromise window to a small, human-legible period, and is long
+/// enough that legitimate, always-online devices don't republish (and thereby route around the
+/// [`PREV_GENERATION_GRACE_SECS`] reconnect-race grace window) more often than is useful. This
+/// constant only feeds [`PrekeyVault::rotation_due`]'s predicate here; nothing in this task acts on
+/// it (that is task 6.2 — actual republish-triggering, warning, and monitoring).
+pub const SPK_ROTATION_INTERVAL_SECS: u64 = 7 * 24 * 3600;
+
 /// Hard cap on the number of undecided [`MessageRequest`]s [`ChatState`] will hold at once (task
 /// 3.10 / review finding F5).
 ///
@@ -298,6 +313,15 @@ pub struct PrekeyVault {
     /// state sealed before 1.31 still opens.
     #[serde(default)]
     previous: Option<PrevGeneration>,
+    /// The wall-clock unix second at which the *current* `spk_public`/`spk_secret` generation was
+    /// published, i.e. the argument [`set_bundle`](Self::set_bundle) was last called with (task
+    /// 6.1, ADR 0016 C1) — the input [`rotation_due`](Self::rotation_due) and
+    /// [`generation_age_secs`](Self::generation_age_secs) reason from. `#[serde(default)]`,
+    /// mirroring `previous`'s own precedent above, so a `PrekeyVault`/`ChatState` sealed before
+    /// this task deserializes as `None` rather than panicking — see `rotation_due`'s doc comment
+    /// for what "unknown age" (`None`) means for the predicate.
+    #[serde(default)]
+    spk_published_at: Option<u64>,
 }
 
 impl PrekeyVault {
@@ -313,6 +337,10 @@ impl PrekeyVault {
     /// Retention is hard-bounded to **one** generation: this replaces (and therefore zeroizes)
     /// whatever was in the previous slot, so a chain of republishes can never accumulate a tail of
     /// live prekey secrets.
+    ///
+    /// Also stamps `spk_published_at = Some(now_unix)` unconditionally (task 6.1, ADR 0016 C1),
+    /// starting a fresh generation's age clock at zero for [`rotation_due`](Self::rotation_due) and
+    /// [`generation_age_secs`](Self::generation_age_secs).
     pub fn set_bundle(
         &mut self,
         spk_public: [u8; 32],
@@ -341,6 +369,48 @@ impl PrekeyVault {
             .into_iter()
             .map(|(public, secret)| Otk { public, secret })
             .collect();
+        // (task 6.1) Record when *this* generation went live, feeding `rotation_due`/
+        // `generation_age_secs`. Unconditional: every call to `set_bundle` — first-ever publish or
+        // a later republish alike — starts a fresh generation's age clock at zero.
+        self.spk_published_at = Some(now_unix);
+    }
+
+    /// How long the current signed-prekey generation has been published, in seconds, as of
+    /// `now_unix` (task 6.1, ADR 0016 C1).
+    ///
+    /// Returns `None` when the publish time is unknown — either no bundle has ever been published
+    /// ([`set_bundle`](Self::set_bundle) never called) or this `PrekeyVault` was deserialized from
+    /// a state sealed before this task (`spk_published_at` defaults to `None`, see that field's
+    /// doc comment). See [`rotation_due`](Self::rotation_due) for how the "unknown age" case is
+    /// treated by the rotation policy itself.
+    pub fn generation_age_secs(&self, now_unix: u64) -> Option<u64> {
+        self.spk_published_at
+            .map(|published_at| now_unix.saturating_sub(published_at))
+    }
+
+    /// Is the current signed-prekey generation due for rotation, as of `now_unix` (task 6.1, ADR
+    /// 0016 C1)?
+    ///
+    /// This is a pure predicate: it only *answers* whether rotation is due. Nothing here
+    /// republishes, warns, or reports metrics — that is task 6.2's job, acting on this signal.
+    ///
+    /// **Unknown-age semantics (deliberate security-relevant default, not a formality).** When
+    /// `generation_age_secs` returns `None` — no bundle ever published, or this vault came from a
+    /// state sealed before task 6.1 and so has no recorded `spk_published_at` — this returns
+    /// `true`: unknown age is treated as due-now, i.e. fail-safe/fail-secure. The alternative
+    /// (treating unknown age as *not* due) risks silently running an old SPK generation of
+    /// unknown, possibly very old, age past ADR 0016's rotation window with nothing to ever flag
+    /// it, which is exactly the "aspirational, not real" rotation posture ADR 0016 C1 exists to
+    /// close out. The cost of the fail-safe choice is bounded and one-time: on upgrade from a
+    /// pre-6.1 build, every existing session's next check of this predicate reports "due" once,
+    /// prompting (once task 6.2 lands and acts on it) a single harmless extra republish — not a
+    /// repeating or escalating cost, since `set_bundle` sets `spk_published_at` on that very
+    /// republish and every subsequent check has a real, known age to reason from.
+    pub fn rotation_due(&self, now_unix: u64) -> bool {
+        match self.generation_age_secs(now_unix) {
+            Some(age) => age >= SPK_ROTATION_INTERVAL_SECS,
+            None => true,
+        }
     }
 
     /// Drop + zeroize the retained previous generation once its grace window has passed.
@@ -1865,5 +1935,121 @@ mod tests {
             "evict_oldest_pending must also forget the evicted sender's responder_session_ek entry"
         );
         assert!(!state.responder_session_ek_order.contains(&b_ik));
+    }
+
+    // -- task 6.1: SPK rotation age tracking --------------------------------------------------
+
+    /// `rotation_due` must be `false` immediately after a publish — age zero is never overdue,
+    /// regardless of how small `SPK_ROTATION_INTERVAL_SECS` might be configured.
+    #[test]
+    fn rotation_due_is_false_immediately_after_publish() {
+        let mut vault = PrekeyVault::default();
+        vault.set_bundle([1u8; 32], [2u8; 32], Vec::new(), 1_000);
+        assert_eq!(vault.generation_age_secs(1_000), Some(0));
+        assert!(!vault.rotation_due(1_000));
+    }
+
+    /// `rotation_due` flips to `true` exactly once the elapsed age reaches
+    /// `SPK_ROTATION_INTERVAL_SECS` — false the instant before the threshold, true at and past it.
+    #[test]
+    fn rotation_due_becomes_true_once_the_interval_elapses() {
+        let mut vault = PrekeyVault::default();
+        vault.set_bundle([1u8; 32], [2u8; 32], Vec::new(), 1_000);
+
+        let just_before = 1_000 + SPK_ROTATION_INTERVAL_SECS - 1;
+        assert_eq!(
+            vault.generation_age_secs(just_before),
+            Some(SPK_ROTATION_INTERVAL_SECS - 1)
+        );
+        assert!(!vault.rotation_due(just_before));
+
+        let at_threshold = 1_000 + SPK_ROTATION_INTERVAL_SECS;
+        assert_eq!(
+            vault.generation_age_secs(at_threshold),
+            Some(SPK_ROTATION_INTERVAL_SECS)
+        );
+        assert!(vault.rotation_due(at_threshold));
+
+        let well_past = at_threshold + 1_000;
+        assert!(vault.rotation_due(well_past));
+    }
+
+    /// The chosen unknown-age default (task 6.1 Outcome / this task file's Risks section):
+    /// `spk_published_at: None` — never published, or a vault deserialized from a state sealed
+    /// before this task — is treated as due-now (fail-safe), not as not-due. Asserted directly
+    /// rather than left to fall out incidentally of some other test.
+    #[test]
+    fn rotation_due_treats_unknown_age_as_due_now() {
+        let vault = PrekeyVault::default();
+        assert_eq!(
+            vault.generation_age_secs(1_000),
+            None,
+            "a vault that has never published a bundle has no known age"
+        );
+        assert!(
+            vault.rotation_due(1_000),
+            "unknown age must be treated as due-now (fail-safe), per task 6.1's documented choice"
+        );
+    }
+
+    /// A `PrekeyVault` (and, nested inside it, a whole `ChatState`) serialized without the new
+    /// `spk_published_at` field at all — simulating a state sealed by pre-6.1 code, not merely a
+    /// freshly-defaulted current-code vault — must still deserialize, defaulting the field to
+    /// `None` rather than panicking. Constructed by stripping the field's CBOR map entry out of a
+    /// current encoding, the same technique `apps/core/tests/desync_recovery.rs`'s
+    /// `state_bytes_excluding_desync_counts` uses for exactly this kind of pre-field-existing
+    /// legacy-shape simulation.
+    #[test]
+    fn a_vault_serialized_without_spk_published_at_still_deserializes() {
+        use ciborium::value::Value;
+
+        let mut vault = PrekeyVault::default();
+        vault.set_bundle([1u8; 32], [2u8; 32], Vec::new(), 1_000);
+
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&vault, &mut encoded).unwrap();
+        let mut value: Value = ciborium::from_reader(&encoded[..]).unwrap();
+        if let Value::Map(entries) = &mut value {
+            entries.retain(|(k, _)| !matches!(k, Value::Text(t) if t == "spk_published_at"));
+        } else {
+            panic!("PrekeyVault must encode as a CBOR map");
+        }
+        let mut legacy_shaped = Vec::new();
+        ciborium::into_writer(&value, &mut legacy_shaped).unwrap();
+
+        let reopened: PrekeyVault = ciborium::from_reader(&legacy_shaped[..])
+            .expect("a PrekeyVault with no spk_published_at field must still deserialize");
+        assert_eq!(reopened.spk_published_at, None);
+        assert!(reopened.rotation_due(1_000));
+
+        // Same shape, but nested inside a whole `ChatState` under `vault`, mirroring how this
+        // field is actually reached at rest via `seal_at_rest`/`open_at_rest`.
+        let state = ChatState {
+            vault,
+            ..ChatState::default()
+        };
+        let mut state_encoded = Vec::new();
+        ciborium::into_writer(&state, &mut state_encoded).unwrap();
+        let mut state_value: Value = ciborium::from_reader(&state_encoded[..]).unwrap();
+        if let Value::Map(entries) = &mut state_value {
+            for (k, v) in entries.iter_mut() {
+                if matches!(k, Value::Text(t) if t == "vault") {
+                    if let Value::Map(vault_entries) = v {
+                        vault_entries.retain(
+                            |(k, _)| !matches!(k, Value::Text(t) if t == "spk_published_at"),
+                        );
+                    }
+                }
+            }
+        } else {
+            panic!("ChatState must encode as a CBOR map");
+        }
+        let mut state_legacy_shaped = Vec::new();
+        ciborium::into_writer(&state_value, &mut state_legacy_shaped).unwrap();
+
+        let reopened_state: ChatState = ciborium::from_reader(&state_legacy_shaped[..]).expect(
+            "a ChatState whose nested vault has no spk_published_at must still deserialize",
+        );
+        assert_eq!(reopened_state.vault.spk_published_at, None);
     }
 }
