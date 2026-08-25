@@ -1,0 +1,92 @@
+# Scheduled, non-blocking runner for demo/p2p-wire-proof — the Docker-based wire-level proof of
+# Meridian's headline "no server sees plaintext, direct P2P" claim (docs/testing/strategy.md §6's
+# "T14 demo scripts run in CI: compose stack weekly" bucket; task 5.9 / review finding F9). Until
+# this workflow landed, the demo had no CI trigger at all — its own README said so explicitly.
+#
+# Deliberately NOT folded into ci.yml's `test-harnesses` gate, or any other job in the blocking
+# push/PR pipeline: the demo needs NET_ADMIN/NET_RAW (for its `monitor` packet-capture sidecar)
+# plus a real Docker daemon — capabilities a plain `cargo test` runner doesn't have, and that the
+# blocking gate must not start depending on. Same shape as task 3.12's own precedent
+# (capacity-check.yml): `schedule:` + `workflow_dispatch:`, `permissions: contents: read` only, no
+# registry credential of any kind, runs the existing script unmodified.
+#
+# Privilege note — reusing 1.25's reasoning, not re-deriving it (see
+# docs/tasks/phase-1/1.25-netns-topology-coturn.md's Status section and
+# harnesses/nat-matrix/run.sh's own `sudo`-availability comment, both about confirming a CI runner
+# actually has the privilege a rig declares it needs before trusting a graceful-skip is truly
+# "skipped, not silently broken"). This is a DIFFERENT privilege shape than 1.25/nat-matrix's netns
+# rig, though, worth being explicit about rather than assuming the precedent transfers unchanged:
+#   - 1.25/nat-matrix needs real root on the HOST (`ip netns`/veth/bridge/iptables) — obtained in
+#     CI via GitHub-hosted runners' passwordless `sudo` (see harnesses/nat-matrix/run.sh).
+#   - This demo's NET_ADMIN/NET_RAW requirement is scoped to a single Docker CONTAINER
+#     (`docker run --network host --cap-add NET_ADMIN --cap-add NET_RAW`, the `monitor` sidecar in
+#     run-wire-proof.sh) — it needs no host root at all, only a dockerd that permits `--cap-add`,
+#     which is standard, unprivileged Docker behavior (a lesser ask than `--privileged`, which the
+#     script never uses). GitHub-hosted `ubuntu-latest` runners ship a full, un-sandboxed Docker
+#     Engine that permits this — the same runner class ci.yml's own `docker-build` job already
+#     builds and runs real containers on. The `runner` user is already in the `docker` group there
+#     too, so no `sudo` is needed for any step in this workflow.
+name: p2p-wire-proof
+
+on:
+  schedule:
+    # docs/architecture/features/14-selfhosting-ops-kit.md: "wire the demo script into CI (compose
+    # path weekly, air-gap path per release)" + docs/testing/strategy.md §6. Offset an hour from
+    # capacity-check.yml's existing Monday 06:00 UTC slot so the two scheduled, longer-running
+    # privileged jobs don't contend for the same runner-queue moment.
+    # TODO: confirm desired cadence — weekly chosen as a reasonable default per the task's own
+    # suggestion; no cadence is specified anywhere in docs/operations/, and there's no on-call
+    # rotation yet to action a red run (docs/operations/runbook.md's own on-call TODO) — the same
+    # open question capacity-check.yml already carries for its own schedule.
+    - cron: "0 7 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  p2p-wire-proof:
+    name: Docker wire-level P2P proof (demo/p2p-wire-proof)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The script itself: builds meridian-rendezvous (--features sqlite) + meridian
+      # (--features webrtc) on the host; brings up the compose stack (rendezvous, coturn, alice,
+      # bob) plus the `network_mode: host`, `--cap-add NET_ADMIN --cap-add NET_RAW` tcpdump
+      # sidecar; drives a real `session connect` under the default `direct` policy and again under
+      # `relay-only`; asserts from the packet capture which flows carried the session and that the
+      # known-plaintext chat markers never appear in cleartext anywhere (rendezvous<->alice,
+      # rendezvous<->bob, alice<->bob, alice<->coturn, bob<->coturn), including the server's own
+      # logs; and finally stops rendezvous+coturn and confirms a brand-new session cannot
+      # establish (the honest "what the server is actually for" boundary check). See
+      # demo/p2p-wire-proof/README.md for the full write-up and expected output. Unchanged from
+      # the existing manual entry point (`just p2p-wire-proof` / `bash run-wire-proof.sh`);
+      # KEEP_UP is intentionally left unset here so the script's own default teardown-on-exit path
+      # always runs.
+      - name: Run demo/p2p-wire-proof
+        run: bash demo/p2p-wire-proof/run-wire-proof.sh
+
+      # Belt-and-suspenders only: run-wire-proof.sh's own `trap cleanup EXIT` already tears the
+      # stack (and the monitor sidecar) down on both success and failure — same fail-closed
+      # teardown discipline as ci.yml's `docker-build` job's own `cleanup` step. This step exists
+      # only to cover the case where the runner kills the job hard enough that the script's own
+      # trap never got a chance to run; the exact commands mirror the demo's own README "Cleanup"
+      # section.
+      - name: Force cleanup (in case the script's own EXIT trap didn't run)
+        if: always()
+        run: |
+          docker rm -f p2p-wire-proof-monitor >/dev/null 2>&1 || true
+          docker compose -p p2p-wire-proof down -v >/dev/null 2>&1 || true
+
+      # Captures/phase-output JSON are gitignored scratch (demo/p2p-wire-proof/.gitignore) that
+      # only exist on disk for this job's lifetime — upload them on failure so a red scheduled run
+      # is debuggable from the Actions UI instead of requiring a local re-run to see what the
+      # capture actually showed.
+      - name: Upload capture + phase output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2p-wire-proof-capture
+          path: demo/p2p-wire-proof/capture/
+          retention-days: 7
