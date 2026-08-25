@@ -2,7 +2,7 @@
 
 # Phase 5 — Review of Phase 4
 
-**Kind:** review · **Status:** planned — 13 fix-tasks broken out, ready for `/next-task` · **Reviews
+**Kind:** review · **Status:** done — all 14 fix-tasks (5.1–5.14) landed and reviewed · **Reviews
 phase(s):** Phase 4 (T08 — Verification & Contact Trust + T17 — Terminal TUI Client, tasks 4.1–4.52)
 plus the untracked out-of-band work merged alongside/after it (PRs #66–#73: a clippy `result_large_err`
 fix, CI job-split + fixes, the Windows/Linux release-binary pipeline (ADR 0022, superseded same-window
@@ -123,3 +123,17 @@ Phase 4's own residuals are carried in [the master tracker](../README.md#live-ca
 All findings from the [review report](./review-report.md) triaged into fix-tasks (or explicitly waived
 with reasons), all fix-tasks `[x]`, unratified architectural decisions recorded via `/adr`, tree green,
 docs synced.
+
+**Met — Phase 5 closed.** All 18 findings triaged into 13 fix-tasks (N8 folded into 5.5, as noted above)
+plus 5.14 (a genuine second instance of F3's bug class, found by 5.3's own review round, not part of
+the original 18) — 14 fix-tasks total, all `[x]`. Every task's named reviewer(s) signed off PASS with no
+blocking findings across the whole phase; each non-blocking should-fix a reviewer raised was either
+closed in the same commit (5.10's two coverage gaps, 5.13's `debug_assert`, 5.14's `export_json`
+fail-closed test) or explicitly ratified as a deliberate, documented carry-forward rather than silently
+dropped (5.10's SIGINT/SIGTERM residual, recorded above). No task's fix-shape decision (5.12's
+tie-break contract, 5.14's export-time-join-over-write-through call) was judged to need an ADR by its
+own architect review — both are internal, single-crate implementation choices, not new
+components/dependencies/wire changes. `cargo build --workspace`, `cargo fmt --check`, and `cargo clippy
+--workspace --all-targets -- -D warnings` all clean as of 5.14's commit. Docs synced incrementally as
+part of each task (N2/N5's doc fixes in 5.13; no wire/protocol/diagram changed this phase, so no
+separate `/doc-sync` pass was warranted).
