@@ -338,7 +338,7 @@ from two lenses, numbered once). Verdict: **green to proceed**, no blocker for t
 - [x] **5.1** Persist and always-reconcile Sent→Delivered receipts (F1) — [file](./phase-5/5.1-persist-reconcile-delivery-receipts.md)
 - [x] **5.2** Diagnostics-surfaced repair action for `run_accept_request`'s partial-failure window (F2) — [file](./phase-5/5.2-accept-request-repair-action.md)
 - [x] **5.4** `spawn_blocking`-wrap `run_mark_verified`/`run_set_petname` (F4) — [file](./phase-5/5.4-spawn-blocking-mark-verified-set-petname.md)
-- [ ] **5.5** Wire receive-side key-change detection into the TUI inbound loop + `session.rs` (F5 + N8 deferred) — [file](./phase-5/5.5-wire-receive-side-key-change-detection.md)
+- [~] **5.5** Wire receive-side key-change detection into the TUI inbound loop + `session.rs` (F5 + N8 deferred) — [file](./phase-5/5.5-wire-receive-side-key-change-detection.md)
 - [ ] **5.7** App-level reconciliation tests for Settings/Diagnostics (F7) — [file](./phase-5/5.7-settings-diagnostics-app-level-tests.md)
 - [ ] **5.8** App-level end-to-end tests for onboarding/unlock (F8) — [file](./phase-5/5.8-onboarding-unlock-app-level-tests.md)
 - [ ] **5.9** Scheduled CI workflow for `demo/p2p-wire-proof` (F9) — [file](./phase-5/5.9-schedule-p2p-wire-proof-ci.md)
@@ -346,9 +346,10 @@ from two lenses, numbered once). Verdict: **green to proceed**, no blocker for t
 - [ ] **5.11** Extract shared `observe_into_live_trust` helper (N1) — [file](./phase-5/5.11-extract-observe-into-live-trust-helper.md)
 - [ ] **5.12** Pin `find_binding`'s keybinding-collision tie-break contract (N7) — [file](./phase-5/5.12-pin-keybinding-collision-tiebreak.md)
 - [ ] **5.13** Nit sweep: doc/comment/mechanical fixes (N2, N3, N4, N5, N6) — [file](./phase-5/5.13-phase-5-nit-sweep.md)
+- [ ] **5.14** `run_acknowledge_key_change` has the same `contacts.json` trust-staleness bug as F3 (found by 5.3's own review, depends on 5.3) — [file](./phase-5/5.14-acknowledge-key-change-trust-staleness.md)
 
 **Wave 2 — sequenced (same-function/same-file conflicts)**
-- [~] **5.3** Fix `contacts.json` trust staleness + cover `export_json` (F3; depends on 5.4) — [file](./phase-5/5.3-fix-contacts-trust-staleness-export.md)
+- [x] **5.3** Fix `contacts.json` trust staleness + cover `export_json` (F3; depends on 5.4) — [file](./phase-5/5.3-fix-contacts-trust-staleness-export.md)
 - [ ] **5.6** Federated mitm-sim cell: verified-contact key-change block (F6; depends on 5.5) — [file](./phase-5/5.6-federated-verified-key-change-mitm-cell.md)
 
 ## Legend / how to read
