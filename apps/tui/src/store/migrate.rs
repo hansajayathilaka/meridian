@@ -96,6 +96,15 @@ pub enum StoreError {
         expected: String,
         found: String,
     },
+    /// (task 5.14) [`super::export::export_json`]'s live `trust.bin` join failed to load —
+    /// distinct from every other variant here because the underlying error comes from
+    /// `meridian_core::trust::TrustError` (X3DH/ratchet crate boundary, not this module's own
+    /// `at_rest`/`serde_json` machinery), so it is carried as a plain message rather than a typed
+    /// `#[from]` wrap. Fails closed exactly like [`StoreError::SealFailure`]: a `trust.bin` that
+    /// exists but won't open (tamper, corruption, wrong key) must abort the export, never silently
+    /// fall back to `contacts.json`'s own (possibly stale) `trust` field.
+    #[error("loading trust.bin for the live trust join: {0}")]
+    TrustLoad(String),
 }
 
 /// Reads `value`'s `"v"` field. Errs [`StoreError::MissingVersion`] if absent or not a

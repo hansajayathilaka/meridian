@@ -92,7 +92,7 @@ wiring lands (a standalone task today would have nothing to test against).
 - [x] **5.13** Nit sweep: doc/comment/mechanical fixes (N2, N3, N4, N5, N6) — [file](./5.13-phase-5-nit-sweep.md)
 
 **Follow-up surfaced by 5.3's own review** — not part of the original 18-finding report
-- [~] **5.14** `run_acknowledge_key_change` has the same `contacts.json` trust-staleness bug as F3 (depends on 5.3) — [file](./5.14-acknowledge-key-change-trust-staleness.md)
+- [x] **5.14** `run_acknowledge_key_change` has the same `contacts.json` trust-staleness bug as F3 (depends on 5.3) — [file](./5.14-acknowledge-key-change-trust-staleness.md)
 
 ### Landing order
 ```

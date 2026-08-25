@@ -918,6 +918,55 @@ mod export_json_tests {
         assert_eq!(exported_state, StateDocument::default());
     }
 
+    /// Task 5.14's `join_live_trust` fails closed if `trust.bin` exists but won't open (tamper,
+    /// corruption, wrong key) — reviewer-flagged gap: this property was only exercised indirectly,
+    /// through `load_trust`'s general contract via the unrelated unlock path, never through
+    /// `export_json` itself. Corrupts `trust.bin`'s sealed bytes on disk after a valid seal, then
+    /// asserts `export_json` returns `Err(StoreError::TrustLoad(_))` and — since `join_live_trust`
+    /// runs before `contacts.json` (or anything after it) is written — that the export aborts
+    /// cleanly rather than leaving a partial/stale destination directory behind.
+    #[test]
+    fn export_json_fails_closed_on_a_corrupt_trust_bin() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(home.path());
+        let (store, handle) = fresh_account();
+
+        contacts::save(&sample_contacts_doc(), &store, &handle).expect("save contacts.json");
+
+        let trust = meridian_core::trust::TrustStore::default();
+        let sealed = trust.seal_at_rest(&store, &handle).expect("seal trust.bin");
+        let trust_path = meridian_core::account::trust_path().expect("trust_path");
+        std::fs::write(&trust_path, &sealed).expect("write trust.bin");
+
+        // Tamper with the sealed bytes so `TrustStore::open_at_rest` fails AEAD verification —
+        // the "won't open" case `join_live_trust` must fail closed on, not "absent" (already
+        // covered by the happy-path fixture above, which never writes trust.bin at all).
+        let mut tampered = sealed;
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+        std::fs::write(&trust_path, &tampered).expect("corrupt trust.bin");
+
+        let dest = home.path().join("export-dest");
+        let err = export_json(&dest, &store, &handle).expect_err(
+            "a trust.bin that exists but won't open must abort the export, never silently fall \
+             back to contacts.json's own possibly-stale trust field",
+        );
+        assert!(
+            matches!(err, super::StoreError::TrustLoad(_)),
+            "expected StoreError::TrustLoad, got {err:?}"
+        );
+
+        assert!(
+            !dest.join("contacts.json").exists(),
+            "the export must abort before contacts.json (or anything after it) is written — no \
+             partial/stale destination directory left behind"
+        );
+        assert!(
+            !dest.join("state.json").exists(),
+            "state.json is written after the contacts.json branch — must not be reached either"
+        );
+    }
+
     /// A `history/` directory that exists but holds only non-`.jsonl` entries yields an empty,
     /// but still-created, exported `history/` directory — the "history dir exists" branch and the
     /// "no .jsonl files inside it" branch are two different code paths in `export_json`, and only

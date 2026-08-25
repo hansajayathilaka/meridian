@@ -876,7 +876,12 @@ fn save_trust(
 /// [`TrustState`] -> `contacts.json`'s [`TrustLabel`] — mirrors `tests/at_rest_audit.rs`'s own
 /// `to_trust_label` exactly (same `PinnedKeyChanged -> Pinned` approximation, since `TrustLabel`'s
 /// four-value enum structurally cannot represent it — see `crate::screens::contacts`' module doc).
-fn to_trust_label(state: TrustState) -> TrustLabel {
+///
+/// `pub(crate)` (task 5.14): also reused by [`crate::store::export::export_json`]'s live
+/// `trust.bin` join, so the `TrustState` -> `TrustLabel` mapping has exactly one implementation
+/// shared by every write-through call site *and* the export-time join, rather than a second,
+/// independently-maintained copy that could silently drift from this one.
+pub(crate) fn to_trust_label(state: TrustState) -> TrustLabel {
     match state {
         TrustState::New => TrustLabel::New,
         TrustState::Pinned => TrustLabel::Pinned,
@@ -3285,7 +3290,14 @@ fn load_live_session(
     })
 }
 
-fn load_trust(store: &dyn SecretStore, handle: &KeyHandle) -> Result<TrustStore, String> {
+/// `pub(crate)` (task 5.14): also reused by [`crate::store::export::export_json`]'s live
+/// `trust.bin` join — see [`to_trust_label`]'s own doc comment for why sharing one implementation
+/// (rather than a second copy of this "missing file means fresh store, any other error is fatal"
+/// load) matters here.
+pub(crate) fn load_trust(
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+) -> Result<TrustStore, String> {
     let path = account::trust_path()?;
     match std::fs::read(&path) {
         Ok(bytes) => TrustStore::open_at_rest(store, handle, &bytes).map_err(|e| e.to_string()),

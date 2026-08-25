@@ -55,7 +55,7 @@ use meridian_tui::app::{
     RepairAcceptedContactRequest, RepairableContact, ScanRepairableContactsEffect,
     ScanRepairableContactsRequest, WorkerEvent,
 };
-use meridian_tui::store::contacts::{self as contacts_store, ContactsDocument};
+use meridian_tui::store::contacts::{self as contacts_store, ContactRecord, ContactsDocument};
 use meridian_tui::store::history::{self, Direction as HistDirection, MessageState};
 use meridian_tui::worker::{dispatch, OnboardingSession};
 
@@ -1460,6 +1460,130 @@ async fn acknowledge_key_change_under_escalation_force_blocks_and_still_fails_cl
          call itself returns Err — otherwise a later plain acknowledge (escalation off again) would \
          still succeed and silently re-pin, exactly the bypass acknowledge_key_change's own doc \
          comment forbids"
+    );
+}
+
+/// **Task 5.14 — the same `contacts.json` trust-staleness bug 5.3 fixed for `run_mark_verified`
+/// (F3), found a second time in `run_acknowledge_key_change`'s escalation branch by 5.3's own
+/// review round.** Reuses this exact test's own fixture — the escalation force-block proven above
+/// to persist to `trust.bin` — but this time asserts on `--export-json`'s real output rather than
+/// on `trust.bin` alone.
+///
+/// Before this task, `contacts.json`'s own [`ContactRecord::trust`] field — stamped `Pinned` here
+/// (`to_trust_label`'s documented approximation for `PinnedKeyChanged`, the state the contact was
+/// in before this test's escalation call) exactly the way a real `PinnedKeyChanged` contact's row
+/// would read — was never touched by `run_acknowledge_key_change`, so a subsequent
+/// `apps/tui/src/store/export.rs::export_json` run mirrored `contacts.json` verbatim and reported
+/// the stale `"trust": "pinned"` for a contact that `trust.bin` — and the live UI, via
+/// `crate::screens::main::build_contact_entries`'s own fresh join — already correctly showed as
+/// hard-blocked.
+///
+/// Task 5.14's chosen fix is an **export-time join** in `export_json` itself (see that module's own
+/// doc comment for why this was chosen over a second `run_acknowledge_key_change` write-through),
+/// so this test deliberately confirms `contacts.json`'s own row is *still* stale after the
+/// `AcknowledgeKeyChange` dispatch (fixture sanity: `run_acknowledge_key_change` was **not** given a
+/// write-through) before asserting that `export_json`'s real output is nonetheless correct — the
+/// join, not a write-through, is what this task's fix actually is. Reverting `export_json`'s join
+/// (restoring the pre-fix body — see this task's own PR diff) makes the final assertion below fail
+/// with `TrustLabel::Pinned`, confirmed by hand against the pre-fix commit while authoring this
+/// test.
+#[tokio::test]
+async fn acknowledge_key_change_escalation_is_not_stale_in_export_json() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let bob = setup_os_account();
+    let previous = [0x80u8; 32];
+    let current = [0x81u8; 32];
+
+    // trust.bin: Pinned -> (key change, escalation off) -> PinnedKeyChanged. Same fixture shape as
+    // `acknowledge_key_change_under_escalation_force_blocks_and_still_fails_closed` above.
+    let mut trust = TrustStore::default();
+    trust.observe(previous, "peer.example", NOW);
+    let resulting = trust
+        .observe_key_change(&previous, current, "peer.example", NOW + 1)
+        .expect("known contact, distinct new key");
+    assert_eq!(
+        resulting,
+        TrustState::PinnedKeyChanged,
+        "fixture setup sanity: escalation is off for the observation itself"
+    );
+    write_trust(&bob, &trust);
+
+    // contacts.json: the row a real `PinnedKeyChanged` contact would have — `Pinned`, the same
+    // approximation `to_trust_label` documents. Hand-built (rather than driven through
+    // `Effect::AddContact`) so this test exercises exactly the `export_json` join, not an
+    // incidental `run_add_contact` behavior.
+    let os = OsSecretStore::new(SERVICE);
+    let doc = ContactsDocument {
+        v: 1,
+        contacts: vec![ContactRecord {
+            pubkey: hex::encode(current),
+            id: format!("mrd1:{}@peer.example", hex::encode(current)),
+            hint: "peer.example".to_string(),
+            petname: None,
+            trust: contacts_store::TrustLabel::Pinned,
+            pinned_key_history: vec![],
+            device_record_version_seen: None,
+            policy_override: None,
+            added_at: NOW,
+            last_activity_at: NOW,
+            unread: 0,
+            conv_handle: None,
+        }],
+    };
+    contacts_store::save(&doc, &os, bob.handle()).expect("save contacts.json");
+
+    // Escalation turns the in-flight PinnedKeyChanged into a real, persisted Blocked — same
+    // "turn escalation on only after the contact is already sitting in PinnedKeyChanged" sequencing
+    // as the fixture above, so the upcoming `AcknowledgeKeyChange` dispatch is what actually walks
+    // the escalate-and-force-block branch.
+    let mut trust = read_trust(&bob);
+    trust.set_escalate_pinned_key_change(true);
+    write_trust(&bob, &trust);
+
+    let effect = Effect::AcknowledgeKeyChange(AcknowledgeKeyChangeEffect {
+        request: AcknowledgeKeyChangeRequest { pubkey: current },
+        outcome: None,
+    });
+    match dispatch_effect(effect).await {
+        WorkerEvent::Failed(Effect::AcknowledgeKeyChange(_), message) => {
+            assert_eq!(message, TrustError::NotAcknowledgeable.to_string());
+        }
+        other => {
+            panic!("expected AcknowledgeKeyChange to fail closed under escalation, got {other:?}")
+        }
+    }
+    assert_eq!(
+        read_trust(&bob).contact(&current).unwrap().state,
+        TrustState::Blocked,
+        "fixture sanity: trust.bin really is force-blocked, same as the test above"
+    );
+    assert_eq!(
+        read_contacts(&bob).contacts[0].trust,
+        contacts_store::TrustLabel::Pinned,
+        "fixture sanity: contacts.json's own row is still stale — run_acknowledge_key_change \
+         deliberately gets no write-through under task 5.14's chosen fix (the export-time join \
+         below is the actual fix)"
+    );
+
+    // --- Act: the bug/fix boundary — export_json's real output. --------------------------------
+    let dest = tmp.path().join("export-dest");
+    meridian_tui::store::export::export_json(&dest, &os, bob.handle()).expect("export_json");
+
+    let exported: ContactsDocument =
+        serde_json::from_slice(&std::fs::read(dest.join("contacts.json")).unwrap())
+            .expect("plaintext JSON");
+    assert_eq!(
+        exported.contacts.len(),
+        1,
+        "no row duplicated or dropped by the join"
+    );
+    assert_eq!(
+        exported.contacts[0].trust,
+        contacts_store::TrustLabel::Blocked,
+        "the load-bearing assertion this task exists for: --export-json must reflect the real, \
+         force-blocked trust.bin state, not the stale Pinned value contacts.json's own row alone \
+         would report"
     );
 }
 
