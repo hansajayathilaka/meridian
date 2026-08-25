@@ -32,21 +32,38 @@
 //!    record survives byte-identical — no phantom `PinnedKeyChanged`/`Blocked` demotion, no new
 //!    contact row for the substituted key.
 //! 2. [`federated_colluding_org_key_substitution_against_a_verified_contact_hard_blocks_via_the_recovery_gate`] —
-//!    decision-gate layer. The *only* path in the whole system where a genuinely different
-//!    signing key can legitimately reach `TrustStore` at all is task 4.9's guarded desync-recovery
-//!    window (every live fetch, including the federated one exercised in (1) above, is
-//!    exact-key-pinned and never reaches `TrustStore` on a substitution — see
-//!    `apps/core/src/desync.rs`'s own doc comment, and (1) above proving that holds for THIS
-//!    federated topology specifically). This half proves what happens if a substituted key from
-//!    the SAME colluding org ever did reach that gate (a future hint/directory-resolution
-//!    scenario — `session.rs`'s own doc comment on why this is driven directly against
-//!    `meridian_core::desync::attempt_recovery`, never a live fetch, applies unchanged here).
-//!    Mallory is hosted at the SAME colluding org (`org-b.test`) as bob — the substituted identity
-//!    is concretely tied to the org already proven malicious in (1), not an unrelated key.
+//!    decision-gate layer, honestly labelled. `attempt_recovery` (`apps/core/src/desync.rs`) is an
+//!    I/O-free, topology-agnostic pure function over `ChatState`/`TrustStore`: no network, no server
+//!    config, and no notion of "org" reaches it. This test's call shape and assertions are therefore
+//!    functionally identical to the pre-existing single-org verified-contact case
+//!    (`apps/core/tests/desync_recovery.rs`'s `Verified` case and
+//!    `apps/core/tests/session.rs::recover_from_desync_hard_blocks_a_key_substitution_against_a_verified_established_session`)
+//!    — only variable/label names differ. Labelling Mallory as hosted at the SAME colluding org
+//!    (`org-b.test`) as bob is documentation flavour, not an enforced or exercised property:
+//!    `attempt_recovery` has no way to check where a key is "hosted". This half is **not**
+//!    federation-specific coverage, and does not claim to be. It exists as a topology-agnostic
+//!    regression-consistency pin that completes the T08 trust-state coverage matrix's symmetry — the
+//!    `Pinned` case already has a decision-gate regression test at the single-org layer, and this
+//!    gives `Verified` the same, reached this time via this file's federated framing — and, per this
+//!    task's mutation testing, it genuinely catches a regression if the gate/guard is bypassed: real
+//!    value, just not a federation-specific proof. See `harnesses/mitm-sim/README.md`'s "Scope
+//!    boundaries" section for why no equivalent federated `Pinned` decision-gate cell was added.
 //!    Mirrors `desync_recovery.rs`'s and `session.rs`'s own verified-contact assertion shape
 //!    exactly: `TrustState::Blocked`, no session installed, canonical `verification-ux.md`
 //!    wording, `acknowledge_key_change` refused even against the state this very call just
 //!    produced.
+//!
+//! **Scope boundary on assertion 1's trust-record half** (the same caveat
+//! `mitm_preexisting_contact.rs` already states for its own byte-identical assertion, applies
+//! unchanged here). `fetch-bundle` is `main.rs::cmd_fetch_bundle`, a standalone verify-and-print
+//! diagnostic that never reads or writes `TrustStore` at all today — so the "pre-existing VERIFIED
+//! record survives byte-identical" half of test 1 is, on today's code, also a **structural**
+//! guarantee (there is no call path from this command into the trust store for it to have taken),
+//! not merely an empirically-observed one. It is still real, non-vacuous coverage: it pins the fact
+//! down as a regression test, so that a future change wiring `fetch-bundle` (or a `chat`-flow
+//! equivalent) into trust bookkeeping over the federated path specifically cannot silently start
+//! writing a failed/tampered fetch's substituted key into an already-VERIFIED contact's record
+//! without this test catching it.
 
 use meridian_core::chat::ChatState;
 use meridian_core::desync::{attempt_recovery, RecoveryOutcome};
@@ -162,7 +179,7 @@ fn federated_colluding_servers_bundle_substitution_against_an_already_verified_c
     rig.kill_both_servers();
 }
 
-// -- 2. decision-gate layer: the one path a substituted key can legitimately reach TrustStore ----
+// -- 2. decision-gate layer: topology-agnostic regression-consistency pin (see module doc) -------
 
 struct Peer {
     store: MemorySecretStore,
@@ -245,16 +262,19 @@ fn federated_colluding_org_key_substitution_against_a_verified_contact_hard_bloc
         )
         .expect("seal_outbound");
 
-    // Alice already has bob VERIFIED — the real headline state 4.10's matrix names, now reached
-    // through this file's federated framing rather than a purely synthetic pair.
+    // Alice already has bob VERIFIED — the real headline state 4.10's matrix names, labelled here
+    // with this file's federated framing (hostnames, hint strings) even though `attempt_recovery`
+    // itself has no notion of "org" and does not check it — see the module doc's honest scope note.
     let mut trust = TrustStore::default();
     trust.observe(bob_ik, "org-b.test", TEST_NOW_UNIX);
     trust.mark_verified(&bob_ik).expect("known contact");
 
     // Mallory's bundle is genuinely, honestly self-signed under her OWN key — not a corrupted
-    // signature. The attack is that org-b, having colluded to surface her identity instead of
-    // bob's during the recovery window, hands `attempt_recovery` a bundle owner key that differs
-    // from the peer alice actually meant to reach.
+    // signature. Framed as if org-b, having colluded to surface her identity instead of bob's during
+    // the recovery window, handed `attempt_recovery` a bundle owner key that differs from the peer
+    // alice actually meant to reach — but `attempt_recovery` takes that key as a plain parameter and
+    // has no way to check its origin, so this framing is documentation only, not an enforced or
+    // exercised property (see module doc).
     let mallory_gen =
         generate_bundle(&mallory.store, &mallory.handle(), mallory_ik, 5).expect("mallory bundle");
 

@@ -22,7 +22,7 @@ Every cell is adversarial and asserts a *negative* property. Per
 | 4.10 (T08) | Rendezvous substitutes a bundle's key against a contact alice **already has a trust record for** (not just first contact) | same exact-key pin as T02; failed attempt leaves the pre-existing trust record byte-identical | `meridian-cli::mitm_preexisting_contact` |
 | 4.10 (T08) | A substituted key is surfaced during task 4.9's guarded desync-recovery bundle-refetch window, against a **pinned** contact | routed through the identical task-4.4 key-change gate — `SendGate::Warn`, `TrustState::PinnedKeyChanged`, canonical `verification-ux.md` wording, no session installed | `meridian-core::desync_recovery::attempt_recovery_routes_a_surfaced_key_change_through_the_gate_never_bypassing_it` |
 | 4.10 (T08) | Same, against a **verified** contact | `SendGate::Blocked`, `TrustState::Blocked`, canonical `verification-ux.md` wording, no session installed, `acknowledge_key_change` refused | same test, verified-state case |
-| 5.6 (F6) | Two **colluding federated servers** (org A honest, org B malicious) substitute a bundle for a cross-org contact alice already has **VERIFIED** — A2×2 against the T08 headline state, not just first contact | fetch layer: same exact-key pin as T02/2.12, over the real federated path, leaving the VERIFIED record byte-identical; decision-gate layer: `TrustState::Blocked`, no session installed, canonical wording, `acknowledge_key_change` refused | `meridian-cli::mitm_federated_verified_contact` (both halves) |
+| 5.6 (F6) | Two **colluding federated servers** (org A honest, org B malicious) substitute a bundle for a cross-org contact alice already has **VERIFIED** — A2×2 against the T08 headline state, not just first contact | fetch layer: same exact-key pin as T02/2.12, over the real federated path, leaving the VERIFIED record byte-identical; decision-gate layer (topology-agnostic — not itself federation-specific, see below): `TrustState::Blocked`, no session installed, canonical wording, `acknowledge_key_change` refused | `meridian-cli::mitm_federated_verified_contact` (both halves) |
 
 ## Scope boundaries (read before extending)
 
@@ -87,14 +87,28 @@ Every cell is adversarial and asserts a *negative* property. Per
   against a **fresh** cross-org contact only — it starts from no trust record at all. Task 5.6
   closed the remaining gap review finding F6 named: no federated cell existed for a contact alice
   already has **VERIFIED**. `meridian-cli::mitm_federated_verified_contact` combines 2.12's real
-  two-server (colluding-org) topology with 4.10's verified-contact assertion shape, the same two
-  layers as above: the fetch layer (real federated fetch, `SignalError::BundleVerification`, the
-  VERIFIED record left byte-identical) and the decision-gate layer (`attempt_recovery` fed a
-  genuinely different key hosted at the SAME colluding org, `TrustState::Blocked`, no session
-  installed). No separate federated "pinned" decision-gate cell was added, for the same reason
-  4.10 itself gives for not re-testing the fetch layer per state: `attempt_recovery`/
-  `recover_from_desync` are pure functions over `ChatState`/`TrustStore` with no network
-  dependency, so a federated variant of the existing single-org pinned decision-gate case
-  (`desync_recovery.rs`'s `Pinned` case / `session.rs`'s pinned cell) would be code-identical to
-  what is already proven — federated framing only adds genuine new coverage at the fetch layer (1)
-  and for the verified/`Blocked` case specifically, which is what F6 named.
+  two-server (colluding-org) topology with 4.10's verified-contact assertion shape, at two layers:
+  1. **Fetch layer** — a real federated fetch, `SignalError::BundleVerification`, the VERIFIED
+     record left byte-identical. This is where federated framing adds genuine, federation-specific
+     new coverage: it is the only layer of this cell that a real server topology and network path
+     actually run through.
+  2. **Decision-gate layer** — `attempt_recovery` fed a key labelled as hosted at the SAME colluding
+     org, `TrustState::Blocked`, no session installed. `attempt_recovery`/`recover_from_desync`
+     (`apps/core/src/desync.rs`) are I/O-free, topology-agnostic pure functions over
+     `ChatState`/`TrustStore` — no network, no server, no notion of "org" reaches them. This means
+     this half is **not** federation-specific coverage: a federated `Pinned` variant and this
+     federated `Verified` variant would both be code-identical, modulo labels, to the existing
+     single-org cases (`desync_recovery.rs`'s `Pinned`/`Verified` cases, `session.rs`'s pinned and
+     verified cells) — the same reasoning that keeps a federated `Pinned` decision-gate cell out of
+     this file entirely (below). The `Verified` half is kept anyway, relabelled honestly as a
+     topology-agnostic regression-consistency pin: it completes *this file's own* fetch+decision-gate
+     pairing for the `Verified` state (mirroring how the single-org layer already pins both `Pinned`
+     and `Verified` at the decision-gate), even though — unlike the fetch-layer half beside it —
+     neither the code path it drives nor the property it proves is itself federation-specific.
+     Mutation testing confirmed it genuinely catches a regression if the gate/guard is bypassed, so
+     it is not worthless — it just proves a narrower thing than the fetch layer beside it. See
+     `meridian-cli::mitm_federated_verified_contact`'s own module doc for the fully spelled-out
+     version of this same reasoning.
+  No separate federated "pinned" decision-gate cell was added: per the point above, it would add
+  zero coverage beyond what the single-org `Pinned` decision-gate case already proves, and — unlike
+  `Verified` — F6 named no gap at that state for it to close.
