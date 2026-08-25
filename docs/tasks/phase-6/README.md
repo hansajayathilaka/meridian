@@ -3,7 +3,7 @@
 
 # Phase 6 — Envelope v2
 
-**Kind:** build · **Status:** planning · **Reviews phase(s):** n/a (this phase itself gets swept by
+**Kind:** build · **Status:** in progress · **Reviews phase(s):** n/a (this phase itself gets swept by
 the next review phase, Phase 7)
 
 ## Goal
@@ -87,10 +87,61 @@ evaporate:
 
 No other phase or task is unresolved ahead of this one; the phase is unblocked now.
 
+## `/plan-phase` refinements (planner + architect consult, before task files were written)
+The 11-item scope list above was written at `/pick-next-phase` time, straight from the ADR text. A
+**planner** pass (task breakdown) and an independent **architect** pass (architecture-guard read of the
+actual code, not just the ADR) both ran before the task files below were written, and changed the shape
+in three ways the scope list above doesn't capture:
+
+1. **C2 and C3 cannot land as separately-mergeable tasks.** The AAD/wire-shape change (C3) is only safe
+   *together with* commit-on-successful-decrypt (C2) — landing one without the other reproduces the R3
+   vulnerability the ADR calls out. Both, plus C5/C6 and C7's short-circuit half, are one task (6.1's
+   sibling **6.3**), not split further, even though that makes 6.3 the largest task in the phase. C7's
+   `eid` half is safely separable (6.4) since it isn't part of the AEAD/AAD safety property.
+2. **6.3 is reviewed by architect + security-reviewer as two independent named lenses**, not the
+   combined `reviewer` agent this workflow otherwise defaults to for a single task. Precedent: this
+   exact function (`ChatState::open_bytes`) was hardened by task 1.18, and a security bug in that fix
+   was caught only by "architect + security-reviewer, independently" (recorded in
+   [messaging-envelope-v1.md](../../api/messaging-envelope-v1.md) around the desync-recovery section).
+   6.3 rewrites the same function under new rules and gets the same treatment.
+3. **C4's doc-sync scope is wider than the ADR's own list**: `apps/rendezvous/src/route_tamper.rs`,
+   `apps/rendezvous/src/auth.rs`, and `apps/core/src/session.rs`'s `ANSWER_TIMEOUT` doc comment all
+   contain v1-specific security-reasoning prose ("every byte is either signed or is the signature")
+   that goes stale — actively misleading, not just outdated — the moment the signature disappears.
+   Folded into **6.7** alongside the ADR's originally-named doc set.
+
+A fourth finding didn't change the task shape but is now an explicit constraint inside **6.3**: the
+`v: 2` field must never be routed through either of the codebase's two *existing* version-negotiation
+mechanisms (Bundle `v:1`/`v:2`'s soft anti-rollback warning, or `Hello.streams[].ver` capability
+exchange) — both are one associative hop away ("we already have versioning") and both are exactly the
+kind of negotiation ADR 0016's R5 forbids for message authentication.
+
+No new ADR was needed for any of this — C1's SPK-rotation-enforcement mechanism (interval, fail-open/
+fail-closed behavior) is the one genuinely unspecified detail in the ADR, and is handled as a
+`TODO: confirm` + documented decision inside 6.1/6.2's own task files with architect + security-reviewer
+sign-off, per this codebase's existing precedent for this class of gap (e.g. `DESYNC_RECOVERY_THRESHOLD`),
+not as a new binding decision that would contradict or extend an accepted ADR.
+
 ## Tasks (todo)
-<!-- Filled by /plan-phase. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
-- [ ] **6.1** <title> — [file](./6.1-<slug>.md)
-- [ ] **6.2** <title> — [file](./6.2-<slug>.md)
+<!-- Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
+
+**Wave 1 — parallel tracks** (rotation enforcement and the core cutover touch disjoint code and can be
+developed independently; the AAD/commit-on-decrypt rewrite must not be split further — see 6.3's own
+Goal section for why)
+- [ ] **6.1** SPK rotation policy: age tracking + rotation-due predicate (C1, part 1/3) — [file](./6.1-spk-rotation-age-tracking.md)
+- [ ] **6.3** Envelope v2 core cutover: wire shape + canonical AAD + commit-on-decrypt + desync short-circuit fix (C2, C3, C5, C6, C7 short-circuit) — [file](./6.3-envelope-v2-core-cutover.md)
+
+**Wave 2**
+- [ ] **6.2** SPK rotation enforcement: trigger + monitoring in both long-running client loops (C1, parts 2–3/3; depends on 6.1) — [file](./6.2-spk-rotation-enforcement.md)
+- [ ] **6.4** `eid` replay-dedup key (C7, second half; depends on 6.3) — [file](./6.4-eid-replay-dedup.md)
+- [ ] **6.6** Test re-pointing: v1 detector → v2 AEAD, plus the new C3/R1 adversarial cells (depends on 6.3) — [file](./6.6-repoint-adversarial-tests.md)
+
+**Wave 3**
+- [ ] **6.5** Conformance vectors: `ratchet-v2.json` + `envelope-v2.json` (depends on 6.3, 6.4) — [file](./6.5-conformance-vectors-v2.md)
+- [ ] **6.7** Doc-sync: describe envelope v2 as shipped (C4; depends on 6.3, 6.4) — [file](./6.7-doc-sync-envelope-v2.md)
+
+**Wave 4 — exit gate**
+- [ ] **6.8** Phase exit: flag-day cutover verification + acceptance demo + roadmap unblock (depends on 6.1–6.7) — [file](./6.8-phase-exit-flag-day-demo.md)
 
 ## Exit criteria
 All tasks `- [x]`; tree green (`cargo build --workspace`, `cargo fmt --check`,
