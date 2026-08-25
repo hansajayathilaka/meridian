@@ -28,7 +28,7 @@ use meridian_core::identity::{
     generate_account, FileSecretStore, KeyHandle, MemorySecretStore, OsSecretStore, SecretStore,
 };
 use meridian_core::signaling::{SignalingClient, DEFAULT_OTK_COUNT};
-use meridian_core::trust::{Contact, PinnedKey, TrustState, TrustStore};
+use meridian_core::trust::{Contact, PinnedKey, SendGate, TrustState, TrustStore};
 
 use crate::app::{
     AcceptRequestEffect, AcceptRequestRequest, AcknowledgeKeyChangeEffect,
@@ -2411,10 +2411,13 @@ fn save_chat(
 // decoded `ChatContent`; anything that fails that (bad signature, sender mismatch, unknown prekey,
 // no session, a ratchet desync, a malformed/truncated blob) is dropped, logged, and never crashes
 // this loop or the app — mirrors `apps/cli/src/chat.rs::handle_inbound`'s own reject-loudly-never-
-// trust catch-all exactly. Automatic desync recovery (task 4.9's receiver-side re-handshake) is
-// deliberately **not** wired into this loop — out of this task's scope; a repeated desync from the
-// same peer is simply dropped here, same as any other rejection, until a future task decides this
-// loop should call `meridian_core::desync::attempt_recovery` too.
+// trust catch-all exactly. **Task 5.5 (review finding F5)** wires task 4.9's receiver-side desync
+// recovery into this loop too, mirroring `apps/cli/src/chat.rs::maybe_attempt_recovery`'s gate
+// discipline exactly: a repeated desync from the same peer, past `DESYNC_RECOVERY_THRESHOLD`, may
+// now trigger a `TrustStore::can_send`-gated bundle re-fetch + `meridian_core::desync::
+// attempt_recovery` call (`attempt_worker_recovery`, below `process_inbound_delivery`) — never a
+// silent bypass, and never reachable for a peer already `Warn`/`Blocked` from an unresolved key
+// change.
 // ---------------------------------------------------------------------------
 
 /// Serializes every load-mutate-save touch of `sessions.bin` across this worker task's two
@@ -2855,8 +2858,20 @@ async fn process_inbound_delivery(
 
     let _chat_guard = chat_state_lock().lock().await;
 
+    // (task 5.5, review finding F5) `store`/`handle` are about to be moved wholesale into the
+    // blocking closure below; a cheap clone kept aside lets the async tail of this function reach
+    // for its own `SecretStore`/`KeyHandle` after that closure returns — see
+    // `attempt_worker_recovery`'s own call site at the bottom of this function.
+    let recovery_store = store.clone();
+    let recovery_handle = handle.clone();
+
     type Ack = ([u8; 32], Option<String>, Vec<u8>);
-    let (event, ack): (Option<InboundEvent>, Option<Ack>) =
+    // The third element is `Some(peer_ik)` exactly when this delivery's own `ChatError::Desync`
+    // arm (below) found `ChatState::recovery_recommended` true AND `TrustStore::can_send` already
+    // read `SendGate::Ok` for `peer_ik` — i.e. the network half (`attempt_worker_recovery`, which
+    // this synchronous closure cannot itself perform) should now fetch a fresh bundle and hand it
+    // to `meridian_core::desync::attempt_recovery`.
+    let (event, ack, needs_recovery_fetch): (Option<InboundEvent>, Option<Ack>, Option<[u8; 32]>) =
         tokio::task::spawn_blocking(move || {
             let store: &dyn SecretStore = store.as_ref();
             let handle = &handle;
@@ -2871,11 +2886,12 @@ async fn process_inbound_delivery(
                     eprintln!(
                         "meridian tui: could not load sessions.bin for an inbound envelope: {e}"
                     );
-                    return (None, None);
+                    return (None, None, None);
                 }
             };
             chat.expire_previous_generation(now_unix());
 
+            let mut needs_recovery_fetch = None;
             let (event, ack) = match chat.open_inbound(
                 store,
                 handle,
@@ -2939,12 +2955,45 @@ async fn process_inbound_delivery(
                     }),
                     None,
                 ),
-                // Everything else — `RequestPending`, `Desync`, `BadSignature`, `SenderMismatch`,
+                // (task 5.5, review finding F5) A ratchet desync — still dropped exactly like any
+                // other rejection (never delivered, never trusted), but repeated occurrences from
+                // the same peer may now trigger the same guarded receiver-side recovery
+                // `apps/cli/src/chat.rs::maybe_attempt_recovery` already applies: consult
+                // `ChatState::recovery_recommended` first (cheap, I/O-free — never fires before the
+                // repeated-`Desync` threshold), then `TrustStore::can_send` *before* any network
+                // I/O — a peer already `Warn`/`Blocked` from an unresolved key change must not get
+                // an automatic re-handshake layered on top, and must not even cost a wasted fetch
+                // round trip to discover that. `note_recovery_attempted` is called on the early-
+                // refusal path too (mirroring `maybe_attempt_recovery`'s own doc), so a gated
+                // peer's counter is rate-limited the same way a successfully-recovered peer's is.
+                // Only `SendGate::Ok` sets `needs_recovery_fetch`, handing the actual network fetch
+                // + `meridian_core::desync::attempt_recovery` call off to `attempt_worker_recovery`
+                // below (this closure is synchronous and performs no network I/O of its own).
+                Err(ChatError::Desync) => {
+                    eprintln!("meridian tui: dropped an inbound envelope: ratchet desync");
+                    if chat.recovery_recommended(&deliver.from) {
+                        match load_trust(store, handle) {
+                            Ok(trust) => match trust.can_send(&deliver.from) {
+                                SendGate::Ok => needs_recovery_fetch = Some(deliver.from),
+                                gate => {
+                                    chat.note_recovery_attempted(&deliver.from);
+                                    eprintln!(
+                                        "meridian tui: desync recovery paused for a peer: {gate:?}"
+                                    );
+                                }
+                            },
+                            Err(e) => eprintln!(
+                                "meridian tui: could not load trust.bin to gate desync \
+                                 recovery: {e}"
+                            ),
+                        }
+                    }
+                    (None, None)
+                }
+                // Everything else — `RequestPending`, `BadSignature`, `SenderMismatch`,
                 // `UnknownPrekey`, `NoSession`, a codec/crypto/store error — dropped, logged,
                 // never trusted. Mirrors `apps/cli/src/chat.rs::handle_inbound`'s own
                 // reject-loudly-never-trust catch-all exactly (this section's own module doc).
-                // Automatic desync recovery is deliberately not wired into this loop — out of
-                // this task's scope.
                 Err(e) => {
                     eprintln!("meridian tui: dropped an inbound envelope: {e}");
                     (None, None)
@@ -2957,19 +3006,129 @@ async fn process_inbound_delivery(
                 );
             }
 
-            (event, ack)
+            (event, ack, needs_recovery_fetch)
         })
         .await
         .unwrap_or_else(|e| {
             eprintln!("meridian tui: inbound-delivery blocking task panicked: {e}");
-            (None, None)
+            (None, None, None)
         });
 
     if let Some((from, hint, receipt_blob)) = ack {
         let _ = client.route_with_hint(from, hint, receipt_blob).await;
     }
 
+    if let Some(peer_ik) = needs_recovery_fetch {
+        attempt_worker_recovery(
+            recovery_store,
+            recovery_handle,
+            account_pub,
+            client,
+            peer_ik,
+        )
+        .await;
+    }
+
     event
+}
+
+/// (task 5.5, review finding F5) The network half of the TUI's own receive-side desync recovery —
+/// [`process_inbound_delivery`]'s blocking closure (synchronous, matching every other handler's
+/// `SecretStore`-derivation discipline in this module) cannot itself perform a network fetch, so it
+/// only decides *whether* one is warranted (`ChatState::recovery_recommended` plus the early
+/// `TrustStore::can_send` gate — see that closure's own `ChatError::Desync` arm) and hands off the
+/// single peer identity that cleared both checks here. Mirrors
+/// `apps/cli/src/chat.rs::maybe_attempt_recovery`'s fetch-then-recover shape one layer down: this
+/// function is only ever reached after that early gate already read [`SendGate::Ok`].
+///
+/// Best-effort and fully logged, like every other failure this worker loop already tolerates
+/// (`eprintln!`, never a crash): a fetch failure, a gated/conflicting outcome, or a trust/session
+/// store I/O error here must never bring down the persistent inbound loop — only this one recovery
+/// attempt is abandoned, and the next repeated `Desync` from the same peer gets another chance once
+/// `note_recovery_attempted`'s rate limit allows it (`DESYNC_RECOVERY_THRESHOLD`'s own doc).
+async fn attempt_worker_recovery(
+    store: std::sync::Arc<dyn SecretStore>,
+    handle: KeyHandle,
+    account_pub: [u8; 32],
+    client: &mut SignalingClient,
+    peer_ik: [u8; 32],
+) {
+    let hint = {
+        let store = store.clone();
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            load_trust(store.as_ref(), &handle)
+                .ok()
+                .and_then(|t| t.contact(&peer_ik).map(|c| c.hint.clone()))
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    };
+
+    // Mirrors `apps/cli/src/chat.rs::maybe_attempt_recovery`'s own fetch call exactly (same
+    // 40-attempt/250ms-backoff bound via `fetch_with_retry`). `meridian_signaling::verify_bundle`
+    // pins the returned bundle's signature to this exact requested `peer_ik` — a genuine
+    // on-the-wire key substitution fails closed right here, before any trust-store mutation is
+    // even possible (see `meridian_core::desync::attempt_recovery`'s own doc comment for why this
+    // makes that specific attack structurally unreachable via this call, and
+    // `apps/core/tests/session.rs` for the substrate-level proof of what happens on the rarer path
+    // where a caller's fetch strategy *does* resolve to a different key).
+    let bundle = match fetch_with_retry(client, peer_ik, &hint, "a peer").await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("meridian tui: desync recovery fetch failed: {e}");
+            return;
+        }
+    };
+
+    let _chat_guard = chat_state_lock().lock().await;
+    let outcome = tokio::task::spawn_blocking(move || {
+        let store: &dyn SecretStore = store.as_ref();
+        let handle = &handle;
+        let mut chat = match load_chat(store, handle) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("meridian tui: could not load sessions.bin for desync recovery: {e}");
+                return None;
+            }
+        };
+        let mut trust = match load_trust(store, handle) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("meridian tui: could not load trust.bin for desync recovery: {e}");
+                return None;
+            }
+        };
+        let outcome = meridian_core::desync::attempt_recovery(
+            &mut chat,
+            &mut trust,
+            store,
+            handle,
+            &account_pub,
+            &peer_ik,
+            &bundle.account_pub,
+            &bundle.spk,
+            bundle.otks.first().copied(),
+            &hint,
+            now_unix(),
+        );
+        if let Err(e) = save_chat(&chat, store, handle) {
+            eprintln!("meridian tui: could not persist sessions.bin after desync recovery: {e}");
+        }
+        if let Err(e) = save_trust(&trust, store, handle) {
+            eprintln!("meridian tui: could not persist trust.bin after desync recovery: {e}");
+        }
+        Some(outcome)
+    })
+    .await
+    .unwrap_or(None);
+
+    match outcome {
+        Some(Ok(o)) => eprintln!("meridian tui: desync recovery outcome: {o:?}"),
+        Some(Err(e)) => eprintln!("meridian tui: desync recovery failed: {e}"),
+        None => {}
+    }
 }
 
 // ---------------------------------------------------------------------------

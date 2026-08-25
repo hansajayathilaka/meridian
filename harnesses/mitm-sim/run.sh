@@ -135,3 +135,34 @@ echo "  verified | 0 successes (BundleVerification, fatal) | n/a (fresh-contact 
 echo "           |                                         |                                  | verification-ux.md wording, no session installed"
 echo "[mitm-sim] OK: 0 silent successes against verified; 0 successes against pinned without the"
 echo "  exact verification-ux.md warning shown."
+
+# Task 5.5 (review finding F5): the T08 matrix above only ever drove substitution/recovery through
+# `apps/cli/src/chat.rs`'s relay path. Before this task, NEITHER the TUI's own persistent inbound
+# loop (`meridian_tui::worker::run_inbound_loop`) NOR the P2P dial/accept substrate
+# (`apps/core/src/session.rs`) held a single TrustStore/can_send reference — a MITM against an
+# already-established conversation on either of those paths went undetected. This section closes
+# that gap, extending the SAME task-4.4/4.9 gate machinery (never itself modified) into both.
+echo ""
+echo "[mitm-sim] task 5.5: receive-side key-change detection wired into the TUI + P2P substrate…"
+
+echo "  -- P2P substrate layer: a substituted key against an already-established P2P session --"
+cargo test -q -p meridian-core --test session
+echo "     OK: P2pSession::recover_from_desync — a real dial/answer session over LoopbackTransport —"
+echo "     warns (pinned) / hard-blocks (verified) a key substitution surfaced during its own"
+echo "     receive-side desync recovery exactly like the CLI's maybe_attempt_recovery, refuses an"
+echo "     automatic re-handshake outright when the session's own peer is already gated, is a true"
+echo "     no-op below the recovery threshold, and leaves the real, already-established session with"
+echo "     the genuine peer perfectly healthy throughout."
+
+echo "  -- TUI layer: run_inbound_loop's own desync-recovery gate, over a real rendezvous --"
+cargo test -q -p meridian-tui --test inbound_delivery \
+  repeated_desync_against_an_already_blocked_contact_never_bypasses_can_send
+echo "     OK: a real peer's repeated, authentic-but-undecryptable envelopes against a contact"
+echo "     already Blocked from an unresolved key change never bypass TrustStore::can_send's early"
+echo "     gate to attempt an automatic re-handshake — trust.bin stays byte-identical, and the live"
+echo "     conversation is still healthy afterward. (The complementary substitution-detection half —"
+echo "     that a genuine key change surfaced by a fresh bundle IS detected and blocked — is the P2P"
+echo "     substrate cell above: a real SignalingClient::fetch_bundle pins its response to the exact"
+echo "     requested key, so an on-the-wire substitution against an already-known peer fails closed"
+echo "     at that fetch, structurally before this TUI path's own attempt_worker_recovery ever"
+echo "     reaches meridian_core::desync::attempt_recovery — see that function's own doc comment.)"

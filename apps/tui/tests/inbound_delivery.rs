@@ -60,13 +60,13 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use meridian_core::account::AccountDescriptor;
-use meridian_core::chat::ChatState as CoreChatState;
-use meridian_core::envelope::ChatContent;
+use meridian_core::chat::{ChatState as CoreChatState, DESYNC_RECOVERY_THRESHOLD};
+use meridian_core::envelope::{ChatContent, MessageEnvelope};
 use meridian_core::identity::{
     generate_account, install_mock_keystore, AccountId, KeyHandle, MemorySecretStore, OsSecretStore,
 };
 use meridian_core::signaling::SignalingClient;
-use meridian_core::trust::TrustStore;
+use meridian_core::trust::{TrustState, TrustStore};
 use meridian_rendezvous::{serve, AppState, Config, MemoryStore};
 
 use meridian_tui::app::{
@@ -1590,4 +1590,182 @@ async fn mark_delivered_for_an_unknown_mid_is_a_no_op_on_disk() {
         MessageState::Sent,
         "the unrelated persisted entry must remain Sent, never flipped by an unknown-mid receipt"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Task 5.5 (review finding F5): receive-side desync recovery wired into `run_inbound_loop` —
+// mirrors `apps/cli/src/chat.rs::maybe_attempt_recovery`'s gate discipline. This section proves the
+// half of the property that is honestly reachable over a real network: repeated `Desync` against a
+// contact already `Blocked` by an unresolved key change never bypasses `TrustStore::can_send`'s
+// early gate to attempt an automatic re-handshake, and never mutates `trust.bin` at all — exactly
+// mirroring `apps/core/tests/desync_recovery.rs`'s own `attempt_recovery`-level proof, now shown
+// through the real `run_inbound_loop` this crate actually runs.
+//
+// The complementary half — that a genuine key *substitution* surfaced by a fresh bundle is detected
+// and blocked (`TrustState::PinnedKeyChanged`/`Blocked`, `SendGate::Warn`/`Blocked`) — is proven at
+// the `meridian-core` level in `apps/core/tests/session.rs`'s
+// `recover_from_desync_warns_and_blocks_a_key_substitution_against_a_pinned_established_session`/
+// `..._hard_blocks_..._verified_...`: `meridian_signaling::verify_bundle` pins a real
+// `SignalingClient::fetch_bundle` response to the *exact requested* key, so a genuine on-the-wire
+// substitution against an already-known peer fails closed at that fetch — structurally before this
+// crate's own `attempt_worker_recovery` ever reaches `meridian_core::desync::attempt_recovery` at
+// all (see that function's own doc comment) — making the substitution-detection half untestable
+// honestly at this network-integration layer, and squarely `apps/core/tests/session.rs`'s job
+// instead.
+// ---------------------------------------------------------------------------
+
+/// The real, sealed `trust.bin` for `handle`, as it stands on disk — mirrors [`setup_us_account`]'s
+/// sibling helpers (`publish_own_bundle`'s own `sessions.bin` read/write) and
+/// `tests/run_worker_trust.rs`'s own `write_trust`/(implicit) read pattern.
+fn read_trust(handle: &KeyHandle) -> TrustStore {
+    let os = OsSecretStore::new(SERVICE);
+    let path = meridian_core::account::trust_path().expect("trust_path");
+    let bytes = std::fs::read(&path).expect("read trust.bin");
+    TrustStore::open_at_rest(&os, handle, &bytes).expect("open trust.bin")
+}
+
+/// Mirrors `tests/run_worker_trust.rs::write_trust` exactly.
+fn write_trust(handle: &KeyHandle, trust: &TrustStore) {
+    let os = OsSecretStore::new(SERVICE);
+    let path = meridian_core::account::trust_path().expect("trust_path");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create trust.bin parent dir");
+    }
+    let sealed = trust.seal_at_rest(&os, handle).expect("seal trust.bin");
+    std::fs::write(&path, sealed).expect("write trust.bin");
+}
+
+/// Corrupts an authentic envelope's ratchet header (a byte inside `enc_header`, past the 2-byte
+/// length prefix) and re-signs it under the real sender's identity key — mirrors
+/// `apps/core/tests/desync_recovery.rs::mangle_and_resign` exactly: authentic (passes signature
+/// verification) but undecryptable (`ChatError::Desync`), never a forged sender.
+fn mangle_and_resign(
+    peer_store: &MemorySecretStore,
+    peer_account: &AccountId,
+    blob: &[u8],
+) -> Vec<u8> {
+    let mut env = MessageEnvelope::from_blob(blob).expect("decode envelope");
+    env.ct[2] ^= 0xFF;
+    let sig =
+        meridian_core::identity::sign(peer_store, peer_account.handle(), &env.signing_bytes())
+            .expect("resign");
+    env.sig = *sig.as_bytes();
+    env.to_blob().expect("encode envelope")
+}
+
+/// The flagship proof for this task's TUI-side wiring: a contact already `TrustState::Blocked` from
+/// a prior, unresolved key-change incident — mirrors `apps/core/tests/desync_recovery.rs`'s own
+/// `stand_in_prior_key` pattern for constructing a real, already-blocked contact record keyed
+/// exactly at the peer this conversation is already talking to — gets repeated, authentic-but-
+/// undecryptable envelopes from that exact peer. Before task 5.5, `run_inbound_loop` had **no**
+/// desync-recovery wiring at all (this file's own module doc, pre-task-5.5 revision, said so
+/// explicitly); now it does, and this proves the wiring never bypasses the early
+/// `TrustStore::can_send` gate just because a repeated desync legitimately crossed the recovery
+/// threshold — mirroring `apps/cli/src/chat.rs::maybe_attempt_recovery`'s identical ordering.
+#[tokio::test]
+async fn repeated_desync_against_an_already_blocked_contact_never_bypasses_can_send() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let server = spawn_server();
+    let (handle, us_pub) = setup_us_account();
+    publish_own_bundle(&server, &handle, us_pub).await;
+
+    let (mut rx, peer_store, peer_account, mut peer_chat, mut peer_client) =
+        establish_accepted_conversation(&server, &handle, us_pub).await;
+    let peer_pub = *peer_account.public_key().as_bytes();
+
+    let pinned = read_trust(&handle);
+    assert_eq!(
+        pinned.trust_state(&peer_pub),
+        TrustState::Pinned,
+        "sanity: accepting a message request TOFU-pins the sender"
+    );
+
+    // Overwrite trust.bin: the peer is already `Blocked` from an unrelated, earlier key-change
+    // incident (`stand_in_prior_key` -> `peer_pub`), simulating a real deployment where a key
+    // change was detected and never resolved *before* this scenario's own repeated desync begins.
+    let mut blocked = TrustStore::default();
+    let stand_in_prior_key = [0xCDu8; 32];
+    blocked.observe(stand_in_prior_key, "peer.example", 1_700_000_000);
+    blocked
+        .mark_verified(&stand_in_prior_key)
+        .expect("known contact");
+    blocked
+        .observe_key_change(&stand_in_prior_key, peer_pub, "peer.example", 1_700_000_001)
+        .expect("known contact, distinct new key");
+    assert_eq!(blocked.trust_state(&peer_pub), TrustState::Blocked);
+    write_trust(&handle, &blocked);
+    let before_bytes = std::fs::read(meridian_core::account::trust_path().unwrap())
+        .expect("read trust.bin after seeding Blocked");
+
+    // Drive DESYNC_RECOVERY_THRESHOLD consecutive, authentic-but-undecryptable envelopes from the
+    // real peer over the real rendezvous relay.
+    for i in 0..DESYNC_RECOVERY_THRESHOLD {
+        let mut id = [0u8; 16];
+        getrandom::fill(&mut id).expect("random id");
+        let blob = peer_chat
+            .seal_outbound(
+                &peer_store,
+                peer_account.handle(),
+                peer_account.public_key().as_bytes(),
+                &us_pub,
+                &ChatContent::Text {
+                    id,
+                    body: format!("noise {i}"),
+                },
+            )
+            .expect("peer seal_outbound");
+        let mangled = mangle_and_resign(&peer_store, &peer_account, &blob);
+        peer_client
+            .route_with_hint(us_pub, None, mangled)
+            .await
+            .expect("route a mangled envelope");
+    }
+
+    // None of the mangled envelopes ever surfaces as an InboundEvent — each is dropped as Desync,
+    // exactly like any other rejection.
+    assert!(
+        recv_inbound(&mut rx, Duration::from_millis(500))
+            .await
+            .is_none(),
+        "a mangled/undecryptable envelope must never surface as an InboundEvent"
+    );
+
+    // A genuine, well-formed follow-up sent AFTER the burst — the ordered-delivery synchronization
+    // point this test uses to know every prior mangled envelope (including the threshold-crossing
+    // one) has already been fully processed: WS delivery is ordered and `run_inbound_loop`
+    // processes strictly sequentially (one `process_inbound_delivery` call fully completes,
+    // including its own `sessions.bin`/`trust.bin` I/O, before the next `next_deliver()` is even
+    // polled), so this event's arrival is a hard barrier, not a fixed sleep.
+    let sync_id = peer_send_text(
+        &peer_store,
+        &peer_account,
+        us_pub,
+        &mut peer_chat,
+        &mut peer_client,
+        "still here after the burst",
+    )
+    .await;
+    let event = recv_inbound(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("the genuine follow-up must still be delivered — the gated refusal wedged nothing");
+    match event {
+        InboundEvent::Message { entry, .. } => assert_eq!(entry.mid, hex::encode(sync_id)),
+        other => panic!("expected InboundEvent::Message, got {other:?}"),
+    }
+
+    // The real assertion this test exists for, now safe to check: `trust.bin` is byte-identical to
+    // what this test itself seeded — the early `can_send` gate refused the automatic re-handshake
+    // outright once the threshold was crossed, never reaching a network fetch or
+    // `meridian_core::desync::attempt_recovery`, and never mutating trust state as a side effect of
+    // even considering one.
+    let after_bytes = std::fs::read(meridian_core::account::trust_path().unwrap())
+        .expect("read trust.bin after the burst");
+    assert_eq!(
+        before_bytes, after_bytes,
+        "trust.bin must be byte-identical: a gated peer's repeated desync must never touch trust \
+         state at all, not even a resealed-but-equivalent document"
+    );
+    let trust_after = read_trust(&handle);
+    assert_eq!(trust_after.trust_state(&peer_pub), TrustState::Blocked);
 }
