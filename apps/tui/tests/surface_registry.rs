@@ -341,6 +341,73 @@ fn palette_command_registration_is_last_write_wins() {
     ));
 }
 
+/// Pins [`PaletteRegistry::find_binding`]'s documented tie-break contract (review finding N7): when
+/// two registered commands share a [`KeyBinding`], the one whose id sorts lowest in
+/// byte-lexicographic order wins, regardless of the order the two `register` calls happened in — see
+/// that method's doc comment for the full rationale. Registers the lexicographically *higher* id
+/// first and the lower id second, so a test that only pinned "first/last registered wins" would pass
+/// for the wrong reason; only an id-order tie-break makes this assertion true both ways.
+#[test]
+fn find_binding_tie_break_is_lowest_id_wins() {
+    let shared_binding = KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+    let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+
+    let mut registry = PaletteRegistry::new();
+    registry.register(PaletteCommand {
+        id: "zzz.registered-first",
+        name: "Registered First",
+        description: "higher id, registered first",
+        keybinding: Some(shared_binding),
+        action: PaletteAction::Effect(Arc::new(|| Effect::FetchBundle)),
+    });
+    registry.register(PaletteCommand {
+        id: "aaa.registered-second",
+        name: "Registered Second",
+        description: "lower id, registered second",
+        keybinding: Some(shared_binding),
+        action: PaletteAction::Effect(Arc::new(|| {
+            Effect::SendMessage(SendMessageEffect {
+                request: SendMessageRequest {
+                    peer_pubkey: [0u8; 32],
+                    peer_hint: String::new(),
+                    body: String::new(),
+                },
+                outcome: None,
+            })
+        })),
+    });
+
+    // Both remain registered — a keybinding collision is not an id collision, so neither entry is
+    // overwritten (that is `register`'s own, unrelated contract, pinned elsewhere).
+    assert_eq!(registry.iter().count(), 2);
+
+    let found = registry.find_binding(&key).expect("binding should resolve");
+    assert_eq!(
+        found.id, "aaa.registered-second",
+        "the lower-sorting id must win regardless of registration order"
+    );
+
+    // Reversing registration order changes nothing: the winner is a function of id, not of when
+    // `register` was called.
+    let mut reversed = PaletteRegistry::new();
+    reversed.register(PaletteCommand {
+        id: "aaa.registered-second",
+        name: "Registered Second",
+        description: "lower id, registered first this time",
+        keybinding: Some(shared_binding),
+        action: PaletteAction::Effect(Arc::new(|| Effect::FetchBundle)),
+    });
+    reversed.register(PaletteCommand {
+        id: "zzz.registered-first",
+        name: "Registered First",
+        description: "higher id, registered second this time",
+        keybinding: Some(shared_binding),
+        action: PaletteAction::Effect(Arc::new(|| Effect::FetchBundle)),
+    });
+    let found_reversed = reversed.find_binding(&key).expect("binding should resolve");
+    assert_eq!(found_reversed.id, "aaa.registered-second");
+}
+
 #[test]
 fn surface_registry_bundles_renderers_and_commands_with_zero_cross_edits() {
     let mut registry = SurfaceRegistry::new();

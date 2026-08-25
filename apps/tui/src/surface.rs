@@ -327,10 +327,27 @@ impl PaletteRegistry {
     /// coverage (a registered binding intercepts a screen's own same-key use; an unregistered key is
     /// completely unaffected).
     ///
-    /// **Tie-break contract for two commands sharing a [`KeyBinding`]:** undefined by iteration order
-    /// today — whichever command happens to come first in [`BTreeMap`] key (id) order wins. Not
-    /// pinned as a deliberate design choice (unlike [`Self::register`]'s last-write-wins collision
-    /// contract), just documented as the current, unexamined behavior.
+    /// **Tie-break contract for two commands sharing a [`KeyBinding`] (pinned, review finding N7):**
+    /// of every registered command whose [`PaletteCommand::keybinding`] matches `key`, the one whose
+    /// [`PaletteCommand::id`] sorts lowest in byte-lexicographic order wins — a bare
+    /// `BTreeMap::values().find(...)` walking [`BTreeMap`]'s natural ascending key order (the same
+    /// order [`Self::iter`] walks). This is deterministic and **independent of registration order**:
+    /// unlike [`Self::register`]'s last-write-wins contract, which depends on *when* a command
+    /// registers, this one depends only on *what id* it registers under. A future feature author
+    /// picking an `id` for a command with a [`KeyBinding`] should not assume "mine wins on collision"
+    /// without checking whether some other registered id sorts lower and claims the same binding —
+    /// picking an id is the only lever a caller has over this outcome.
+    ///
+    /// This is the registry's actual, pre-existing behavior (a bare `BTreeMap` lookup), kept as-is
+    /// and pinned rather than changed: it is already fully deterministic and reproducible (same
+    /// registered ids always produce the same winner, regardless of registration order), which is a
+    /// reasonable default for an additive registry where independently-developed features cannot see
+    /// each other's code. Deliberately **not** changed to a hard error on collision at registration
+    /// time here — that would be a bigger design decision than this pin scopes, since it would also
+    /// change [`Self::register`]'s own contract (out of scope for this fix); revisit toward that if
+    /// real-world binding collisions between shipped features turn out to be common enough to warrant
+    /// rejecting them outright. Pinned by `surface_registry.rs`'s
+    /// `find_binding_tie_break_is_lowest_id_wins` test.
     pub fn find_binding(&self, key: &KeyEvent) -> Option<&PaletteCommand> {
         self.commands
             .values()

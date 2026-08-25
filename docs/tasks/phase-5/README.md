@@ -88,7 +88,7 @@ wiring lands (a standalone task today would have nothing to test against).
 
 **Nits taken up (N1, N7 as their own tasks; N2–N6 bundled)**
 - [x] **5.11** Extract shared `observe_into_live_trust` helper (N1) — [file](./5.11-extract-observe-into-live-trust-helper.md)
-- [~] **5.12** Pin `find_binding`'s keybinding-collision tie-break contract (N7) — [file](./5.12-pin-keybinding-collision-tiebreak.md)
+- [x] **5.12** Pin `find_binding`'s keybinding-collision tie-break contract (N7) — [file](./5.12-pin-keybinding-collision-tiebreak.md)
 - [ ] **5.13** Nit sweep: doc/comment/mechanical fixes (N2, N3, N4, N5, N6) — [file](./5.13-phase-5-nit-sweep.md)
 
 **Follow-up surfaced by 5.3's own review** — not part of the original 18-finding report
