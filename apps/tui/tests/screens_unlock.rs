@@ -6,18 +6,35 @@
 //! `screens_onboarding.rs` (see its own doc comment for why 40 was chosen), plus the
 //! no-secret-rendered structural checks (masked with `•`, and never in a `{:?}` dump).
 //!
-//! No real worker exists yet — every test below drives transitions by directly feeding
-//! `handle_key`/`handle_worker` the same way `screens_onboarding.rs` does, simulating what a
-//! future worker's `WorkerEvent::Completed`/`Failed` would report for `Effect::Unlock`.
+//! Every test up to the "App-level boot test" section below drives transitions by directly
+//! feeding `handle_key`/`handle_worker` the same way `screens_onboarding.rs` does, simulating what
+//! a worker's `WorkerEvent::Completed`/`Failed` would report for `Effect::Unlock` — a real worker
+//! now exists (task 4.29/4.37), and task 5.8's own boot test at the bottom of this file drives it
+//! for real: a typed passphrase, through real `crossterm` key events into a real `App`, dispatched
+//! through the real `meridian_tui::worker::dispatch` against a real, sealed `$MERIDIAN_HOME`,
+//! landing on a real `Screen::Main` — mirroring `apps/tui/tests/accept_to_chat.rs`'s own harness
+//! discipline (that file's own module doc names the precedent this one follows for the same reason:
+//! every downstream screen-level test in this crate bypasses the unlock step entirely via a
+//! pre-provisioned account fixture, so nothing before task 5.8 ever proved the passphrase → real
+//! `Effect::Unlock` → real `Screen::Main` path end to end).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
-use meridian_tui::app::{Effect, SessionOutcome, UnlockEffect, UnlockRequest, WorkerEvent};
+use meridian_core::account::{self, AccountDescriptor};
+use meridian_core::identity::{generate_account, FileSecretStore};
+
+use meridian_tui::app::{
+    App, AppEvent, Effect, Screen, SessionOutcome, UnlockEffect, UnlockRequest, WorkerEvent,
+};
+use meridian_tui::config::TuiConfig;
+use meridian_tui::preflight::{preflight_route, InitialRoute};
 use meridian_tui::screens::unlock::{handle_key, handle_worker, render, Entering, UnlockState};
+use meridian_tui::worker::{dispatch, OnboardingSession};
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
@@ -363,4 +380,207 @@ fn snapshot_unlocking_in_progress() {
         assert!(text.contains("Unlocking"));
         assert!(!text.contains("hunter2"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// App-level boot test (task 5.8) — a typed passphrase, driven by real `crossterm` key events
+// through a real `App`, dispatched through the real `meridian_tui::worker::dispatch` against a
+// real, sealed `$MERIDIAN_HOME`, landing on a real `Screen::Main`. See this file's own module doc
+// for why this closes a real coverage gap rather than duplicating the state-machine tests above.
+// ---------------------------------------------------------------------------
+
+const APP_TEST_PASSPHRASE: &str = "correct horse battery staple";
+
+/// `$MERIDIAN_HOME` environment guard — mirrors `apps/tui/tests/run_worker_account.rs`'s own
+/// (no OS-keystore warmup needed: unlocking a **file-backed** account never touches `keyring`).
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct EnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    prev_home: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(dir: &Path) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var("MERIDIAN_HOME").ok();
+        // SAFETY: serialized by ENV_LOCK, the only place in this test binary touching this var.
+        unsafe {
+            std::env::set_var("MERIDIAN_HOME", dir);
+        }
+        Self {
+            _lock: lock,
+            prev_home,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `EnvGuard::set`.
+        unsafe {
+            match &self.prev_home {
+                Some(v) => std::env::set_var("MERIDIAN_HOME", v),
+                None => std::env::remove_var("MERIDIAN_HOME"),
+            }
+        }
+    }
+}
+
+/// Seeds a real, on-disk file-backed account — a real `age`/`scrypt`-wrapped keyfile plus its
+/// matching `account.json` — exactly the shape a returning user's `$MERIDIAN_HOME` holds when
+/// `meridian tui` starts up and `Preflight` routes it to `Screen::Unlock`.
+fn setup_file_backed_account() -> String {
+    let keyfile = account::config_dir()
+        .expect("config_dir")
+        .join("account.key");
+    std::fs::create_dir_all(keyfile.parent().unwrap()).unwrap();
+    let fs = FileSecretStore::new(&keyfile, APP_TEST_PASSPHRASE);
+    let account = generate_account(&fs, "chat.example").expect("generate_account");
+    AccountDescriptor::new_file(&account, &keyfile)
+        .save()
+        .expect("save account.json");
+    account.to_id_string()
+}
+
+fn render_app_to_text(app: &App, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test backend");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    format!("{}", terminal.backend())
+}
+
+/// Property 1: a correctly typed passphrase, submitted through real key events, unlocks a real
+/// keyfile through the real worker and lands the real `App` on `Screen::Main`.
+#[tokio::test]
+async fn typed_passphrase_through_a_real_unlock_effect_lands_on_a_real_screen_main() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let expected_id = setup_file_backed_account();
+
+    // --- Preflight really routes a file-backed account to Screen::Unlock --------------------------
+    let descriptor = AccountDescriptor::load().expect("read account.json");
+    let route = preflight_route(Some(descriptor));
+    assert!(
+        matches!(route, InitialRoute::Unlock(_)),
+        "a file-backed account must route to Screen::Unlock, not straight to Screen::Main"
+    );
+    let (mut app, initial_effects) = App::new_with_route(TuiConfig::default(), route);
+    assert!(
+        initial_effects.is_empty(),
+        "Unlock needs no effect until a passphrase is actually submitted"
+    );
+    match app.current_screen() {
+        Screen::Unlock(state) => match state.as_ref() {
+            UnlockState::Entering(e) => assert_eq!(e.id, expected_id),
+            other => panic!("expected UnlockState::Entering, got {other:?}"),
+        },
+        other => panic!("expected Screen::Unlock, got {other:?}"),
+    }
+
+    // --- Real key events: type the passphrase one char at a time, exactly like a real terminal ----
+    for c in APP_TEST_PASSPHRASE.chars() {
+        let effects = app.update(AppEvent::Key(char_key(c)));
+        assert!(
+            effects.is_empty(),
+            "typing a character must not dispatch anything"
+        );
+    }
+    let rendered = render_app_to_text(&app, 80, 24);
+    assert!(
+        !rendered.contains(APP_TEST_PASSPHRASE),
+        "the typed passphrase must never render in cleartext:\n{rendered}"
+    );
+
+    // --- Enter submits: a real Effect::Unlock, executed by the real worker ------------------------
+    let effects = app.update(AppEvent::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        effects.len(),
+        1,
+        "Enter with a non-empty passphrase must dispatch Effect::Unlock"
+    );
+    let effect = effects.into_iter().next().unwrap();
+    assert!(matches!(effect, Effect::Unlock(_)));
+    match app.current_screen() {
+        Screen::Unlock(state) => assert!(matches!(state.as_ref(), UnlockState::Unlocking(_))),
+        other => panic!("expected Screen::Unlock(Unlocking), got {other:?}"),
+    }
+
+    let mut session = OnboardingSession::default();
+    let event = dispatch(effect, &mut session).await;
+    assert!(
+        matches!(event, WorkerEvent::Completed(Effect::Unlock(_))),
+        "the correct passphrase must succeed against the real keyfile: {event:?}"
+    );
+    let leftover = app.update(AppEvent::Worker(Box::new(event)));
+    assert!(leftover.is_empty());
+
+    // --- The real end state: Screen::Main, built from a real (empty, brand-new) LiveSession -------
+    match app.current_screen() {
+        Screen::Main(main) => assert!(
+            main.contacts.entries.is_empty(),
+            "a brand-new account has no contacts yet"
+        ),
+        other => panic!("expected Screen::Main, got {other:?}"),
+    }
+}
+
+/// Property 2: a wrong passphrase, submitted through real key events, really fails against the
+/// real keyfile (never a lockout — task 4.17's own no-lockout contract), and the very next,
+/// correct attempt still reaches `Screen::Main` in the same session — the retry-with-attempt-count
+/// property from the state-machine tests above, now proven against the real worker instead of a
+/// hand-built `WorkerEvent`.
+#[tokio::test]
+async fn a_real_wrong_passphrase_retries_in_place_before_the_correct_one_reaches_main() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    setup_file_backed_account();
+
+    let descriptor = AccountDescriptor::load().expect("read account.json");
+    let route = preflight_route(Some(descriptor));
+    let (mut app, _) = App::new_with_route(TuiConfig::default(), route);
+    let mut session = OnboardingSession::default();
+
+    for c in "totally-wrong-guess".chars() {
+        app.update(AppEvent::Key(char_key(c)));
+    }
+    let effects = app.update(AppEvent::Key(key(KeyCode::Enter)));
+    let effect = effects.into_iter().next().unwrap();
+    assert!(matches!(effect, Effect::Unlock(_)));
+
+    let event = dispatch(effect, &mut session).await;
+    let message = match &event {
+        WorkerEvent::Failed(Effect::Unlock(_), message) => {
+            assert!(!message.contains("totally-wrong-guess"));
+            message.clone()
+        }
+        other => panic!("a wrong passphrase against the real keyfile must fail: {other:?}"),
+    };
+    let leftover = app.update(AppEvent::Worker(Box::new(event)));
+    assert!(leftover.is_empty());
+
+    match app.current_screen() {
+        Screen::Unlock(state) => match state.as_ref() {
+            UnlockState::Entering(e) => {
+                assert_eq!(e.attempts, 1);
+                assert!(e.passphrase.is_empty());
+                assert_eq!(e.error.as_deref(), Some(message.as_str()));
+            }
+            other => panic!("expected Entering after a real failure, got {other:?}"),
+        },
+        other => panic!("expected Screen::Unlock, got {other:?}"),
+    }
+
+    // No lockout: the correct passphrase, typed right after, still reaches Main in this same
+    // session.
+    for c in APP_TEST_PASSPHRASE.chars() {
+        app.update(AppEvent::Key(char_key(c)));
+    }
+    let effects = app.update(AppEvent::Key(key(KeyCode::Enter)));
+    let effect = effects.into_iter().next().unwrap();
+    let event = dispatch(effect, &mut session).await;
+    assert!(matches!(event, WorkerEvent::Completed(Effect::Unlock(_))));
+    let leftover = app.update(AppEvent::Worker(Box::new(event)));
+    assert!(leftover.is_empty());
+    assert!(matches!(app.current_screen(), Screen::Main(_)));
 }

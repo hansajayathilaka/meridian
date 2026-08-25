@@ -11,11 +11,22 @@
 //! rendering defensively at a narrower width is still worth proving now, in case that floor ever
 //! moves or this screen is ever embedded in a smaller pane.
 //!
-//! No real worker exists yet (task 4.16's own scope: this is a pure state machine + rendering
-//! task, not the effect-execution runtime) — every test below drives transitions by directly
-//! feeding `handle_key`/`handle_worker` the same way `apps/tui/src/app.rs`'s own
-//! `tick_resize_and_paste_events_are_no_ops_for_now`-style tests do, simulating what a future
-//! worker's `WorkerEvent::Completed`/`Failed` would report.
+//! Every test up to the "App-level boot test" section below drives transitions by directly feeding
+//! `handle_key`/`handle_worker` the same way `apps/tui/src/app.rs`'s own
+//! `tick_resize_and_paste_events_are_no_ops_for_now`-style tests do, simulating what a worker's
+//! `WorkerEvent::Completed`/`Failed` would report — a real worker now exists (task 4.30/4.37), and
+//! task 5.8's own boot test at the bottom of this file drives the *whole* stepped wizard through it
+//! for real: real `crossterm` key events into a real `App`, each sub-step's `Effect` executed by the
+//! real `meridian_tui::worker::dispatch` (including a real in-process `meridian-rendezvous` server
+//! for the `Register`/`PublishBundle` steps, mirroring `apps/tui/tests/run_worker_account.rs`'s own
+//! `spawn_server`), landing on a real `Screen::Main` — mirroring
+//! `apps/tui/tests/accept_to_chat.rs`'s own harness discipline. Every state-machine test above only
+//! ever proves one sub-step's *own* transition in isolation; nothing before task 5.8 drove the full
+//! `ChooseStore -> OrgHint -> Generate -> ShowIdentity -> Register -> PublishBundle -> Success ->
+//! Main` chain end to end.
+
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 use meridian_core::identity;
 use meridian_core::signaling::DEFAULT_OTK_COUNT;
@@ -24,14 +35,18 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
+use meridian_rendezvous::{serve, AppState, Config, MemoryStore};
+
 use meridian_tui::app::{
-    Effect, GenerateAccountEffect, GenerateAccountRequest, GeneratedAccount, PublishBundleEffect,
-    PublishBundleRequest, PublishedBundle, RegisterRequest, StoreChoice, WorkerEvent,
+    App, AppEvent, Effect, GenerateAccountEffect, GenerateAccountRequest, GeneratedAccount,
+    PublishBundleEffect, PublishBundleRequest, PublishedBundle, RegisterRequest, Screen,
+    StoreChoice, WorkerEvent,
 };
 use meridian_tui::screens::onboarding::{
     handle_key, handle_worker, render, ChooseStore, Failed, Generating, OnboardingState, OrgHint,
     PublishingBundle, Registering, ShowIdentity, ShowIdentityFocus, StoreKindChoice, Success,
 };
+use meridian_tui::worker::{dispatch, OnboardingSession};
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
@@ -560,4 +575,258 @@ fn snapshot_failed_terminal_state() {
         })),
     });
     assert_renders_at_both_widths(&state, &["connection refused", "retry"]);
+}
+
+// ---------------------------------------------------------------------------
+// App-level boot test (task 5.8) — the full stepped onboarding wizard, driven end to end by real
+// `crossterm` key events through a real `App`, each sub-step's `Effect` executed by the real
+// `meridian_tui::worker::dispatch`, landing on a real `Screen::Main`. See this file's own module
+// doc for why this closes a real coverage gap rather than duplicating the state-machine tests
+// above.
+// ---------------------------------------------------------------------------
+
+const APP_TEST_PASSPHRASE: &str = "correct horse battery staple";
+const APP_TEST_HINT: &str = "chat.example";
+
+/// `$MERIDIAN_HOME` environment guard — mirrors `apps/tui/tests/run_worker_account.rs`'s own (no
+/// OS-keystore warmup needed: this test exercises the `StoreChoice::File` branch throughout, the
+/// same reason that file's own module doc gives for never exercising `StoreChoice::Os` — a
+/// headless CI runner has no real platform credential store).
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct EnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    prev_home: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(dir: &Path) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var("MERIDIAN_HOME").ok();
+        // SAFETY: serialized by ENV_LOCK, the only place in this test binary touching this var.
+        unsafe {
+            std::env::set_var("MERIDIAN_HOME", dir);
+        }
+        Self {
+            _lock: lock,
+            prev_home,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `EnvGuard::set`.
+        unsafe {
+            match &self.prev_home {
+                Some(v) => std::env::set_var("MERIDIAN_HOME", v),
+                None => std::env::remove_var("MERIDIAN_HOME"),
+            }
+        }
+    }
+}
+
+/// A real, in-process `meridian-rendezvous` server on an ephemeral port, backed by a plain
+/// `MemoryStore` — mirrors `apps/tui/tests/run_worker_account.rs::spawn_server` exactly (that
+/// file's own doc comment explains why a background OS thread with its own runtime, rather than
+/// the calling `#[tokio::test]`'s own, is used: the cached `SignalingClient` a real `Register`
+/// dispatch produces has to keep working across this test's own later `PublishBundle` dispatch).
+fn spawn_server() -> String {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let config = Config::default();
+            let state = AppState::new(config, std::sync::Arc::new(MemoryStore::new()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tx.send(addr).unwrap();
+            let _ = serve(state, listener).await;
+        });
+    });
+    let addr = rx.recv().unwrap();
+    format!("ws://{addr}")
+}
+
+fn render_app_to_text(app: &App, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test backend");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    format!("{}", terminal.backend())
+}
+
+#[tokio::test]
+async fn the_full_stepped_onboarding_wizard_reaches_a_real_screen_main() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let server = spawn_server();
+    let mut session = OnboardingSession::default();
+
+    let mut app = App::new();
+    assert!(matches!(app.current_screen(), Screen::Onboarding(_)));
+
+    // --- ChooseStore: select the File-backed keystore and type its passphrase ---------------------
+    let effects = app.update(AppEvent::Key(key(KeyCode::Down))); // toggle Os -> File
+    assert!(effects.is_empty());
+    let effects = app.update(AppEvent::Key(key(KeyCode::Enter))); // enter the passphrase phase
+    assert!(effects.is_empty());
+    for c in APP_TEST_PASSPHRASE.chars() {
+        app.update(AppEvent::Key(char_key(c)));
+    }
+    let rendered = render_app_to_text(&app, 80, 24);
+    assert!(
+        !rendered.contains(APP_TEST_PASSPHRASE),
+        "the typed passphrase must never render in cleartext:\n{rendered}"
+    );
+    let effects = app.update(AppEvent::Key(key(KeyCode::Enter))); // submit -> OrgHint
+    assert!(effects.is_empty());
+    assert!(matches!(
+        app.current_screen(),
+        Screen::Onboarding(state) if matches!(state.as_ref(), OnboardingState::OrgHint(_))
+    ));
+
+    // --- OrgHint: type the domain hint, dispatching a real Effect::GenerateAccount ------------------
+    for c in APP_TEST_HINT.chars() {
+        app.update(AppEvent::Key(char_key(c)));
+    }
+    let effects = app.update(AppEvent::Key(key(KeyCode::Enter)));
+    assert_eq!(effects.len(), 1);
+    let effect = effects.into_iter().next().unwrap();
+    assert!(matches!(effect, Effect::GenerateAccount(_)));
+    let event = dispatch(effect, &mut session).await;
+    assert!(
+        matches!(
+            event,
+            WorkerEvent::Completed(Effect::GenerateAccount(GenerateAccountEffect {
+                outcome: Some(_),
+                ..
+            }))
+        ),
+        "account generation against a real File-backed keyfile must succeed: {event:?}"
+    );
+    let leftover = app.update(AppEvent::Worker(Box::new(event)));
+    assert!(leftover.is_empty());
+
+    // --- ShowIdentity: a really rendered id/QR, then re-point the prefilled server at the real
+    // in-process rendezvous server this test just started, and submit ------------------------------
+    let (real_id, prefill_len) = match app.current_screen() {
+        Screen::Onboarding(state) => match state.as_ref() {
+            OnboardingState::ShowIdentity(si) => {
+                assert!(si.qr.contains('\n'), "QR should be multi-line block art");
+                assert_eq!(si.server, format!("wss://{APP_TEST_HINT}"));
+                (si.account.id.clone(), si.server.chars().count())
+            }
+            other => panic!("expected ShowIdentity, got {other:?}"),
+        },
+        other => panic!("expected Screen::Onboarding, got {other:?}"),
+    };
+    assert!(real_id.starts_with("mrd1:"));
+    assert!(real_id.ends_with(&format!("@{APP_TEST_HINT}")));
+    let shown = render_app_to_text(&app, 80, 24);
+    // The id is long enough to wrap across two rows at 80 cols (each row in `render_app_to_text`'s
+    // dump is its own quoted line), so a naive contiguous-substring check on the full id would fail
+    // on wrapping alone — checking its own prefix (which always lands on the first row regardless
+    // of width) is the width-independent way to assert it renders, same discipline
+    // `snapshot_show_identity_renders_public_id_and_qr` above already uses.
+    assert!(
+        shown.contains(&real_id[..40]),
+        "expected the real minted id to render:\n{shown}"
+    );
+
+    for _ in 0..prefill_len {
+        app.update(AppEvent::Key(key(KeyCode::Backspace)));
+    }
+    for c in server.chars() {
+        app.update(AppEvent::Key(char_key(c)));
+    }
+    let effects = app.update(AppEvent::Key(key(KeyCode::Enter)));
+    assert_eq!(effects.len(), 1);
+    let effect = effects.into_iter().next().unwrap();
+    match &effect {
+        Effect::Register(req) => {
+            assert_eq!(req.server, server);
+            assert_eq!(req.invite, None);
+        }
+        other => panic!("expected Effect::Register, got {other:?}"),
+    }
+    let event = dispatch(effect, &mut session).await;
+    assert!(
+        matches!(event, WorkerEvent::Completed(Effect::Register(_))),
+        "registration against the real in-process rendezvous server must succeed: {event:?}"
+    );
+
+    // --- Registering -> PublishingBundle: App::handle_worker's own Registering arm dispatches the
+    // next real effect itself, with no further key event needed --------------------------------
+    let effects = app.update(AppEvent::Worker(Box::new(event)));
+    assert_eq!(effects.len(), 1);
+    let effect = effects.into_iter().next().unwrap();
+    assert!(matches!(effect, Effect::PublishBundle(_)));
+    assert!(matches!(
+        app.current_screen(),
+        Screen::Onboarding(state) if matches!(state.as_ref(), OnboardingState::PublishingBundle(_))
+    ));
+    let event = dispatch(effect, &mut session).await;
+    let otk_count = match &event {
+        WorkerEvent::Completed(Effect::PublishBundle(PublishBundleEffect {
+            outcome: Some(published),
+            ..
+        })) => published.otk_count,
+        other => panic!(
+            "expected a completed PublishBundle against the real rendezvous server, got {other:?}"
+        ),
+    };
+    assert!(otk_count > 0);
+
+    // --- PublishingBundle -> Success ----------------------------------------------------------------
+    let leftover = app.update(AppEvent::Worker(Box::new(event)));
+    assert!(leftover.is_empty());
+    match app.current_screen() {
+        Screen::Onboarding(state) => match state.as_ref() {
+            OnboardingState::Success(s) => {
+                assert_eq!(s.id, real_id);
+                assert_eq!(s.otk_count, otk_count);
+            }
+            other => panic!("expected Success, got {other:?}"),
+        },
+        other => panic!("expected Screen::Onboarding, got {other:?}"),
+    }
+    let shown = render_app_to_text(&app, 80, 24);
+    assert!(
+        shown.to_lowercase().contains("registered"),
+        "expected the real Success screen to render:\n{shown}"
+    );
+
+    // --- Success -> Enter finishes onboarding: for a File-backed account this reuses the passphrase
+    // already typed at ChooseStore to dispatch a real Effect::Unlock (task 4.37's own File-store
+    // branch), landing on the Unlock screen's own Unlocking sub-state ------------------------------
+    let effects = app.update(AppEvent::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        effects.len(),
+        1,
+        "finishing onboarding for a File-backed account must dispatch exactly one Effect::Unlock"
+    );
+    let effect = effects.into_iter().next().unwrap();
+    assert!(matches!(effect, Effect::Unlock(_)));
+    assert!(matches!(app.current_screen(), Screen::Unlock(_)));
+
+    let event = dispatch(effect, &mut session).await;
+    assert!(
+        matches!(event, WorkerEvent::Completed(Effect::Unlock(_))),
+        "the real, just-minted keyfile must unlock with the same passphrase typed at ChooseStore: \
+         {event:?}"
+    );
+    let leftover = app.update(AppEvent::Worker(Box::new(event)));
+    assert!(leftover.is_empty());
+
+    // --- The real end state: a brand-new Screen::Main, with no contacts yet -------------------------
+    match app.current_screen() {
+        Screen::Main(main) => assert!(
+            main.contacts.entries.is_empty(),
+            "a brand-new onboarded account has no contacts yet"
+        ),
+        other => panic!("expected Screen::Main, got {other:?}"),
+    }
 }
