@@ -544,6 +544,16 @@ async fn a_real_wrong_passphrase_retries_in_place_before_the_correct_one_reaches
     for c in "totally-wrong-guess".chars() {
         app.update(AppEvent::Key(char_key(c)));
     }
+    let rendered = render_app_to_text(&app, 80, 24);
+    assert!(
+        !rendered.contains("totally-wrong-guess"),
+        "the typed wrong guess must never render in cleartext:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains(APP_TEST_PASSPHRASE),
+        "the correct passphrase must never render in cleartext either:\n{rendered}"
+    );
+
     let effects = app.update(AppEvent::Key(key(KeyCode::Enter)));
     let effect = effects.into_iter().next().unwrap();
     assert!(matches!(effect, Effect::Unlock(_)));
@@ -552,6 +562,7 @@ async fn a_real_wrong_passphrase_retries_in_place_before_the_correct_one_reaches
     let message = match &event {
         WorkerEvent::Failed(Effect::Unlock(_), message) => {
             assert!(!message.contains("totally-wrong-guess"));
+            assert!(!message.contains(APP_TEST_PASSPHRASE));
             message.clone()
         }
         other => panic!("a wrong passphrase against the real keyfile must fail: {other:?}"),
@@ -570,6 +581,15 @@ async fn a_real_wrong_passphrase_retries_in_place_before_the_correct_one_reaches
         },
         other => panic!("expected Screen::Unlock, got {other:?}"),
     }
+    let rendered = render_app_to_text(&app, 80, 24);
+    assert!(
+        !rendered.contains("totally-wrong-guess"),
+        "the wrong guess must never render, even inside the rendered error message:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains(APP_TEST_PASSPHRASE),
+        "the correct passphrase must never render either:\n{rendered}"
+    );
 
     // No lockout: the correct passphrase, typed right after, still reaches Main in this same
     // session.

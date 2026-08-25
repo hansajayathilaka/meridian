@@ -82,8 +82,8 @@ wiring lands (a standalone task today would have nothing to test against).
 - [x] **5.5** Wire receive-side key-change detection into the TUI inbound loop + `session.rs` (F5 + N8 deferred) — [file](./5.5-wire-receive-side-key-change-detection.md)
 - [x] **5.6** Federated mitm-sim cell: verified-contact key-change block (F6; depends on 5.5) — [file](./5.6-federated-verified-key-change-mitm-cell.md)
 - [x] **5.7** App-level reconciliation tests for Settings/Diagnostics (F7) — [file](./5.7-settings-diagnostics-app-level-tests.md)
-- [~] **5.8** App-level end-to-end tests for onboarding/unlock (F8) — [file](./5.8-onboarding-unlock-app-level-tests.md)
-- [ ] **5.9** Scheduled CI workflow for `demo/p2p-wire-proof` (F9) — [file](./5.9-schedule-p2p-wire-proof-ci.md)
+- [x] **5.8** App-level end-to-end tests for onboarding/unlock (F8) — [file](./5.8-onboarding-unlock-app-level-tests.md)
+- [~] **5.9** Scheduled CI workflow for `demo/p2p-wire-proof` (F9) — [file](./5.9-schedule-p2p-wire-proof-ci.md)
 - [ ] **5.10** Drain/flush-on-shutdown hook for `Effect::PersistHistory` (F10) — [file](./5.10-persist-history-drain-on-shutdown.md)
 
 **Nits taken up (N1, N7 as their own tasks; N2–N6 bundled)**
