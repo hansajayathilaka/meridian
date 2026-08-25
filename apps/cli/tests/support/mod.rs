@@ -225,6 +225,22 @@ impl BidirectionalPair {
 /// Stand up org-a and org-b, each federating to the other (mutual dial) at fixed domains
 /// `"org-a.test"`/`"org-b.test"`, returning both c2s URLs and abortable listener handles.
 pub async fn boot_federated_pair_bidirectional() -> BidirectionalPair {
+    boot_federated_pair_bidirectional_inner(false).await
+}
+
+/// Same as [`boot_federated_pair_bidirectional`], with org B's `allow_test_tamper` (task 2.12's
+/// federated bundle-substitution hook) armed — org B becomes the colluding/malicious server, org A
+/// stays honest. Needed by task 5.6's federated already-verified-contact cell. The
+/// `test-tamper-hook` cargo feature itself is always compiled into this crate's dev-dependency
+/// graph (this crate's `meridian-rendezvous` dev-dependency pins the feature workspace-wide, the
+/// same resolver-2 unification `mitm_preexisting_contact.rs`/`relay_rewrite.rs` document), so no
+/// additional `#[cfg]` gate is needed at this crate's own test-file level — only the runtime
+/// `allow_test_tamper` flag below actually arms the substitution.
+pub async fn boot_federated_pair_bidirectional_with_b_tamper() -> BidirectionalPair {
+    boot_federated_pair_bidirectional_inner(true).await
+}
+
+async fn boot_federated_pair_bidirectional_inner(b_allow_test_tamper: bool) -> BidirectionalPair {
     let dir = tempfile::tempdir().unwrap();
     let ca = TestCa::new();
 
@@ -250,6 +266,7 @@ pub async fn boot_federated_pair_bidirectional() -> BidirectionalPair {
     let (a_c2s_url, a_c2s_handle) = spawn_c2s_handle(a_state).await;
 
     let mut b_config = base_config("org-b.test");
+    b_config.server.allow_test_tamper = b_allow_test_tamper;
     b_config.federation = federation_config(
         dir.path(),
         &ca,

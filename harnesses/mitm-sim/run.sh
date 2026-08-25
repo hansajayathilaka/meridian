@@ -166,3 +166,21 @@ echo "     substrate cell above: a real SignalingClient::fetch_bundle pins its r
 echo "     requested key, so an on-the-wire substitution against an already-known peer fails closed"
 echo "     at that fetch, structurally before this TUI path's own attempt_worker_recovery ever"
 echo "     reaches meridian_core::desync::attempt_recovery — see that function's own doc comment.)"
+
+# Task 5.6 (review finding F6): the T08 matrix's federated cell (2.12, above) only ever proved
+# rejection on a FRESH cross-org contact — no prior trust record at all. This section closes the
+# remaining question: does the SAME A2×2 (colluding org servers) defense hold against a contact
+# alice already has VERIFIED, not just first contact? Combines 2.12's real two-server
+# (colluding-org) topology with 4.10's verified-contact key-substitution assertion shape — no new
+# trust-state-machine logic, apps/core/src/trust.rs stays untouched.
+echo ""
+echo "[mitm-sim] task 5.6: federated (colluding-org) key substitution against an already-VERIFIED"
+echo "  contact…"
+cargo test -q -p meridian-cli --test mitm_federated_verified_contact
+echo "  OK: org A (honest) + org B (malicious, colluding) attempt a key substitution against a"
+echo "  cross-org contact alice already has VERIFIED — fails closed at the fetch layer"
+echo "  (SignalError::BundleVerification, VERIFIED trust record left byte-identical) exactly like"
+echo "  the fresh-contact federated cell above, AND — the part that cell cannot check — the"
+echo "  decision-gate layer (task 4.9's recovery window, the one path a substituted key can"
+echo "  legitimately reach TrustStore) hard-blocks a key surfaced by the same colluding org"
+echo "  (TrustState::Blocked, no session installed, acknowledge_key_change refused)."
