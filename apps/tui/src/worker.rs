@@ -2248,6 +2248,14 @@ async fn route_tolerant(
 // PersistHistory (task 4.33)
 // ---------------------------------------------------------------------------
 
+/// **Task 5.10 (F10), load-bearing for `lib.rs::run`'s shutdown drain.** The `WorkerEvent`
+/// returned here — `Completed`/`Failed`, sent back to `run`'s own `worker_rx` — is the completion
+/// signal `run`'s `drain_pending_persist_history` waits on before letting the process exit. This
+/// works with no change to [`run_persist_history`] itself precisely because that function is a
+/// synchronous, non-yielding write (no `.await` inside it, see its own doc comment): once this
+/// `async fn`'s single call into it returns, the write has already landed on disk, so by the time
+/// the `WorkerEvent` this constructs reaches `run`, "acked" and "durable" are the same moment —
+/// there is no window between them for the drain to miss.
 async fn handle_persist_history(
     effect: PersistHistoryEffect,
     session: &OnboardingSession,

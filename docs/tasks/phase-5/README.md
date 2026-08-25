@@ -84,7 +84,7 @@ wiring lands (a standalone task today would have nothing to test against).
 - [x] **5.7** App-level reconciliation tests for Settings/Diagnostics (F7) — [file](./5.7-settings-diagnostics-app-level-tests.md)
 - [x] **5.8** App-level end-to-end tests for onboarding/unlock (F8) — [file](./5.8-onboarding-unlock-app-level-tests.md)
 - [x] **5.9** Scheduled CI workflow for `demo/p2p-wire-proof` (F9) — [file](./5.9-schedule-p2p-wire-proof-ci.md)
-- [~] **5.10** Drain/flush-on-shutdown hook for `Effect::PersistHistory` (F10) — [file](./5.10-persist-history-drain-on-shutdown.md)
+- [x] **5.10** Drain/flush-on-shutdown hook for `Effect::PersistHistory` (F10) — [file](./5.10-persist-history-drain-on-shutdown.md)
 
 **Nits taken up (N1, N7 as their own tasks; N2–N6 bundled)**
 - [ ] **5.11** Extract shared `observe_into_live_trust` helper (N1) — [file](./5.11-extract-observe-into-live-trust-helper.md)
@@ -108,6 +108,16 @@ Wave 2 — gated on a Wave-1 sibling landing first:
 5.1 (app.rs `handle_inbound`) and 5.11 (app.rs `apply_accepted_request`/`apply_added_contact`) share a
 file but touch disjoint functions — safe to parallelize. Same for 5.2 (worker.rs
 `run_accept_request`) vs. 5.3/5.4 (worker.rs `run_mark_verified`/`run_set_petname`).
+
+## Residual carried forward by 5.10's review
+5.10's own `code-reviewer` pass found that its fix (a drain awaited before `run()`'s normal-quit return)
+does not cover `apps/tui/src/terminal.rs::spawn_signal_watch`'s `SIGINT`/`SIGTERM` handler, which calls
+`std::process::exit` directly — an external `kill`/supervisor/orchestration termination can still lose an
+in-flight `PersistHistory` write, unlike an in-app quit. This was already named in 5.10's own Scope as
+deliberately out-of-scope ("a broader shutdown-durability audit is a separate concern if warranted
+later"); the review ratified that deferral explicitly rather than silently letting F10 read as fully
+closed. Not spawned as its own fix-task here — pick up if warranted by a future phase, mirroring how
+Phase 4's own residuals are carried in [the master tracker](../README.md#live-carry-forwards-not-owned-by-any-open-task).
 
 ## Exit criteria
 All findings from the [review report](./review-report.md) triaged into fix-tasks (or explicitly waived
