@@ -627,6 +627,43 @@ pub struct PersistHistoryEffect {
     pub outcome: Option<()>,
 }
 
+/// Inputs for [`Effect::PersistReceipt`] (task 5.1, `crate::app::App::handle_inbound`): mark the
+/// outbound entry matching `ack` (a [`HistoryEntry::mid`]) `Delivered` in `peer_pubkey`'s sealed
+/// transcript — `crate::store::history::mark_delivered`/`mark_delivered_at`.
+///
+/// **Deliberately carries only `peer_pubkey`/`ack`, never the whole updated `Vec<HistoryEntry>`.**
+/// `App::handle_inbound`'s `InboundEvent::Receipt` arm already applies the in-memory `Sent` →
+/// `Delivered` transition synchronously, via [`chat::apply_receipt`](crate::screens::chat::apply_receipt),
+/// against whichever `Screen::Chat` (if any) matches `peer_pubkey` — this request's own job is purely
+/// the durability side of that same transition, a small "find-and-flip-one-field" update-in-place
+/// write, not a full history rewrite driven by re-threading this crate's already-mutated in-memory
+/// `entries` back out over the effect boundary (review fix, task 5.1's own Finding — see that task's
+/// file for the full reconciliation-bug writeup this closes).
+///
+/// **Dispatched unconditionally**, exactly like [`PersistHistoryRequest`]'s own append for a live
+/// [`InboundEvent::Message`] — a receipt for a peer with no `Screen::Chat` currently open must still
+/// update `history.jsonl` so the next `Effect::LoadHistory` (or a restart) reflects `Delivered`
+/// rather than reverting to `Sent`; [`crate::store::history::mark_delivered_at`]'s own no-op-if-
+/// absent contract makes this always safe to dispatch even when no matching `Out`/`Sent` row is
+/// on disk to update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistReceiptRequest {
+    pub peer_pubkey: [u8; 32],
+    /// The acknowledged message's `mid` (hex) — same shape [`InboundEvent::Receipt::ack`] already
+    /// carries.
+    pub ack: String,
+}
+
+/// [`Effect::PersistReceipt`]'s payload. No separate outcome data — same contract as
+/// [`PersistHistoryEffect`]: the mere fact of `WorkerEvent::Completed` vs. `WorkerEvent::Failed`
+/// arriving is everything a caller needs (`crate::screens::chat::handle_worker`'s own
+/// `Effect::PersistHistory` failure-notice arm is mirrored for this effect too).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistReceiptEffect {
+    pub request: PersistReceiptRequest,
+    pub outcome: Option<()>,
+}
+
 /// Inputs for [`Effect::LoadHistory`] (task 4.44, `crate::screens::main`): read `peer_pubkey`'s whole
 /// sealed transcript — `crate::store::history::load_or_default` (task 4.15), the **same** reader
 /// [`crate::store::export`] already uses, never a second, divergent one — off disk, the "no I/O in
@@ -927,6 +964,100 @@ pub struct RunDoctorEffect {
     pub outcome: Option<DoctorReport>,
 }
 
+/// Inputs for [`Effect::ScanRepairableContacts`] (task 5.2, `crate::screens::diagnostics`):
+/// read-only scan of every `trust.bin` contact [`run_accept_request`](crate::worker) synthesized
+/// (`hint == ""` — see that function's own doc comment for why an empty hint is the durable marker
+/// of "this contact was created by an accept, not by [`Effect::AddContact`]") for the two
+/// partial-failure shapes that function's own doc comment names: a missing `contacts.json` display
+/// row, and/or a missing `history.jsonl` accepted-intro entry. Carries no fields — this is a scan of
+/// whatever is currently on disk for the signed-in account, not a query over a caller-supplied set.
+///
+/// **Crisp, load-bearing distinction this scan enforces (the reason this repair path exists at
+/// all): "repairable" is not "any contact missing a `contacts.json` row."**
+/// [`DeleteContactRequest`]'s own doc comment establishes that deleting a contact removes *only*
+/// its `contacts.json` row, leaving the `trust.bin` record (and, transitively, its `history.jsonl`
+/// transcript) untouched — so a **tombstoned** contact and a **partial-failure** contact can look
+/// identical on the one axis of "row missing." The second axis, `history.jsonl` emptiness, is what
+/// mostly separates them, but not perfectly: `history.jsonl` **empty** with the row missing is
+/// unambiguous (only a genuine partial failure produces it — at the moment `run_accept_request`'s
+/// `contacts::save` call never ran or failed, the history write placed strictly after it was never
+/// reached either), so that shape alone is what this scan surfaces as repairable. `history.jsonl`
+/// **non-empty** with the row missing is *not* unambiguous, though: it is the real tombstone shape
+/// (a completed accept's row later removed by [`Effect::DeleteContact`], which never touches
+/// `history.jsonl`) **and** it is separately reachable by a still-unrepaired partial-failure contact
+/// that has simply received an ordinary inbound message since the original failure (inbound
+/// delivery appends to `history.jsonl` whenever a session exists, never gated on the
+/// `contacts.json` row) — so this scan conservatively treats row-missing-and-history-non-empty as
+/// never repairable, accepting some real repair candidates going unsurfaced rather than ever risking
+/// a tombstone resurrection. See `crate::worker::run_scan_repairable_contacts`'s own doc comment for
+/// the exact predicate and both of the further, honestly-flagged ambiguities it cannot resolve: the
+/// row-missing/history-non-empty one just described, and a legitimate
+/// [`meridian_core::envelope::ChatContent::Receipt`] first-contact intro (which 4.49's own scope
+/// also skips writing), which produces the identical empty-history fingerprint as a genuinely lost
+/// text intro on an otherwise-healthy contact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScanRepairableContactsRequest;
+
+/// One `trust.bin` contact this scan found repairable, and exactly which of `run_accept_request`'s
+/// two later writes it is still missing. `label` is the same honest fallback
+/// `crate::screens::contacts::ContactEntry::display_label` would show for this contact (petname →
+/// hint → short pubkey) — repaired or not, this contact's `hint` is always `""` per the eligibility
+/// rule above, so in practice this is always the short-pubkey form, never a petname or hint (a
+/// petname requires an explicit local [`Effect::SetPetname`], and nothing about being repairable
+/// changes that).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairableContact {
+    pub pubkey: [u8; 32],
+    pub label: String,
+    pub missing_contact_row: bool,
+    pub missing_history_intro: bool,
+}
+
+/// [`Effect::ScanRepairableContacts`]'s payload — same request/outcome shape as
+/// [`RunDoctorEffect`], just with no meaningful request fields (see
+/// [`ScanRepairableContactsRequest`]'s own doc comment).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScanRepairableContactsEffect {
+    pub request: ScanRepairableContactsRequest,
+    pub outcome: Option<Vec<RepairableContact>>,
+}
+
+/// Inputs for [`Effect::RepairAcceptedContact`] (task 5.2): repair whichever of
+/// `run_accept_request`'s two later writes is missing for `pubkey` — rebuilding the `contacts.json`
+/// display row from `trust.bin`'s own [`meridian_core::trust::Contact`] (fully recoverable — that
+/// row is only ever a mirror of data `trust.bin` already has) and/or appending a placeholder
+/// `history.jsonl` entry (**not** fully recoverable — see
+/// `crate::worker::run_repair_accepted_contact`'s own doc comment for why the original intro's
+/// content cannot be reconstructed, and what this repairs instead).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairAcceptedContactRequest {
+    pub pubkey: [u8; 32],
+}
+
+/// What [`Effect::RepairAcceptedContact`] actually did — mirrors [`AddedContact`]'s "read back what
+/// really happened, never assume" discipline: both flags are `false` unless that specific write
+/// genuinely ran during this dispatch, never inferred from the request alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairedContact {
+    pub pubkey: [u8; 32],
+    pub contact_row_repaired: bool,
+    pub history_repaired: bool,
+}
+
+/// [`Effect::RepairAcceptedContact`]'s payload. `outcome: None` is the same honest "this dispatch
+/// decided nothing" answer [`AcceptRequestEffect`]'s own no-op branches use — reached when `pubkey`
+/// turns out to have nothing missing (already healthy) by the time this actually runs, e.g. a stale
+/// scan result raced against a concurrent repair. A `pubkey` this dispatch refuses outright (no
+/// `trust.bin` record at all, not accept-shaped, or the row-missing/history-non-empty shape
+/// [`ScanRepairableContactsRequest`]'s own doc comment names — real tombstone or not, see that doc
+/// comment for why this dispatch cannot tell) is a [`WorkerEvent::Failed`], not a silent `None` —
+/// see `crate::worker::run_repair_accepted_contact`'s own doc comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairAcceptedContactEffect {
+    pub request: RepairAcceptedContactRequest,
+    pub outcome: Option<RepairedContact>,
+}
+
 /// The only path from `update` to the network, the keystore, or disk. A worker task executes these
 /// and reports the outcome back as [`WorkerEvent`] / [`AppEvent::Worker`], so a slow rendezvous can
 /// never freeze the UI. `FetchBundle` is still a placeholder (no task needs it yet);
@@ -947,6 +1078,11 @@ pub struct RunDoctorEffect {
 /// `PersistHistory`'s write, dispatched whenever `Screen::Chat` opens (first time or a same-session
 /// re-open) so the transcript reflects `crate::store::history`'s real, sealed on-disk state rather
 /// than starting empty — see [`LoadHistoryEffect`] and `crate::app::App::apply_loaded_history`.
+/// `PersistReceipt` is task 5.1's own new one — the persisted counterpart to `apply_receipt`'s
+/// in-memory-only `Sent` → `Delivered` transition — see [`PersistReceiptEffect`].
+/// `ScanRepairableContacts`/`RepairAcceptedContact` are task 5.2's own two new ones — the
+/// diagnostics-surfaced repair path for `run_accept_request`'s own twice-instantiated
+/// partial-failure window — see [`ScanRepairableContactsEffect`]/[`RepairAcceptedContactEffect`].
 ///
 /// **Does not derive `PartialEq`/`Eq`** (unlike most of the payload structs above): `Unlock`/
 /// `LoadSession` carry a [`SessionOutcome`], and the [`crate::session::LiveSession`] it wraps
@@ -971,6 +1107,9 @@ pub enum Effect {
     FetchBundle,
     PublishBundle(PublishBundleEffect),
     PersistHistory(PersistHistoryEffect),
+    /// Task 5.1: the persisted half of an inbound delivery receipt's `Sent` → `Delivered`
+    /// transition — see [`PersistReceiptEffect`]/[`PersistReceiptRequest`]'s own doc comments.
+    PersistReceipt(PersistReceiptEffect),
     LoadHistory(LoadHistoryEffect),
     /// Boxed: `clippy::large_enum_variant` flags the size gap against the smaller variants
     /// otherwise, once [`UnlockEffect::outcome`] can carry a whole [`LiveSession`] — the same
@@ -991,6 +1130,11 @@ pub enum Effect {
     AcknowledgeKeyChange(AcknowledgeKeyChangeEffect),
     SaveSetting(SaveSettingEffect),
     RunDoctor(RunDoctorEffect),
+    /// Task 5.2: the diagnostics screen's read-only scan for `run_accept_request`'s partial-failure
+    /// gap — see [`ScanRepairableContactsEffect`].
+    ScanRepairableContacts(ScanRepairableContactsEffect),
+    /// Task 5.2: the diagnostics screen's repair trigger — see [`RepairAcceptedContactEffect`].
+    RepairAcceptedContact(RepairAcceptedContactEffect),
 }
 
 /// The outcome of a worker task executing an [`Effect`], reported back as [`AppEvent::Worker`].
@@ -1426,10 +1570,18 @@ impl App {
     ///   double-lists); otherwise it joins [`App::pending_inbound_requests`], drained into the next
     ///   `Screen::Requests` that opens (`Ctrl+R`/Contacts' own `r`) — this task's own named
     ///   deliverable.
-    /// - [`InboundEvent::Receipt`]: an open `Screen::Chat` for that peer updates the matching `Sent`
-    ///   row to `Delivered` in memory; otherwise dropped (out of this task's scope — see
-    ///   [`chat::apply_receipt`]'s own doc comment for why there is no disk-persistence effect for an
-    ///   in-place delivery-state update today).
+    /// - [`InboundEvent::Receipt`] (task 5.1 review fix): walks the **whole** screen stack — not
+    ///   only `self.screens.last_mut()` — for a `Screen::Chat` matching `peer_pubkey`, exactly like
+    ///   [`App::apply_accepted_request`]/[`App::apply_added_contact`] already do for their own
+    ///   inbound-reconciliation events, and applies [`chat::apply_receipt`]'s in-memory `Sent` →
+    ///   `Delivered` transition there if found. Before this fix, a receipt for a chat that was open
+    ///   but not the topmost screen (e.g. `Ctrl-R` pushed `Screen::Requests` on top of it) was
+    ///   silently dropped — never reconciled, and the sender's own transcript stayed stuck on `Sent`
+    ///   until a full reload happened to relayout it correctly. Also dispatches
+    ///   [`Effect::PersistReceipt`] **unconditionally**, mirroring `InboundEvent::Message`'s own
+    ///   "persist regardless of what's on top" discipline above: the durable `history.jsonl` state
+    ///   must reflect `Delivered` even when no matching `Screen::Chat` is open right now, so a later
+    ///   `Effect::LoadHistory` (same session or after a restart) never reverts it back to `Sent`.
     fn handle_inbound(&mut self, event: InboundEvent) -> Vec<Effect> {
         match event {
             InboundEvent::Message { peer_pubkey, entry } => {
@@ -1458,12 +1610,18 @@ impl App {
                 Vec::new()
             }
             InboundEvent::Receipt { peer_pubkey, ack } => {
-                if let Some(Screen::Chat(state)) = self.screens.last_mut() {
-                    if state.peer_pubkey == peer_pubkey {
-                        chat::apply_receipt(state, &ack);
+                for screen in &mut self.screens {
+                    if let Screen::Chat(state) = screen {
+                        if state.peer_pubkey == peer_pubkey {
+                            chat::apply_receipt(state, &ack);
+                            break;
+                        }
                     }
                 }
-                Vec::new()
+                vec![Effect::PersistReceipt(PersistReceiptEffect {
+                    request: PersistReceiptRequest { peer_pubkey, ack },
+                    outcome: None,
+                })]
             }
         }
     }
@@ -2166,6 +2324,52 @@ impl App {
         }
     }
 
+    /// Routes a `trust.observe(pubkey, hint, at)` call for the `Screen::Main` at `main_idx` into
+    /// whichever `TrustStore` is actually live for it right now (task 5.11 review fix, N1: this
+    /// exact stack-walk-and-dispatch was duplicated verbatim between
+    /// [`App::apply_accepted_request`] and [`App::apply_added_contact`] — the same duplicated
+    /// logic that let tasks 4.42/4.45/4.46 each independently trace and fix a defect in it before
+    /// this task collapsed the two copies into one place to stop a fourth from doing the same).
+    ///
+    /// **`Ctrl-R` is a global binding, reachable with a `Screen::Chat`/`Screen::Verify` already open
+    /// on top of `Screen::Main`** (open Chat with A, `Ctrl-R` pushes `Screen::Requests` on top of
+    /// that, accept/add a contact for B): `MainState::trust` is `std::mem::take`n by whichever of
+    /// those two screens is open (see `crate::screens::main`'s "moved, not borrowed" doc), leaving a
+    /// placeholder `TrustStore::default()` behind on the `Main` frame itself — an `observe` call
+    /// against *that* placeholder would be silently discarded when [`App::reclaim_trust`] later
+    /// overwrites `main.trust` wholesale with the popped screen's own (unrelated) store. So the
+    /// `observe` call is routed to wherever the live store for this `Screen::Main` actually is: the
+    /// first `Screen::Chat`/`Screen::Verify` frame **above** `main_idx` on the stack, if one exists
+    /// (there is at most one at a time — the whole point of "moved, not cloned"), else
+    /// `Screen::Main` itself.
+    ///
+    /// Callers pass their own freshly `position`-scanned `main_idx`, so the `Some(Screen::Main(_))`
+    /// check below (a no-op fallback rather than a panic if it ever fails) should never actually
+    /// miss in practice.
+    fn observe_into_live_trust(&mut self, main_idx: usize, pubkey: [u8; 32], hint: &str, at: u64) {
+        let live_trust_idx = self.screens[main_idx + 1..]
+            .iter()
+            .position(|s| matches!(s, Screen::Chat(_) | Screen::Verify(_)))
+            .map(|offset| main_idx + 1 + offset);
+        match live_trust_idx {
+            Some(idx) => match &mut self.screens[idx] {
+                Screen::Chat(chat) => {
+                    chat.trust.observe(pubkey, hint, at);
+                }
+                Screen::Verify(verify) => {
+                    verify.trust.observe(pubkey, hint, at);
+                }
+                _ => unreachable!("live_trust_idx only ever points at Chat|Verify"),
+            },
+            None => {
+                let Some(Screen::Main(main)) = self.screens.get_mut(main_idx) else {
+                    return;
+                };
+                main.trust.observe(pubkey, hint, at);
+            }
+        }
+    }
+
     /// Replays a completed [`Effect::AcceptRequest`]'s persisted mutations into whichever
     /// [`Screen::Main`] is on the stack (task 4.42, piece C) — the in-memory half of the fix for
     /// task 4.41's Defect C.
@@ -2199,19 +2403,13 @@ impl App {
     /// and is likewise a no-op when there is no `Screen::Main` at all (a `Screen::Requests` pushed
     /// standalone in a test, with no backing session to reconcile into).
     ///
-    /// **`Ctrl-R` is a global binding, reachable with a `Screen::Chat`/`Screen::Verify` already open
-    /// on top of `Screen::Main`** (open Chat with A, `Ctrl-R` pushes `Screen::Requests` on top of
-    /// that, accept a request from B): `MainState::trust` is `std::mem::take`n by whichever of those
-    /// two screens is open (see `crate::screens::main`'s "moved, not borrowed" doc), leaving a
-    /// placeholder `TrustStore::default()` behind on the `Main` frame itself — an `observe` call
-    /// against *that* placeholder would be silently discarded when [`App::reclaim_trust`] later
-    /// overwrites `main.trust` wholesale with the popped screen's own (unrelated) store. So the
-    /// `trust.observe` step below is routed to wherever the live store for this `Screen::Main`
-    /// actually is: the first `Screen::Chat`/`Screen::Verify` frame **above** it on the stack, if one
-    /// exists (there is at most one at a time — the whole point of "moved, not cloned"), else
-    /// `Screen::Main` itself. `main.chat`/`main.contacts` are never moved by that same `mem::take`
-    /// (only `trust` is — see `crate::screens::main`'s "moved" doc again), so those two steps always
-    /// land on the `Screen::Main` frame directly, regardless of what else is stacked above it.
+    /// Step 1's routing (where the live `TrustStore` for this `Screen::Main` actually is, given
+    /// `Ctrl-R` can reach this while `Screen::Chat`/`Screen::Verify` sits on top) is
+    /// [`App::observe_into_live_trust`]'s own concern, shared with [`App::apply_added_contact`] —
+    /// see that helper's doc for the full reasoning. `main.chat`/`main.contacts` (steps 2 and 3
+    /// below) are never moved by the same `mem::take` (only `trust` is — see
+    /// `crate::screens::main`'s "moved" doc), so those two steps always land on the `Screen::Main`
+    /// frame directly, regardless of what else is stacked above it.
     fn apply_accepted_request(&mut self, added: AddedContact) {
         let Some(main_idx) = self
             .screens
@@ -2220,27 +2418,7 @@ impl App {
         else {
             return;
         };
-        let live_trust_idx = self.screens[main_idx + 1..]
-            .iter()
-            .position(|s| matches!(s, Screen::Chat(_) | Screen::Verify(_)))
-            .map(|offset| main_idx + 1 + offset);
-        match live_trust_idx {
-            Some(idx) => match &mut self.screens[idx] {
-                Screen::Chat(chat) => {
-                    chat.trust.observe(added.pubkey, "", added.added_at);
-                }
-                Screen::Verify(verify) => {
-                    verify.trust.observe(added.pubkey, "", added.added_at);
-                }
-                _ => unreachable!("live_trust_idx only ever points at Chat|Verify"),
-            },
-            None => {
-                let Some(Screen::Main(main)) = self.screens.get_mut(main_idx) else {
-                    return;
-                };
-                main.trust.observe(added.pubkey, "", added.added_at);
-            }
-        }
+        self.observe_into_live_trust(main_idx, added.pubkey, "", added.added_at);
         let Some(Screen::Main(main)) = self.screens.get_mut(main_idx) else {
             return;
         };
@@ -2255,22 +2433,23 @@ impl App {
     /// `MainState::trust`). `worker::run_add_contact` has, by the time this runs, already
     /// TOFU-pinned the peer in the real `trust.bin` (and, if a petname was given, called
     /// `set_petname`) and written its `contacts.json` display row — same "replay durable state,
-    /// decide nothing" character as [`App::apply_accepted_request`], whose exact `live_trust_idx`
-    /// stack walk this reuses verbatim in structure (see that method's own doc comment for the
-    /// full "moved, not cloned" reasoning; not re-derived here): locate `Screen::Main`, then scan
-    /// above it for a `Screen::Chat`/`Screen::Verify` frame — if one exists, `MainState::trust` was
-    /// `std::mem::take`n into it, so `trust.observe(added.pubkey, "", added.added_at)` routes there
-    /// instead of the placeholder left on `Main`; else it routes to `Screen::Main` directly.
+    /// decide nothing" character as [`App::apply_accepted_request`], which shares this method's
+    /// trust-routing step via [`App::observe_into_live_trust`] (task 5.11 review fix, N1 — see that
+    /// helper's own doc comment for the full "moved, not cloned" reasoning; not re-derived here):
+    /// locate `Screen::Main`, then scan above it for a `Screen::Chat`/`Screen::Verify` frame — if
+    /// one exists, `MainState::trust` was `std::mem::take`n into it, so
+    /// `trust.observe(added.pubkey, "", added.added_at)` routes there instead of the placeholder
+    /// left on `Main`; else it routes to `Screen::Main` directly.
     ///
     /// This planning pass traced that `Screen::Chat`/`Screen::Verify` cannot actually be pushed on
     /// top of `Screen::Main` while an `Effect::AddContact` is in flight today (unlike the accepted-
     /// request case, the add-contact sub-flow is embedded in `Screen::Main` itself, not a
     /// separately pushed screen, so there is no navigation path that opens Chat/Verify while it is
-    /// running) — the stack walk is reused anyway, deliberately not hand-optimized to a bare
-    /// `Screen::Main`-only lookup, because reusing the general mechanism is cheap and forecloses a
-    /// future navigation feature silently reintroducing this exact defect class a third time
-    /// (`apply_accepted_request`'s own "not reachable today" claim already turned out false once,
-    /// under 4.42's own review).
+    /// running) — the shared helper's general stack walk is used anyway, deliberately not
+    /// hand-optimized to a bare `Screen::Main`-only lookup here, because reusing the general
+    /// mechanism is cheap and forecloses a future navigation feature silently reintroducing this
+    /// exact defect class a third time (`apply_accepted_request`'s own "not reachable today" claim
+    /// already turned out false once, under 4.42's own review).
     ///
     /// **A second, closely related interleaving gap** (traced during 4.46's planning pass, fixed
     /// here rather than deferred): `Effect::AddContact` is dispatched from `Screen::Main`'s own
@@ -2307,27 +2486,7 @@ impl App {
         else {
             return;
         };
-        let live_trust_idx = self.screens[main_idx + 1..]
-            .iter()
-            .position(|s| matches!(s, Screen::Chat(_) | Screen::Verify(_)))
-            .map(|offset| main_idx + 1 + offset);
-        match live_trust_idx {
-            Some(idx) => match &mut self.screens[idx] {
-                Screen::Chat(chat) => {
-                    chat.trust.observe(added.pubkey, "", added.added_at);
-                }
-                Screen::Verify(verify) => {
-                    verify.trust.observe(added.pubkey, "", added.added_at);
-                }
-                _ => unreachable!("live_trust_idx only ever points at Chat|Verify"),
-            },
-            None => {
-                let Some(Screen::Main(main)) = self.screens.get_mut(main_idx) else {
-                    return;
-                };
-                main.trust.observe(added.pubkey, "", added.added_at);
-            }
-        }
+        self.observe_into_live_trust(main_idx, added.pubkey, "", added.added_at);
         let Some(Screen::Main(main)) = self.screens.get_mut(main_idx) else {
             return;
         };

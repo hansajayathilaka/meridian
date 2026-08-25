@@ -4,7 +4,15 @@
 //! fabricated newer-version fixture for every file type.
 //!
 //! Each test builds its own `MemorySecretStore` + generated account and drives the `_at`/explicit-
-//! path entry points, so no test touches `$MERIDIAN_HOME` or shares state with any other test.
+//! path entry points, so no test touches `$MERIDIAN_HOME` or shares state with any other test —
+//! **except** the `export_json` module at the bottom of this file (task 5.3), which by construction
+//! has to: `export_json` itself only ever reads from the `$MERIDIAN_HOME`-derived default paths
+//! (`super::contacts_path()`/`outbox_path()`/`history_dir()`, `state::load_or_default()`), never an
+//! explicit-path test seam (`export.rs` has no `export_json_at` — see that module's own doc comment
+//! for why real coverage of it was deferred until this task). That module gets its own
+//! `$MERIDIAN_HOME`-guarding `EnvGuard`, mirroring `tests/run_worker_trust.rs`'s own exactly, so it
+//! stays correctly isolated from every other test in this binary (each integration-test binary is
+//! its own process, so this file's own `ENV_LOCK` is independent of every other test file's).
 
 use meridian_core::crypto::at_rest;
 use meridian_core::identity::{generate_account, KeyHandle, MemorySecretStore, SecretStore};
@@ -724,4 +732,266 @@ fn write_sealed_and_write_plain_round_trip_through_the_harness_helpers_directly(
         serde_json::from_slice::<serde_json::Value>(&raw).unwrap(),
         doc
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// `export.rs::export_json` — the document-mirroring logic itself (task 5.3, closing the gap
+// `export.rs`'s own module doc names: before this task, that module had only its `chmod`-helper
+// unit tests, never any coverage of what it actually mirrors). `export_json` reads every document
+// through the **default**, `$MERIDIAN_HOME`-derived path functions (`contacts::load_or_default`/
+// `outbox::load_or_default`/`history::load_or_default`/`state::load_or_default`), so — unlike
+// every other test in this file — these seed their fixtures through the matching default-path
+// `save`/`append` functions under a real, per-test `$MERIDIAN_HOME`, guarded by `EnvGuard` below.
+// ---------------------------------------------------------------------------------------------
+mod export_json_tests {
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard};
+
+    use meridian_core::identity::{generate_account, MemorySecretStore};
+    use meridian_tui::store::contacts::ContactsDocument;
+    use meridian_tui::store::export::export_json;
+    use meridian_tui::store::history::{Direction, HistoryEntry, MessageState};
+    use meridian_tui::store::outbox::OutboxDocument;
+    use meridian_tui::store::state::StateDocument;
+    use meridian_tui::store::{contacts, history, outbox, state};
+
+    use super::{sample_contacts_doc, sample_entry, sample_outbox_doc};
+
+    /// Mirrors `tests/run_worker_trust.rs`'s own `EnvGuard` exactly (a distinct `static` here,
+    /// scoped to this test binary — see this file's own module doc for why that's sufficient
+    /// isolation from every other integration-test binary in this crate).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        prev_home: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(dir: &Path) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_home = std::env::var("MERIDIAN_HOME").ok();
+            // SAFETY: serialized by ENV_LOCK, the only place in this module touching this var.
+            unsafe {
+                std::env::set_var("MERIDIAN_HOME", dir);
+            }
+            Self {
+                _lock: lock,
+                prev_home,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: see `EnvGuard::set`.
+            unsafe {
+                match &self.prev_home {
+                    Some(v) => std::env::set_var("MERIDIAN_HOME", v),
+                    None => std::env::remove_var("MERIDIAN_HOME"),
+                }
+            }
+        }
+    }
+
+    fn fresh_account() -> (MemorySecretStore, meridian_core::identity::KeyHandle) {
+        let store = MemorySecretStore::new();
+        let account =
+            generate_account(&store, "export-json-test.example").expect("generate_account");
+        let handle = account.handle().clone();
+        (store, handle)
+    }
+
+    /// The core mirroring behavior: every sealed document `export_json` copies must land in
+    /// `dest_dir` as genuinely **plain**, directly-`serde_json`-parseable JSON — matching, field
+    /// for field, the same document the sealed source decrypts to — never the still-sealed bytes,
+    /// and never a lossy/partial re-encoding.
+    #[test]
+    fn export_json_writes_plaintext_mirrors_that_match_the_sealed_source_documents() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(home.path());
+        let (store, handle) = fresh_account();
+
+        let contacts_doc = sample_contacts_doc();
+        contacts::save(&contacts_doc, &store, &handle).expect("save contacts.json");
+
+        let outbox_doc = sample_outbox_doc();
+        outbox::save(&outbox_doc, &store, &handle).expect("save outbox.json");
+
+        let peer = "aa".repeat(32);
+        let e1 = sample_entry("8c1f", Direction::Out, MessageState::Delivered);
+        let e2 = sample_entry("8c20", Direction::In, MessageState::Received);
+        history::append(&peer, &e1, &store, &handle).expect("append 1");
+        history::append(&peer, &e2, &store, &handle).expect("append 2");
+
+        let state_doc = state::StateDocument {
+            v: 1,
+            last_conversation: Some([0x22; 16]),
+            panes: state::PaneGeometry {
+                sidebar_width: 28,
+                composer_height: 3,
+            },
+            scroll: state::ScrollState { offset: 5 },
+        };
+        state::save(&state_doc).expect("save state.json");
+
+        // Sanity: every source file really is sealed (contacts/outbox/history) or, for
+        // state.json, was already plaintext before export — export_json's job is to make the
+        // *destination* copies plaintext, not to have found them that way already.
+        let sealed_contacts_bytes =
+            std::fs::read(meridian_tui::store::contacts_path().unwrap()).unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&sealed_contacts_bytes).is_err());
+
+        // --- Act ---------------------------------------------------------------------------
+        let dest = home.path().join("export-dest");
+        export_json(&dest, &store, &handle).expect("export_json");
+
+        // --- contacts.json: plaintext on disk, matching the sealed source exactly ----------
+        let exported_contacts_bytes = std::fs::read(dest.join("contacts.json")).unwrap();
+        let exported_contacts: ContactsDocument =
+            serde_json::from_slice(&exported_contacts_bytes).expect("plaintext JSON");
+        assert_eq!(exported_contacts, contacts_doc);
+
+        // --- outbox.json ---------------------------------------------------------------------
+        let exported_outbox_bytes = std::fs::read(dest.join("outbox.json")).unwrap();
+        let exported_outbox: OutboxDocument =
+            serde_json::from_slice(&exported_outbox_bytes).expect("plaintext JSON");
+        assert_eq!(exported_outbox, outbox_doc);
+
+        // --- history/<peer>.jsonl: plaintext, order-preserving, one JSON object per line -----
+        let exported_history_bytes =
+            std::fs::read(dest.join("history").join(format!("{peer}.jsonl"))).unwrap();
+        let exported_history_text = String::from_utf8(exported_history_bytes).expect("valid utf8");
+        let exported_entries: Vec<HistoryEntry> = exported_history_text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("plaintext JSON line"))
+            .collect();
+        assert_eq!(exported_entries, vec![e1, e2]);
+
+        // --- state.json: always mirrored, byte-for-byte the same document ---------------------
+        let exported_state_bytes = std::fs::read(dest.join("state.json")).unwrap();
+        let exported_state: StateDocument =
+            serde_json::from_slice(&exported_state_bytes).expect("plaintext JSON");
+        assert_eq!(exported_state, state_doc);
+    }
+
+    /// A document that never existed on disk (no contacts ever added, no history directory) is
+    /// skipped entirely — never written out as an empty placeholder — while `state.json` is
+    /// always written, per `export_json`'s own doc comment. This is the mirroring logic's other
+    /// documented behavior, distinct from (and just as untested before this task as) the
+    /// happy-path copy above.
+    #[test]
+    fn export_json_skips_absent_documents_but_always_writes_state_json() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(home.path());
+        let (store, handle) = fresh_account();
+
+        // Nothing at all written under $MERIDIAN_HOME/tui — no contacts.json, no outbox.json, no
+        // history/ directory.
+        assert!(!meridian_tui::store::contacts_path().unwrap().exists());
+        assert!(!meridian_tui::store::outbox_path().unwrap().exists());
+        assert!(!meridian_tui::store::history_dir().unwrap().is_dir());
+
+        let dest = home.path().join("export-dest");
+        export_json(&dest, &store, &handle).expect("export_json");
+
+        assert!(
+            !dest.join("contacts.json").exists(),
+            "a contacts.json that never existed must not be exported as an empty placeholder"
+        );
+        assert!(
+            !dest.join("outbox.json").exists(),
+            "an outbox.json that never existed must not be exported as an empty placeholder"
+        );
+        assert!(
+            !dest.join("history").exists(),
+            "no history/ directory at all was ever created — export_json must not synthesize one"
+        );
+        assert!(
+            dest.join("state.json").exists(),
+            "state.json must always be written, even with no prior state.json on disk — its \
+             well-defined default is a harmless starting point"
+        );
+        let exported_state: StateDocument =
+            serde_json::from_slice(&std::fs::read(dest.join("state.json")).unwrap())
+                .expect("plaintext JSON");
+        assert_eq!(exported_state, StateDocument::default());
+    }
+
+    /// Task 5.14's `join_live_trust` fails closed if `trust.bin` exists but won't open (tamper,
+    /// corruption, wrong key) — reviewer-flagged gap: this property was only exercised indirectly,
+    /// through `load_trust`'s general contract via the unrelated unlock path, never through
+    /// `export_json` itself. Corrupts `trust.bin`'s sealed bytes on disk after a valid seal, then
+    /// asserts `export_json` returns `Err(StoreError::TrustLoad(_))` and — since `join_live_trust`
+    /// runs before `contacts.json` (or anything after it) is written — that the export aborts
+    /// cleanly rather than leaving a partial/stale destination directory behind.
+    #[test]
+    fn export_json_fails_closed_on_a_corrupt_trust_bin() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(home.path());
+        let (store, handle) = fresh_account();
+
+        contacts::save(&sample_contacts_doc(), &store, &handle).expect("save contacts.json");
+
+        let trust = meridian_core::trust::TrustStore::default();
+        let sealed = trust.seal_at_rest(&store, &handle).expect("seal trust.bin");
+        let trust_path = meridian_core::account::trust_path().expect("trust_path");
+        std::fs::write(&trust_path, &sealed).expect("write trust.bin");
+
+        // Tamper with the sealed bytes so `TrustStore::open_at_rest` fails AEAD verification —
+        // the "won't open" case `join_live_trust` must fail closed on, not "absent" (already
+        // covered by the happy-path fixture above, which never writes trust.bin at all).
+        let mut tampered = sealed;
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+        std::fs::write(&trust_path, &tampered).expect("corrupt trust.bin");
+
+        let dest = home.path().join("export-dest");
+        let err = export_json(&dest, &store, &handle).expect_err(
+            "a trust.bin that exists but won't open must abort the export, never silently fall \
+             back to contacts.json's own possibly-stale trust field",
+        );
+        assert!(
+            matches!(err, super::StoreError::TrustLoad(_)),
+            "expected StoreError::TrustLoad, got {err:?}"
+        );
+
+        assert!(
+            !dest.join("contacts.json").exists(),
+            "the export must abort before contacts.json (or anything after it) is written — no \
+             partial/stale destination directory left behind"
+        );
+        assert!(
+            !dest.join("state.json").exists(),
+            "state.json is written after the contacts.json branch — must not be reached either"
+        );
+    }
+
+    /// A `history/` directory that exists but holds only non-`.jsonl` entries yields an empty,
+    /// but still-created, exported `history/` directory — the "history dir exists" branch and the
+    /// "no .jsonl files inside it" branch are two different code paths in `export_json`, and only
+    /// the fixture above exercises the first with real content; this covers the second.
+    #[test]
+    fn export_json_exports_an_empty_history_dir_when_the_source_has_no_jsonl_files() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(home.path());
+        let (store, handle) = fresh_account();
+
+        let history_dir = meridian_tui::store::history_dir().unwrap();
+        std::fs::create_dir_all(&history_dir).unwrap();
+        std::fs::write(history_dir.join("not-a-transcript.txt"), b"stray file").unwrap();
+
+        let dest = home.path().join("export-dest");
+        export_json(&dest, &store, &handle).expect("export_json");
+
+        assert!(dest.join("history").is_dir());
+        let entries: Vec<_> = std::fs::read_dir(dest.join("history"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "a non-.jsonl file in the source history dir must never be mirrored into the export"
+        );
+    }
 }

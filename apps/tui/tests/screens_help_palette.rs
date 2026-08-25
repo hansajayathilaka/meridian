@@ -16,15 +16,34 @@
 //! `PaletteRegistry::find_binding` ordering-regression coverage (`Ctrl+Q`/`Ctrl+R` unaffected, a
 //! screen's own same-key use documented and tested) that needs private `App` access this external test
 //! file doesn't have.
+//!
+//! ## Task 5.7 — App-level reconciliation for Diagnostics (this file's own final section)
+//! `diagnostics_is_reachable_end_to_end_through_the_palette` above only proves the palette *opens*
+//! the pane — it never presses `r`, never runs a real `Effect::RunDoctor` through
+//! `crate::worker::dispatch`, and never checks that the completion reconciles back into the live
+//! `Screen::Extension`'s own `DiagnosticsPane`. That is exactly the gap class that took Phase 4 six
+//! gap-closure waves to find and fix for contacts/requests/chat (see
+//! `apps/tui/tests/accept_to_chat.rs`'s own module doc). The final section of this file closes it:
+//! `Ctrl+K` → the real `Diagnostics` pane → a real `r` → a real `Effect::RunDoctor` → the real
+//! worker's real subprocess call to `crate::screens::diagnostics::DOCTOR_BINARY` (`"meridian"`,
+//! resolved via `$PATH` at invocation time — hardcoded, not injectable, so both branches below drive
+//! it by controlling the test process's own `$PATH` rather than the request) → fed back through
+//! `App::update` → rendered in the live pane. Both the not-on-`PATH` failure path and a genuine
+//! success path (a real, tiny, on-`PATH` stand-in executable, since this crate cannot depend on
+//! `meridian-cli` to build a real one — ADR 0020) are driven, not just one with the other assumed.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::{Frame, Terminal};
 
-use meridian_tui::app::{App, AppEvent, Effect, Screen, SendMessageEffect, SendMessageRequest};
+use meridian_tui::app::{
+    App, AppEvent, Effect, RunDoctorEffect, Screen, SendMessageEffect, SendMessageRequest,
+    WorkerEvent,
+};
 use meridian_tui::screens::help::{self, HelpState};
 use meridian_tui::screens::palette::{self, PaletteOutcome, PaletteState};
 use meridian_tui::surface::{KeyBinding, PaletteAction, PaletteCommand, PaletteRegistry};
+use meridian_tui::worker::{dispatch as worker_dispatch, OnboardingSession};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -388,4 +407,195 @@ fn diagnostics_is_reachable_end_to_end_through_the_palette() {
     let effects = app.update(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)));
     assert!(effects.is_empty());
     assert!(matches!(app.current_screen(), Screen::Extension(_)));
+}
+
+// ---------------------------------------------------------------------------
+// 5. Task 5.7 — App-level reconciliation: a real `r`, a real `Effect::RunDoctor`, a real
+// `meridian_tui::worker::dispatch` subprocess call, fed back into the live `Screen::Extension` pane —
+// see this file's own module doc's "Task 5.7" section.
+// ---------------------------------------------------------------------------
+
+/// Serializes test access to `$PATH`, which is process-global — same discipline
+/// `tests/accept_to_chat.rs::EnvGuard` uses for `$MERIDIAN_HOME`. `DiagnosticsPane` hardcodes
+/// `DOCTOR_BINARY = "meridian"` (never injectable through the effect/request — see that module's own
+/// doc comment), so the only way to drive a real subprocess call down either branch (found vs.
+/// not-found) from a real, live pane is to control what `"meridian"` resolves to on `$PATH`.
+static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct PathGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prev_path: Option<String>,
+}
+
+impl PathGuard {
+    fn set(dir: &std::path::Path) -> Self {
+        let lock = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_path = std::env::var("PATH").ok();
+        // SAFETY: serialized by PATH_LOCK, the only place in this test binary touching this var.
+        unsafe {
+            std::env::set_var("PATH", dir);
+        }
+        Self {
+            _lock: lock,
+            prev_path,
+        }
+    }
+}
+
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `PathGuard::set`.
+        unsafe {
+            match &self.prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+}
+
+fn render_app_to_text(app: &App, width: u16, height: u16) -> String {
+    render_to_text(width, height, |f| app.render(f))
+}
+
+/// `Ctrl+K` → filter to the built-in `Diagnostics` command → `Enter` — lands on the real
+/// `Screen::Extension` pane, exactly like `diagnostics_is_reachable_end_to_end_through_the_palette`
+/// above, pulled out here since both tests below need it plus a following `r`.
+fn open_diagnostics_via_palette(app: &mut App) {
+    app.update(AppEvent::Key(key(
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(matches!(app.current_screen(), Screen::Palette(_)));
+    for c in "diagnostics".chars() {
+        app.update(AppEvent::Key(char_key(c)));
+    }
+    let effects = app.update(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)));
+    assert!(effects.is_empty(), "PushPane dispatches no worker Effect");
+    assert!(matches!(app.current_screen(), Screen::Extension(_)));
+}
+
+/// **The not-on-`PATH` failure branch.** `$PATH` is pointed at an empty temp directory — guaranteed
+/// to contain no `meridian` binary — so the real worker's real subprocess call genuinely fails to
+/// even start the process, surfacing `std::io::ErrorKind::NotFound`. Proves the whole chain: real
+/// `r` key → real `Effect::RunDoctor` → real `worker::dispatch` → real `WorkerEvent::Failed` → real
+/// reconciliation into the live pane's `DiagnosticsStatus::Error`, rendered.
+#[tokio::test]
+async fn ctrl_k_diagnostics_r_runs_doctor_and_renders_a_real_not_on_path_failure() {
+    let empty_path_dir = tempfile::tempdir().expect("tempdir");
+    let _path_guard = PathGuard::set(empty_path_dir.path());
+
+    let mut app = App::new();
+    open_diagnostics_via_palette(&mut app);
+
+    let effects = app.update(AppEvent::Key(char_key('r')));
+    assert_eq!(effects.len(), 1, "r must dispatch exactly one effect");
+    let effect = effects.into_iter().next().unwrap();
+    match &effect {
+        Effect::RunDoctor(RunDoctorEffect { request, .. }) => {
+            assert_eq!(
+                request.binary,
+                meridian_tui::screens::diagnostics::DOCTOR_BINARY
+            );
+        }
+        other => panic!("expected Effect::RunDoctor, got {other:?}"),
+    }
+
+    // The real worker — a real `std::process::Command` spawn attempt, not a hand-built
+    // `WorkerEvent`.
+    let mut session = OnboardingSession::default();
+    let event = worker_dispatch(effect, &mut session).await;
+    let message = match &event {
+        WorkerEvent::Failed(Effect::RunDoctor(RunDoctorEffect { outcome: None, .. }), message) => {
+            assert!(
+                message.contains("not found"),
+                "expected an honest not-found message, got: {message}"
+            );
+            message.clone()
+        }
+        other => panic!(
+            "the doctor-binary-not-found path must surface as WorkerEvent::Failed against a real \
+             $PATH with no meridian binary on it, got {other:?}"
+        ),
+    };
+
+    let leftover = app.update(AppEvent::Worker(Box::new(event)));
+    assert!(leftover.is_empty());
+
+    let text = render_app_to_text(&app, 80, 24);
+    assert!(
+        text.contains(&message),
+        "expected the real not-found message rendered live in the diagnostics pane:\n{text}"
+    );
+    assert!(
+        text.contains("doctor failed"),
+        "expected the pane's own honest failure framing:\n{text}"
+    );
+}
+
+/// **The success branch, through a real subprocess.** `apps/tui` cannot depend on `apps/cli` at all
+/// (ADR 0020 — see `crate::screens::diagnostics`'s own module doc), so this cannot invoke the real
+/// `meridian doctor --json`. Instead `$PATH` is pointed at a tiny temp directory containing a real,
+/// executable, on-`PATH` script literally named `meridian` that answers `doctor --json` with one
+/// valid report line — a genuine subprocess spawn and a genuine stdout capture/parse
+/// (`crate::screens::diagnostics::run_doctor_binary`/`parse_doctor_json`), standing in only for the
+/// *content* `apps/cli`'s own real binary would have produced, never for the spawn/parse mechanism
+/// itself. Unix-only (`std::os::unix::fs::PermissionsExt` for `chmod +x`; the shebang line requires a
+/// POSIX shell) — mirrors `apps/tui/src/store/export.rs`'s own `#[cfg(unix)]` precedent for
+/// filesystem-permission-dependent tests in this crate.
+#[cfg(unix)]
+#[tokio::test]
+async fn ctrl_k_diagnostics_r_runs_doctor_and_renders_a_real_success_report_from_a_real_subprocess()
+{
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin_dir = tempfile::tempdir().expect("tempdir");
+    let script_path = bin_dir.path().join("meridian");
+    std::fs::write(
+        &script_path,
+        "#!/bin/sh\n\
+         echo '{\"nat\":\"full-cone\",\"host\":true,\"srflx\":true,\"relay\":true,\"path\":\"direct\"}'\n",
+    )
+    .expect("write fake meridian script");
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod +x the fake meridian script");
+    let _path_guard = PathGuard::set(bin_dir.path());
+
+    let mut app = App::new();
+    open_diagnostics_via_palette(&mut app);
+
+    let effects = app.update(AppEvent::Key(char_key('r')));
+    assert_eq!(effects.len(), 1, "r must dispatch exactly one effect");
+    let effect = effects.into_iter().next().unwrap();
+    assert!(matches!(effect, Effect::RunDoctor(_)));
+
+    let mut session = OnboardingSession::default();
+    let event = worker_dispatch(effect, &mut session).await;
+    match &event {
+        WorkerEvent::Completed(Effect::RunDoctor(RunDoctorEffect {
+            outcome: Some(report),
+            ..
+        })) => {
+            assert_eq!(report.cells.len(), 1);
+            assert_eq!(report.cells[0].nat, "full-cone");
+            assert_eq!(report.cells[0].path, "direct");
+        }
+        other => panic!(
+            "expected a completed RunDoctor against the real fake-meridian subprocess, got {other:?}"
+        ),
+    }
+
+    let leftover = app.update(AppEvent::Worker(Box::new(event)));
+    assert!(leftover.is_empty());
+
+    let text = render_app_to_text(&app, 80, 24);
+    assert!(
+        text.contains("full-cone"),
+        "expected the real subprocess's report rendered live in the diagnostics pane:\n{text}"
+    );
+    assert!(text.contains("direct"));
+    assert!(
+        !text.to_lowercase().contains("doctor failed"),
+        "a successful run must never render as a failure:\n{text}"
+    );
 }

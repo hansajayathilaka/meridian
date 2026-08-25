@@ -109,10 +109,21 @@ pub async fn run() -> io::Result<()> {
     let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<AppEvent>();
     tokio::spawn(run_worker(effect_rx, worker_tx));
 
+    // Task 5.10 (F10): how many `Effect::PersistHistory` values have been sent to the worker via
+    // `effect_tx` but have not yet come back acknowledged (`WorkerEvent::Completed`/`Failed`) on
+    // `worker_rx` — incremented at both `effect_tx.send` sites below, decremented as acks arrive in
+    // the event loop. Drained to zero (bounded) right before this function returns — see
+    // `drain_pending_persist_history`'s own doc comment for why this exists and what it does not
+    // cover.
+    let mut pending_persist_history: u32 = 0;
+
     // Task 4.37: the `Preflight` route's own initial effect (if any — one `Effect::LoadSession`
     // for the OS-keystore route, none for `Onboarding`/`Unlock`), dispatched before the event loop
     // starts so it reaches the worker exactly like every later effect `App::update` returns.
     for effect in initial_effects {
+        if matches!(effect, Effect::PersistHistory(_)) {
+            pending_persist_history += 1;
+        }
         let _ = effect_tx.send(effect);
     }
 
@@ -127,8 +138,18 @@ pub async fn run() -> io::Result<()> {
             _ = tick.tick() => AppEvent::Tick,
         };
 
+        // Task 5.10: count down `pending_persist_history` on its matching ack *before* `event` is
+        // moved into `app.update` below — this is the only place a `WorkerEvent::Completed`/`Failed`
+        // for a `PersistHistory` effect is ever observed.
+        if is_persist_history_ack(&event) {
+            pending_persist_history = pending_persist_history.saturating_sub(1);
+        }
+
         let effects = app.update(event);
         for effect in effects {
+            if matches!(effect, Effect::PersistHistory(_)) {
+                pending_persist_history += 1;
+            }
             let _ = effect_tx.send(effect);
         }
 
@@ -139,8 +160,100 @@ pub async fn run() -> io::Result<()> {
         }
     }
 
+    // Task 5.10 (F10): give any `Effect::PersistHistory` the loop above dispatched but never saw
+    // acknowledged a bounded window to actually land on disk before the process exits — see
+    // `drain_pending_persist_history`'s own doc comment.
+    drain_pending_persist_history(
+        &mut worker_rx,
+        pending_persist_history,
+        PERSIST_HISTORY_DRAIN_TIMEOUT,
+    )
+    .await;
+
     drop(guard);
     Ok(())
+}
+
+/// How long [`run`]'s shutdown drain ([`drain_pending_persist_history`]) waits for outstanding
+/// `Effect::PersistHistory` writes to be acknowledged before giving up — chosen to comfortably
+/// cover the finding's own "~2s" window (`docs/tasks/phase-5/5.10-persist-history-drain-on-
+/// shutdown.md`, review finding F10) while still being bounded (see that function's own doc
+/// comment for why bounded, not indefinite).
+const PERSIST_HISTORY_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Waits (up to `timeout`) for `pending` outstanding `Effect::PersistHistory` writes — dispatched
+/// to the worker task via `effect_tx` but not yet acknowledged back on `worker_rx` — to complete,
+/// closing task 5.10 / review finding F10: without this, `run`'s old shutdown path (`drop(guard);
+/// Ok(())` with no intervening await) could return, and the process go on to exit, while a
+/// `PersistHistory` effect a user had already seen rendered was still sitting unpolled in
+/// `effect_tx`'s channel buffer or mid-flight in the worker task — losing that message across a
+/// restart. `run_persist_history` (`crate::worker`) itself needed no change to make this safe: it
+/// is a synchronous, non-yielding write (no `.await` inside it), so by the time its
+/// `WorkerEvent::Completed`/`Failed` ack is sent, the write has already landed — that ack is
+/// already exactly the completion signal this drain needs, nothing new had to be built in
+/// `worker.rs` to supply one.
+///
+/// **Scoped to `PersistHistory` only** (this task's own Scope) — no other in-flight `Effect` (a
+/// `SendMessage` mid-network-round-trip, say) is waited on here; it is simply dropped along with
+/// the worker task once this returns or `timeout` elapses. A broader shutdown-durability audit is
+/// explicitly out of this task's scope.
+///
+/// **Bounded, not indefinite.** The worker's effect queue is strictly FIFO (`run_worker`'s single
+/// `while let Some(effect) = effects.recv().await` loop), so a `PersistHistory` effect queued
+/// behind one that never completes (e.g. `run_worker`'s own documented residual: an in-flight
+/// prekey-bundle republish's `SignalingClient::connect` has no timeout against a black-holed
+/// server) would otherwise hang shutdown forever. Giving up after `timeout` trades a vanishingly
+/// rare residual loss for a shutdown that always terminates.
+///
+/// **Does not cover `spawn_signal_watch`'s `SIGINT`/`SIGTERM` path** (`crate::terminal`): that
+/// handler calls `std::process::exit` directly, without ever returning through this function, so a
+/// `PersistHistory` effect still in flight at the moment of a signal is not drained by this at all.
+/// That path is not named in this task's own Scope (only `lib.rs::run()` and `worker.rs` are), and
+/// closing it would need the signal handler itself to await a drain before exiting — left as a
+/// separate, deliberately out-of-scope concern (this task's own "Out" note: "a broader
+/// shutdown-durability audit is a separate concern if warranted later").
+async fn drain_pending_persist_history(
+    worker_rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+    mut pending: u32,
+    timeout: Duration,
+) {
+    if pending == 0 {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    while pending > 0 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, worker_rx.recv()).await {
+            Ok(Some(event)) => {
+                if is_persist_history_ack(&event) {
+                    pending -= 1;
+                }
+            }
+            // The worker task ended (channel closed) or the wait timed out — nothing left to do.
+            Ok(None) | Err(_) => break,
+        }
+    }
+}
+
+/// True for the `AppEvent::Worker` outcome of dispatching an `Effect::PersistHistory` —
+/// [`drain_pending_persist_history`] (and `run`'s own main loop, to keep its `pending_persist_
+/// history` counter accurate) count this down. Both `WorkerEvent::Completed` and `WorkerEvent::
+/// Failed` count: a *failed* persist write is still a worker that is done attempting it — nothing
+/// more in flight to wait on — it just didn't land, which is a separate, already-handled concern
+/// (`crate::screens::chat::handle_worker`'s own failure-notice arm for this effect).
+fn is_persist_history_ack(event: &AppEvent) -> bool {
+    matches!(
+        event,
+        AppEvent::Worker(worker_event)
+            if matches!(
+                worker_event.as_ref(),
+                WorkerEvent::Completed(Effect::PersistHistory(_))
+                    | WorkerEvent::Failed(Effect::PersistHistory(_), _)
+            )
+    )
 }
 
 /// The `Preflight` step's own synchronous I/O (task 4.37): whatever `account.json` (if any) is on
@@ -325,6 +438,54 @@ async fn run_worker(
             break;
         }
     }
+}
+
+/// Task 5.10 (F10): a test-only seam exposing `run`'s real shutdown-drain machinery — otherwise
+/// entirely private — to `tests/persist_history_drain.rs`, which cannot reach `run` itself (its own
+/// doc comment: "not itself invoked by any test in this crate, since it requires a real terminal").
+/// Mirrors `terminal::test_support`'s identical `#[cfg(any(test, feature = "test-support"))]`
+/// pattern for the exact same reason: an integration test crate only sees this crate's genuinely
+/// `pub` surface, so the pieces under test have to be re-exported through a seam like this one
+/// rather than the test reaching into `lib.rs`'s private items directly.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
+
+    use super::{AppEvent, Effect};
+
+    /// Re-exports `run`'s own [`super::run_worker`] under a `pub` wrapper (rather than `pub use`,
+    /// which would require `run_worker` itself to be `pub` — see this module's own doc comment):
+    /// this submodule, as a descendant of the module `run_worker` is defined in, already has
+    /// visibility to call it directly; wrapping it is what lets that visibility reach outside the
+    /// crate without widening `run_worker`'s own declared visibility for normal (non-test)
+    /// callers.
+    pub async fn run_worker(
+        effects: mpsc::UnboundedReceiver<Effect>,
+        replies: mpsc::UnboundedSender<AppEvent>,
+    ) {
+        super::run_worker(effects, replies).await
+    }
+
+    /// Re-exports [`super::drain_pending_persist_history`] — see [`run_worker`]'s own doc comment
+    /// for why a wrapper, not a `pub use`.
+    pub async fn drain_pending_persist_history(
+        worker_rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+        pending: u32,
+        timeout: Duration,
+    ) {
+        super::drain_pending_persist_history(worker_rx, pending, timeout).await
+    }
+
+    /// Re-exports [`super::is_persist_history_ack`] — see [`run_worker`]'s own doc comment for why
+    /// a wrapper, not a `pub use`.
+    pub fn is_persist_history_ack(event: &AppEvent) -> bool {
+        super::is_persist_history_ack(event)
+    }
+
+    /// Re-exports [`super::PERSIST_HISTORY_DRAIN_TIMEOUT`].
+    pub const PERSIST_HISTORY_DRAIN_TIMEOUT: Duration = super::PERSIST_HISTORY_DRAIN_TIMEOUT;
 }
 
 #[cfg(test)]

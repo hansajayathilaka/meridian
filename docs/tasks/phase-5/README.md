@@ -2,7 +2,7 @@
 
 # Phase 5 — Review of Phase 4
 
-**Kind:** review · **Status:** planned — 13 fix-tasks broken out, ready for `/next-task` · **Reviews
+**Kind:** review · **Status:** done — all 14 fix-tasks (5.1–5.14) landed and reviewed · **Reviews
 phase(s):** Phase 4 (T08 — Verification & Contact Trust + T17 — Terminal TUI Client, tasks 4.1–4.52)
 plus the untracked out-of-band work merged alongside/after it (PRs #66–#73: a clippy `result_large_err`
 fix, CI job-split + fixes, the Windows/Linux release-binary pipeline (ADR 0022, superseded same-window
@@ -75,21 +75,24 @@ deferred stretch-goal, since the interleaving it names isn't reachable until 5.5
 wiring lands (a standalone task today would have nothing to test against).
 
 **Should-fix findings (F1–F9), plus F10**
-- [ ] **5.1** Persist and always-reconcile Sent→Delivered receipts (F1) — [file](./5.1-persist-reconcile-delivery-receipts.md)
-- [ ] **5.2** Diagnostics-surfaced repair action for `run_accept_request`'s partial-failure window (F2) — [file](./5.2-accept-request-repair-action.md)
-- [ ] **5.4** `spawn_blocking`-wrap `run_mark_verified`/`run_set_petname` (F4; **land before 5.3**) — [file](./5.4-spawn-blocking-mark-verified-set-petname.md)
-- [ ] **5.3** Fix `contacts.json` trust staleness + cover `export_json` (F3; depends on 5.4) — [file](./5.3-fix-contacts-trust-staleness-export.md)
-- [ ] **5.5** Wire receive-side key-change detection into the TUI inbound loop + `session.rs` (F5 + N8 deferred) — [file](./5.5-wire-receive-side-key-change-detection.md)
-- [ ] **5.6** Federated mitm-sim cell: verified-contact key-change block (F6; depends on 5.5) — [file](./5.6-federated-verified-key-change-mitm-cell.md)
-- [ ] **5.7** App-level reconciliation tests for Settings/Diagnostics (F7) — [file](./5.7-settings-diagnostics-app-level-tests.md)
-- [ ] **5.8** App-level end-to-end tests for onboarding/unlock (F8) — [file](./5.8-onboarding-unlock-app-level-tests.md)
-- [ ] **5.9** Scheduled CI workflow for `demo/p2p-wire-proof` (F9) — [file](./5.9-schedule-p2p-wire-proof-ci.md)
-- [ ] **5.10** Drain/flush-on-shutdown hook for `Effect::PersistHistory` (F10) — [file](./5.10-persist-history-drain-on-shutdown.md)
+- [x] **5.1** Persist and always-reconcile Sent→Delivered receipts (F1) — [file](./5.1-persist-reconcile-delivery-receipts.md)
+- [x] **5.2** Diagnostics-surfaced repair action for `run_accept_request`'s partial-failure window (F2) — [file](./5.2-accept-request-repair-action.md)
+- [x] **5.4** `spawn_blocking`-wrap `run_mark_verified`/`run_set_petname` (F4; **land before 5.3**) — [file](./5.4-spawn-blocking-mark-verified-set-petname.md)
+- [x] **5.3** Fix `contacts.json` trust staleness + cover `export_json` (F3; depends on 5.4) — [file](./5.3-fix-contacts-trust-staleness-export.md)
+- [x] **5.5** Wire receive-side key-change detection into the TUI inbound loop + `session.rs` (F5 + N8 deferred) — [file](./5.5-wire-receive-side-key-change-detection.md)
+- [x] **5.6** Federated mitm-sim cell: verified-contact key-change block (F6; depends on 5.5) — [file](./5.6-federated-verified-key-change-mitm-cell.md)
+- [x] **5.7** App-level reconciliation tests for Settings/Diagnostics (F7) — [file](./5.7-settings-diagnostics-app-level-tests.md)
+- [x] **5.8** App-level end-to-end tests for onboarding/unlock (F8) — [file](./5.8-onboarding-unlock-app-level-tests.md)
+- [x] **5.9** Scheduled CI workflow for `demo/p2p-wire-proof` (F9) — [file](./5.9-schedule-p2p-wire-proof-ci.md)
+- [x] **5.10** Drain/flush-on-shutdown hook for `Effect::PersistHistory` (F10) — [file](./5.10-persist-history-drain-on-shutdown.md)
 
 **Nits taken up (N1, N7 as their own tasks; N2–N6 bundled)**
-- [ ] **5.11** Extract shared `observe_into_live_trust` helper (N1) — [file](./5.11-extract-observe-into-live-trust-helper.md)
-- [ ] **5.12** Pin `find_binding`'s keybinding-collision tie-break contract (N7) — [file](./5.12-pin-keybinding-collision-tiebreak.md)
-- [ ] **5.13** Nit sweep: doc/comment/mechanical fixes (N2, N3, N4, N5, N6) — [file](./5.13-phase-5-nit-sweep.md)
+- [x] **5.11** Extract shared `observe_into_live_trust` helper (N1) — [file](./5.11-extract-observe-into-live-trust-helper.md)
+- [x] **5.12** Pin `find_binding`'s keybinding-collision tie-break contract (N7) — [file](./5.12-pin-keybinding-collision-tiebreak.md)
+- [x] **5.13** Nit sweep: doc/comment/mechanical fixes (N2, N3, N4, N5, N6) — [file](./5.13-phase-5-nit-sweep.md)
+
+**Follow-up surfaced by 5.3's own review** — not part of the original 18-finding report
+- [x] **5.14** `run_acknowledge_key_change` has the same `contacts.json` trust-staleness bug as F3 (depends on 5.3) — [file](./5.14-acknowledge-key-change-trust-staleness.md)
 
 ### Landing order
 ```
@@ -106,7 +109,31 @@ Wave 2 — gated on a Wave-1 sibling landing first:
 file but touch disjoint functions — safe to parallelize. Same for 5.2 (worker.rs
 `run_accept_request`) vs. 5.3/5.4 (worker.rs `run_mark_verified`/`run_set_petname`).
 
+## Residual carried forward by 5.10's review
+5.10's own `code-reviewer` pass found that its fix (a drain awaited before `run()`'s normal-quit return)
+does not cover `apps/tui/src/terminal.rs::spawn_signal_watch`'s `SIGINT`/`SIGTERM` handler, which calls
+`std::process::exit` directly — an external `kill`/supervisor/orchestration termination can still lose an
+in-flight `PersistHistory` write, unlike an in-app quit. This was already named in 5.10's own Scope as
+deliberately out-of-scope ("a broader shutdown-durability audit is a separate concern if warranted
+later"); the review ratified that deferral explicitly rather than silently letting F10 read as fully
+closed. Not spawned as its own fix-task here — pick up if warranted by a future phase, mirroring how
+Phase 4's own residuals are carried in [the master tracker](../README.md#live-carry-forwards-not-owned-by-any-open-task).
+
 ## Exit criteria
 All findings from the [review report](./review-report.md) triaged into fix-tasks (or explicitly waived
 with reasons), all fix-tasks `[x]`, unratified architectural decisions recorded via `/adr`, tree green,
 docs synced.
+
+**Met — Phase 5 closed.** All 18 findings triaged into 13 fix-tasks (N8 folded into 5.5, as noted above)
+plus 5.14 (a genuine second instance of F3's bug class, found by 5.3's own review round, not part of
+the original 18) — 14 fix-tasks total, all `[x]`. Every task's named reviewer(s) signed off PASS with no
+blocking findings across the whole phase; each non-blocking should-fix a reviewer raised was either
+closed in the same commit (5.10's two coverage gaps, 5.13's `debug_assert`, 5.14's `export_json`
+fail-closed test) or explicitly ratified as a deliberate, documented carry-forward rather than silently
+dropped (5.10's SIGINT/SIGTERM residual, recorded above). No task's fix-shape decision (5.12's
+tie-break contract, 5.14's export-time-join-over-write-through call) was judged to need an ADR by its
+own architect review — both are internal, single-crate implementation choices, not new
+components/dependencies/wire changes. `cargo build --workspace`, `cargo fmt --check`, and `cargo clippy
+--workspace --all-targets -- -D warnings` all clean as of 5.14's commit. Docs synced incrementally as
+part of each task (N2/N5's doc fixes in 5.13; no wire/protocol/diagram changed this phase, so no
+separate `/doc-sync` pass was warranted).

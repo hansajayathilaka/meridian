@@ -19,6 +19,29 @@
 //! small a window as practical. Non-Unix platforms (Windows) do not get this hardening yet — this
 //! codebase has no existing precedent for cross-platform permission handling for
 //! [`export_json`] to follow, so that gap is left honest rather than papered over.
+//!
+//! **Live `trust.bin` join (task 5.14).** `contacts.json`'s own [`contacts::ContactRecord::trust`]
+//! field is a write-only cache: whichever trust-mutating handler in `crate::worker` last touched a
+//! given contact (`run_mark_verified`, `run_set_petname`'s neighbors, `run_acknowledge_key_change`,
+//! …) stamps it at that moment, and — absent this join — it goes stale the instant `trust.bin`
+//! changes again through any *other* path. Task 5.3 first hit this for `run_mark_verified` and
+//! fixed it there with a write-through (reload `contacts.json`, patch the row, save). Task 5.14
+//! found the identical bug a second time in `run_acknowledge_key_change`'s escalation branch
+//! (`PinnedKeyChanged` → `Blocked`) and made the call this module's doc now documents: rather than
+//! add a third, fourth, … write-through at every future trust-mutating call site, [`export_json`]
+//! joins `trust.bin` fresh at export time — the same join
+//! `crate::screens::main::build_contact_entries` already performs for the live UI, reusing its
+//! exact `TrustState -> TrustLabel` mapping ([`crate::worker::to_trust_label`], now `pub(crate)`)
+//! rather than a second copy. This closes the bug class at its one true choke point: every
+//! `--export-json` run, present and future, reflects the real `trust.bin` state regardless of
+//! whether the handler that last touched a contact remembered to write through `contacts.json`.
+//! **5.3's own write-through was deliberately left in place**, not removed — the exported
+//! `contacts.json` row is now always overwritten with the live value regardless, so that write is
+//! genuinely-redundant, harmless belt-and-suspenders (it also still matters for
+//! `build_contact_entries`'s own defensive fallback branch, taken when a `trust.bin` record is
+//! missing entirely — see that function's doc comment). `run_acknowledge_key_change` itself was
+//! *not* given a matching write-through: with the join in place here, one would be pure unused
+//! work on every call.
 
 use std::path::Path;
 
@@ -89,7 +112,8 @@ pub fn export_json(
     create_dir_hardened(dest_dir)?;
 
     if super::contacts_path()?.exists() {
-        let doc = contacts::load_or_default(store, handle)?;
+        let mut doc = contacts::load_or_default(store, handle)?;
+        join_live_trust(&mut doc, store, handle)?;
         let bytes = serde_json::to_vec_pretty(&doc)?;
         write_hardened(&dest_dir.join("contacts.json"), &bytes)?;
     }
@@ -132,6 +156,46 @@ pub fn export_json(
     write_hardened(&dest_dir.join("state.json"), &bytes)?;
 
     Ok(())
+}
+
+/// Task 5.14: overwrites every row's `trust` field with the live value from `trust.bin`, so
+/// [`export_json`]'s output can never lag behind whatever `contacts.json` itself last happened to
+/// have written — see the module doc's "Live `trust.bin` join" section. Mirrors
+/// `crate::screens::main::build_contact_entries`'s own join exactly: a row with no matching
+/// `trust.bin` record (an inconsistent store — a `contacts.json` row and its `trust.bin` record are
+/// always written together in the normal path, per `crate::worker::upsert_contact_record`'s own doc
+/// comment) is left at whatever `contacts.json` already recorded, the same defensive fallback that
+/// function uses, never a hard error over a merely-absent record.
+///
+/// **Fails closed, unlike the fallback above, if `trust.bin` exists but won't open** (tamper,
+/// corruption, wrong key — [`crate::worker::load_trust`]'s own "missing file means fresh store, any
+/// other error is fatal" contract): that is a real integrity failure, not "nothing to join yet",
+/// and silently falling back to `contacts.json`'s possibly-stale field in that case would defeat
+/// the whole point of this join.
+fn join_live_trust(
+    doc: &mut contacts::ContactsDocument,
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+) -> Result<(), StoreError> {
+    let trust = crate::worker::load_trust(store, handle).map_err(StoreError::TrustLoad)?;
+    for record in doc.contacts.iter_mut() {
+        if let Some(pubkey) = parse_pubkey_hex(&record.pubkey) {
+            if let Some(contact) = trust.contact(&pubkey) {
+                record.trust = crate::worker::to_trust_label(contact.state);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Mirrors `crate::screens::main`'s own private `parse_pubkey_hex` exactly (same "malformed hex or
+/// wrong length is `None`, never a panic" contract) — a small enough helper that a second,
+/// module-local copy (rather than a shared export solely for this) matches this codebase's existing
+/// precedent (e.g. `to_trust_label`'s own doc comment on `tests/at_rest_audit.rs`'s independent
+/// copy).
+fn parse_pubkey_hex(s: &str) -> Option<[u8; 32]> {
+    let raw = hex::decode(s).ok()?;
+    raw.as_slice().try_into().ok()
 }
 
 #[cfg(all(test, unix))]

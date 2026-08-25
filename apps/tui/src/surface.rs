@@ -227,7 +227,9 @@ pub enum PaletteAction {
     /// trigger — see this type's own doc comment for why a factory, not a stored value.
     Effect(Arc<dyn Fn() -> Effect + Send + Sync>),
     /// Push a freshly constructed extension pane onto the screen stack
-    /// (`Screen::Extension(pane())`).
+    /// (`Screen::Extension(pane())`). **This is the sanctioned third-party extension point** — a
+    /// feature outside this crate registers a [`PaletteCommand`] whose action is `PushPane`, never
+    /// `PushScreen` (see that variant's own doc comment for why `Screen` itself is closed to it).
     PushPane(Arc<dyn Fn() -> Box<dyn ExtensionPane> + Send + Sync>),
     /// Push a freshly constructed, **built-in, first-party** [`Screen`] directly (task 4.36) — for
     /// core screens that predate this registry and are not, and should not become,
@@ -235,6 +237,12 @@ pub enum PaletteAction {
     /// 4.25 could register a *pane* but not yet a real "open Settings" command). `PushPane` remains
     /// the mechanism for third-party feature panes per this module's own doc — this variant exists
     /// only because `Screen` itself gains no new cases for third parties to reach through it.
+    ///
+    /// **Not an extension point.** Only this crate's own built-in [`Screen`] variants can appear
+    /// here — the closure's return type is the crate-local `Screen` enum itself, which a
+    /// downstream feature crate cannot add cases to. A third-party feature that wants a palette
+    /// command to open a new screen must use [`PaletteAction::PushPane`] instead, which is the
+    /// mechanism actually designed to be reached from outside this crate.
     PushScreen(Arc<dyn Fn() -> Screen + Send + Sync>),
 }
 
@@ -327,10 +335,27 @@ impl PaletteRegistry {
     /// coverage (a registered binding intercepts a screen's own same-key use; an unregistered key is
     /// completely unaffected).
     ///
-    /// **Tie-break contract for two commands sharing a [`KeyBinding`]:** undefined by iteration order
-    /// today — whichever command happens to come first in [`BTreeMap`] key (id) order wins. Not
-    /// pinned as a deliberate design choice (unlike [`Self::register`]'s last-write-wins collision
-    /// contract), just documented as the current, unexamined behavior.
+    /// **Tie-break contract for two commands sharing a [`KeyBinding`] (pinned, review finding N7):**
+    /// of every registered command whose [`PaletteCommand::keybinding`] matches `key`, the one whose
+    /// [`PaletteCommand::id`] sorts lowest in byte-lexicographic order wins — a bare
+    /// `BTreeMap::values().find(...)` walking [`BTreeMap`]'s natural ascending key order (the same
+    /// order [`Self::iter`] walks). This is deterministic and **independent of registration order**:
+    /// unlike [`Self::register`]'s last-write-wins contract, which depends on *when* a command
+    /// registers, this one depends only on *what id* it registers under. A future feature author
+    /// picking an `id` for a command with a [`KeyBinding`] should not assume "mine wins on collision"
+    /// without checking whether some other registered id sorts lower and claims the same binding —
+    /// picking an id is the only lever a caller has over this outcome.
+    ///
+    /// This is the registry's actual, pre-existing behavior (a bare `BTreeMap` lookup), kept as-is
+    /// and pinned rather than changed: it is already fully deterministic and reproducible (same
+    /// registered ids always produce the same winner, regardless of registration order), which is a
+    /// reasonable default for an additive registry where independently-developed features cannot see
+    /// each other's code. Deliberately **not** changed to a hard error on collision at registration
+    /// time here — that would be a bigger design decision than this pin scopes, since it would also
+    /// change [`Self::register`]'s own contract (out of scope for this fix); revisit toward that if
+    /// real-world binding collisions between shipped features turn out to be common enough to warrant
+    /// rejecting them outright. Pinned by `surface_registry.rs`'s
+    /// `find_binding_tie_break_is_lowest_id_wins` test.
     pub fn find_binding(&self, key: &KeyEvent) -> Option<&PaletteCommand> {
         self.commands
             .values()

@@ -28,7 +28,7 @@ use meridian_core::identity::{
     generate_account, FileSecretStore, KeyHandle, MemorySecretStore, OsSecretStore, SecretStore,
 };
 use meridian_core::signaling::{SignalingClient, DEFAULT_OTK_COUNT};
-use meridian_core::trust::{Contact, PinnedKey, TrustState, TrustStore};
+use meridian_core::trust::{Contact, PinnedKey, SendGate, TrustState, TrustStore};
 
 use crate::app::{
     AcceptRequestEffect, AcceptRequestRequest, AcknowledgeKeyChangeEffect,
@@ -37,11 +37,13 @@ use crate::app::{
     GenerateAccountRequest, GeneratedAccount, ImportContactQrEffect, ImportContactQrRequest,
     LoadHistoryEffect, LoadHistoryRequest, LoadSessionEffect, LoadSessionOutcome,
     MarkVerifiedEffect, MarkVerifiedRequest, PersistHistoryEffect, PersistHistoryRequest,
-    PublishBundleEffect, PublishedBundle, RegisterRequest, RejectRequestEffect,
-    RejectRequestRequest, RunDoctorEffect, SaveSettingEffect, SendMessageEffect,
-    SendMessageRequest, SentMessage, SessionOutcome, SetPetnameEffect, SetPetnameRequest,
-    SetPolicyOverrideEffect, SetPolicyOverrideRequest, SetUserBlockedEffect, SetUserBlockedRequest,
-    StoreChoice, UnlockEffect, UnlockRequest, WorkerEvent,
+    PersistReceiptEffect, PersistReceiptRequest, PublishBundleEffect, PublishedBundle,
+    RegisterRequest, RejectRequestEffect, RejectRequestRequest, RepairAcceptedContactEffect,
+    RepairAcceptedContactRequest, RepairableContact, RepairedContact, RunDoctorEffect,
+    SaveSettingEffect, ScanRepairableContactsEffect, SendMessageEffect, SendMessageRequest,
+    SentMessage, SessionOutcome, SetPetnameEffect, SetPetnameRequest, SetPolicyOverrideEffect,
+    SetPolicyOverrideRequest, SetUserBlockedEffect, SetUserBlockedRequest, StoreChoice,
+    UnlockEffect, UnlockRequest, WorkerEvent,
 };
 use crate::session::LiveSession;
 use crate::store::contacts::{ContactRecord, ContactsDocument, PinnedKeyRecord, TrustLabel};
@@ -126,7 +128,22 @@ pub struct OnboardingSession {
     /// only one copy of the passphrase-derived key material resident. `TODO: confirm`: unifying the
     /// two (e.g. behind one shared `Arc<dyn SecretStore>`) is a larger refactor than this task's own
     /// scope — left for a future task to decide, not implemented here.
-    live_store: Option<(Box<dyn SecretStore>, KeyHandle)>,
+    ///
+    /// **`Arc`, not `Box` (task 5.4).** [`run_mark_verified`]/[`run_set_petname`] now run their
+    /// `load_trust`/`save_trust`(/`contacts.json`)-driving `decrypt_seed()` unwraps inside
+    /// [`tokio::task::spawn_blocking`], whose closure must be `'static + Send` — a
+    /// `Box<dyn SecretStore>` borrowed as `&dyn SecretStore` cannot satisfy that, but a cloned
+    /// `Arc<dyn SecretStore>` can (`SecretStore: Send + Sync` already), exactly the reasoning
+    /// [`InboundHandoff::store`]'s own doc comment already gives for the same widening (task 4.51).
+    /// **Pure execution-context change, not a residency extension:** this is still the *same* store
+    /// object [`handle_unlock`]'s success path constructs, cloned (an `Arc` clone is an atomic
+    /// refcount bump, never a re-unwrap) rather than moved — [`OnboardingSession::live_store`]'s own
+    /// read accessor is unchanged (`Arc<dyn SecretStore>` derefs to `&dyn SecretStore` exactly like
+    /// `Box` did), so the other `open_account_store`-routed handlers (task 4.51's own Deliverable 7
+    /// residual, still unowned — its count has grown since 4.51's own snapshot and should be
+    /// re-measured against current source, not assumed, by whichever task closes more of them) see
+    /// no behavior change at all from this widening.
+    live_store: Option<(std::sync::Arc<dyn SecretStore>, KeyHandle)>,
 }
 
 struct PendingConnection {
@@ -192,8 +209,14 @@ impl OnboardingSession {
     /// [`run_unlock`]'s own guard, which rejects an OS-keystore `account.json` before this is ever
     /// reached). Every other handler in this module only ever reads the cache back via
     /// [`OnboardingSession::live_store`] — never writes it.
+    ///
+    /// Still takes an owned `Box<dyn SecretStore>` (unchanged signature — every existing caller,
+    /// including this module's own tests, keeps building a `Box` exactly as before); task 5.4's
+    /// `Arc`-widening of the field itself happens internally, via `Arc::from` (`Box<dyn Trait> ->
+    /// Arc<dyn Trait>` is a stable, allocation-cheap conversion — the box's existing heap allocation
+    /// is reused, not copied), so this is not a second construction of the store.
     fn set_live_store(&mut self, store: Box<dyn SecretStore>, handle: KeyHandle) {
-        self.live_store = Some((store, handle));
+        self.live_store = Some((std::sync::Arc::from(store), handle));
     }
 
     /// **Task 4.40, binding modification 4:** borrows (never consumes) the cached file-backed
@@ -207,6 +230,18 @@ impl OnboardingSession {
         self.live_store
             .as_ref()
             .map(|(store, handle)| (store.as_ref(), handle))
+    }
+
+    /// **Task 5.4.** The owned counterpart to [`OnboardingSession::live_store`] above, for callers
+    /// that need to move the store into [`tokio::task::spawn_blocking`]'s `'static + Send` closure
+    /// rather than merely borrow it — currently only [`open_account_store_owned`]. Clones the cached
+    /// `Arc<dyn SecretStore>` (an atomic refcount bump, never a re-unwrap — see the field's own doc
+    /// comment) and the cheap, `Clone`-cheap [`KeyHandle`]. `None` under the same conditions as
+    /// [`OnboardingSession::live_store`].
+    fn live_store_arc(&self) -> Option<(std::sync::Arc<dyn SecretStore>, KeyHandle)> {
+        self.live_store
+            .as_ref()
+            .map(|(store, handle)| (store.clone(), handle.clone()))
     }
 
     /// Borrows (never consumes) the cached client + store for `account_pub`, so a fallible operation
@@ -270,6 +305,9 @@ pub async fn dispatch(effect: Effect, session: &mut OnboardingSession) -> Worker
         // Task 4.33: outbound chat (the send half of the T17 demo's "both sides chat" step).
         Effect::SendMessage(effect) => handle_send_message(effect, session).await,
         Effect::PersistHistory(effect) => handle_persist_history(effect, session).await,
+        // Task 5.1: the persisted half of an inbound delivery receipt's `Sent` → `Delivered`
+        // transition — see `crate::app::App::handle_inbound`'s `InboundEvent::Receipt` arm.
+        Effect::PersistReceipt(effect) => handle_persist_receipt(effect, session).await,
         // Task 4.44: the read half of `PersistHistory` above — dispatched whenever `Screen::Chat`
         // opens (`crate::screens::main::handle_key`'s `OpenChat` arm), so the transcript reflects
         // this exact same `crate::store::history` file rather than starting empty.
@@ -280,6 +318,15 @@ pub async fn dispatch(effect: Effect, session: &mut OnboardingSession) -> Worker
         // wiring, not new logic.
         Effect::SaveSetting(effect) => handle_save_setting(effect).await,
         Effect::RunDoctor(effect) => handle_run_doctor(effect).await,
+        // Task 5.2: the diagnostics screen's repair path for `run_accept_request`'s own
+        // twice-instantiated partial-failure window — see `run_scan_repairable_contacts`/
+        // `run_repair_accepted_contact`'s own doc comments.
+        Effect::ScanRepairableContacts(effect) => {
+            handle_scan_repairable_contacts(effect, session).await
+        }
+        Effect::RepairAcceptedContact(effect) => {
+            handle_repair_accepted_contact(effect, session).await
+        }
         // Effect::FetchBundle is the only variant still falling through here: a placeholder no task
         // has claimed yet (see `crate::app::Effect::FetchBundle`'s own doc comment). Task 4.35's
         // inbound-delivery work is a separate `AppEvent::Inbound` push path, not a `dispatch` arm, so
@@ -745,6 +792,44 @@ fn open_account_store(session: &OnboardingSession) -> Result<AccountStore<'_>, S
     }
 }
 
+/// **Task 5.4.** Additive to [`open_account_store`] — mirrors task 4.51's own
+/// `SignalingClient::connect_owned`/`handshake_owned` precedent (a second, parallel entry point
+/// rather than a widened signature for the existing one) — returns an **owned**
+/// `(Arc<dyn SecretStore>, KeyHandle)` pair instead of [`AccountStore`]'s borrow-shaped `.parts()`,
+/// for callers that need to move the store into [`tokio::task::spawn_blocking`]'s `'static + Send`
+/// closure. Currently only [`run_mark_verified`]/[`run_set_petname`] call this — every other caller
+/// of [`open_account_store`]/[`AccountStore`] (the remaining `live_store`-routed handlers, task
+/// 4.51's own named-but-unowned residual — its count has grown since 4.51's own snapshot and should
+/// be re-measured against current source, not assumed) is untouched by this function's existence.
+///
+/// Same resolution logic as [`open_account_store`], just returning owned rather than borrowed data:
+/// **`StoreKind::Os`** re-constructs a fresh, free-to-construct [`OsSecretStore`] (no KDF, so no
+/// residency cost either way — see [`open_account_store`]'s own doc comment); **`StoreKind::File`**
+/// clones [`OnboardingSession::live_store_arc`]'s already-cached `Arc` (an atomic refcount bump, not
+/// a re-unwrap) rather than re-deriving anything, and fails closed with the same message
+/// [`open_account_store`] uses when nothing is cached yet.
+fn open_account_store_owned(
+    session: &OnboardingSession,
+) -> Result<(std::sync::Arc<dyn SecretStore>, KeyHandle), String> {
+    let descriptor = AccountDescriptor::load()?;
+    match descriptor.store {
+        StoreKind::Os => {
+            init_os_keystore()?;
+            let service = descriptor
+                .service
+                .clone()
+                .unwrap_or_else(|| OS_KEYSTORE_SERVICE.to_string());
+            let handle = KeyHandle::from_label(&descriptor.label);
+            Ok((std::sync::Arc::new(OsSecretStore::new(&service)), handle))
+        }
+        StoreKind::File => session.live_store_arc().ok_or_else(|| {
+            "this account is passphrase-protected and has not been unlocked in this session \
+             yet — send Effect::Unlock first"
+                .to_string()
+        }),
+    }
+}
+
 /// [`AccountDescriptor::pubkey`] as raw bytes — mirrors `apps/cli/src/main.rs::account_pub_bytes`
 /// exactly. [`open_account_store`] resolves the `SecretStore`/`KeyHandle` pair from the same
 /// descriptor but has no reason to also decode `pubkey`; [`run_send_message`] is the one caller in
@@ -791,7 +876,12 @@ fn save_trust(
 /// [`TrustState`] -> `contacts.json`'s [`TrustLabel`] — mirrors `tests/at_rest_audit.rs`'s own
 /// `to_trust_label` exactly (same `PinnedKeyChanged -> Pinned` approximation, since `TrustLabel`'s
 /// four-value enum structurally cannot represent it — see `crate::screens::contacts`' module doc).
-fn to_trust_label(state: TrustState) -> TrustLabel {
+///
+/// `pub(crate)` (task 5.14): also reused by [`crate::store::export::export_json`]'s live
+/// `trust.bin` join, so the `TrustState` -> `TrustLabel` mapping has exactly one implementation
+/// shared by every write-through call site *and* the export-time join, rather than a second,
+/// independently-maintained copy that could silently drift from this one.
+pub(crate) fn to_trust_label(state: TrustState) -> TrustLabel {
     match state {
         TrustState::New => TrustLabel::New,
         TrustState::Pinned => TrustLabel::Pinned,
@@ -956,7 +1046,7 @@ fn run_import_contact_qr(request: &ImportContactQrRequest) -> Result<String, Str
 
 async fn handle_set_petname(effect: SetPetnameEffect, session: &OnboardingSession) -> WorkerEvent {
     let SetPetnameEffect { request, .. } = effect;
-    match run_set_petname(&request, session) {
+    match run_set_petname(&request, session).await {
         Ok(()) => WorkerEvent::Completed(Effect::SetPetname(SetPetnameEffect {
             request,
             outcome: Some(()),
@@ -974,29 +1064,52 @@ async fn handle_set_petname(effect: SetPetnameEffect, session: &OnboardingSessio
 /// Mirrors `apps/cli/src/contact.rs::cmd_rename`'s write path: `TrustStore::set_petname`, then the
 /// matching `contacts.json` `ContactRecord.petname` — both writes, per [`SetPetnameEffect`]'s own
 /// doc comment in `crate::app`, unlike [`SetUserBlockedEffect`] (`trust.bin` only).
-fn run_set_petname(request: &SetPetnameRequest, session: &OnboardingSession) -> Result<(), String> {
-    let account_store = open_account_store(session)?;
-    let (store, handle) = account_store.parts();
+///
+/// **Task 5.4: the whole load-mutate-save sequence runs inside [`tokio::task::spawn_blocking`].**
+/// `load_trust`'s `derive_key`, `save_trust`'s `derive_key`, and (when a matching `contacts.json`
+/// row exists) `load_or_default`'s/`save`'s own `derive_key` calls are each a full, synchronous
+/// age/scrypt unwrap for a file-backed account — run directly on this task, as before this task's
+/// fix, that freezes `apps/cli/src/main.rs`'s single `current_thread` runtime (rendering, every
+/// other effect) for the whole sequence. Mirrors task 4.51's own `process_inbound_delivery` shape
+/// exactly: one `spawn_blocking` call wrapping the entire synchronous sequence, not one per call, so
+/// intermediate values (`trust`, `petname`, `doc`) never have to cross the closure boundary
+/// individually. **No new caching, no new residency** — [`open_account_store_owned`] hands this an
+/// `Arc` clone of the *same* store [`open_account_store`] would have borrowed, never a second
+/// construction (see that function's own doc comment); the same `decrypt_seed()` calls, at the same
+/// call sites, the same number of times as before this task.
+async fn run_set_petname(
+    request: &SetPetnameRequest,
+    session: &OnboardingSession,
+) -> Result<(), String> {
+    let (store, handle) = open_account_store_owned(session)?;
+    let pubkey = request.pubkey;
+    let petname_input = request.petname.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let store: &dyn SecretStore = store.as_ref();
+        let handle = &handle;
 
-    let mut trust = load_trust(store, handle)?;
-    trust
-        .set_petname(&request.pubkey, request.petname.clone())
-        .map_err(|e| e.to_string())?;
-    let petname = trust
-        .contact(&request.pubkey)
-        .expect("set_petname succeeded — contact exists")
-        .petname
-        .clone();
-    save_trust(&trust, store, handle)?;
+        let mut trust = load_trust(store, handle)?;
+        trust
+            .set_petname(&pubkey, petname_input)
+            .map_err(|e| e.to_string())?;
+        let petname = trust
+            .contact(&pubkey)
+            .expect("set_petname succeeded — contact exists")
+            .petname
+            .clone();
+        save_trust(&trust, store, handle)?;
 
-    let mut doc =
-        crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
-    let pubkey_hex = hex::encode(request.pubkey);
-    if let Some(record) = doc.contacts.iter_mut().find(|c| c.pubkey == pubkey_hex) {
-        record.petname = petname;
-        crate::store::contacts::save(&doc, store, handle).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+        let mut doc =
+            crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
+        let pubkey_hex = hex::encode(pubkey);
+        if let Some(record) = doc.contacts.iter_mut().find(|c| c.pubkey == pubkey_hex) {
+            record.petname = petname;
+            crate::store::contacts::save(&doc, store, handle).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("set-petname task panicked: {e}"))?
 }
 
 // --- SetUserBlocked --------------------------------------------------------------------------------
@@ -1372,6 +1485,277 @@ async fn run_accept_request(
     }))
 }
 
+// --- ScanRepairableContacts / RepairAcceptedContact (task 5.2) -----------------------------------
+//
+// The diagnostics-surfaced repair path [`run_accept_request`]'s own doc comment (above) names twice
+// and defers both times: a `trust.bin` contact left durably trusted but missing its `contacts.json`
+// display row (the review fix's "residual, narrower-than-the-pin window"), and/or missing its
+// accepted-intro `history.jsonl` entry (task 4.49's "narrower, but real, partial-failure window").
+//
+// **The repair-vs-tombstone distinction, precisely.** `run_accept_request` synthesizes every
+// accept-created `trust.bin` `Contact` with `hint == ""` (see that function's own doc comment for
+// why: `MessageRequest` carries no hint, and no hint-less `mrd1:` id is ever invented). That empty
+// hint survives untouched unless a *later*, real [`AddContactRequest`] re-observes the same pubkey
+// with a genuine hint — so `hint == ""` is this crate's only durable, already-existing marker of "a
+// contact whose `trust.bin` record was created by an accept, not by add." Both functions below use
+// it as their eligibility gate before touching anything else.
+//
+// Within that gate, `history.jsonl` emptiness — not `contacts.json` row presence alone — is what
+// tells a genuine partial failure apart from [`DeleteContactRequest`]'s legitimate tombstone case,
+// for the row-missing-and-history-empty shape these functions actually repair: at the moment
+// `run_accept_request`'s `contacts::save` call never ran or failed, the history write sequenced
+// strictly after it was never reached either, so `history.jsonl` is provably still empty right
+// then, and [`DeleteContactRequest`] (which never touches `trust.bin` or `history.jsonl`, only the
+// `contacts.json` row) cannot have produced that shape without a real accept having completed
+// first — which would have left a non-empty history. So row-missing-and-history-empty is repaired
+// freely; that half of the predicate is sound.
+//
+// **Two honestly-unresolved ambiguities — not one.** The row-missing-and-history-**non-empty**
+// shape ([`run_repair_accepted_contact`]'s refusal case) is where the predicate stops being able to
+// tell two very different situations apart, both of which produce the identical on-disk fingerprint:
+//
+// 1. Task 4.49's `Receipt`-vs-lost-intro ambiguity: a first-contact intro that is a
+//    [`meridian_core::envelope::ChatContent::Receipt`] (a degenerate, adversarial-shaped case — see
+//    that task's own doc comment) is deliberately never written to `history.jsonl` — a
+//    **legitimate**, non-failure reason for `history.jsonl` to be empty even though
+//    `contacts.json`'s row is present and healthy. Nothing persisted anywhere distinguishes that
+//    from a genuine lost-text-intro partial failure; both leave an identical fingerprint
+//    (accept-shaped contact, row present, history empty). `TODO: confirm`: no design doc this task
+//    read resolves this — the considered choice made here is that a repair action's job is to turn
+//    a *silent* dead end into a *surfaced* one, not to guarantee perfect content recovery, so
+//    [`run_repair_accepted_contact`] still offers the history repair in this case too, but writes an
+//    honest, clearly-marked placeholder (mirroring `screens/requests.rs::intro_summary`'s own "(not
+//    a text message — a delivery receipt)" precedent) rather than fabricating message content it
+//    cannot actually know.
+// 2. The tombstone-vs-still-unrepaired ambiguity this task's own review found: ordinary inbound
+//    `Text` delivery (`process_inbound_delivery`/`App::handle_inbound`'s `InboundEvent::Message`
+//    arm) appends to `history.jsonl` unconditionally once a session exists — gated on
+//    `sessions.bin` alone, never on `contacts.json` row presence. So a contact genuinely stuck in
+//    the row-missing partial-failure state (never deleted) can still receive further inbound
+//    messages *before* anyone repairs it, which flips `history.jsonl` from empty to non-empty while
+//    the row is still legitimately missing — producing exactly the same fingerprint a real
+//    [`DeleteContactRequest`] tombstone leaves (row missing, history non-empty).
+//    [`run_repair_accepted_contact`]'s refusal in this shape therefore fails safe in the direction
+//    that matters (it can never resurrect a real delete — the worse of the two possible mistakes)
+//    but is a genuine false-negative risk in the other direction: it can wrongly refuse a real
+//    repair candidate that has simply received a message since the original partial failure. Its
+//    error message says so honestly (naming both possibilities) rather than asserting the tombstone
+//    reading as fact. `TODO: confirm`: no design doc resolves how to recover this contact once
+//    stuck this way; nothing short of a second, independent signal (not yet designed) could break
+//    the tie safely.
+
+/// Read-only scan for `trust.bin` contacts eligible for [`run_repair_accepted_contact`] — see this
+/// section's own module-level doc comment for the full eligibility rule (`hint == ""`) and the
+/// repair-vs-tombstone predicate (`history.jsonl` emptiness). Touches no file for writing; every
+/// contact this returns is exactly the set [`run_repair_accepted_contact`] would accept for the same
+/// `pubkey`, computed the same way, so the two can never silently disagree.
+fn scan_repairable_contacts(session: &OnboardingSession) -> Result<Vec<RepairableContact>, String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
+    let trust = load_trust(store, handle)?;
+    let contacts_doc =
+        crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
+
+    let mut out = Vec::new();
+    for contact in trust.contacts() {
+        if !contact.hint.is_empty() {
+            // Not accept-shaped (an `AddContact`-originated or re-observed-with-a-real-hint
+            // contact) — never a candidate for this repair path.
+            continue;
+        }
+        let pubkey_hex = hex::encode(contact.pubkey);
+        let row_present = contacts_doc.contacts.iter().any(|c| c.pubkey == pubkey_hex);
+        let history = crate::store::history::load_or_default(&pubkey_hex, store, handle)
+            .map_err(|e| e.to_string())?;
+        let history_empty = history.is_empty();
+
+        if !row_present && !history_empty {
+            // Either the tombstone case (a genuine accept fully completed, and the row was later
+            // removed by an explicit `DeleteContactRequest`), or an unrepaired partial-failure
+            // contact that has since received an ordinary inbound message (see the module doc's
+            // second ambiguity) — this predicate cannot tell the two apart, so neither is ever
+            // surfaced here: never risk offering a "repair" that could resurrect a real delete.
+            continue;
+        }
+        if row_present && !history_empty {
+            // Fully healthy — nothing missing.
+            continue;
+        }
+        out.push(RepairableContact {
+            pubkey: contact.pubkey,
+            label: pubkey_hex,
+            missing_contact_row: !row_present,
+            missing_history_intro: history_empty,
+        });
+    }
+    Ok(out)
+}
+
+async fn handle_scan_repairable_contacts(
+    effect: ScanRepairableContactsEffect,
+    session: &OnboardingSession,
+) -> WorkerEvent {
+    match scan_repairable_contacts(session) {
+        Ok(contacts) => WorkerEvent::Completed(Effect::ScanRepairableContacts(
+            ScanRepairableContactsEffect {
+                request: effect.request,
+                outcome: Some(contacts),
+            },
+        )),
+        Err(message) => WorkerEvent::Failed(
+            Effect::ScanRepairableContacts(ScanRepairableContactsEffect {
+                request: effect.request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// A fixed, honestly-worded placeholder body for a history-repair entry whose real content is
+/// permanently unrecoverable (see this section's own module-level doc comment for exactly why:
+/// `MessageRequest`/its `intro` field are consumed and discarded the moment `chat.accept_request`
+/// first ran, live nowhere else, and cannot be reconstructed by any later repair). Mirrors
+/// `screens/requests.rs::intro_summary`'s own "(not a text message — a delivery receipt)"
+/// convention: parenthetical, factual, never claiming to be the peer's real words.
+const UNRECOVERABLE_INTRO_PLACEHOLDER: &str =
+    "(this conversation's first message could not be recovered locally — repaired from diagnostics \
+     after a partial accept failure; the sender's original text is not available)";
+
+async fn handle_repair_accepted_contact(
+    effect: RepairAcceptedContactEffect,
+    session: &OnboardingSession,
+) -> WorkerEvent {
+    let RepairAcceptedContactEffect { request, .. } = effect;
+    match run_repair_accepted_contact(&request, session) {
+        Ok(outcome) => {
+            WorkerEvent::Completed(Effect::RepairAcceptedContact(RepairAcceptedContactEffect {
+                request,
+                outcome,
+            }))
+        }
+        Err(message) => WorkerEvent::Failed(
+            Effect::RepairAcceptedContact(RepairAcceptedContactEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Repairs whichever of `run_accept_request`'s two later writes is missing for `request.pubkey` —
+/// see this section's own module-level doc comment for the full repair-vs-tombstone eligibility
+/// rule this re-derives and re-checks independently (never trusting a possibly-stale
+/// [`RepairableContact`] the UI is holding: a concurrent [`DeleteContactRequest`] between a scan and
+/// a triggered repair must still be caught here, not just by the scan that produced the UI's list).
+///
+/// **Refuses outright (`Err`, a real [`WorkerEvent::Failed`], never a silent no-op) for exactly the
+/// three cases that would risk resurrecting a real delete rather than repairing a real partial
+/// failure:** no `trust.bin` record for `pubkey` at all (nothing to repair from); a record whose
+/// `hint` is not empty (not accept-shaped — see the module doc); and the row-missing/history-
+/// non-empty shape (`contacts.json` row missing but `history.jsonl` non-empty) — which the module
+/// doc's second ambiguity above is explicit is *not* proof of a tombstone by itself (an unrepaired
+/// partial-failure contact can reach this same shape by receiving an ordinary inbound message before
+/// repair runs), only the one on-disk signal available to distinguish the two, so refusing is the
+/// only safe choice even though it is sometimes an over-refusal, never asserted as a certain
+/// tombstone.
+///
+/// **`Ok(None)`** is the honest "nothing was missing" answer for a `pubkey` that turns out already
+/// fully healthy by the time this runs (row present, history non-empty) — mirrors
+/// [`run_accept_request`]'s own no-op convention.
+///
+/// **The two repairs, independently gated:**
+/// - `contacts.json` row missing → rebuilt via [`upsert_contact_record`], from `trust.bin`'s own
+///   already-real [`Contact`] — fully recoverable, since that row is only ever a mirror of data
+///   `trust.bin` already has (exactly the write [`run_accept_request`] itself performs).
+/// - `history.jsonl` empty → one placeholder [`crate::store::history::HistoryEntry`] appended
+///   ([`UNRECOVERABLE_INTRO_PLACEHOLDER`]), `mid` freshly minted via [`getrandom::fill`] (the
+///   original sender-minted id is gone along with the rest of the discarded `MessageRequest`, so
+///   there is no real id to reuse — inventing one for dedup purposes only, never claiming it is the
+///   sender's own).
+fn run_repair_accepted_contact(
+    request: &RepairAcceptedContactRequest,
+    session: &OnboardingSession,
+) -> Result<Option<RepairedContact>, String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
+    let pubkey = request.pubkey;
+
+    let trust = load_trust(store, handle)?;
+    let contact = trust.contact(&pubkey).cloned().ok_or_else(|| {
+        "no trust.bin record exists for this contact — nothing to repair".to_string()
+    })?;
+    if !contact.hint.is_empty() {
+        return Err(
+            "this contact was not created by accepting a message request — refusing to repair"
+                .to_string(),
+        );
+    }
+
+    let pubkey_hex = hex::encode(pubkey);
+    let mut contacts_doc =
+        crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
+    let row_present = contacts_doc.contacts.iter().any(|c| c.pubkey == pubkey_hex);
+    let history = crate::store::history::load_or_default(&pubkey_hex, store, handle)
+        .map_err(|e| e.to_string())?;
+    let history_empty = history.is_empty();
+
+    if !row_present && !history_empty {
+        // See the module-level doc comment's second, honestly-named ambiguity: this shape
+        // (`contacts.json` row missing, `history.jsonl` non-empty) is produced by the real
+        // tombstone case, but is *also* producible by a genuine, still-unrepaired partial-failure
+        // contact that has since received an ordinary inbound message — `process_inbound_delivery`
+        // gates history writes on `sessions.bin` alone, never on `contacts.json` row presence, so
+        // this predicate cannot tell the two apart from on-disk state alone. Refusing either way is
+        // still the only safe choice (never risk resurrecting a real delete), but the message must
+        // not assert the tombstone reading as fact.
+        return Err(
+            "this contact's contacts.json row is missing, but it has since exchanged further \
+             messages — cannot safely repair the row: the contact may have been explicitly \
+             deleted, or a message may simply have arrived before this repair ran; refusing to \
+             resurrect it either way"
+                .to_string(),
+        );
+    }
+    if row_present && !history_empty {
+        return Ok(None);
+    }
+
+    let now = now_unix();
+    let mut contact_row_repaired = false;
+    if !row_present {
+        let id = contact.id_string().unwrap_or_default();
+        upsert_contact_record(&mut contacts_doc, &id, &contact, now);
+        crate::store::contacts::save(&contacts_doc, store, handle).map_err(|e| e.to_string())?;
+        contact_row_repaired = true;
+    }
+
+    let mut history_repaired = false;
+    if history_empty {
+        let mut mid = [0u8; 16];
+        getrandom::fill(&mut mid).map_err(|e| e.to_string())?;
+        let entry = crate::store::history::HistoryEntry {
+            v: crate::store::history::CURRENT_VERSION,
+            mid: hex::encode(mid),
+            dir: crate::store::history::Direction::In,
+            ts: now,
+            stream: "mrd.chat/1".to_string(),
+            body: UNRECOVERABLE_INTRO_PLACEHOLDER.to_string(),
+            state: crate::store::history::MessageState::Received,
+        };
+        crate::store::history::append(&pubkey_hex, &entry, store, handle)
+            .map_err(|e| e.to_string())?;
+        history_repaired = true;
+    }
+
+    Ok(Some(RepairedContact {
+        pubkey,
+        contact_row_repaired,
+        history_repaired,
+    }))
+}
+
 // --- RejectRequest -------------------------------------------------------------------------------
 
 async fn handle_reject_request(
@@ -1425,7 +1809,7 @@ async fn handle_mark_verified(
     session: &OnboardingSession,
 ) -> WorkerEvent {
     let MarkVerifiedEffect { request, .. } = effect;
-    match run_mark_verified(&request, session) {
+    match run_mark_verified(&request, session).await {
         Ok(()) => WorkerEvent::Completed(Effect::MarkVerified(MarkVerifiedEffect {
             request,
             outcome: Some(()),
@@ -1446,17 +1830,57 @@ async fn handle_mark_verified(
 /// screen dispatched this effect). Faithfully propagates [`TrustError::UnknownContact`] (e.g. a
 /// concurrently-deleted contact) as a real [`WorkerEvent::Failed`], never swallowed into a silent
 /// success.
-fn run_mark_verified(
+///
+/// **Task 5.3 (review fix F3): also write-throughs the new `trust` state into `contacts.json`'s own
+/// [`ContactRecord::trust`] field**, mirroring [`run_set_petname`]'s own "reload the doc, patch the
+/// matching row, save" shape exactly (same `load_or_default` -> find-by-pubkey-hex -> save
+/// sequence, same "row absent — nothing to patch" no-op when `contacts.json` and `trust.bin` have
+/// drifted). Before this fix, `trust.bin` alone recorded a `Verified` contact — `contacts.json`'s
+/// own `trust` field stayed at whatever [`upsert_contact_record`] last wrote (typically `Pinned`),
+/// so `apps/tui/src/store/export.rs::export_json`, which mirrors `contacts.json` verbatim and never
+/// reads `trust.bin` at all, exported a stale `"trust": "pinned"` for a contact the live UI already
+/// showed as `"verified"` (the live UI never had this bug — `crate::screens::main::
+/// build_contact_entries` joins `trust.bin` fresh on every render, `contacts.json`'s own `trust`
+/// field is only ever a fallback there for a row with no matching `trust.bin` entry). This is a
+/// write-through fix, not an export-time join: `export_json` itself is untouched by this task,
+/// `contacts.json`'s own `trust` field is simply kept live instead of going stale.
+///
+/// **Task 5.4: `load_trust`/`save_trust`'s two `derive_key` unwraps run inside
+/// [`tokio::task::spawn_blocking`]**, in one call spanning both — the same shape
+/// [`run_set_petname`]'s own doc comment describes in full (this function is the other of the two
+/// highest-impact `live_store`-routed handlers task 4.51's own Deliverable 7 named and split off,
+/// not the whole thirteen). **No new caching, no new residency** — same store, same call sites, same
+/// unwrap count as before this task; task 5.3's `contacts.json` write-through above reuses the same
+/// already-open `store`/`handle` inside this same `spawn_blocking` closure rather than paying a
+/// second, redundant unwrap for a second blocking call.
+async fn run_mark_verified(
     request: &MarkVerifiedRequest,
     session: &OnboardingSession,
 ) -> Result<(), String> {
-    let account_store = open_account_store(session)?;
-    let (store, handle) = account_store.parts();
-    let mut trust = load_trust(store, handle)?;
-    trust
-        .mark_verified(&request.pubkey)
-        .map_err(|e| e.to_string())?;
-    save_trust(&trust, store, handle)
+    let (store, handle) = open_account_store_owned(session)?;
+    let pubkey = request.pubkey;
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let store: &dyn SecretStore = store.as_ref();
+        let handle = &handle;
+        let mut trust = load_trust(store, handle)?;
+        trust.mark_verified(&pubkey).map_err(|e| e.to_string())?;
+        let state = trust
+            .contact(&pubkey)
+            .expect("mark_verified succeeded — contact exists")
+            .state;
+        save_trust(&trust, store, handle)?;
+
+        let mut doc =
+            crate::store::contacts::load_or_default(store, handle).map_err(|e| e.to_string())?;
+        let pubkey_hex = hex::encode(pubkey);
+        if let Some(record) = doc.contacts.iter_mut().find(|c| c.pubkey == pubkey_hex) {
+            record.trust = to_trust_label(state);
+            crate::store::contacts::save(&doc, store, handle).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("mark-verified task panicked: {e}"))?
 }
 
 // --- AcknowledgeKeyChange -------------------------------------------------------------------------
@@ -1829,6 +2253,14 @@ async fn route_tolerant(
 // PersistHistory (task 4.33)
 // ---------------------------------------------------------------------------
 
+/// **Task 5.10 (F10), load-bearing for `lib.rs::run`'s shutdown drain.** The `WorkerEvent`
+/// returned here — `Completed`/`Failed`, sent back to `run`'s own `worker_rx` — is the completion
+/// signal `run`'s `drain_pending_persist_history` waits on before letting the process exit. This
+/// works with no change to [`run_persist_history`] itself precisely because that function is a
+/// synchronous, non-yielding write (no `.await` inside it, see its own doc comment): once this
+/// `async fn`'s single call into it returns, the write has already landed on disk, so by the time
+/// the `WorkerEvent` this constructs reaches `run`, "acked" and "durable" are the same moment —
+/// there is no window between them for the drain to miss.
 async fn handle_persist_history(
     effect: PersistHistoryEffect,
     session: &OnboardingSession,
@@ -1863,6 +2295,45 @@ fn run_persist_history(
     let (store, handle) = account_store.parts();
     let peer_pubkey_hex = hex::encode(request.peer_pubkey);
     crate::store::history::append(&peer_pubkey_hex, &request.entry, store, handle)
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// PersistReceipt (task 5.1)
+// ---------------------------------------------------------------------------
+
+async fn handle_persist_receipt(
+    effect: PersistReceiptEffect,
+    session: &OnboardingSession,
+) -> WorkerEvent {
+    let PersistReceiptEffect { request, .. } = effect;
+    match run_persist_receipt(&request, session) {
+        Ok(()) => WorkerEvent::Completed(Effect::PersistReceipt(PersistReceiptEffect {
+            request,
+            outcome: Some(()),
+        })),
+        Err(message) => WorkerEvent::Failed(
+            Effect::PersistReceipt(PersistReceiptEffect {
+                request,
+                outcome: None,
+            }),
+            message,
+        ),
+    }
+}
+
+/// Marks `request.peer_pubkey`'s `history.jsonl` entry with `mid == request.ack` `Delivered` —
+/// `crate::store::history::mark_delivered` (task 5.1), fresh `SecretStore`/`KeyHandle` via
+/// [`open_account_store`] like every other handler in this module. A no-op, not an error, if no
+/// matching `Out`/`Sent` row is on disk — `mark_delivered`'s own tolerant contract.
+fn run_persist_receipt(
+    request: &PersistReceiptRequest,
+    session: &OnboardingSession,
+) -> Result<(), String> {
+    let account_store = open_account_store(session)?;
+    let (store, handle) = account_store.parts();
+    let peer_pubkey_hex = hex::encode(request.peer_pubkey);
+    crate::store::history::mark_delivered(&peer_pubkey_hex, &request.ack, store, handle)
         .map_err(|e| e.to_string())
 }
 
@@ -1953,10 +2424,13 @@ fn save_chat(
 // decoded `ChatContent`; anything that fails that (bad signature, sender mismatch, unknown prekey,
 // no session, a ratchet desync, a malformed/truncated blob) is dropped, logged, and never crashes
 // this loop or the app — mirrors `apps/cli/src/chat.rs::handle_inbound`'s own reject-loudly-never-
-// trust catch-all exactly. Automatic desync recovery (task 4.9's receiver-side re-handshake) is
-// deliberately **not** wired into this loop — out of this task's scope; a repeated desync from the
-// same peer is simply dropped here, same as any other rejection, until a future task decides this
-// loop should call `meridian_core::desync::attempt_recovery` too.
+// trust catch-all exactly. **Task 5.5 (review finding F5)** wires task 4.9's receiver-side desync
+// recovery into this loop too, mirroring `apps/cli/src/chat.rs::maybe_attempt_recovery`'s gate
+// discipline exactly: a repeated desync from the same peer, past `DESYNC_RECOVERY_THRESHOLD`, may
+// now trigger a `TrustStore::can_send`-gated bundle re-fetch + `meridian_core::desync::
+// attempt_recovery` call (`attempt_worker_recovery`, below `process_inbound_delivery`) — never a
+// silent bypass, and never reachable for a peer already `Warn`/`Blocked` from an unresolved key
+// change.
 // ---------------------------------------------------------------------------
 
 /// Serializes every load-mutate-save touch of `sessions.bin` across this worker task's two
@@ -2372,9 +2846,30 @@ pub async fn run_inbound_loop(
 /// on this task (as before this task's fix), that freezes `apps/cli/src/main.rs`'s single
 /// `current_thread` runtime (rendering, every other effect, this very loop's next envelope) for the
 /// whole sequence.
-/// `chat_state_lock`'s guard (`_chat_guard` below) is still held across *all* of it, spanning both
-/// the blocking closure and the network route after it — the lock discipline this function's own
-/// doc comment requires is unchanged; only the execution context moved.
+///
+/// **`_chat_guard`'s scope, precisely (task 5.5 deadlock fix — review finding, blocking).**
+/// [`chat_state_lock`] is a non-reentrant `tokio::sync::Mutex<()>`, and [`attempt_worker_recovery`]
+/// below (task 5.5's new receive-side recovery network half) re-acquires that exact same lock for its
+/// own, independent load-mutate-save sequence over `sessions.bin`/`trust.bin`. `_chat_guard` is
+/// therefore dropped (explicitly, via [`drop`]) the moment the blocking closure below returns —
+/// **before** the auto-ack's `client.route_with_hint` call and **before** any
+/// [`attempt_worker_recovery`] call — never held across either. Holding it across the latter would
+/// deadlock this task forever: the caller would be blocked waiting for `attempt_worker_recovery`'s own
+/// `.lock().await` to succeed, which can only happen once the caller's own guard drops, which can only
+/// happen once the caller returns, which can only happen once that `.await` succeeds — an
+/// unbreakable cycle, reliably triggered by any peer whose repeated (authentic but corrupted)
+/// envelopes cross `DESYNC_RECOVERY_THRESHOLD` while `TrustStore::can_send` still reads
+/// `SendGate::Ok` for them (the ordinary, non-gated case this task's whole recovery path exists for).
+/// This preserves — does not weaken — [`chat_state_lock`]'s actual invariant ("every load-mutate-save
+/// touch of `sessions.bin` is serialized"): each atomic load-mutate-save unit here (this function's
+/// own blocking closure, and separately `attempt_worker_recovery`'s own blocking closure) still runs
+/// under the lock for its own full duration; they are simply two separate, sequential critical
+/// sections rather than one artificially fused span that also happened to span unrelated network
+/// I/O. A concurrent `run_send_message`/`run_accept_request`/`run_reject_request` dispatch may now
+/// interleave its own atomic unit between this function's closure and `attempt_worker_recovery`'s —
+/// harmless, since `attempt_worker_recovery` always re-`load_chat`/`load_trust`s fresh state under its
+/// own freshly-acquired guard rather than assuming anything about what this function's own closure
+/// last saw.
 ///
 /// **Ordering note.** [`save_chat`] now runs *before* the auto-ack's best-effort
 /// `client.route_with_hint` (previously it ran after, inside the `Text` match arm). This is a
@@ -2397,8 +2892,20 @@ async fn process_inbound_delivery(
 
     let _chat_guard = chat_state_lock().lock().await;
 
+    // (task 5.5, review finding F5) `store`/`handle` are about to be moved wholesale into the
+    // blocking closure below; a cheap clone kept aside lets the async tail of this function reach
+    // for its own `SecretStore`/`KeyHandle` after that closure returns — see
+    // `attempt_worker_recovery`'s own call site at the bottom of this function.
+    let recovery_store = store.clone();
+    let recovery_handle = handle.clone();
+
     type Ack = ([u8; 32], Option<String>, Vec<u8>);
-    let (event, ack): (Option<InboundEvent>, Option<Ack>) =
+    // The third element is `Some(peer_ik)` exactly when this delivery's own `ChatError::Desync`
+    // arm (below) found `ChatState::recovery_recommended` true AND `TrustStore::can_send` already
+    // read `SendGate::Ok` for `peer_ik` — i.e. the network half (`attempt_worker_recovery`, which
+    // this synchronous closure cannot itself perform) should now fetch a fresh bundle and hand it
+    // to `meridian_core::desync::attempt_recovery`.
+    let (event, ack, needs_recovery_fetch): (Option<InboundEvent>, Option<Ack>, Option<[u8; 32]>) =
         tokio::task::spawn_blocking(move || {
             let store: &dyn SecretStore = store.as_ref();
             let handle = &handle;
@@ -2413,11 +2920,12 @@ async fn process_inbound_delivery(
                     eprintln!(
                         "meridian tui: could not load sessions.bin for an inbound envelope: {e}"
                     );
-                    return (None, None);
+                    return (None, None, None);
                 }
             };
             chat.expire_previous_generation(now_unix());
 
+            let mut needs_recovery_fetch = None;
             let (event, ack) = match chat.open_inbound(
                 store,
                 handle,
@@ -2481,12 +2989,45 @@ async fn process_inbound_delivery(
                     }),
                     None,
                 ),
-                // Everything else — `RequestPending`, `Desync`, `BadSignature`, `SenderMismatch`,
+                // (task 5.5, review finding F5) A ratchet desync — still dropped exactly like any
+                // other rejection (never delivered, never trusted), but repeated occurrences from
+                // the same peer may now trigger the same guarded receiver-side recovery
+                // `apps/cli/src/chat.rs::maybe_attempt_recovery` already applies: consult
+                // `ChatState::recovery_recommended` first (cheap, I/O-free — never fires before the
+                // repeated-`Desync` threshold), then `TrustStore::can_send` *before* any network
+                // I/O — a peer already `Warn`/`Blocked` from an unresolved key change must not get
+                // an automatic re-handshake layered on top, and must not even cost a wasted fetch
+                // round trip to discover that. `note_recovery_attempted` is called on the early-
+                // refusal path too (mirroring `maybe_attempt_recovery`'s own doc), so a gated
+                // peer's counter is rate-limited the same way a successfully-recovered peer's is.
+                // Only `SendGate::Ok` sets `needs_recovery_fetch`, handing the actual network fetch
+                // + `meridian_core::desync::attempt_recovery` call off to `attempt_worker_recovery`
+                // below (this closure is synchronous and performs no network I/O of its own).
+                Err(ChatError::Desync) => {
+                    eprintln!("meridian tui: dropped an inbound envelope: ratchet desync");
+                    if chat.recovery_recommended(&deliver.from) {
+                        match load_trust(store, handle) {
+                            Ok(trust) => match trust.can_send(&deliver.from) {
+                                SendGate::Ok => needs_recovery_fetch = Some(deliver.from),
+                                gate => {
+                                    chat.note_recovery_attempted(&deliver.from);
+                                    eprintln!(
+                                        "meridian tui: desync recovery paused for a peer: {gate:?}"
+                                    );
+                                }
+                            },
+                            Err(e) => eprintln!(
+                                "meridian tui: could not load trust.bin to gate desync \
+                                 recovery: {e}"
+                            ),
+                        }
+                    }
+                    (None, None)
+                }
+                // Everything else — `RequestPending`, `BadSignature`, `SenderMismatch`,
                 // `UnknownPrekey`, `NoSession`, a codec/crypto/store error — dropped, logged,
                 // never trusted. Mirrors `apps/cli/src/chat.rs::handle_inbound`'s own
                 // reject-loudly-never-trust catch-all exactly (this section's own module doc).
-                // Automatic desync recovery is deliberately not wired into this loop — out of
-                // this task's scope.
                 Err(e) => {
                     eprintln!("meridian tui: dropped an inbound envelope: {e}");
                     (None, None)
@@ -2499,19 +3040,162 @@ async fn process_inbound_delivery(
                 );
             }
 
-            (event, ack)
+            (event, ack, needs_recovery_fetch)
         })
         .await
         .unwrap_or_else(|e| {
             eprintln!("meridian tui: inbound-delivery blocking task panicked: {e}");
-            (None, None)
+            (None, None, None)
         });
+
+    // (task 5.5 deadlock fix — review finding, blocking) Dropped here, explicitly, the instant the
+    // blocking closure's own atomic load-mutate-save sequence has completed — never held across the
+    // ack route or `attempt_worker_recovery` below. See this function's own doc comment
+    // ("`_chat_guard`'s scope, precisely") for exactly why: `attempt_worker_recovery` re-acquires this
+    // exact same non-reentrant lock for its own, independent `sessions.bin`/`trust.bin` load-mutate-
+    // save sequence, so holding this guard into that call would deadlock forever.
+    drop(_chat_guard);
 
     if let Some((from, hint, receipt_blob)) = ack {
         let _ = client.route_with_hint(from, hint, receipt_blob).await;
     }
 
+    if let Some(peer_ik) = needs_recovery_fetch {
+        attempt_worker_recovery(
+            recovery_store,
+            recovery_handle,
+            account_pub,
+            client,
+            peer_ik,
+        )
+        .await;
+    }
+
     event
+}
+
+/// (task 5.5, review finding F5) The network half of the TUI's own receive-side desync recovery —
+/// [`process_inbound_delivery`]'s blocking closure (synchronous, matching every other handler's
+/// `SecretStore`-derivation discipline in this module) cannot itself perform a network fetch, so it
+/// only decides *whether* one is warranted (`ChatState::recovery_recommended` plus the early
+/// `TrustStore::can_send` gate — see that closure's own `ChatError::Desync` arm) and hands off the
+/// single peer identity that cleared both checks here. Mirrors
+/// `apps/cli/src/chat.rs::maybe_attempt_recovery`'s fetch-then-recover shape one layer down: this
+/// function is only ever reached after that early gate already read [`SendGate::Ok`].
+///
+/// Best-effort and fully logged, like every other failure this worker loop already tolerates
+/// (`eprintln!`, never a crash): a fetch failure, a gated/conflicting outcome, or a trust/session
+/// store I/O error here must never bring down the persistent inbound loop — only this one recovery
+/// attempt is abandoned, and the next repeated `Desync` from the same peer gets another chance once
+/// `note_recovery_attempted`'s rate limit allows it (`DESYNC_RECOVERY_THRESHOLD`'s own doc).
+async fn attempt_worker_recovery(
+    store: std::sync::Arc<dyn SecretStore>,
+    handle: KeyHandle,
+    account_pub: [u8; 32],
+    client: &mut SignalingClient,
+    peer_ik: [u8; 32],
+) {
+    let hint = {
+        let store = store.clone();
+        let handle = handle.clone();
+        tokio::task::spawn_blocking(move || {
+            load_trust(store.as_ref(), &handle)
+                .ok()
+                .and_then(|t| t.contact(&peer_ik).map(|c| c.hint.clone()))
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    };
+
+    // Mirrors `apps/cli/src/chat.rs::maybe_attempt_recovery`'s own fetch call exactly (same
+    // 40-attempt/250ms-backoff bound via `fetch_with_retry`). `meridian_signaling::verify_bundle`
+    // pins the returned bundle's signature to this exact requested `peer_ik` — a genuine
+    // on-the-wire key substitution fails closed right here, before any trust-store mutation is
+    // even possible (see `meridian_core::desync::attempt_recovery`'s own doc comment for why this
+    // makes that specific attack structurally unreachable via this call, and
+    // `apps/core/tests/session.rs` for the substrate-level proof of what happens on the rarer path
+    // where a caller's fetch strategy *does* resolve to a different key).
+    let bundle = match fetch_with_retry(client, peer_ik, &hint, "a peer").await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("meridian tui: desync recovery fetch failed: {e}");
+            return;
+        }
+    };
+
+    let _chat_guard = chat_state_lock().lock().await;
+    let outcome = tokio::task::spawn_blocking(move || {
+        let store: &dyn SecretStore = store.as_ref();
+        let handle = &handle;
+        let mut chat = match load_chat(store, handle) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("meridian tui: could not load sessions.bin for desync recovery: {e}");
+                return None;
+            }
+        };
+        let mut trust = match load_trust(store, handle) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("meridian tui: could not load trust.bin for desync recovery: {e}");
+                return None;
+            }
+        };
+        let outcome = meridian_core::desync::attempt_recovery(
+            &mut chat,
+            &mut trust,
+            store,
+            handle,
+            &account_pub,
+            &peer_ik,
+            &bundle.account_pub,
+            &bundle.spk,
+            bundle.otks.first().copied(),
+            &hint,
+            now_unix(),
+        );
+        if let Err(e) = save_chat(&chat, store, handle) {
+            eprintln!("meridian tui: could not persist sessions.bin after desync recovery: {e}");
+        }
+        if let Err(e) = save_trust(&trust, store, handle) {
+            eprintln!("meridian tui: could not persist trust.bin after desync recovery: {e}");
+        }
+        Some(outcome)
+    })
+    .await
+    .unwrap_or(None);
+
+    // (task 5.5, review finding) Mirrors `apps/cli/src/chat.rs::maybe_attempt_recovery`'s own
+    // per-variant match exactly, rather than a blanket `{o:?}` dump: `RecoveryOutcome`'s Debug derive
+    // prints `UnknownIdentitySurfaced`'s raw `[u8; 32]` pubkey as a bare byte array, so a `{:?}` here
+    // would put a raw key byte dump into this worker's own stderr. Every variant is named explicitly
+    // instead, and the one variant that does carry a key hex-encodes it before printing — the same
+    // encoding every other key this crate ever logs already uses.
+    match outcome {
+        Some(Ok(meridian_core::desync::RecoveryOutcome::Recovered)) => {
+            eprintln!("meridian tui: desync recovery outcome: re-established a fresh session");
+        }
+        Some(Ok(meridian_core::desync::RecoveryOutcome::Gated(gate))) => {
+            eprintln!("meridian tui: desync recovery outcome: paused ({gate:?})");
+        }
+        Some(Ok(meridian_core::desync::RecoveryOutcome::KeyChangeConflict)) => {
+            eprintln!(
+                "meridian tui: desync recovery outcome: refused — the fetched key already \
+                 belongs to a different known contact"
+            );
+        }
+        Some(Ok(meridian_core::desync::RecoveryOutcome::UnknownIdentitySurfaced(new_key))) => {
+            eprintln!(
+                "meridian tui: desync recovery outcome: the fetched bundle is signed by a key \
+                 with no prior contact record at all (surfaced key: {}) — this requires explicit \
+                 verification, not an automatic re-handshake",
+                hex::encode(new_key)
+            );
+        }
+        Some(Err(e)) => eprintln!("meridian tui: desync recovery failed: {e}"),
+        None => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2606,7 +3290,14 @@ fn load_live_session(
     })
 }
 
-fn load_trust(store: &dyn SecretStore, handle: &KeyHandle) -> Result<TrustStore, String> {
+/// `pub(crate)` (task 5.14): also reused by [`crate::store::export::export_json`]'s live
+/// `trust.bin` join — see [`to_trust_label`]'s own doc comment for why sharing one implementation
+/// (rather than a second copy of this "missing file means fresh store, any other error is fatal"
+/// load) matters here.
+pub(crate) fn load_trust(
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+) -> Result<TrustStore, String> {
     let path = account::trust_path()?;
     match std::fs::read(&path) {
         Ok(bytes) => TrustStore::open_at_rest(store, handle, &bytes).map_err(|e| e.to_string()),
@@ -2916,8 +3607,12 @@ mod tests {
     /// therefore could never observe this) and drives two *different* handler dispatches
     /// (`run_add_contact` then `run_set_petname`) against the same `session` — both must succeed,
     /// and [`CountingStore::new`] must never have run a second time.
-    #[test]
-    fn open_account_store_reuses_the_cached_file_backed_store_never_rebuilding_it() {
+    ///
+    /// Task 5.4 made `run_set_petname` `async fn` (a `spawn_blocking` wrap), so this test needs a
+    /// real runtime — `#[tokio::test]` rather than plain `#[test]`, mirroring task 4.51's own
+    /// identical `#[test]` -> `#[tokio::test]` precedent for `run_unlock`'s equivalent test.
+    #[tokio::test]
+    async fn open_account_store_reuses_the_cached_file_backed_store_never_rebuilding_it() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _env = EnvGuard::set(tmp.path());
         let keyfile = tmp.path().join("account.key");
@@ -2955,6 +3650,7 @@ mod tests {
             petname: Some("bff".to_string()),
         };
         run_set_petname(&petname_request, &session)
+            .await
             .expect("run_set_petname against the same cached store");
         assert_eq!(
             constructions.load(std::sync::atomic::Ordering::SeqCst),
@@ -3218,6 +3914,181 @@ mod tests {
              real scrypt) was in flight — observed {observed}. A near-zero count here is what \
              running that unwrap synchronously on this `current_thread` runtime would produce — \
              the exact regression this test exists to catch."
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Task 5.4 — `run_mark_verified`/`run_set_petname`, the two highest-impact of the
+    // `live_store`-routed handlers task 4.51's own Deliverable 7 named and split off (that
+    // residual's count has grown since 4.51's own snapshot — re-measure against current source
+    // rather than reusing a cached figure; the remaining handlers stay a named, unowned residual,
+    // untouched here).
+    //
+    // Unlike `run_unlock`/`unwrap_keyfile_for_bulk_signing` above, both functions take an
+    // injectable `&dyn SecretStore` (via `OnboardingSession::live_store`/`open_account_store_owned`
+    // — see `open_account_store_reuses_the_cached_file_backed_store_never_rebuilding_it`'s own
+    // `CountingStore` double, just above), so — mirroring `apps/tui/tests/inbound_delivery.rs`'s
+    // own `SlowStore` double for `process_inbound_delivery`'s equivalent tests — a synthetic,
+    // controllable delay is used instead of a real keyfile's genuine (but slower, less
+    // deterministic) scrypt cost.
+    // -----------------------------------------------------------------------------------------
+
+    /// A `SecretStore` double that sleeps a fixed, controllable duration on every `use_key`/
+    /// `derive_key` call — a stand-in for a real `FileSecretStore::decrypt_seed()` unwrap, same
+    /// technique and same reasoning as `apps/tui/tests/inbound_delivery.rs`'s own `SlowStore`.
+    /// `std::thread::sleep`, not `tokio::time::sleep`: this delegate runs inside
+    /// `spawn_blocking`'s own dedicated blocking thread, so a real, thread-blocking sleep is the
+    /// correct stand-in for a real, thread-blocking scrypt unwrap — an async sleep would not
+    /// reproduce the hazard these tests exist to catch at all. Delegates every real trait method to
+    /// a wrapped `MemorySecretStore` (like `CountingStore` above) so a session built around this
+    /// double can still do genuine, successful sealed-store round trips.
+    struct SlowStore {
+        inner: MemorySecretStore,
+        delay: std::time::Duration,
+    }
+
+    impl SlowStore {
+        fn new(inner: MemorySecretStore, delay: std::time::Duration) -> Self {
+            Self { inner, delay }
+        }
+    }
+
+    impl SecretStore for SlowStore {
+        fn store(
+            &self,
+            label: &str,
+            secret: &[u8],
+        ) -> std::result::Result<KeyHandle, meridian_core::identity::StoreError> {
+            self.inner.store(label, secret)
+        }
+
+        fn use_key(
+            &self,
+            h: &KeyHandle,
+            op: meridian_core::identity::SignOrDh,
+            input: &[u8],
+        ) -> std::result::Result<Vec<u8>, meridian_core::identity::StoreError> {
+            std::thread::sleep(self.delay);
+            self.inner.use_key(h, op, input)
+        }
+
+        fn nonextractable(&self) -> bool {
+            self.inner.nonextractable()
+        }
+
+        fn derive_key(
+            &self,
+            h: &KeyHandle,
+            info: &[u8],
+        ) -> std::result::Result<[u8; 32], meridian_core::identity::StoreError> {
+            std::thread::sleep(self.delay);
+            self.inner.derive_key(h, info)
+        }
+    }
+
+    const SLOW_STORE_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
+    /// [`run_mark_verified`] falsifiable concurrency proof: `load_trust`/`save_trust` inside the
+    /// same [`tokio::task::spawn_blocking`] call cost 2 x [`SLOW_STORE_DELAY`] = 300ms; the
+    /// concurrently-scheduled heartbeat must accumulate a real fraction of that, not near-zero.
+    /// **Independently falsified** (not just asserted to pass): reverting `run_mark_verified`'s own
+    /// `spawn_blocking` wrap back to a direct synchronous call (applied, tested, and reverted in
+    /// this session, not left in the diff) drops the observed count to 0 — the whole
+    /// `current_thread` runtime is frozen for the full 300ms before the heartbeat's first tick can
+    /// even be scheduled, and this test's own assertion reads the tick count immediately afterward
+    /// with no further `.await` point in between to let it catch up.
+    #[tokio::test]
+    async fn run_mark_verifieds_trust_store_load_and_save_never_freezes_a_concurrently_scheduled_task(
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(tmp.path());
+        dummy_file_descriptor(&tmp.path().join("account.key"))
+            .save()
+            .expect("save account.json");
+
+        let inner = MemorySecretStore::new();
+        let account = generate_account(&inner, "example.org").expect("generate_account");
+        let handle = account.handle().clone();
+        let peer = [7u8; 32];
+        let mut trust = TrustStore::default();
+        trust.observe(peer, "peer.example", 0);
+        save_trust(&trust, &inner, &handle).expect("seed trust.bin under the slow store's inner");
+
+        let mut session = OnboardingSession::default();
+        session.set_live_store(Box::new(SlowStore::new(inner, SLOW_STORE_DELAY)), handle);
+
+        let (ticks, heartbeat) = spawn_heartbeat();
+
+        let request = MarkVerifiedRequest { pubkey: peer };
+        let result = run_mark_verified(&request, &session).await;
+        assert!(
+            result.is_ok(),
+            "run_mark_verified must succeed against its own seeded trust.bin: {:?}",
+            result.err()
+        );
+
+        let observed = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        heartbeat.abort();
+        assert!(
+            observed >= 8,
+            "expected the concurrently-scheduled heartbeat task to have ticked at least ~8 \
+             times while run_mark_verified's load_trust/save_trust unwraps (2 x {SLOW_STORE_DELAY:?} \
+             SlowStore delay) were in flight — observed {observed}. A near-zero count here is what \
+             running that whole sequence synchronously on this `current_thread` runtime would \
+             produce — the exact regression this test exists to catch."
+        );
+    }
+
+    /// [`run_set_petname`] falsifiable concurrency proof — same shape as the `run_mark_verified`
+    /// test just above. No `contacts.json` exists in this fixture, so `load_or_default` returns its
+    /// default without an extra `SlowStore` call (see that function's own "file absent -> default,
+    /// no store call" contract) and `save` is never reached either — `load_trust`/`save_trust`'s
+    /// own 2 x [`SLOW_STORE_DELAY`] = 300ms is still the load-bearing window this test proves stays
+    /// non-blocking, the same two calls [`run_mark_verified`]'s own test above exercises.
+    /// **Independently falsified**, same method as above: reverting `run_set_petname`'s own
+    /// `spawn_blocking` wrap drops the observed count to 0.
+    #[tokio::test]
+    async fn run_set_petnames_trust_store_load_and_save_never_freezes_a_concurrently_scheduled_task(
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::set(tmp.path());
+        dummy_file_descriptor(&tmp.path().join("account.key"))
+            .save()
+            .expect("save account.json");
+
+        let inner = MemorySecretStore::new();
+        let account = generate_account(&inner, "example.org").expect("generate_account");
+        let handle = account.handle().clone();
+        let peer = [8u8; 32];
+        let mut trust = TrustStore::default();
+        trust.observe(peer, "peer.example", 0);
+        save_trust(&trust, &inner, &handle).expect("seed trust.bin under the slow store's inner");
+
+        let mut session = OnboardingSession::default();
+        session.set_live_store(Box::new(SlowStore::new(inner, SLOW_STORE_DELAY)), handle);
+
+        let (ticks, heartbeat) = spawn_heartbeat();
+
+        let request = SetPetnameRequest {
+            pubkey: peer,
+            petname: Some("bff".to_string()),
+        };
+        let result = run_set_petname(&request, &session).await;
+        assert!(
+            result.is_ok(),
+            "run_set_petname must succeed against its own seeded trust.bin: {:?}",
+            result.err()
+        );
+
+        let observed = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        heartbeat.abort();
+        assert!(
+            observed >= 8,
+            "expected the concurrently-scheduled heartbeat task to have ticked at least ~8 \
+             times while run_set_petname's load_trust/save_trust unwraps (2 x {SLOW_STORE_DELAY:?} \
+             SlowStore delay) were in flight — observed {observed}. A near-zero count here is what \
+             running that whole sequence synchronously on this `current_thread` runtime would \
+             produce — the exact regression this test exists to catch."
         );
     }
 }

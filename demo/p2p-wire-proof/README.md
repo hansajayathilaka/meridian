@@ -65,8 +65,20 @@ namespaces (not Docker containers) to simulate four NAT topologies and runs auto
 when `NET_ADMIN` is available. This demo is a **separate, complementary artifact**: real Docker
 containers anyone can `docker compose up` and inspect by hand, a capture-analysis sidecar that
 ships with the demo instead of requiring host tooling, and (new relative to nat-matrix) an
-explicit "stop the server and prove a new session can't start" boundary check. It is not wired
-into CI — like `demo/two-orgs`, it's a manual, on-demand verification run (`just p2p-wire-proof`).
+explicit "stop the server and prove a new session can't start" boundary check.
+
+**CI status (task 5.9):** this demo now also runs on a **scheduled, non-blocking** GitHub Actions
+workflow — [`.github/workflows/p2p-wire-proof.yml`](../../.github/workflows/p2p-wire-proof.yml),
+triggered weekly (`schedule:`) and on-demand (`workflow_dispatch:`), running
+`run-wire-proof.sh` exactly as documented below, unmodified. This is deliberately **not** part of
+`ci.yml`'s blocking `test-harnesses` gate on every push/PR — the demo needs `NET_ADMIN`/`NET_RAW`
+(for the `monitor` sidecar) plus a real Docker daemon, which a plain `cargo test` runner doesn't
+have, and folding a privileged, multi-minute Docker Compose run into the blocking gate would slow
+down or destabilize every PR for a check that's better suited to a periodic ops-verification
+cadence (`docs/testing/strategy.md` §6). It remains fully runnable by hand exactly as below — like
+`demo/two-orgs`, on-demand human runs are still the primary way to *develop against* this demo; the
+scheduled workflow's job is only to make sure nobody has to remember to run it periodically for the
+project's single most load-bearing architectural claim to stay checked.
 
 ## Prerequisites
 

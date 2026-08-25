@@ -52,6 +52,7 @@ use crate::relay::{self, GatherClasses};
 
 use crate::chat::{ChatError, ChatState};
 use crate::streams::{CapabilityError, StreamRegistry};
+use crate::trust::TrustStore;
 
 /// Channel-0 label — always opened first, reliable/ordered (§5.3).
 pub const CTRL_LABEL: &str = "mrd.ctrl/1";
@@ -211,6 +212,12 @@ pub enum SessionError {
     /// checks (conflating the two is exactly the failure mode this task exists to prevent).
     #[error("unreachable at hint {hint}: no such account there ({detail})")]
     NotFoundAtHint { hint: String, detail: String },
+    /// (task 5.5, review finding F5) [`P2pSession::recover_from_desync`]'s own error — either the
+    /// underlying `ChatState`/ratchet machinery or the `TrustStore`, exactly the same two failure
+    /// modes [`crate::desync::RecoveryError`] already distinguishes for
+    /// `apps/cli/src/chat.rs`'s identical CLI-side call, surfaced here rather than invented afresh.
+    #[error("desync recovery error: {0}")]
+    Recovery(#[from] crate::desync::RecoveryError),
 }
 
 /// A signaling carrier for the offer/answer/ICE exchange — the rendezvous relay in production, an
@@ -665,6 +672,74 @@ impl<T: Transport> P2pSession<T> {
                 self.handle_ctrl(store, handle, chat, frame).await
             }
         }
+    }
+
+    /// (task 5.5, review finding F5) The P2P substrate's own receive-side half of task 4.9's guarded
+    /// desync recovery — mirrors `apps/cli/src/chat.rs::maybe_attempt_recovery`'s gate discipline
+    /// exactly, closing the gap review finding F5 named: before this task, `session.rs` held no
+    /// `TrustStore`/`can_send` reference at all, so a key substitution against an already-established
+    /// P2P session went undetected outside `meridian chat`'s relay path.
+    ///
+    /// **Deliberately decoupled from any live signaling connection.** By the time [`pump`](Self::pump)
+    /// is looping, the rendezvous connection may already be gone — T04's headline "servers out of the
+    /// data path" property (this module's own doc comment) — so this substrate makes no network calls
+    /// of its own to recover from a desync. The caller supplies an already-fetched,
+    /// already-signature-verified bundle for this session's peer (`bundle_owner_ik`/`peer_spk`/
+    /// `peer_opk`/`hint` — the exact shape [`crate::desync::attempt_recovery`] already takes), however
+    /// it obtained it — a reconnected `SignalingClient::fetch_bundle`, in practice — mirroring
+    /// `fetch_with_retry`/`attempt_recovery`'s existing split between "fetch" (network, caller-owned)
+    /// and "decide + apply" (I/O-free, here). Note that in the one production call path that exists
+    /// today (a real `SignalingClient::fetch_bundle(peer_ik, ..)`), `meridian_signaling::verify_bundle`
+    /// pins the fetched signature to the *exact requested* key, so a genuine on-the-wire substitution
+    /// against `self.peer_ik` fails closed at that fetch, before this method is ever reached — exactly
+    /// `crate::desync::attempt_recovery`'s own doc comment's point, restated here for this substrate's
+    /// callers. `bundle_owner_ik` still exists as its own parameter (never assumed equal to this
+    /// session's peer) precisely so a future fetch strategy that *can* resolve to a different key
+    /// inherits the same guard automatically, and so this method's key-change handling stays testable
+    /// in isolation (`apps/core/tests/session.rs`).
+    ///
+    /// **Ordering, precisely (mirrors `maybe_attempt_recovery`'s own doc, design requirement 2).**
+    /// Returns `Ok(None)` without touching `chat`/`trust` at all when
+    /// [`ChatState::recovery_recommended`] reads `false` for this session's peer (not yet at the
+    /// repeated-`Desync` threshold) — callers should check this cheap, I/O-free condition *before*
+    /// spending a network round trip on a bundle fetch at all, exactly as `maybe_attempt_recovery`
+    /// does. Once recovery is recommended, delegates directly to
+    /// [`crate::desync::attempt_recovery`], which itself resets the desync counter as its very first
+    /// action (whatever the outcome) and consults [`TrustStore::can_send`] before ever calling
+    /// [`ChatState::replace_session_as_initiator`] — so a peer already `Warn`/`Blocked` from an
+    /// unresolved key change never gets an automatic re-handshake layered on top, and a substituted
+    /// key is routed through [`TrustStore::observe_key_change`] exactly like any other key-change
+    /// discovery, never silently accepted just because a recovery flow happened to be in progress.
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_from_desync(
+        &self,
+        chat: &mut ChatState,
+        trust: &mut TrustStore,
+        store: &dyn SecretStore,
+        handle: &KeyHandle,
+        bundle_owner_ik: &[u8; 32],
+        peer_spk: &[u8; 32],
+        peer_opk: Option<[u8; 32]>,
+        hint: &str,
+        now_unix: u64,
+    ) -> Result<Option<crate::desync::RecoveryOutcome>, SessionError> {
+        if !chat.recovery_recommended(&self.peer_ik) {
+            return Ok(None);
+        }
+        let outcome = crate::desync::attempt_recovery(
+            chat,
+            trust,
+            store,
+            handle,
+            &self.our_ik,
+            &self.peer_ik,
+            bundle_owner_ik,
+            peer_spk,
+            peer_opk,
+            hint,
+            now_unix,
+        )?;
+        Ok(Some(outcome))
     }
 
     /// Send + await a keepalive echo, returning the round-trip milliseconds.

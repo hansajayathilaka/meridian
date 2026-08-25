@@ -11,23 +11,39 @@
 //! branch) — rather than only exercising one and assuming the other, per the task's own explicit
 //! instruction.
 //!
-//! No real worker exists yet — every test below drives transitions by directly feeding
-//! `handle_key`/`handle_worker`, exactly like `screens_chat.rs`/`screens_requests.rs`/
-//! `screens_verify.rs` do. The one exception is the dedicated "never silent" test above, which also
-//! calls `meridian_tui::config_write::write_setting_at` directly — standing in for what a future
-//! worker executing `Effect::SaveSetting` would do — since that is the only way to prove the
-//! "genuinely persists" branch is real rather than merely asserted.
+//! Most tests below drive transitions by directly feeding `handle_key`/`handle_worker`, exactly like
+//! `screens_chat.rs`/`screens_requests.rs`/`screens_verify.rs` do — no real `App`, no real worker.
+//! The "never silent" test above also calls `meridian_tui::config_write::write_setting_at` directly
+//! — standing in for what a worker executing `Effect::SaveSetting` would do — since that is the only
+//! way to prove the "genuinely persists" branch is real rather than merely asserted.
+//!
+//! ## Task 5.7 — App-level reconciliation (this file's own final section)
+//! Every test above this point stops at the screen layer: it never goes through `crate::app::App`'s
+//! own screen-stack dispatch, and (aside from the direct `config_write` calls above) never goes
+//! through `crate::worker::dispatch` either. That is exactly the gap class that took Phase 4 six
+//! gap-closure waves to find and fix for contacts/requests/chat (see
+//! `apps/tui/tests/accept_to_chat.rs`'s own module doc) — a live-UI reconciliation path invisible to
+//! lower-layer tests. The final section of this file closes that gap for Settings: a real key edit,
+//! reached through the real command palette (`Ctrl+K`) on a real `App`, producing a real
+//! `Effect::SaveSetting` that a real `meridian_tui::worker::dispatch` executes against a real, sealed
+//! `$MERIDIAN_HOME/tui/config.toml` — then the completion, fed back through `App::update`, must
+//! reconcile into the live `Screen::Settings` still on the stack. Both the `Saved` and
+//! `SessionOnly` outcomes are driven this way, not just one with the other assumed.
 
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
-use meridian_tui::app::{Effect, SaveSettingEffect, SaveSettingRequest, SettingValue, WorkerEvent};
+use meridian_tui::app::{
+    App, AppEvent, Effect, SaveSettingEffect, SaveSettingRequest, Screen, SettingValue, WorkerEvent,
+};
 use meridian_tui::config::{Bell, NetworkPolicy, Theme, Timestamps, TuiConfig};
 use meridian_tui::config_write;
 use meridian_tui::screens::settings::{self, PersistOutcome, SettingsMode, SettingsState};
+use meridian_tui::worker::{dispatch as worker_dispatch, OnboardingSession};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -579,4 +595,268 @@ fn a_successful_save_is_also_never_silent() {
         .expect("a completed save must always leave a notice");
     assert!(notice.contains("saved"));
     assert!(!notice.contains("session-only"));
+}
+
+// ---------------------------------------------------------------------------
+// Task 5.7 — App-level reconciliation: real key events through a real `App`, reached via the real
+// command palette, a real `Effect::SaveSetting` executed by the real `meridian_tui::worker::dispatch`
+// against a real, sealed `$MERIDIAN_HOME/tui/config.toml` — see this file's own module doc's "Task
+// 5.7" section.
+// ---------------------------------------------------------------------------
+
+/// Serializes test access to `$MERIDIAN_HOME`, which is process-global — mirrors
+/// `tests/accept_to_chat.rs::EnvGuard` exactly (minus that file's mock-keystore setup, which nothing
+/// below needs: `Effect::SaveSetting` touches only `config_path`, never identity/`SecretStore`).
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct EnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    prev_home: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(dir: &std::path::Path) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var("MERIDIAN_HOME").ok();
+        // SAFETY: serialized by ENV_LOCK, the only place in this test binary touching this var.
+        unsafe {
+            std::env::set_var("MERIDIAN_HOME", dir);
+        }
+        Self {
+            _lock: lock,
+            prev_home,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `EnvGuard::set`.
+        unsafe {
+            match &self.prev_home {
+                Some(v) => std::env::set_var("MERIDIAN_HOME", v),
+                None => std::env::remove_var("MERIDIAN_HOME"),
+            }
+        }
+    }
+}
+
+fn render_app_to_text(app: &App, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test backend");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    format!("{}", terminal.backend())
+}
+
+fn type_str_app(app: &mut App, s: &str) {
+    for c in s.chars() {
+        app.update(AppEvent::Key(char_key(c)));
+    }
+}
+
+/// `Ctrl+K`, then a query narrowing the palette down to exactly one entry, then `Enter` — the real
+/// navigation path a user takes to reach a first-party built-in screen, mirroring
+/// `tests/screens_help_palette.rs::diagnostics_is_reachable_end_to_end_through_the_palette`'s own
+/// shape, reused here for "Settings". `query` is chosen so it matches only the intended command's
+/// combined name+description under `PaletteState`'s subsequence fuzzy match, never both built-in
+/// commands at once (verified by hand against the exact registered strings in
+/// `App::register_builtin_commands`, not merely assumed).
+fn open_via_palette(app: &mut App, query: &str) {
+    app.update(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(matches!(app.current_screen(), Screen::Palette(_)));
+    for c in query.chars() {
+        app.update(AppEvent::Key(char_key(c)));
+    }
+    let effects = app.update(AppEvent::Key(key(KeyCode::Enter)));
+    assert!(
+        effects.is_empty(),
+        "opening a screen/pane from the palette dispatches no effect"
+    );
+}
+
+const SAMPLE_CONFIG_FOR_APP_LEVEL_TEST: &str = r#"# Meridian TUI configuration — hand-authored.
+
+[account]
+# The server this account registered against.
+server = "old.example"
+
+[ui]
+theme = "dark"
+
+[network]
+policy = "direct"
+"#;
+
+/// **The load-bearing property this task exists to close (the `Saved` branch).** A real key edit,
+/// driven through a real `App` reached via the real command palette (not a hand-built
+/// `SettingsState`), produces a real `Effect::SaveSetting` that a real `meridian_tui::worker::
+/// dispatch` executes against a real, sealed `$MERIDIAN_HOME/tui/config.toml` — and the completion,
+/// fed back through `App::update`, reconciles into the live `Screen::Settings` still on the stack:
+/// `notice`/`last_persist` render `Saved`, and both the in-memory `config` and the real file on disk
+/// changed, comments intact.
+#[tokio::test]
+async fn a_real_key_edit_through_the_live_app_persists_through_a_real_worker_dispatch_and_renders_saved(
+) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let config_path = tmp.path().join("tui").join("config.toml");
+    std::fs::create_dir_all(config_path.parent().unwrap()).expect("mkdir tui/");
+    std::fs::write(&config_path, SAMPLE_CONFIG_FOR_APP_LEVEL_TEST).expect("write config.toml");
+
+    // `App::new` resolves `nav.settings`'s own `config_path` from `$MERIDIAN_HOME` at construction
+    // time (`crate::config::default_config_path`) — set *before* constructing `App`, mirroring every
+    // other test in this crate that needs a real on-disk fixture in place first.
+    let mut app = App::new();
+    open_via_palette(&mut app, "settings");
+    assert!(matches!(app.current_screen(), Screen::Settings(_)));
+
+    // ServerUrl is field 0 (the default selection) — a real key edit, one KeyCode::Char at a time.
+    app.update(AppEvent::Key(key(KeyCode::Enter)));
+    match app.current_screen() {
+        Screen::Settings(state) => assert!(matches!(state.mode, SettingsMode::EditText { .. })),
+        other => panic!("expected Screen::Settings, got {other:?}"),
+    }
+    type_str_app(&mut app, "new.example");
+    let effects = app.update(AppEvent::Key(key(KeyCode::Enter)));
+    let effect = only_save_effect(effects);
+    assert_eq!(
+        effect.request.config_path, config_path,
+        "the effect must carry the real, on-disk config_path App::new resolved via $MERIDIAN_HOME"
+    );
+    match app.current_screen() {
+        Screen::Settings(state) => {
+            assert!(matches!(state.mode, SettingsMode::Saving(_)));
+            // Applied immediately, before the worker ever resolves — same "screen already knows the
+            // answer" property the direct-dispatch tests above already pin, now proven live on the
+            // App's own screen stack.
+            assert_eq!(state.config.account.server.as_deref(), Some("new.example"));
+        }
+        other => panic!("expected Screen::Settings, got {other:?}"),
+    }
+
+    // The real worker, not a hand-built WorkerEvent.
+    let mut session = OnboardingSession::default();
+    let event = worker_dispatch(Effect::SaveSetting(effect), &mut session).await;
+    match &event {
+        WorkerEvent::Completed(Effect::SaveSetting(SaveSettingEffect {
+            outcome: Some(()),
+            ..
+        })) => {}
+        other => panic!("expected a completed SaveSetting, got {other:?}"),
+    }
+    let leftover = app.update(AppEvent::Worker(Box::new(event)));
+    assert!(leftover.is_empty());
+
+    match app.current_screen() {
+        Screen::Settings(state) => {
+            assert_eq!(state.last_persist, Some(PersistOutcome::Saved));
+            let notice = state
+                .notice
+                .as_deref()
+                .expect("a completed save must leave a notice");
+            assert!(notice.contains("saved"));
+            assert!(matches!(state.mode, SettingsMode::List));
+        }
+        other => panic!("expected Screen::Settings, got {other:?}"),
+    }
+
+    let text = render_app_to_text(&app, 80, 24);
+    assert!(
+        text.contains("saved"),
+        "expected the saved notice rendered live in the real app:\n{text}"
+    );
+    assert!(
+        text.contains("new.example"),
+        "expected the new value rendered live in the real app:\n{text}"
+    );
+
+    // And it genuinely persisted, comments intact — not merely asserted in memory.
+    let updated = std::fs::read_to_string(&config_path).expect("read back config.toml");
+    assert!(updated.contains("# Meridian TUI configuration"));
+    assert!(updated.contains(r#"server = "new.example""#));
+    assert!(!updated.contains("old.example"));
+    assert!(updated.contains(r#"theme = "dark""#));
+}
+
+/// **The mirror-image branch: `SessionOnly`.** Same real-App/real-palette/real-worker path as above,
+/// but `$MERIDIAN_HOME/tui/config.toml` is deliberately never created — a real, honest
+/// `ConfigWriteError::NoFile` — and the live `Screen::Settings` must reconcile that into a clearly
+/// marked session-only notice, never silently either (this task's own `handle_key`/`handle_worker`
+/// unit tests above already pin this property against a hand-built `SettingsState`; this proves the
+/// same reconciliation holds through `App::update`'s real screen-stack dispatch too).
+#[tokio::test]
+async fn a_real_key_edit_through_the_live_app_is_honestly_marked_session_only_when_no_config_toml_exists_on_disk(
+) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let config_path = tmp.path().join("tui").join("config.toml");
+
+    let mut app = App::new();
+    open_via_palette(&mut app, "settings");
+    assert!(matches!(app.current_screen(), Screen::Settings(_)));
+
+    app.update(AppEvent::Key(key(KeyCode::Enter))); // ServerUrl -> EditText
+    type_str_app(&mut app, "session-only.example");
+    let effects = app.update(AppEvent::Key(key(KeyCode::Enter)));
+    let effect = only_save_effect(effects);
+
+    match app.current_screen() {
+        Screen::Settings(state) => assert_eq!(
+            state.config.account.server.as_deref(),
+            Some("session-only.example"),
+            "the change is already live for this session, before the worker ever resolves"
+        ),
+        other => panic!("expected Screen::Settings, got {other:?}"),
+    }
+
+    let mut session = OnboardingSession::default();
+    let event = worker_dispatch(Effect::SaveSetting(effect), &mut session).await;
+    match &event {
+        WorkerEvent::Failed(
+            Effect::SaveSetting(SaveSettingEffect { outcome: None, .. }),
+            message,
+        ) => {
+            assert!(
+                message.contains("no config.toml exists yet"),
+                "expected the honest ConfigWriteError::NoFile message, got: {message}"
+            );
+        }
+        other => {
+            panic!("expected a failed SaveSetting (no config.toml to preserve), got {other:?}")
+        }
+    }
+    let leftover = app.update(AppEvent::Worker(Box::new(event)));
+    assert!(leftover.is_empty());
+
+    match app.current_screen() {
+        Screen::Settings(state) => {
+            assert_eq!(state.last_persist, Some(PersistOutcome::SessionOnly));
+            let notice = state
+                .notice
+                .as_deref()
+                .expect("a failed save must leave a notice");
+            assert!(notice.contains("session-only"));
+            assert!(notice.contains("not saved"));
+            // Not reverted — session-only still means it took effect for this session.
+            assert_eq!(
+                state.config.account.server.as_deref(),
+                Some("session-only.example")
+            );
+        }
+        other => panic!("expected Screen::Settings, got {other:?}"),
+    }
+
+    let text = render_app_to_text(&app, 80, 24);
+    assert!(
+        text.contains("session-only"),
+        "expected the session-only notice rendered live in the real app:\n{text}"
+    );
+
+    assert!(
+        !config_path.exists(),
+        "the worker must never author a config.toml from nothing"
+    );
 }

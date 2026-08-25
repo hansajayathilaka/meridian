@@ -16,48 +16,25 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 ## ▶ NOW / NEXT
 
-- **NOW:** **Phase 4 (T08 + T17) is closed — 52/52 tasks done.** **4.52, the seventh exit-gate attempt,
-  genuinely passed**, re-verifying 4.51's fix for the sixth defect (4.50's finding). Held to the same
-  two-independent-live-runs-plus-reviewer discipline as every prior attempt, with one deliberate,
-  explicitly authorized deviation: both live runs (implementer + `test-engineer`) drove the full T17
-  demo — both account types, a ≥10-trial (24 total, both directions) first-contact delivery-reliability
-  check, message-request accept, intro-history no-duplicate, safety-number verify, restart-with-no-
-  re-handshake, `--export-json` — against a real, owner-operated rendezvous server
-  (`wss://rendezvous.hansajayathilaka.com`) instead of a local in-process one. Both runs agreed on every
-  Scope point: 4.51's fix holds (nothing near the original 70s–260s range across 24 fresh trials), and
-  the one residual finding — `run_mark_verified`'s real backend latency for a file-backed account
-  (~3.7–4.1s) — is the same, already-known, already-named `live_store`-routed hazard 4.51 itself split
-  off, not a new regression, independently re-confirmed against source by the `reviewer` pass. Full
-  lineage of all seven exit-gate attempts in [Phase 4's README](./phase-4/README.md#exit-criteria); full
-  evidence in [4.52's own Status section](./phase-4/4.52-t17-acceptance-demo-closure-attempt-7.md).
-- **NOW:** **Phase 5 (review of Phase 4) swept.** Four parallel lenses (code-reviewer, security-reviewer,
-  architect, test-engineer) reviewed the full diff since the Phase-3 review — Phase 4's T08+T17
-  (4.1–4.52) plus 19 untracked out-of-band commits (PRs #66–#73: CI job-split, the release-binary
-  pipeline + ADR 0022→0023 self-correction, a Windows TUI input fix, message-status indicators, and the
-  `demo/p2p-wire-proof` demo). **Verdict: green, zero blocking findings** — an unusually clean result
-  given the diff's size, consistent with Phase 4's own heavy internal review discipline (seven exit-gate
-  attempts, six defects caught and fixed before this sweep even started). 9 should-fix + 8 nit findings,
-  none newly regressing anything already shipped: six are re-confirmations of residuals Phase 4's own
-  README already named and left unowned (partial-failure repair action, stale `^N`/`^V` doc, stale
-  `contacts.json.trust`/`export_json` gap, file-backed `run_mark_verified`/`run_set_petname` latency,
-  `PersistHistory` drain-window flake); the rest are freshly found, the most notable being that the
-  out-of-band Sent/Delivered message-status feature (landed outside the tracked-task pipeline) has an
-  unreachable/unpersisted "Delivered" state and zero App-level test — reproducing, on a brand-new
-  feature, the exact reconciliation-gap class T17's own six-wave closure spent the whole phase fixing.
-  No ADR drift, no unratified on-the-fly decisions, no trust-state-machine bypass, no sealed-store leak.
-  Full findings: [phase-5/review-report.md](./phase-5/review-report.md).
-- **NOW:** **Phase 5 planned — 13 fix-tasks broken out** from the review report's 18 findings (F1–F10,
-  N1–N8). Delegated to the **planner** agent; grounded against current source before finalizing scope.
-  All 9 should-fix findings (F1–F9) plus F10 got their own task; N1 (a trust-reconciliation helper
-  extraction with real defect history) and N7 (a genuine extension-registry policy decision) each got
-  their own task; N2–N6 (doc/comment/mechanical) bundled into one nit sweep (5.13), mirroring Phase 3's
-  3.21 precedent; N8 folded into 5.5 as a deferred stretch-goal since it isn't independently reachable
-  until 5.5's own fix lands. Two same-function/same-file conflicts required explicit sequencing: **5.4
-  before 5.3** (both touch `run_mark_verified`) and **5.5 before 5.6** (both append to
-  `harnesses/mitm-sim/run.sh`); everything else runs in parallel. Full breakdown:
-  [phase-5/README.md](./phase-5/README.md#tasks-todo).
-- **NEXT:** `/next-task` — start landing Phase 5's 13 fix-tasks (Wave 1 first: 5.1, 5.2, 5.4, 5.5, 5.7,
-  5.8, 5.9, 5.10, 5.11, 5.12, 5.13; then 5.3 after 5.4, and 5.6 after 5.5).
+- **NOW:** **Phase 4 (T08 + T17) is closed — 52/52 tasks done**, exit gate passed on its seventh attempt
+  (4.52). Full lineage: [Phase 4's README](./phase-4/README.md#exit-criteria).
+- **NOW:** **Phase 5 (review of Phase 4) closed — 14/14 fix-tasks done** (5.1–5.14; 5.14 was a genuine
+  second instance of F3's bug class found by 5.3's own review round, not part of the original
+  18-finding report). Every task's named reviewer(s) signed off PASS with zero blocking findings across
+  the whole phase — the second consecutive phase-wide sweep this clean, after Phase 4's own seven-attempt
+  exit-gate discipline. Each non-blocking should-fix a reviewer raised was either closed in the same
+  commit (5.10's two coverage-gap tests, 5.13's `debug_assert`, 5.14's `export_json` fail-closed test) or
+  explicitly ratified as a deliberate, documented carry-forward rather than silently dropped (5.10's
+  `SIGINT`/`SIGTERM`-bypasses-the-drain residual — [phase-5/README.md](./phase-5/README.md#residual-carried-forward-by-510s-review)).
+  No task's fix-shape decision (5.12's keybinding tie-break contract, 5.14's export-time-join-over-
+  write-through call) was judged to need an ADR — both internal, single-crate implementation choices,
+  not new components/dependencies/wire changes. Tree green (`cargo build --workspace`, `cargo fmt
+  --check`, `cargo clippy --workspace --all-targets -- -D warnings` all clean). Full closure summary:
+  [phase-5/README.md](./phase-5/README.md#exit-criteria).
+- **NEXT:** `/pick-next-phase` — Phase 5 (review) is closed, so the next command opens the next
+  **build** phase per the lifecycle. Envelope v2 is the named trigger for the next build phase (see
+  "Live carry-forwards" below); the six Phase-4-named residuals and the Phase-1 adversarial frontier
+  remain unowned carry-forwards for `/plan-phase` to pick up alongside it.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -326,30 +303,32 @@ pre-announced.
 - [x] **4.52** T17 acceptance-demo closure, seventh exit-gate attempt — verdict PASS, Phase 4 exit gate
   closed — [file](./phase-4/4.52-t17-acceptance-demo-closure-attempt-7.md)
 
-### Phase 5 — Review of Phase 4 · **in progress** · [details](./phase-5/README.md)
+### Phase 5 — Review of Phase 4 · **done** · [details](./phase-5/README.md)
 Review phase. Sweeps everything built since the Phase-3 review: Phase 4 (T08 + T17, tasks 4.1–4.52) and
 the untracked out-of-band PRs #66–#73 that landed alongside/after it. [Report](./phase-5/review-report.md):
 18 findings — **0 blocking**, 9 should-fix, 9 nits (F1 combines a duplicate correctness+coverage finding
 from two lenses, numbered once). Verdict: **green to proceed**, no blocker for the next build phase
-(envelope-v2). 13 fix-tasks cover all 18 findings (N8 folded into 5.5 rather than its own task — see
-[phase-5/README.md](./phase-5/README.md#tasks-todo)).
+(envelope-v2). 14 fix-tasks landed, all `[x]`: 13 covering all 18 findings (N8 folded into 5.5 rather
+than its own task) plus 5.14, a genuine second instance of F3's bug class found by 5.3's own review
+round — see [phase-5/README.md](./phase-5/README.md#exit-criteria) for the closure summary.
 
 **Wave 1 — fully parallel**
-- [ ] **5.1** Persist and always-reconcile Sent→Delivered receipts (F1) — [file](./phase-5/5.1-persist-reconcile-delivery-receipts.md)
-- [ ] **5.2** Diagnostics-surfaced repair action for `run_accept_request`'s partial-failure window (F2) — [file](./phase-5/5.2-accept-request-repair-action.md)
-- [ ] **5.4** `spawn_blocking`-wrap `run_mark_verified`/`run_set_petname` (F4) — [file](./phase-5/5.4-spawn-blocking-mark-verified-set-petname.md)
-- [ ] **5.5** Wire receive-side key-change detection into the TUI inbound loop + `session.rs` (F5 + N8 deferred) — [file](./phase-5/5.5-wire-receive-side-key-change-detection.md)
-- [ ] **5.7** App-level reconciliation tests for Settings/Diagnostics (F7) — [file](./phase-5/5.7-settings-diagnostics-app-level-tests.md)
-- [ ] **5.8** App-level end-to-end tests for onboarding/unlock (F8) — [file](./phase-5/5.8-onboarding-unlock-app-level-tests.md)
-- [ ] **5.9** Scheduled CI workflow for `demo/p2p-wire-proof` (F9) — [file](./phase-5/5.9-schedule-p2p-wire-proof-ci.md)
-- [ ] **5.10** Drain/flush-on-shutdown hook for `Effect::PersistHistory` (F10) — [file](./phase-5/5.10-persist-history-drain-on-shutdown.md)
-- [ ] **5.11** Extract shared `observe_into_live_trust` helper (N1) — [file](./phase-5/5.11-extract-observe-into-live-trust-helper.md)
-- [ ] **5.12** Pin `find_binding`'s keybinding-collision tie-break contract (N7) — [file](./phase-5/5.12-pin-keybinding-collision-tiebreak.md)
-- [ ] **5.13** Nit sweep: doc/comment/mechanical fixes (N2, N3, N4, N5, N6) — [file](./phase-5/5.13-phase-5-nit-sweep.md)
+- [x] **5.1** Persist and always-reconcile Sent→Delivered receipts (F1) — [file](./phase-5/5.1-persist-reconcile-delivery-receipts.md)
+- [x] **5.2** Diagnostics-surfaced repair action for `run_accept_request`'s partial-failure window (F2) — [file](./phase-5/5.2-accept-request-repair-action.md)
+- [x] **5.4** `spawn_blocking`-wrap `run_mark_verified`/`run_set_petname` (F4) — [file](./phase-5/5.4-spawn-blocking-mark-verified-set-petname.md)
+- [x] **5.5** Wire receive-side key-change detection into the TUI inbound loop + `session.rs` (F5 + N8 deferred) — [file](./phase-5/5.5-wire-receive-side-key-change-detection.md)
+- [x] **5.7** App-level reconciliation tests for Settings/Diagnostics (F7) — [file](./phase-5/5.7-settings-diagnostics-app-level-tests.md)
+- [x] **5.8** App-level end-to-end tests for onboarding/unlock (F8) — [file](./phase-5/5.8-onboarding-unlock-app-level-tests.md)
+- [x] **5.9** Scheduled CI workflow for `demo/p2p-wire-proof` (F9) — [file](./phase-5/5.9-schedule-p2p-wire-proof-ci.md)
+- [x] **5.10** Drain/flush-on-shutdown hook for `Effect::PersistHistory` (F10) — [file](./phase-5/5.10-persist-history-drain-on-shutdown.md)
+- [x] **5.11** Extract shared `observe_into_live_trust` helper (N1) — [file](./phase-5/5.11-extract-observe-into-live-trust-helper.md)
+- [x] **5.12** Pin `find_binding`'s keybinding-collision tie-break contract (N7) — [file](./phase-5/5.12-pin-keybinding-collision-tiebreak.md)
+- [x] **5.13** Nit sweep: doc/comment/mechanical fixes (N2, N3, N4, N5, N6) — [file](./phase-5/5.13-phase-5-nit-sweep.md)
+- [x] **5.14** `run_acknowledge_key_change` has the same `contacts.json` trust-staleness bug as F3 (found by 5.3's own review, depends on 5.3) — [file](./phase-5/5.14-acknowledge-key-change-trust-staleness.md)
 
 **Wave 2 — sequenced (same-function/same-file conflicts)**
-- [ ] **5.3** Fix `contacts.json` trust staleness + cover `export_json` (F3; depends on 5.4) — [file](./phase-5/5.3-fix-contacts-trust-staleness-export.md)
-- [ ] **5.6** Federated mitm-sim cell: verified-contact key-change block (F6; depends on 5.5) — [file](./phase-5/5.6-federated-verified-key-change-mitm-cell.md)
+- [x] **5.3** Fix `contacts.json` trust staleness + cover `export_json` (F3; depends on 5.4) — [file](./phase-5/5.3-fix-contacts-trust-staleness-export.md)
+- [x] **5.6** Federated mitm-sim cell: verified-contact key-change block (F6; depends on 5.5) — [file](./phase-5/5.6-federated-verified-key-change-mitm-cell.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.

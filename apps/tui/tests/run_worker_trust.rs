@@ -49,10 +49,13 @@ use meridian_core::trust::{TrustError, TrustState, TrustStore};
 
 use meridian_tui::app::{
     AcceptRequestEffect, AcceptRequestRequest, AcknowledgeKeyChangeEffect,
-    AcknowledgeKeyChangeRequest, AddedContact, Effect, MarkVerifiedEffect, MarkVerifiedRequest,
-    RejectRequestEffect, RejectRequestRequest, WorkerEvent,
+    AcknowledgeKeyChangeRequest, AddContactEffect, AddContactRequest, AddedContact,
+    DeleteContactEffect, DeleteContactRequest, Effect, MarkVerifiedEffect, MarkVerifiedRequest,
+    RejectRequestEffect, RejectRequestRequest, RepairAcceptedContactEffect,
+    RepairAcceptedContactRequest, RepairableContact, ScanRepairableContactsEffect,
+    ScanRepairableContactsRequest, WorkerEvent,
 };
-use meridian_tui::store::contacts::{self as contacts_store, ContactsDocument};
+use meridian_tui::store::contacts::{self as contacts_store, ContactRecord, ContactsDocument};
 use meridian_tui::store::history::{self, Direction as HistDirection, MessageState};
 use meridian_tui::worker::{dispatch, OnboardingSession};
 
@@ -587,6 +590,397 @@ async fn accept_request_retry_after_a_partial_failure_still_completes_the_pin() 
 }
 
 // ---------------------------------------------------------------------------
+// ScanRepairableContacts / RepairAcceptedContact (task 5.2)
+//
+// Extends the coverage above — never duplicates it: `accept_request_retry_after_a_partial_
+// failure_still_completes_the_pin` (immediately above) already owns "a retry completes an owed
+// pin/row"; these tests own the diagnostics-surfaced repair path for what a retry, by design, never
+// re-attempts (a lost `contacts.json` row / a lost `history.jsonl` intro), and the repair-vs-
+// tombstone distinction that path must never blur.
+// ---------------------------------------------------------------------------
+
+fn scan(effect: ScanRepairableContactsEffect) -> Effect {
+    Effect::ScanRepairableContacts(effect)
+}
+
+async fn scan_repairable() -> Vec<RepairableContact> {
+    match dispatch_effect(scan(ScanRepairableContactsEffect {
+        request: ScanRepairableContactsRequest,
+        outcome: None,
+    }))
+    .await
+    {
+        WorkerEvent::Completed(Effect::ScanRepairableContacts(ScanRepairableContactsEffect {
+            outcome: Some(contacts),
+            ..
+        })) => contacts,
+        other => panic!("expected the scan to complete with a contact list, got {other:?}"),
+    }
+}
+
+async fn repair(pubkey: [u8; 32]) -> WorkerEvent {
+    dispatch_effect(Effect::RepairAcceptedContact(RepairAcceptedContactEffect {
+        request: RepairAcceptedContactRequest { pubkey },
+        outcome: None,
+    }))
+    .await
+}
+
+/// Reproduces the genuine partial failure `run_accept_request`'s own doc comment names for its
+/// `contacts.json` write: `trust.bin` succeeds, `contacts.json` never does — so `history.jsonl`
+/// (sequenced strictly after it) never even gets attempted. Both are provably missing, and the scan/
+/// repair must recover both from `trust.bin`'s own already-real `Contact`.
+#[tokio::test]
+async fn repair_rebuilds_both_the_contacts_row_and_the_history_intro_after_a_contacts_json_failure()
+{
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let bob = setup_os_account();
+
+    let mut bob_chat = ChatState::default();
+    let alice = receive_first_contact(&bob, &mut bob_chat);
+    let alice_ik = alice.ik();
+
+    // --- Simulate: chat side + trust side both succeed, contacts.json/history.jsonl never do ----
+    assert!(bob_chat.accept_request(&alice_ik).is_some());
+    write_chat(&bob, &bob_chat);
+    let mut trust = TrustStore::default();
+    trust.observe(alice_ik, "", NOW);
+    write_trust(&bob, &trust);
+    assert!(read_contacts(&bob).contacts.is_empty(), "fixture sanity");
+    assert!(read_history(&bob, &alice_ik).is_empty(), "fixture sanity");
+
+    // --- The scan must list exactly this contact, both flags set -------------------------------
+    let listed = scan_repairable().await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].pubkey, alice_ik);
+    assert!(listed[0].missing_contact_row);
+    assert!(listed[0].missing_history_intro);
+
+    // --- The repair must fix both, from trust.bin's own real Contact ---------------------------
+    let outcome = match repair(alice_ik).await {
+        WorkerEvent::Completed(Effect::RepairAcceptedContact(RepairAcceptedContactEffect {
+            outcome: Some(outcome),
+            ..
+        })) => outcome,
+        other => panic!("expected the repair to complete with a real outcome, got {other:?}"),
+    };
+    assert!(outcome.contact_row_repaired);
+    assert!(outcome.history_repaired);
+
+    let doc = read_contacts(&bob);
+    assert_eq!(doc.contacts.len(), 1);
+    assert_eq!(doc.contacts[0].pubkey, hex::encode(alice_ik));
+    assert_eq!(doc.contacts[0].id, "");
+    assert_eq!(
+        doc.contacts[0].trust,
+        meridian_tui::store::contacts::TrustLabel::Pinned
+    );
+
+    let history = read_history(&bob, &alice_ik);
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].dir, HistDirection::In);
+    assert_eq!(history[0].state, MessageState::Received);
+    assert!(
+        !history[0].body.is_empty(),
+        "the repaired entry must carry an honest placeholder, never an empty body"
+    );
+
+    // --- A second scan/repair against the now-healthy contact is a genuine no-op ---------------
+    assert!(
+        scan_repairable().await.is_empty(),
+        "a repaired contact must not still be listed as repairable"
+    );
+    match repair(alice_ik).await {
+        WorkerEvent::Completed(Effect::RepairAcceptedContact(RepairAcceptedContactEffect {
+            outcome: None,
+            ..
+        })) => {}
+        other => {
+            panic!("expected a no-op repair against an already-healthy contact, got {other:?}")
+        }
+    }
+    assert_eq!(
+        read_contacts(&bob),
+        doc,
+        "a no-op repair must not touch the row"
+    );
+    assert_eq!(
+        read_history(&bob, &alice_ik),
+        history,
+        "a no-op repair must not touch the transcript"
+    );
+}
+
+/// Reproduces the narrower, `history.jsonl`-only failure task 4.49's own doc comment names — driven
+/// through the *real* `pin_still_owed` retry path (the same fixture shape as
+/// `accept_request_retry_after_a_partial_failure_still_completes_the_pin` above), not a hand-rolled
+/// one: the retry completes the pin and the row (task 4.42's own guard), but by design never
+/// re-attempts the history write, since the retry's own `chat.accept_request` call returns `None`
+/// (no `MessageRequest` to source content from). The repair must fix only the transcript, never
+/// re-touch the already-healthy row.
+#[tokio::test]
+async fn repair_appends_a_placeholder_history_entry_after_the_narrower_history_only_failure() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let bob = setup_os_account();
+
+    let mut bob_chat = ChatState::default();
+    let alice = receive_first_contact(&bob, &mut bob_chat);
+    let alice_ik = alice.ik();
+
+    // Step 1 only (mirrors the existing retry test's own fixture) — trust/contacts/history all
+    // still owed.
+    assert!(bob_chat.accept_request(&alice_ik).is_some());
+    write_chat(&bob, &bob_chat);
+
+    // The real retry completes the pin and the row, but — by design — no history entry.
+    let retry_effect = Effect::AcceptRequest(AcceptRequestEffect {
+        request: AcceptRequestRequest {
+            sender_ik: alice_ik,
+        },
+        outcome: None,
+    });
+    match dispatch_effect(retry_effect).await {
+        WorkerEvent::Completed(Effect::AcceptRequest(AcceptRequestEffect {
+            outcome: Some(_),
+            ..
+        })) => {}
+        other => panic!("expected the retry to complete, got {other:?}"),
+    }
+    let doc_before = read_contacts(&bob);
+    assert_eq!(doc_before.contacts.len(), 1, "fixture sanity");
+    assert!(read_history(&bob, &alice_ik).is_empty(), "fixture sanity");
+
+    // --- The scan must list exactly this contact, only the history flag set --------------------
+    let listed = scan_repairable().await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].pubkey, alice_ik);
+    assert!(!listed[0].missing_contact_row);
+    assert!(listed[0].missing_history_intro);
+
+    // --- The repair must fix only the transcript ------------------------------------------------
+    let outcome = match repair(alice_ik).await {
+        WorkerEvent::Completed(Effect::RepairAcceptedContact(RepairAcceptedContactEffect {
+            outcome: Some(outcome),
+            ..
+        })) => outcome,
+        other => panic!("expected the repair to complete with a real outcome, got {other:?}"),
+    };
+    assert!(
+        !outcome.contact_row_repaired,
+        "the row was already healthy — repair must not report touching it"
+    );
+    assert!(outcome.history_repaired);
+
+    assert_eq!(
+        read_contacts(&bob),
+        doc_before,
+        "an already-healthy contacts.json row must be left byte-for-byte untouched"
+    );
+    let history = read_history(&bob, &alice_ik);
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].dir, HistDirection::In);
+    assert_eq!(history[0].state, MessageState::Received);
+}
+
+/// A fully-healthy contact (a genuine, uninterrupted accept) must never be listed as repairable, and
+/// a repair forced against it anyway (defense in depth — the worker re-derives eligibility itself,
+/// never trusting a stale scan) must be a real no-op that touches neither file.
+#[tokio::test]
+async fn repair_never_touches_an_already_healthy_contact() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let bob = setup_os_account();
+
+    let mut bob_chat = ChatState::default();
+    let alice = receive_first_contact(&bob, &mut bob_chat);
+    let alice_ik = alice.ik();
+    write_chat(&bob, &bob_chat);
+
+    let accept_effect = Effect::AcceptRequest(AcceptRequestEffect {
+        request: AcceptRequestRequest {
+            sender_ik: alice_ik,
+        },
+        outcome: None,
+    });
+    match dispatch_effect(accept_effect).await {
+        WorkerEvent::Completed(Effect::AcceptRequest(AcceptRequestEffect {
+            outcome: Some(_),
+            ..
+        })) => {}
+        other => panic!("expected the genuine accept to complete, got {other:?}"),
+    }
+    let doc_before = read_contacts(&bob);
+    let history_before = read_history(&bob, &alice_ik);
+    assert_eq!(doc_before.contacts.len(), 1, "fixture sanity");
+    assert_eq!(history_before.len(), 1, "fixture sanity");
+
+    assert!(
+        scan_repairable().await.is_empty(),
+        "a fully-healthy accept must never be listed as repairable"
+    );
+
+    match repair(alice_ik).await {
+        WorkerEvent::Completed(Effect::RepairAcceptedContact(RepairAcceptedContactEffect {
+            outcome: None,
+            ..
+        })) => {}
+        other => panic!(
+            "a repair forced against an already-healthy contact must be a real no-op, got {other:?}"
+        ),
+    }
+    assert_eq!(read_contacts(&bob), doc_before);
+    assert_eq!(read_history(&bob, &alice_ik), history_before);
+}
+
+/// The exact case this whole task exists to stay distinct from: a genuine accept completes fully
+/// (real `contacts.json` row, real history), the user then explicitly deletes the contact
+/// ([`DeleteContactRequest`]'s own "removes only the local `contacts.json` row" contract), and the
+/// repair path must never mistake that for a partial failure and resurrect the row.
+#[tokio::test]
+async fn repair_never_resurrects_a_contact_the_user_explicitly_deleted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let bob = setup_os_account();
+
+    let mut bob_chat = ChatState::default();
+    let alice = receive_first_contact(&bob, &mut bob_chat);
+    let alice_ik = alice.ik();
+    write_chat(&bob, &bob_chat);
+
+    let accept_effect = Effect::AcceptRequest(AcceptRequestEffect {
+        request: AcceptRequestRequest {
+            sender_ik: alice_ik,
+        },
+        outcome: None,
+    });
+    match dispatch_effect(accept_effect).await {
+        WorkerEvent::Completed(Effect::AcceptRequest(AcceptRequestEffect {
+            outcome: Some(_),
+            ..
+        })) => {}
+        other => panic!("expected the genuine accept to complete, got {other:?}"),
+    }
+    let history_before_delete = read_history(&bob, &alice_ik);
+    assert_eq!(history_before_delete.len(), 1, "fixture sanity");
+
+    // --- The user explicitly deletes the contact ------------------------------------------------
+    match dispatch_effect(Effect::DeleteContact(DeleteContactEffect {
+        request: DeleteContactRequest { pubkey: alice_ik },
+        outcome: None,
+    }))
+    .await
+    {
+        WorkerEvent::Completed(Effect::DeleteContact(DeleteContactEffect {
+            outcome: Some(()),
+            ..
+        })) => {}
+        other => panic!("expected the delete to complete, got {other:?}"),
+    }
+    assert!(
+        read_contacts(&bob).contacts.is_empty(),
+        "fixture sanity: the row must actually be gone"
+    );
+    // trust.bin/history.jsonl survive untouched — DeleteContact's own contract.
+    assert!(
+        read_trust(&bob).contact(&alice_ik).is_some(),
+        "fixture sanity"
+    );
+    assert_eq!(
+        read_history(&bob, &alice_ik),
+        history_before_delete,
+        "fixture sanity: delete must not touch history.jsonl"
+    );
+
+    // --- The tombstoned contact must never be listed as repairable -----------------------------
+    assert!(
+        scan_repairable().await.is_empty(),
+        "a tombstoned contact must never be surfaced as repairable"
+    );
+
+    // --- And a repair forced against it anyway must be refused, not silently resurrect it ------
+    match repair(alice_ik).await {
+        WorkerEvent::Failed(Effect::RepairAcceptedContact(_), message) => {
+            assert!(
+                message.to_lowercase().contains("delet")
+                    || message.to_lowercase().contains("resurrect"),
+                "expected an honest tombstone-refusal message, got: {message}"
+            );
+        }
+        other => panic!("expected the repair to be refused, got {other:?}"),
+    }
+    assert!(
+        read_contacts(&bob).contacts.is_empty(),
+        "the refused repair must never resurrect the deleted row"
+    );
+    assert_eq!(
+        read_history(&bob, &alice_ik),
+        history_before_delete,
+        "the refused repair must never touch the surviving transcript"
+    );
+}
+
+/// A `pubkey` with no `trust.bin` record at all (never accepted, never added) is refused, not
+/// silently treated as a no-op — the same "propagate faithfully" discipline every other guard in
+/// this module already follows.
+#[tokio::test]
+async fn repair_refuses_a_pubkey_with_no_trust_record_at_all() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let _bob = setup_os_account();
+
+    let phantom = [0x77u8; 32];
+    match repair(phantom).await {
+        WorkerEvent::Failed(Effect::RepairAcceptedContact(_), message) => {
+            assert!(!message.is_empty());
+        }
+        other => panic!("expected a phantom pubkey's repair to be refused, got {other:?}"),
+    }
+}
+
+/// A `trust.bin` contact created via [`Effect::AddContact`] (a real, non-empty hint) is not
+/// accept-shaped and must never be treated as repairable, even if its `contacts.json` row happens to
+/// be missing for an unrelated reason — the `hint == ""` eligibility gate this whole path relies on.
+#[tokio::test]
+async fn repair_refuses_a_contact_that_was_never_accept_shaped() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let _bob = setup_os_account();
+
+    let added_pubkey = [0x99u8; 32];
+    match dispatch_effect(Effect::AddContact(AddContactEffect {
+        request: AddContactRequest {
+            id: format!("mrd1:{}@friend.example", hex::encode(added_pubkey)),
+            pubkey: added_pubkey,
+            hint: "friend.example".to_string(),
+            petname: None,
+        },
+        outcome: None,
+    }))
+    .await
+    {
+        WorkerEvent::Completed(Effect::AddContact(AddContactEffect {
+            outcome: Some(_), ..
+        })) => {}
+        other => panic!("expected the add to complete, got {other:?}"),
+    }
+
+    assert!(
+        scan_repairable().await.is_empty(),
+        "an AddContact-originated contact must never be listed as repairable"
+    );
+    match repair(added_pubkey).await {
+        WorkerEvent::Failed(Effect::RepairAcceptedContact(_), message) => {
+            assert!(!message.is_empty());
+        }
+        other => panic!(
+            "expected a repair against a non-accept-shaped contact to be refused, got {other:?}"
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RejectRequest — "leaves no trace"
 // ---------------------------------------------------------------------------
 
@@ -729,6 +1123,106 @@ async fn mark_verified_persists_through_a_fresh_trust_store_reload() {
     assert_eq!(
         reloaded.contact(&peer_ik).unwrap().state,
         TrustState::Verified
+    );
+}
+
+/// **Task 5.3 (review finding F3): the `contacts.json` trust-staleness bug this task exists to
+/// fix.** Before this task, [`run_mark_verified`](meridian_tui::worker) wrote only `trust.bin` —
+/// `contacts.json`'s own [`ContactRecord::trust`](meridian_tui::store::contacts::ContactRecord)
+/// field, last written by [`Effect::AddContact`]'s own
+/// [`upsert_contact_record`](meridian_tui::worker) at `Pinned`, was never touched again. The live
+/// UI never showed this bug — `crate::screens::main::build_contact_entries` joins `trust.bin`
+/// fresh on every render — but `meridian tui --export-json`, which mirrors `contacts.json`
+/// verbatim and never reads `trust.bin` at all (`apps/tui/src/store/export.rs::export_json`),
+/// reported a stale `"trust": "pinned"` for a contact the operator had just verified.
+///
+/// This test drives the real bug fixture — `AddContact` (stamps `contacts.json`'s row at
+/// `Pinned`, exactly `upsert_contact_record`'s documented behavior) then `MarkVerified` (the
+/// effect the review finding names) — and asserts the **post-fix** value: a fresh,
+/// independent reload of `contacts.json` must show `Verified`, matching the equally-fresh
+/// `trust.bin` reload, not the stale `Pinned` `AddContact` alone would have left behind.
+/// Reverting this task's `run_mark_verified` write-through (restoring the pre-fix body — see this
+/// task's own PR diff) makes this exact assertion fail with `TrustLabel::Pinned`, byte-for-byte
+/// the wrong value the bug report describes — confirmed by hand against the pre-fix commit while
+/// authoring this test, not merely asserted here.
+#[tokio::test]
+async fn mark_verified_write_through_keeps_contacts_json_trust_field_from_going_stale() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let bob = setup_os_account();
+    let peer_ik = [0x12u8; 32];
+
+    // --- AddContact: contacts.json's own `trust` field is stamped `Pinned`, exactly like a real
+    //     TOFU-added contact prior to any out-of-band verification. ---------------------------
+    match dispatch_effect(Effect::AddContact(AddContactEffect {
+        request: AddContactRequest {
+            id: format!("mrd1:{}@peer.example", hex::encode(peer_ik)),
+            pubkey: peer_ik,
+            hint: "peer.example".to_string(),
+            petname: None,
+        },
+        outcome: None,
+    }))
+    .await
+    {
+        WorkerEvent::Completed(Effect::AddContact(AddContactEffect {
+            outcome: Some(_), ..
+        })) => {}
+        other => panic!("expected AddContact to complete, got {other:?}"),
+    }
+    let doc_before = read_contacts(&bob);
+    assert_eq!(doc_before.contacts.len(), 1, "fixture sanity");
+    assert_eq!(
+        doc_before.contacts[0].trust,
+        meridian_tui::store::contacts::TrustLabel::Pinned,
+        "fixture sanity: a freshly-added contact's contacts.json row starts Pinned, same as \
+         trust.bin"
+    );
+
+    // --- Act: verify the contact — the effect the bug report names. ----------------------------
+    match dispatch_effect(Effect::MarkVerified(MarkVerifiedEffect {
+        request: MarkVerifiedRequest { pubkey: peer_ik },
+        outcome: None,
+    }))
+    .await
+    {
+        WorkerEvent::Completed(Effect::MarkVerified(MarkVerifiedEffect {
+            outcome: Some(()),
+            ..
+        })) => {}
+        other => panic!("expected MarkVerified to complete, got {other:?}"),
+    }
+
+    // --- Assert: both stores agree on Verified, on a fresh, independent reload of each ---------
+    let trust_after = read_trust(&bob);
+    assert_eq!(
+        trust_after.contact(&peer_ik).unwrap().state,
+        TrustState::Verified,
+        "fixture sanity: trust.bin itself was never the buggy side"
+    );
+    let doc_after = read_contacts(&bob);
+    assert_eq!(doc_after.contacts.len(), 1, "no row duplicated or dropped");
+    assert_eq!(doc_after.contacts[0].pubkey, hex::encode(peer_ik));
+    assert_eq!(
+        doc_after.contacts[0].trust,
+        meridian_tui::store::contacts::TrustLabel::Verified,
+        "the load-bearing assertion this task exists for: contacts.json's own `trust` field — \
+         the exact field `--export-json` mirrors verbatim — must reflect the verification, not \
+         stay stuck at the Pinned value AddContact left behind. Before task 5.3's write-through \
+         fix this was TrustLabel::Pinned here — a stale export a verified contact's operator \
+         would read as 'never verified'."
+    );
+    // Every other field on the row is untouched by the verify — same conservative-update
+    // discipline `upsert_contact_record`'s own doc comment documents for a re-observe.
+    assert_eq!(doc_after.contacts[0].id, doc_before.contacts[0].id);
+    assert_eq!(doc_after.contacts[0].hint, doc_before.contacts[0].hint);
+    assert_eq!(
+        doc_after.contacts[0].petname,
+        doc_before.contacts[0].petname
+    );
+    assert_eq!(
+        doc_after.contacts[0].added_at,
+        doc_before.contacts[0].added_at
     );
 }
 
@@ -966,6 +1460,130 @@ async fn acknowledge_key_change_under_escalation_force_blocks_and_still_fails_cl
          call itself returns Err — otherwise a later plain acknowledge (escalation off again) would \
          still succeed and silently re-pin, exactly the bypass acknowledge_key_change's own doc \
          comment forbids"
+    );
+}
+
+/// **Task 5.14 — the same `contacts.json` trust-staleness bug 5.3 fixed for `run_mark_verified`
+/// (F3), found a second time in `run_acknowledge_key_change`'s escalation branch by 5.3's own
+/// review round.** Reuses this exact test's own fixture — the escalation force-block proven above
+/// to persist to `trust.bin` — but this time asserts on `--export-json`'s real output rather than
+/// on `trust.bin` alone.
+///
+/// Before this task, `contacts.json`'s own [`ContactRecord::trust`] field — stamped `Pinned` here
+/// (`to_trust_label`'s documented approximation for `PinnedKeyChanged`, the state the contact was
+/// in before this test's escalation call) exactly the way a real `PinnedKeyChanged` contact's row
+/// would read — was never touched by `run_acknowledge_key_change`, so a subsequent
+/// `apps/tui/src/store/export.rs::export_json` run mirrored `contacts.json` verbatim and reported
+/// the stale `"trust": "pinned"` for a contact that `trust.bin` — and the live UI, via
+/// `crate::screens::main::build_contact_entries`'s own fresh join — already correctly showed as
+/// hard-blocked.
+///
+/// Task 5.14's chosen fix is an **export-time join** in `export_json` itself (see that module's own
+/// doc comment for why this was chosen over a second `run_acknowledge_key_change` write-through),
+/// so this test deliberately confirms `contacts.json`'s own row is *still* stale after the
+/// `AcknowledgeKeyChange` dispatch (fixture sanity: `run_acknowledge_key_change` was **not** given a
+/// write-through) before asserting that `export_json`'s real output is nonetheless correct — the
+/// join, not a write-through, is what this task's fix actually is. Reverting `export_json`'s join
+/// (restoring the pre-fix body — see this task's own PR diff) makes the final assertion below fail
+/// with `TrustLabel::Pinned`, confirmed by hand against the pre-fix commit while authoring this
+/// test.
+#[tokio::test]
+async fn acknowledge_key_change_escalation_is_not_stale_in_export_json() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let bob = setup_os_account();
+    let previous = [0x80u8; 32];
+    let current = [0x81u8; 32];
+
+    // trust.bin: Pinned -> (key change, escalation off) -> PinnedKeyChanged. Same fixture shape as
+    // `acknowledge_key_change_under_escalation_force_blocks_and_still_fails_closed` above.
+    let mut trust = TrustStore::default();
+    trust.observe(previous, "peer.example", NOW);
+    let resulting = trust
+        .observe_key_change(&previous, current, "peer.example", NOW + 1)
+        .expect("known contact, distinct new key");
+    assert_eq!(
+        resulting,
+        TrustState::PinnedKeyChanged,
+        "fixture setup sanity: escalation is off for the observation itself"
+    );
+    write_trust(&bob, &trust);
+
+    // contacts.json: the row a real `PinnedKeyChanged` contact would have — `Pinned`, the same
+    // approximation `to_trust_label` documents. Hand-built (rather than driven through
+    // `Effect::AddContact`) so this test exercises exactly the `export_json` join, not an
+    // incidental `run_add_contact` behavior.
+    let os = OsSecretStore::new(SERVICE);
+    let doc = ContactsDocument {
+        v: 1,
+        contacts: vec![ContactRecord {
+            pubkey: hex::encode(current),
+            id: format!("mrd1:{}@peer.example", hex::encode(current)),
+            hint: "peer.example".to_string(),
+            petname: None,
+            trust: contacts_store::TrustLabel::Pinned,
+            pinned_key_history: vec![],
+            device_record_version_seen: None,
+            policy_override: None,
+            added_at: NOW,
+            last_activity_at: NOW,
+            unread: 0,
+            conv_handle: None,
+        }],
+    };
+    contacts_store::save(&doc, &os, bob.handle()).expect("save contacts.json");
+
+    // Escalation turns the in-flight PinnedKeyChanged into a real, persisted Blocked — same
+    // "turn escalation on only after the contact is already sitting in PinnedKeyChanged" sequencing
+    // as the fixture above, so the upcoming `AcknowledgeKeyChange` dispatch is what actually walks
+    // the escalate-and-force-block branch.
+    let mut trust = read_trust(&bob);
+    trust.set_escalate_pinned_key_change(true);
+    write_trust(&bob, &trust);
+
+    let effect = Effect::AcknowledgeKeyChange(AcknowledgeKeyChangeEffect {
+        request: AcknowledgeKeyChangeRequest { pubkey: current },
+        outcome: None,
+    });
+    match dispatch_effect(effect).await {
+        WorkerEvent::Failed(Effect::AcknowledgeKeyChange(_), message) => {
+            assert_eq!(message, TrustError::NotAcknowledgeable.to_string());
+        }
+        other => {
+            panic!("expected AcknowledgeKeyChange to fail closed under escalation, got {other:?}")
+        }
+    }
+    assert_eq!(
+        read_trust(&bob).contact(&current).unwrap().state,
+        TrustState::Blocked,
+        "fixture sanity: trust.bin really is force-blocked, same as the test above"
+    );
+    assert_eq!(
+        read_contacts(&bob).contacts[0].trust,
+        contacts_store::TrustLabel::Pinned,
+        "fixture sanity: contacts.json's own row is still stale — run_acknowledge_key_change \
+         deliberately gets no write-through under task 5.14's chosen fix (the export-time join \
+         below is the actual fix)"
+    );
+
+    // --- Act: the bug/fix boundary — export_json's real output. --------------------------------
+    let dest = tmp.path().join("export-dest");
+    meridian_tui::store::export::export_json(&dest, &os, bob.handle()).expect("export_json");
+
+    let exported: ContactsDocument =
+        serde_json::from_slice(&std::fs::read(dest.join("contacts.json")).unwrap())
+            .expect("plaintext JSON");
+    assert_eq!(
+        exported.contacts.len(),
+        1,
+        "no row duplicated or dropped by the join"
+    );
+    assert_eq!(
+        exported.contacts[0].trust,
+        contacts_store::TrustLabel::Blocked,
+        "the load-bearing assertion this task exists for: --export-json must reflect the real, \
+         force-blocked trust.bin state, not the stale Pinned value contacts.json's own row alone \
+         would report"
     );
 }
 
