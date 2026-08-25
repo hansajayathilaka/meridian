@@ -338,7 +338,7 @@ from two lenses, numbered once). Verdict: **green to proceed**, no blocker for t
 - [x] **5.1** Persist and always-reconcile Sent→Delivered receipts (F1) — [file](./phase-5/5.1-persist-reconcile-delivery-receipts.md)
 - [x] **5.2** Diagnostics-surfaced repair action for `run_accept_request`'s partial-failure window (F2) — [file](./phase-5/5.2-accept-request-repair-action.md)
 - [x] **5.4** `spawn_blocking`-wrap `run_mark_verified`/`run_set_petname` (F4) — [file](./phase-5/5.4-spawn-blocking-mark-verified-set-petname.md)
-- [~] **5.5** Wire receive-side key-change detection into the TUI inbound loop + `session.rs` (F5 + N8 deferred) — [file](./phase-5/5.5-wire-receive-side-key-change-detection.md)
+- [x] **5.5** Wire receive-side key-change detection into the TUI inbound loop + `session.rs` (F5 + N8 deferred) — [file](./phase-5/5.5-wire-receive-side-key-change-detection.md)
 - [ ] **5.7** App-level reconciliation tests for Settings/Diagnostics (F7) — [file](./phase-5/5.7-settings-diagnostics-app-level-tests.md)
 - [ ] **5.8** App-level end-to-end tests for onboarding/unlock (F8) — [file](./phase-5/5.8-onboarding-unlock-app-level-tests.md)
 - [ ] **5.9** Scheduled CI workflow for `demo/p2p-wire-proof` (F9) — [file](./phase-5/5.9-schedule-p2p-wire-proof-ci.md)
@@ -350,7 +350,7 @@ from two lenses, numbered once). Verdict: **green to proceed**, no blocker for t
 
 **Wave 2 — sequenced (same-function/same-file conflicts)**
 - [x] **5.3** Fix `contacts.json` trust staleness + cover `export_json` (F3; depends on 5.4) — [file](./phase-5/5.3-fix-contacts-trust-staleness-export.md)
-- [ ] **5.6** Federated mitm-sim cell: verified-contact key-change block (F6; depends on 5.5) — [file](./phase-5/5.6-federated-verified-key-change-mitm-cell.md)
+- [~] **5.6** Federated mitm-sim cell: verified-contact key-change block (F6; depends on 5.5) — [file](./phase-5/5.6-federated-verified-key-change-mitm-cell.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.

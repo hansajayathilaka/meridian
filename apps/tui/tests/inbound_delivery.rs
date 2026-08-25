@@ -1934,10 +1934,17 @@ async fn repeated_desync_against_an_ordinary_pinned_contact_reaches_recovery_and
     assert!(!sent.mid.is_empty());
 
     // Not just "some Result came back" — the conversation is genuinely live and responsive: the
-    // peer actually receives this fresh message and can decode it (a real X3DH open under the
-    // session `attempt_worker_recovery`'s own successful recovery just re-established on "us"'s
-    // side), proving both halves — the lock and the crypto — recovered correctly, not merely that
-    // some error path silently avoided the lock.
+    // peer actually receives this fresh message and can decode it. This proves the lock-discipline
+    // half this test exists for: SendMessage genuinely completes after attempt_worker_recovery runs,
+    // rather than the whole worker staying wedged. It does NOT independently prove attempt_worker_
+    // recovery's own fetch/recover/persist logic ran correctly — the mangled-ciphertext desync this
+    // test drives never actually breaks "us"'s own sending chain toward the peer (Double Ratchet
+    // keeps independent send/receive chains), so this same assertion would still pass even if
+    // attempt_worker_recovery's body were replaced with a no-op (confirmed by mutation testing during
+    // this task's review). Recovery-outcome correctness for the shared core logic is covered
+    // separately and genuinely by apps/core/tests/session.rs's
+    // recover_from_desync_actually_recovers_against_the_genuine_peer_with_a_clean_can_send, which
+    // does assert on the real RecoveryOutcome::Recovered return value.
     let deliver = tokio::time::timeout(Duration::from_secs(10), peer_client.next_deliver())
         .await
         .expect("the peer must receive the recovered message within a bounded time")
