@@ -31,10 +31,17 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   not new components/dependencies/wire changes. Tree green (`cargo build --workspace`, `cargo fmt
   --check`, `cargo clippy --workspace --all-targets -- -D warnings` all clean). Full closure summary:
   [phase-5/README.md](./phase-5/README.md#exit-criteria).
-- **NEXT:** `/pick-next-phase` — Phase 5 (review) is closed, so the next command opens the next
-  **build** phase per the lifecycle. Envelope v2 is the named trigger for the next build phase (see
-  "Live carry-forwards" below); the six Phase-4-named residuals and the Phase-1 adversarial frontier
-  remain unowned carry-forwards for `/plan-phase` to pick up alongside it.
+- **NOW:** **Phase 6 (Envelope v2) picked** — build phase, not yet planned. Scope is pre-written by
+  [ADR 0016](../adr/0016-envelope-deniability.md) and by
+  [Phase 4's re-deferral](./phase-4/README.md#envelope-v2-re-deferred--the-concrete-trigger), which
+  named this phase (the one immediately following Phase 5's review) as the mechanical trigger so the
+  obligation couldn't evaporate a third time. Full scope, dependency check, and reading list:
+  [Phase 6's README](./phase-6/README.md).
+- **NEXT:** `/plan-phase` — break Phase 6's pre-written scope (ADR 0016 C1–C7 + `ratchet-v2.json`/
+  `envelope-v2.json` vectors + flag-day cutover) into tasks. The Phase-1 adversarial frontier remains an
+  unowned carry-forward `/plan-phase` may pick up alongside it if capacity allows; the six
+  Phase-4-named TUI/T08 residuals are Phase-4-scoped follow-ups, not envelope-v2 scope, and stay listed
+  below for a future phase.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -329,6 +336,19 @@ round — see [phase-5/README.md](./phase-5/README.md#exit-criteria) for the clo
 **Wave 2 — sequenced (same-function/same-file conflicts)**
 - [x] **5.3** Fix `contacts.json` trust staleness + cover `export_json` (F3; depends on 5.4) — [file](./phase-5/5.3-fix-contacts-trust-staleness-export.md)
 - [x] **5.6** Federated mitm-sim cell: verified-contact key-change block (F6; depends on 5.5) — [file](./phase-5/5.6-federated-verified-key-change-mitm-cell.md)
+
+### Phase 6 — Envelope v2 · **planning** · [details](./phase-6/README.md)
+Build phase. **Envelope v2** — [ADR 0016](../adr/0016-envelope-deniability.md) (binding), not a
+numbered feature: drops the per-message identity-key signature from `MessageEnvelope`, relying on the
+ratchet AEAD + X3DH `DH1` for authentication. Scope = ADR 0016's binding conditions C1–C7 (enforced SPK
+rotation, commit-on-successful-decrypt, canonical v2 AAD, doc corrections, leading `v: 2` field, no
+tautological AD-assertion claim, desync-short-circuit rewrite + `eid` replay-dedup) plus
+`ratchet-v2.json`/`envelope-v2.json` conformance vectors and a hard flag-day cutover (no v1/v2
+interop). Deps: T03 (done), ADR 0016 (accepted). This is the standing dependency gate named in
+[roadmap.md](../architecture/roadmap.md) that unblocks T07 (mailbox) and, transitively, T14.
+Task breakdown not yet written — next command is `/plan-phase`.
+
+- [ ] **6.1** *(to be planned)*
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
