@@ -227,7 +227,9 @@ pub enum PaletteAction {
     /// trigger — see this type's own doc comment for why a factory, not a stored value.
     Effect(Arc<dyn Fn() -> Effect + Send + Sync>),
     /// Push a freshly constructed extension pane onto the screen stack
-    /// (`Screen::Extension(pane())`).
+    /// (`Screen::Extension(pane())`). **This is the sanctioned third-party extension point** — a
+    /// feature outside this crate registers a [`PaletteCommand`] whose action is `PushPane`, never
+    /// `PushScreen` (see that variant's own doc comment for why `Screen` itself is closed to it).
     PushPane(Arc<dyn Fn() -> Box<dyn ExtensionPane> + Send + Sync>),
     /// Push a freshly constructed, **built-in, first-party** [`Screen`] directly (task 4.36) — for
     /// core screens that predate this registry and are not, and should not become,
@@ -235,6 +237,12 @@ pub enum PaletteAction {
     /// 4.25 could register a *pane* but not yet a real "open Settings" command). `PushPane` remains
     /// the mechanism for third-party feature panes per this module's own doc — this variant exists
     /// only because `Screen` itself gains no new cases for third parties to reach through it.
+    ///
+    /// **Not an extension point.** Only this crate's own built-in [`Screen`] variants can appear
+    /// here — the closure's return type is the crate-local `Screen` enum itself, which a
+    /// downstream feature crate cannot add cases to. A third-party feature that wants a palette
+    /// command to open a new screen must use [`PaletteAction::PushPane`] instead, which is the
+    /// mechanism actually designed to be reached from outside this crate.
     PushScreen(Arc<dyn Fn() -> Screen + Send + Sync>),
 }
 

@@ -99,9 +99,9 @@ $ cargo run -p meridian-rendezvous &          # or: just two-orgs, for the cross
 $ meridian tui                                # no account on disk → onboarding
   — pick keystore (OS keychain / passphrase file), enter org hint —
   — keypair generated, mrd1:…@org-a.test shown with QR, "registered ✔ bundle published ✔" —
-  — ^N, paste the peer's mrd1: ID, petname "bob" —
+  — n, paste the peer's mrd1: ID, petname "bob" —
   — peer runs `meridian tui` too and sees a message request: key + safety number + intro —
-  — accept → both sides chat; ^V shows the same 60-digit safety number on both → mark verified —
+  — accept → both sides chat; v shows the same 60-digit safety number on both → mark verified —
 $ pkill meridian-tui && meridian tui          # restart
   — contact list, petnames, full history, and the ratchet session all restored, no re-handshake —
 $ meridian tui --export-json /tmp/dump && jq '.contacts[0].petname' /tmp/dump/contacts.json

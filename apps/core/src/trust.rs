@@ -427,10 +427,23 @@ impl TrustStore {
             // nothing about the trust state.
             return Ok(self.observe(new_pubkey, hint, now_unix));
         }
+        // `self.contacts` is keyed by each contact's own current `pubkey` (the only two insert
+        // sites in this module both uphold `contacts[k].pubkey == k`), and the early return above
+        // already guarantees `new_pubkey != previous_pubkey`. So if `new_pubkey` names an entry at
+        // all here, that entry's `pubkey` is `new_pubkey` itself — necessarily different from
+        // `previous_pubkey` — meaning any hit here is by construction always a *different* known
+        // contact, never `previous_pubkey`'s own record under its new key. A flat `contains_key`
+        // is therefore equivalent to the seemingly-per-entry check this replaces.
         if let Some(existing) = self.contacts.get(&new_pubkey) {
-            if &existing.pubkey != previous_pubkey {
-                return Err(TrustError::ConflictingContact);
-            }
+            // Defense in depth for the invariant this guard relies on (comment above): if it were
+            // ever violated by some future insert site, fail loudly in debug builds rather than
+            // silently trusting a flat `contains_key` that assumed it.
+            debug_assert_eq!(
+                existing.pubkey, new_pubkey,
+                "contacts map invariant violated: entry keyed by {new_pubkey:?} has pubkey {:?}",
+                existing.pubkey
+            );
+            return Err(TrustError::ConflictingContact);
         }
 
         let mut contact = self

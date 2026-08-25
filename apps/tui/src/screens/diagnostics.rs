@@ -43,9 +43,11 @@
 //! is accepted rather than hardened against here: the user already implicitly trusts their shell's
 //! `PATH` enough to launch this TUI in the first place (the same environment resolves `meridian tui`
 //! itself), so this screen's own subprocess call adds no new trust boundary beyond one the user has
-//! already crossed to get here. `TODO: confirm` whether a future task should instead resolve/pin an
-//! absolute path (e.g. `std::env::current_exe()`'s sibling, if colocated) if this trust assumption is
-//! ever judged too broad for a security-sensitive diagnostics screen.
+//! already crossed to get here. **Closed decision:** `PATH` lookup stays as-is; this screen does not
+//! resolve or pin an absolute install location (e.g. via `std::env::current_exe()`'s sibling), because
+//! doing so would harden a boundary this task never actually widens. Revisit only if a future task
+//! changes the trust assumption itself (e.g. `meridian tui` gaining a privilege level `meridian doctor`
+//! does not share) — not as standalone follow-up work against this screen.
 //!
 //! ## What happens if `meridian` isn't on `PATH`, or the subprocess otherwise fails
 //! Never a silent blank/fabricated result — every failure mode is a distinct, honest message reaching
