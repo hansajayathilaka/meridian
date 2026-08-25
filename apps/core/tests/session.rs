@@ -502,3 +502,109 @@ async fn recover_from_desync_refuses_outright_when_the_sessions_own_peer_is_alre
     }
     assert!(!alice.chat.has_session(&[0x22u8; 32]));
 }
+
+// -------------------------------------------------------------------------------------------------
+// The genuine success path (test-engineer review finding): none of the four tests above ever call
+// `recover_from_desync` with `bundle_owner_ik == peer_ik` (the real, non-adversarial peer) and a
+// clean `can_send` — the ordinary, everyday case this whole receive-side recovery path exists for.
+// Proves the wrapper actually completes a real re-handshake, not merely that it correctly refuses in
+// every adversarial/gated shape.
+// -------------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn recover_from_desync_actually_recovers_against_the_genuine_peer_with_a_clean_can_send() {
+    let (mut asess, mut bsess, mut alice, mut bob) = establish().await;
+    open_and_confirm(&mut asess, &mut bsess, &mut alice, &mut bob).await;
+    let bob_ik = bob.ik();
+
+    force_desync_threshold(&mut alice, &mut bob);
+
+    // Alice's trust record for Bob is an ordinary, healthy TOFU-pinned contact — `can_send` reads
+    // `Ok`, the everyday, non-adversarial case.
+    let mut trust = TrustStore::default();
+    trust.observe(bob_ik, "session5-5.b", TEST_NOW_UNIX);
+    assert_eq!(trust.can_send(&bob_ik), SendGate::Ok);
+
+    // Bob genuinely republishes a fresh bundle — the ordinary, non-key-change case:
+    // `bundle_owner_ik == peer_ik`, mirroring `apps/core/tests/desync_recovery.rs`'s own
+    // `repeated_desync_triggers_guarded_recovery_and_restores_the_session_end_to_end`.
+    let bob_gen2 =
+        generate_bundle(&bob.store, &bob.handle(), bob_ik, 5).expect("bob's fresh bundle");
+    let otks2: Vec<([u8; 32], [u8; 32])> = bob_gen2
+        .bundle
+        .otks
+        .iter()
+        .zip(bob_gen2.otk_secrets.iter())
+        .map(|(p, s)| (*p, **s))
+        .collect();
+    bob.chat.vault.set_bundle(
+        bob_gen2.bundle.spk,
+        *bob_gen2.spk_secret,
+        otks2,
+        TEST_NOW_UNIX + 1,
+    );
+
+    let alice_handle = alice.handle();
+    let outcome = asess
+        .recover_from_desync(
+            &mut alice.chat,
+            &mut trust,
+            &alice.store,
+            &alice_handle,
+            &bob_ik, // bundle_owner_ik == peer_ik: the ordinary, non-key-change case
+            &bob_gen2.bundle.spk,
+            bob_gen2.bundle.otks.first().copied(),
+            "session5-5.b",
+            TEST_NOW_UNIX + 2,
+        )
+        .expect("recovery against the genuine peer must never error");
+
+    assert_eq!(
+        outcome,
+        Some(RecoveryOutcome::Recovered),
+        "recover_from_desync must actually complete a fresh re-handshake on the ordinary, \
+         non-gated success path — not merely refuse in every adversarial shape"
+    );
+    assert_eq!(
+        alice.chat.desync_count(&bob_ik),
+        0,
+        "an attempted recovery resets the desync counter regardless of outcome"
+    );
+    assert_eq!(
+        trust.trust_state(&bob_ik),
+        TrustState::Pinned,
+        "recovering against the genuine, non-substituted peer must never touch trust state"
+    );
+
+    // The channel is genuinely live again, end to end, over the real P2P transport: Alice's freshly
+    // re-initiated session reaches Bob — who still holds the old, now-stale session, exactly like
+    // `ChatState::open_bytes`'s existing "accept a fresh reinitiation despite a stale session"
+    // contract — and Bob's reply decodes cleanly back through the same live `asess`/`bsess` pair
+    // used throughout this test.
+    asess
+        .send_chat(&alice.store, &alice_handle, &mut alice.chat, "recovered!")
+        .await
+        .expect("alice send over the freshly re-initiated session");
+    let bob_handle = bob.handle();
+    match bsess.pump(&bob.store, &bob_handle, &mut bob.chat).await {
+        Ok(Some(SessionEvent::Chat(ChatContent::Text { body, .. }))) => {
+            assert_eq!(body, "recovered!");
+        }
+        other => panic!(
+            "bob must accept the fresh re-initiation despite holding a stale session: {other:?}"
+        ),
+    }
+    bsess
+        .send_chat(&bob.store, &bob_handle, &mut bob.chat, "welcome back")
+        .await
+        .expect("bob send");
+    match asess
+        .pump(&alice.store, &alice_handle, &mut alice.chat)
+        .await
+    {
+        Ok(Some(SessionEvent::Chat(ChatContent::Text { body, .. }))) => {
+            assert_eq!(body, "welcome back");
+        }
+        other => panic!("the channel must be genuinely live again in both directions: {other:?}"),
+    }
+}

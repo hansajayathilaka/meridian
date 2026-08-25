@@ -1769,3 +1769,190 @@ async fn repeated_desync_against_an_already_blocked_contact_never_bypasses_can_s
     let trust_after = read_trust(&handle);
     assert_eq!(trust_after.trust_state(&peer_pub), TrustState::Blocked);
 }
+
+// -------------------------------------------------------------------------------------------------
+// The deadlock regression (task 5.5 review finding, blocking): the scenario the test above
+// deliberately does NOT cover, because it never reaches `worker::attempt_worker_recovery` at all —
+// the peer there is already `Blocked`, so the early `TrustStore::can_send` gate refuses before any
+// network I/O. This test drives the exact opposite, ordinary/non-gated case (Pinned, `SendGate::Ok`)
+// so `attempt_worker_recovery` is actually reached and actually completes — the code path where
+// `process_inbound_delivery` used to hold `chat_state_lock` across `attempt_worker_recovery`'s own
+// (re-)acquisition of that same, non-reentrant lock, wedging this worker's every future
+// `chat_state_lock`-guarded effect (`SendMessage`/`AcceptRequest`/`RejectRequest`, and every future
+// inbound delivery) forever. Reproduced and verified against the pre-fix code per this task's own
+// Status section: reverting the `drop(_chat_guard)` this task added to `process_inbound_delivery`
+// makes this test hang/time out; restoring it makes this test pass.
+// -------------------------------------------------------------------------------------------------
+
+/// Mirrors [`publish_own_bundle`] exactly, but for the *peer* side of this file's tests, and also
+/// populates the peer's own [`CoreChatState::vault`] with the matching private material (spk/otk
+/// secrets) — every other test in this file only ever has the peer *send*, never *receive*, so no
+/// prior helper needed this. This test's peer must be able to decode a genuine inbound X3DH open
+/// from "us" (exactly what a successful [`worker::attempt_worker_recovery`] produces on "us"'s side:
+/// a fresh [`meridian_core::chat::ChatState::replace_session_as_initiator`] re-handshake), which
+/// requires the peer to actually hold the private counterpart to whatever bundle "us" fetched —
+/// `attempt_worker_recovery`'s own network fetch (`worker::fetch_with_retry`) also requires a real
+/// bundle to exist on the server at all, which this publish step (not just the vault populate) is
+/// what provides.
+async fn publish_peer_bundle(
+    server: &str,
+    peer_store: &MemorySecretStore,
+    peer_account: &AccountId,
+    peer_chat: &mut CoreChatState,
+) {
+    let peer_pub = *peer_account.public_key().as_bytes();
+    let mut client =
+        SignalingClient::connect(server, peer_store, peer_account.handle(), peer_pub, None, 1)
+            .await
+            .expect("peer connect to republish a bundle");
+    let generated = client
+        .publish_bundle(peer_store, peer_account.handle(), 8)
+        .await
+        .expect("peer publish_bundle");
+    let _ = client.close().await;
+
+    let otks: Vec<([u8; 32], [u8; 32])> = generated
+        .bundle
+        .otks
+        .iter()
+        .zip(generated.otk_secrets.iter())
+        .map(|(p, s)| (*p, **s))
+        .collect();
+    peer_chat.vault.set_bundle(
+        generated.bundle.spk,
+        *generated.spk_secret,
+        otks,
+        1_760_000_000,
+    );
+}
+
+#[tokio::test]
+async fn repeated_desync_against_an_ordinary_pinned_contact_reaches_recovery_and_never_deadlocks_the_worker(
+) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let server = spawn_server();
+    write_server_config(tmp.path(), &server);
+    let (handle, us_pub) = setup_us_account();
+    publish_own_bundle(&server, &handle, us_pub).await;
+
+    let (mut rx, peer_store, peer_account, mut peer_chat, mut peer_client) =
+        establish_accepted_conversation(&server, &handle, us_pub).await;
+    let peer_pub = *peer_account.public_key().as_bytes();
+
+    let pinned = read_trust(&handle);
+    assert_eq!(
+        pinned.trust_state(&peer_pub),
+        TrustState::Pinned,
+        "sanity: an ordinary, non-gated contact — the exact case that reaches \
+         attempt_worker_recovery, unlike this file's already-Blocked test above"
+    );
+
+    // Unlike the already-Blocked scenario, this scenario needs `attempt_worker_recovery`'s own
+    // network fetch to actually succeed: the peer must have genuinely (re)published a real,
+    // fetchable bundle, with the matching private material resident locally so the peer can also
+    // decode "us"'s subsequent fresh re-initiation.
+    publish_peer_bundle(&server, &peer_store, &peer_account, &mut peer_chat).await;
+
+    // Drive DESYNC_RECOVERY_THRESHOLD consecutive, authentic-but-undecryptable envelopes from the
+    // real peer over the real rendezvous relay — identical to this file's already-Blocked test,
+    // except this peer is never gated, so the threshold-crossing envelope's own `SendGate::Ok` read
+    // actually reaches `attempt_worker_recovery` (the exact call this task's deadlock lived in).
+    for i in 0..DESYNC_RECOVERY_THRESHOLD {
+        let mut id = [0u8; 16];
+        getrandom::fill(&mut id).expect("random id");
+        let blob = peer_chat
+            .seal_outbound(
+                &peer_store,
+                peer_account.handle(),
+                peer_account.public_key().as_bytes(),
+                &us_pub,
+                &ChatContent::Text {
+                    id,
+                    body: format!("noise {i}"),
+                },
+            )
+            .expect("peer seal_outbound");
+        let mangled = mangle_and_resign(&peer_store, &peer_account, &blob);
+        peer_client
+            .route_with_hint(us_pub, None, mangled)
+            .await
+            .expect("route a mangled envelope");
+    }
+
+    // None of the mangled envelopes ever surfaces as an InboundEvent — each is dropped as Desync,
+    // exactly like any other rejection, whether or not recovery ends up firing on the last one.
+    assert!(
+        recv_inbound(&mut rx, Duration::from_millis(500))
+            .await
+            .is_none(),
+        "a mangled/undecryptable envelope must never surface as an InboundEvent"
+    );
+
+    // THE DEADLOCK-REGRESSION ASSERTION. Pre-fix, `process_inbound_delivery` (running inside
+    // `run_inbound_loop`'s own spawned task) is, right now, permanently blocked inside
+    // `attempt_worker_recovery`'s own `chat_state_lock().lock().await` — which can never succeed,
+    // because the *same* task is the one still holding that lock's only guard, one stack frame up.
+    // `chat_state_lock` is a single process-wide singleton also guarding `run_send_message`
+    // (`worker::run_send_message`'s own `let _chat_guard = chat_state_lock().lock().await;`), so
+    // dispatching an ordinary `Effect::SendMessage` right now would, pre-fix, hang forever too —
+    // exactly the "no more messages can be sent" DoS this task's own Status section names. Bounded
+    // by `tokio::time::timeout` so this test fails loudly (a timeout panic) rather than hanging the
+    // whole test binary if the fix ever regresses.
+    let send_outcome = tokio::time::timeout(
+        Duration::from_secs(20),
+        dispatch_effect(Effect::SendMessage(SendMessageEffect {
+            request: SendMessageRequest {
+                peer_pubkey: peer_pub,
+                // Blank, not `"peer.example"`: mirrors
+                // `reply_to_a_message_request_accepted_contact_with_a_blank_hint_routes_locally`'s
+                // own comment — this is the exact hint `dispatch_gated_send` actually produces for a
+                // contact accepted via a message request, this test's own setup path
+                // (`establish_accepted_conversation`).
+                peer_hint: String::new(),
+                body: "still alive after the burst".to_string(),
+            },
+            outcome: None,
+        })),
+    )
+    .await
+    .expect(
+        "process_inbound_delivery must never deadlock the whole worker: a repeated desync against \
+         an ordinary (non-gated) contact that crosses DESYNC_RECOVERY_THRESHOLD, reaching \
+         attempt_worker_recovery, must not wedge chat_state_lock forever — the very next \
+         SendMessage dispatch must still complete",
+    );
+    let sent = match send_outcome {
+        meridian_tui::app::WorkerEvent::Completed(Effect::SendMessage(SendMessageEffect {
+            outcome: Some(sent),
+            ..
+        })) => sent,
+        other => {
+            panic!("expected a completed SendMessage after the recovery attempt, got {other:?}")
+        }
+    };
+    assert!(!sent.mid.is_empty());
+
+    // Not just "some Result came back" — the conversation is genuinely live and responsive: the
+    // peer actually receives this fresh message and can decode it (a real X3DH open under the
+    // session `attempt_worker_recovery`'s own successful recovery just re-established on "us"'s
+    // side), proving both halves — the lock and the crypto — recovered correctly, not merely that
+    // some error path silently avoided the lock.
+    let deliver = tokio::time::timeout(Duration::from_secs(10), peer_client.next_deliver())
+        .await
+        .expect("the peer must receive the recovered message within a bounded time")
+        .expect("next_deliver for the recovered message");
+    let content = peer_chat
+        .open_inbound(
+            &peer_store,
+            peer_account.handle(),
+            &peer_pub,
+            &deliver.from,
+            deliver.blob.as_bytes(),
+        )
+        .expect("the peer must accept us's fresh re-initiation despite holding a stale session");
+    match content {
+        ChatContent::Text { body, .. } => assert_eq!(body, "still alive after the burst"),
+        other => panic!("expected the recovered Text message, got {other:?}"),
+    }
+}

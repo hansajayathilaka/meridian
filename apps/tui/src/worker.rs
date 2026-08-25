@@ -2833,9 +2833,30 @@ pub async fn run_inbound_loop(
 /// on this task (as before this task's fix), that freezes `apps/cli/src/main.rs`'s single
 /// `current_thread` runtime (rendering, every other effect, this very loop's next envelope) for the
 /// whole sequence.
-/// `chat_state_lock`'s guard (`_chat_guard` below) is still held across *all* of it, spanning both
-/// the blocking closure and the network route after it — the lock discipline this function's own
-/// doc comment requires is unchanged; only the execution context moved.
+///
+/// **`_chat_guard`'s scope, precisely (task 5.5 deadlock fix — review finding, blocking).**
+/// [`chat_state_lock`] is a non-reentrant `tokio::sync::Mutex<()>`, and [`attempt_worker_recovery`]
+/// below (task 5.5's new receive-side recovery network half) re-acquires that exact same lock for its
+/// own, independent load-mutate-save sequence over `sessions.bin`/`trust.bin`. `_chat_guard` is
+/// therefore dropped (explicitly, via [`drop`]) the moment the blocking closure below returns —
+/// **before** the auto-ack's `client.route_with_hint` call and **before** any
+/// [`attempt_worker_recovery`] call — never held across either. Holding it across the latter would
+/// deadlock this task forever: the caller would be blocked waiting for `attempt_worker_recovery`'s own
+/// `.lock().await` to succeed, which can only happen once the caller's own guard drops, which can only
+/// happen once the caller returns, which can only happen once that `.await` succeeds — an
+/// unbreakable cycle, reliably triggered by any peer whose repeated (authentic but corrupted)
+/// envelopes cross `DESYNC_RECOVERY_THRESHOLD` while `TrustStore::can_send` still reads
+/// `SendGate::Ok` for them (the ordinary, non-gated case this task's whole recovery path exists for).
+/// This preserves — does not weaken — [`chat_state_lock`]'s actual invariant ("every load-mutate-save
+/// touch of `sessions.bin` is serialized"): each atomic load-mutate-save unit here (this function's
+/// own blocking closure, and separately `attempt_worker_recovery`'s own blocking closure) still runs
+/// under the lock for its own full duration; they are simply two separate, sequential critical
+/// sections rather than one artificially fused span that also happened to span unrelated network
+/// I/O. A concurrent `run_send_message`/`run_accept_request`/`run_reject_request` dispatch may now
+/// interleave its own atomic unit between this function's closure and `attempt_worker_recovery`'s —
+/// harmless, since `attempt_worker_recovery` always re-`load_chat`/`load_trust`s fresh state under its
+/// own freshly-acquired guard rather than assuming anything about what this function's own closure
+/// last saw.
 ///
 /// **Ordering note.** [`save_chat`] now runs *before* the auto-ack's best-effort
 /// `client.route_with_hint` (previously it ran after, inside the `Text` match arm). This is a
@@ -3014,6 +3035,14 @@ async fn process_inbound_delivery(
             (None, None, None)
         });
 
+    // (task 5.5 deadlock fix — review finding, blocking) Dropped here, explicitly, the instant the
+    // blocking closure's own atomic load-mutate-save sequence has completed — never held across the
+    // ack route or `attempt_worker_recovery` below. See this function's own doc comment
+    // ("`_chat_guard`'s scope, precisely") for exactly why: `attempt_worker_recovery` re-acquires this
+    // exact same non-reentrant lock for its own, independent `sessions.bin`/`trust.bin` load-mutate-
+    // save sequence, so holding this guard into that call would deadlock forever.
+    drop(_chat_guard);
+
     if let Some((from, hint, receipt_blob)) = ack {
         let _ = client.route_with_hint(from, hint, receipt_blob).await;
     }
@@ -3124,8 +3153,33 @@ async fn attempt_worker_recovery(
     .await
     .unwrap_or(None);
 
+    // (task 5.5, review finding) Mirrors `apps/cli/src/chat.rs::maybe_attempt_recovery`'s own
+    // per-variant match exactly, rather than a blanket `{o:?}` dump: `RecoveryOutcome`'s Debug derive
+    // prints `UnknownIdentitySurfaced`'s raw `[u8; 32]` pubkey as a bare byte array, so a `{:?}` here
+    // would put a raw key byte dump into this worker's own stderr. Every variant is named explicitly
+    // instead, and the one variant that does carry a key hex-encodes it before printing — the same
+    // encoding every other key this crate ever logs already uses.
     match outcome {
-        Some(Ok(o)) => eprintln!("meridian tui: desync recovery outcome: {o:?}"),
+        Some(Ok(meridian_core::desync::RecoveryOutcome::Recovered)) => {
+            eprintln!("meridian tui: desync recovery outcome: re-established a fresh session");
+        }
+        Some(Ok(meridian_core::desync::RecoveryOutcome::Gated(gate))) => {
+            eprintln!("meridian tui: desync recovery outcome: paused ({gate:?})");
+        }
+        Some(Ok(meridian_core::desync::RecoveryOutcome::KeyChangeConflict)) => {
+            eprintln!(
+                "meridian tui: desync recovery outcome: refused — the fetched key already \
+                 belongs to a different known contact"
+            );
+        }
+        Some(Ok(meridian_core::desync::RecoveryOutcome::UnknownIdentitySurfaced(new_key))) => {
+            eprintln!(
+                "meridian tui: desync recovery outcome: the fetched bundle is signed by a key \
+                 with no prior contact record at all (surfaced key: {}) — this requires explicit \
+                 verification, not an automatic re-handshake",
+                hex::encode(new_key)
+            );
+        }
         Some(Err(e)) => eprintln!("meridian tui: desync recovery failed: {e}"),
         None => {}
     }
