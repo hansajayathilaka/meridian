@@ -355,7 +355,7 @@ consult) that shaped them: [phase-6/README.md](./phase-6/README.md).
 
 **Wave 1 — independent, both unblocked now**
 - [x] **6.1** SPK rotation policy: age tracking + rotation-due predicate (C1, 1/3) — [file](./phase-6/6.1-spk-rotation-age-tracking.md)
-- [ ] **6.3** Envelope v2 core cutover: wire shape + canonical AAD + commit-on-decrypt + desync short-circuit fix (C2, C3, C5, C6, C7 short-circuit) — [file](./phase-6/6.3-envelope-v2-core-cutover.md)
+- [~] **6.3** Envelope v2 core cutover: wire shape + canonical AAD + commit-on-decrypt + desync short-circuit fix (C2, C3, C5, C6, C7 short-circuit) — [file](./phase-6/6.3-envelope-v2-core-cutover.md)
 
 **Wave 2**
 - [ ] **6.2** SPK rotation enforcement: trigger + monitoring in both client loops (C1, 2–3/3; depends on 6.1) — [file](./phase-6/6.2-spk-rotation-enforcement.md)
