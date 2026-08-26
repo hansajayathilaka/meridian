@@ -22,3 +22,6 @@ serde = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }
+# `envelope_version_is_mandatory_and_never_defaulted` (task 6.3, ADR 0016 C5) hand-builds a
+# v1-shaped (no `v` field) CBOR map to prove it fails to decode as a v2 envelope.
+ciborium = { workspace = true }

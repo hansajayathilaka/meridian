@@ -183,15 +183,23 @@ fn ratchet_vectors_match_real_derivation() {
             pinned_by_n.push((step["n"].as_u64().unwrap(), ck_before, next));
         }
 
+        // (task 6.3, ADR 0016 C2/C3) `encrypt`/`decrypt` now take a preamble argument, folded into
+        // the v2 AAD alongside the domain tag baked into `ad` at construction. This transcript
+        // never carries an X3DH preamble on any step (it starts from an already-established
+        // `init_initiator_with_keypair`/`init_responder` pair, not a fresh X3DH handshake), so both
+        // sides consistently use the empty preamble here — this is a self-consistent round-trip
+        // check (chain-key continuity + plaintext recovery), never a byte-pinned ciphertext check
+        // (see the note below), so it needs no v2 vector regeneration (task 6.5) to stay meaningful.
+        let preamble: &[u8] = &[];
         match direction {
             "alice->bob" => {
-                let ct = alice.encrypt(&plaintext).unwrap();
-                let pt = bob.decrypt(&ct).unwrap();
+                let ct = alice.encrypt(&plaintext, preamble).unwrap();
+                let pt = bob.decrypt(&ct, preamble).unwrap();
                 assert_eq!(pt, plaintext);
             }
             "bob->alice" => {
-                let ct = bob.encrypt(&plaintext).unwrap();
-                let pt = alice.decrypt(&ct).unwrap();
+                let ct = bob.encrypt(&plaintext, preamble).unwrap();
+                let pt = alice.decrypt(&ct, preamble).unwrap();
                 assert_eq!(pt, plaintext);
             }
             other => panic!("unknown direction {other}"),
@@ -232,15 +240,22 @@ fn ratchet_vectors_match_real_derivation() {
     );
 }
 
+/// `test-vectors/envelope-v1.json` pins the **v1** wire shape (`sender_pub`/`prekey`/`ct`/`sig`),
+/// which envelope v2 (task 6.3, ADR 0016 C2/C3/C5) deliberately no longer parses at all — v1/v2 is
+/// a hard flag day (R5), not a mixed-version window. Regenerating a byte-pinned `envelope-v2.json`
+/// (and the `ratchet-v2.json` this file's `ratchet_vectors_match_real_derivation` would then also
+/// pin against) is task 6.5's explicit job, not this task's — see
+/// `docs/tasks/phase-6/6.3-envelope-v2-core-cutover.md`'s "Out" scope and ADR 0016's Consequences
+/// section. Ignored (not deleted) until 6.5 lands; re-enable once `envelope-v2.json` exists and
+/// this body is rewritten against it.
 #[test]
+#[ignore = "envelope-v1.json is v1-shaped and obsolete post-cutover; v2 vector regeneration is task 6.5"]
 fn envelope_vectors_match_real_encoding() {
     let fixtures = load("envelope-v1.json");
     for vec in fixtures["vectors"].as_array().unwrap() {
         let name = vec["name"].as_str().unwrap();
         let sender_pub = b32(vec, "sender_pub_hex");
         let ct = bvec(vec, "ct_hex");
-        let sig_bytes = bvec(vec, "sig_hex");
-        let sig: [u8; 64] = sig_bytes.try_into().unwrap();
         let prekey = vec["prekey"].as_object().map(|p| Prekey {
             ek_pub: {
                 let b = hex::decode(p["ek_pub_hex"].as_str().unwrap()).unwrap();
@@ -258,10 +273,10 @@ fn envelope_vectors_match_real_encoding() {
         });
 
         let env = MessageEnvelope {
+            v: meridian_envelope::ENVELOPE_VERSION,
             sender_pub,
             prekey,
             ct,
-            sig,
         };
         let blob = env.to_blob().unwrap();
         assert_eq!(hex::encode(&blob), vec["blob_hex"], "{name}: to_blob()");

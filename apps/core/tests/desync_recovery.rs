@@ -13,8 +13,9 @@
 //!   4.4's block/warn gate) before any session is ever touched.
 //!
 //! Follows `apps/core/tests/chat_manager.rs`'s `Party` pattern and its task-1.18 test's technique
-//! for constructing a genuine desync (mangle a byte inside `enc_header`, then re-sign so the
-//! envelope is authentic and reaches the ratchet rather than being caught by the signature check).
+//! for constructing a genuine desync (mangle a byte inside `enc_header`). Envelope v2 (task 6.3)
+//! has no signature to preserve, so the mangled envelope reaches the ratchet unchanged — see
+//! [`mangle`] below.
 
 use meridian_core::chat::{
     ChatError, ChatState, DESYNC_RECOVERY_THRESHOLD, PREV_GENERATION_GRACE_SECS,
@@ -107,14 +108,6 @@ impl Party {
             .open_inbound(&self.store, self.account.handle(), &ik, from, blob)
             .err()
     }
-    /// Re-sign a (possibly modified) envelope under this party's identity key, so it is authentic
-    /// rather than merely forged.
-    fn resign(&self, mut env: MessageEnvelope) -> Vec<u8> {
-        let sig = meridian_identity::sign(&self.store, self.account.handle(), &env.signing_bytes())
-            .unwrap();
-        env.sig = *sig.as_bytes();
-        env.to_blob().unwrap()
-    }
 }
 
 /// Deterministic CBOR of the whole chat state, for byte-identical before/after comparisons (same
@@ -144,13 +137,15 @@ fn state_bytes_excluding_desync_counts(state: &ChatState) -> Vec<u8> {
     out
 }
 
-/// Corrupt an authentic envelope's ratchet header (byte inside `enc_header`, past the 2-byte length
-/// prefix) and re-sign it under `signer` — the exact technique `chat_manager.rs`'s task-1.18 test
-/// uses to construct a genuine, signature-valid-but-undecryptable `Desync` condition.
-fn mangle_and_resign(signer: &Party, blob: &[u8]) -> Vec<u8> {
+/// Corrupt an envelope's ratchet header (byte inside `enc_header`, past the 2-byte length prefix) —
+/// the exact technique `chat_manager.rs`'s task-1.18 test uses to construct a genuine,
+/// undecryptable `Desync` condition. Envelope v2 (task 6.3) has no signature to re-apply: the
+/// envelope's `sender_pub`/routing `from` are untouched, so the mangled bytes reach the ratchet
+/// unchanged.
+fn mangle(blob: &[u8]) -> Vec<u8> {
     let mut env = MessageEnvelope::from_blob(blob).unwrap();
     env.ct[2] ^= 0xFF;
-    signer.resign(env)
+    env.to_blob().unwrap()
 }
 
 // -- deliverable 3, bullet 1: end-to-end, both directions --------------------------------------
@@ -183,7 +178,7 @@ fn repeated_desync_triggers_guarded_recovery_and_restores_the_session_end_to_end
             "must not fire before the threshold"
         );
         let noise = bob.send(&alice_ik, (100 + i) as u8, "noise");
-        let mangled = mangle_and_resign(&bob, &noise);
+        let mangled = mangle(&noise);
         assert!(
             matches!(alice.recv_err(&bob_ik, &mangled), Some(ChatError::Desync)),
             "iteration {i} must classify as Desync"
@@ -322,7 +317,7 @@ fn a_single_desync_does_not_recommend_recovery() {
     alice.recv(&bob_ik, &reply).unwrap();
 
     let noise = bob.send(&alice_ik, 3, "noise");
-    let mangled = mangle_and_resign(&bob, &noise);
+    let mangled = mangle(&noise);
     assert!(matches!(
         alice.recv_err(&bob_ik, &mangled),
         Some(ChatError::Desync)
@@ -360,7 +355,7 @@ fn recovery_recommended_only_crosses_at_exactly_the_threshold() {
             "must read false before the {i}th Desync of this run"
         );
         let noise = bob.send(&alice_ik, (10 + i) as u8, "noise");
-        let mangled = mangle_and_resign(&bob, &noise);
+        let mangled = mangle(&noise);
         assert!(matches!(
             alice.recv_err(&bob_ik, &mangled),
             Some(ChatError::Desync)
@@ -508,10 +503,18 @@ fn attempt_recovery_routes_a_surfaced_key_change_through_the_gate_never_bypassin
     assert_eq!(trust2.can_send(&mallory_ik), SendGate::Blocked(reason2));
 }
 
-// -- deliverable 3, bullet 4: signature check still runs before the new branch ------------------
+// -- deliverable 3, bullet 4: a mutated preamble on the recovery-fallback branch is rejected -----
 
+/// (task 6.3 re-point, ADR 0016 C2/C3) Envelope v2 has no signature: a mutated preamble on the
+/// task-4.9 recovery-fallback branch is instead rejected by the ratchet AEAD, via
+/// commit-on-successful-decrypt — the provisional session `establish_responder_session_provisional`
+/// derives from the mutated (OTK-downgraded) preamble fails to decrypt `reinit`'s genuine
+/// ciphertext, so nothing commits and this falls through to the ordinary, untouched-state `Desync`
+/// path (the *same* path an actually-lost/corrupted header takes — see this file's `mangle`-based
+/// tests above). This is a hard rejection either way; only the specific error variant and the
+/// (expected, ordinary) desync-counter bump changed from the v1 version of this test.
 #[test]
-fn mutated_preamble_is_rejected_by_signature_before_the_recovery_fallback_ever_runs() {
+fn mutated_preamble_on_the_recovery_fallback_branch_is_rejected_by_the_aead() {
     let mut alice = Party::new("mutate.a");
     let mut bob = Party::new("mutate.b");
     let bob_gen1 = bob.publish_at(TEST_NOW_UNIX);
@@ -522,36 +525,45 @@ fn mutated_preamble_is_rejected_by_signature_before_the_recovery_fallback_ever_r
     bob.recv(&alice_ik, &opening).unwrap();
 
     // Alice re-initiates fresh — Bob now holds a stale session for her, exactly the scenario the
-    // task-4.9 fallback branch exists for.
+    // task-4.9 fallback branch exists for. `Session::initiate` draws a fresh ephemeral each call, so
+    // `reinit`'s `ek_pub` is genuinely new — not a replay of `opening`'s — and so is not blocked by
+    // the freshness gate; the mutated preamble must therefore be rejected by the AEAD attempt
+    // itself, not the freshness pre-filter, which is the property this cell actually needs to prove.
     alice.state = ChatState::default();
     let bob_gen2 = bob.publish_at(TEST_NOW_UNIX + 1);
     alice.start(&bob_ik, &bob_gen2.bundle.spk, Some(bob_gen2.bundle.otks[0]));
     let reinit = alice.send(&bob_ik, 2, "it's me");
 
-    // An on-path attacker mutates the preamble WITHOUT re-signing (the capability of someone with
-    // the bytes but not Alice's identity key) — must be rejected by the signature check, which
-    // still runs unconditionally before either session-establishment branch (first-contact or the
-    // new recovery fallback) is ever reached.
+    // An on-path attacker mutates the preamble (no signature exists to stop them at the wire layer
+    // any more) — the referenced material is still real (Bob's actual current SPK), so this reaches
+    // a genuine provisional establishment attempt; only the AEAD decrypt can, and must, catch it.
     let mut env = MessageEnvelope::from_blob(&reinit).unwrap();
     env.prekey.as_mut().unwrap().used_opk = None; // downgrade to OTK-free X3DH — a preamble mutation
     let mutated = env.to_blob().unwrap();
 
-    let before = state_bytes(&bob.state);
+    let before = state_bytes_excluding_desync_counts(&bob.state);
     match bob.recv_err(&alice_ik, &mutated) {
-        Some(ChatError::BadSignature) => {}
+        Some(ChatError::Desync) => {}
         other => panic!(
-            "a mutated preamble must be rejected by the ENVELOPE SIGNATURE specifically, before \
-             either the first-contact or task-4.9 recovery-fallback session-establishment branch \
-             runs. Got: {other:?}"
+            "a mutated preamble on the recovery-fallback branch must be rejected as Desync (the \
+             provisional establishment's decrypt fails, so it falls through to the ordinary \
+             untouched-state path) — got: {other:?}"
         ),
     }
     assert_eq!(
         before,
-        state_bytes(&bob.state),
-        "a signature failure must touch nothing at all — including the new desync_counts \
-         bookkeeping, which only the UndecryptableHeader branch touches"
+        state_bytes_excluding_desync_counts(&bob.state),
+        "a rejected provisional establishment must touch nothing beyond the ordinary Desync \
+         bookkeeping — no OTK consumed (only ever peeked), no session installed, no \
+         responder_session_ek entry recorded"
     );
-    assert_eq!(bob.state.desync_count(&alice_ik), 0);
+    assert_eq!(
+        bob.state.desync_count(&alice_ik),
+        1,
+        "this is an ordinary Desync classification (task 6.3: the provisional-decrypt failure \
+         path merges into the same Desync outcome the genuinely-undecryptable-header path already \
+         used) — it DOES bump the counter, same as any other Desync"
+    );
 
     // The genuine (unmutated) re-initiation still works afterwards — proving the rejection above
     // broke nothing.
@@ -1046,8 +1058,7 @@ fn replay_after_the_referenced_spk_generation_genuinely_expires_still_fails_safe
 
 /// Drive `n` consecutive, genuinely-mangled `Desync`s from `bob` (sending to `alice_ik`) against
 /// `alice`'s inbound path for `bob_ik`, asserting each one classifies as `Desync`. Mirrors this
-/// file's own `mangle_and_resign`-based technique, factored out since both burst tests below need it
-/// twice.
+/// file's own [`mangle`]-based technique, factored out since both burst tests below need it twice.
 fn drive_desync_burst(
     alice: &mut Party,
     bob: &mut Party,
@@ -1059,7 +1070,7 @@ fn drive_desync_burst(
     for _ in 0..n {
         let noise = bob.send(alice_ik, *next_id, "noise");
         *next_id = next_id.wrapping_add(1);
-        let mangled = mangle_and_resign(bob, &noise);
+        let mangled = mangle(&noise);
         assert!(matches!(
             alice.recv_err(bob_ik, &mangled),
             Some(ChatError::Desync)

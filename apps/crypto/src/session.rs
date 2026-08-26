@@ -115,17 +115,55 @@ impl Session {
         })
     }
 
-    /// Ratchet-encrypt an outbound plaintext (the CBOR of a `mrd.chat/1` payload).
+    /// Ratchet-encrypt an outbound plaintext (the CBOR of a `mrd.chat/1` payload). The v2 AAD's
+    /// per-message preamble component (ADR 0016 C3) is derived here from this session's own
+    /// `needs_prekey()`/`prekey_material()` state — the exact same state the caller
+    /// (`apps/core/src/chat.rs::seal_bytes`) separately reads, right after this call, to decide
+    /// what `Prekey` (if any) to attach to the wire envelope. Both derivations MUST stay in lock
+    /// step; see [`preamble_bytes`]'s own doc comment for why the encoding itself is duplicated
+    /// (not shared) with `meridian_envelope::preamble_aad_bytes`.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        self.ratchet.encrypt(plaintext)
+        let preamble = self.outbound_preamble_bytes();
+        self.ratchet.encrypt(plaintext, &preamble)
+    }
+
+    /// The v2 preamble-AAD bytes (ADR 0016 C3) that [`encrypt`](Self::encrypt) would bind into its
+    /// *next* outbound message right now — i.e. exactly what a caller with no `MessageEnvelope` of
+    /// its own (a lower-level test, or a future non-`meridian-envelope` caller) needs in order to
+    /// exercise [`decrypt`](Self::decrypt)'s explicit-preamble contract correctly. Ordinary callers
+    /// that do have a wire envelope should prefer `meridian_envelope::preamble_aad_bytes(&envelope.prekey)`
+    /// on the RECEIVED envelope instead — this method reflects only this session's own local state
+    /// and must never be used to build the argument to [`decrypt`](Self::decrypt) for an inbound
+    /// message (see that method's doc comment for why).
+    pub fn outbound_preamble_bytes(&self) -> Vec<u8> {
+        preamble_bytes(self.outbound_prekey())
     }
 
     /// Ratchet-decrypt an inbound ratchet message. Marks the session confirmed on success.
-    pub fn decrypt(&mut self, message: &[u8]) -> Result<Vec<u8>> {
-        let pt = self.ratchet.decrypt(message)?;
+    ///
+    /// `preamble` MUST be the caller's [`preamble_bytes`]-shaped (or, at the wire layer,
+    /// `meridian_envelope::preamble_aad_bytes`-shaped) encoding of the `Prekey` **actually present
+    /// on the received envelope** — never a value reconstructed from this session's own local
+    /// state. See [`crate::ratchet::DoubleRatchet::decrypt`]'s doc comment (ADR 0016 C3): this is
+    /// the exact property that keeps a mutated preamble on a genuine envelope detectable rather
+    /// than silently matching whatever the receiver already expected.
+    pub fn decrypt(&mut self, message: &[u8], preamble: &[u8]) -> Result<Vec<u8>> {
+        let pt = self.ratchet.decrypt(message, preamble)?;
         self.confirmed = true;
         self.prekey = None;
         Ok(pt)
+    }
+
+    /// This session's own prekey material, but only when [`needs_prekey`](Self::needs_prekey)
+    /// holds — i.e. exactly the material [`encrypt`](Self::encrypt) should bind into its outbound
+    /// AAD and the caller should attach to the wire envelope. `None` once confirmed (or for a
+    /// responder, which never attaches a preamble).
+    fn outbound_prekey(&self) -> Option<&PrekeyMaterial> {
+        if self.needs_prekey() {
+            self.prekey.as_ref()
+        } else {
+            None
+        }
     }
 
     /// Whether the opening message(s) should still carry the X3DH prekey preamble: true for an
@@ -143,4 +181,32 @@ impl Session {
     pub fn safety_number(&self, our_ik: &[u8; 32]) -> String {
         safety_number(our_ik, &self.peer_ik)
     }
+}
+
+/// The canonical C3 preamble encoding (ADR 0016), over this crate's own local [`PrekeyMaterial`]
+/// rather than `meridian_envelope::Prekey`. This crate cannot depend on `meridian-envelope` in
+/// production code — the dependency direction runs the other way (`meridian-envelope` depends on
+/// its sibling `meridian-proto` only, per F15/`apps/crypto/CLAUDE.md`), so the byte-identical
+/// encoding is duplicated here on purpose rather than shared. Both fields' shapes are identical
+/// (`ek_pub`/`used_spk`/`used_opk`), so the two encodings MUST be kept in lockstep by hand; the v2
+/// conformance vectors (task 6.5) pin both together, and
+/// `meridian-envelope`'s own `preamble_aad_bytes` doc comment cross-references this function.
+fn preamble_bytes(prekey: Option<&PrekeyMaterial>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 32 + 32 + 1 + 32);
+    match prekey {
+        Some(p) => {
+            out.push(1);
+            out.extend_from_slice(&p.ek_pub);
+            out.extend_from_slice(&p.used_spk);
+            match &p.used_opk {
+                Some(opk) => {
+                    out.push(1);
+                    out.extend_from_slice(opk);
+                }
+                None => out.push(0),
+            }
+        }
+        None => out.push(0),
+    }
+    out
 }

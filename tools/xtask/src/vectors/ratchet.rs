@@ -148,11 +148,22 @@ pub fn generate_ratchet() -> Result<(), String> {
 
     let mut transcript = Vec::new();
 
+    // (task 6.3, ADR 0016 C2/C3) `encrypt`/`decrypt` now take a preamble argument, folded into the
+    // v2 AAD. This generator never carries an X3DH preamble on any step (its ratchets are built
+    // directly, not via a fresh X3DH handshake), so every call below consistently uses the empty
+    // preamble — this does not change any pinned value: ciphertext is never byte-pinned (see the
+    // module doc), `ad_hex` is recorded from the local `ad` variable directly (not read back
+    // through the now domain-tag-baked `DoubleRatchet::associated_data()`), and chain/message-key
+    // derivation never depended on the AAD in the first place.
+    let no_preamble: &[u8] = &[];
+
     // Step 0: Alice -> Bob, N=0. Establishes Bob's receiving chain (his first DH-ratchet step).
     let (ck_before, ck_after, mk) = alice_send.advance();
     let pt0 = b"hello bob".to_vec();
-    let c0 = alice.encrypt(&pt0).map_err(|e| e.to_string())?;
-    bob.decrypt(&c0).map_err(|e| e.to_string())?;
+    let c0 = alice
+        .encrypt(&pt0, no_preamble)
+        .map_err(|e| e.to_string())?;
+    bob.decrypt(&c0, no_preamble).map_err(|e| e.to_string())?;
     transcript.push(Step {
         direction: "alice->bob".into(),
         plaintext_hex: hex::encode(&pt0),
@@ -171,14 +182,14 @@ pub fn generate_ratchet() -> Result<(), String> {
     let mut steps = Vec::new();
     for pt in [b"m1".to_vec(), b"m2".to_vec(), b"m3".to_vec()] {
         let (ck_before, ck_after, mk) = alice_send.advance();
-        let ct = alice.encrypt(&pt).map_err(|e| e.to_string())?;
+        let ct = alice.encrypt(&pt, no_preamble).map_err(|e| e.to_string())?;
         steps.push((pt, ck_before, ck_after, mk, ct));
     }
     let (pt1, ck1b, ck1a, mk1, ct1) = steps.remove(0);
     let (pt2, ck2b, ck2a, mk2, ct2) = steps.remove(0);
     let (pt3, ck3b, ck3a, mk3, ct3) = steps.remove(0);
 
-    bob.decrypt(&ct3).map_err(|e| e.to_string())?; // delivered first: N=3, out of order
+    bob.decrypt(&ct3, no_preamble).map_err(|e| e.to_string())?; // delivered first: N=3, out of order
     transcript.push(Step {
         direction: "alice->bob".into(),
         plaintext_hex: hex::encode(&pt3),
@@ -190,7 +201,7 @@ pub fn generate_ratchet() -> Result<(), String> {
         ck_after_hex: Some(hex::encode(ck3a)),
         mk_hex: Some(hex::encode(mk3)),
     });
-    bob.decrypt(&ct1).map_err(|e| e.to_string())?; // N=1, arrives after N=3 (skipped-key path)
+    bob.decrypt(&ct1, no_preamble).map_err(|e| e.to_string())?; // N=1, arrives after N=3 (skipped-key path)
     transcript.push(Step {
         direction: "alice->bob".into(),
         plaintext_hex: hex::encode(&pt1),
@@ -202,7 +213,7 @@ pub fn generate_ratchet() -> Result<(), String> {
         ck_after_hex: Some(hex::encode(ck1a)),
         mk_hex: Some(hex::encode(mk1)),
     });
-    bob.decrypt(&ct2).map_err(|e| e.to_string())?; // N=2, also a stored skipped key
+    bob.decrypt(&ct2, no_preamble).map_err(|e| e.to_string())?; // N=2, also a stored skipped key
     transcript.push(Step {
         direction: "alice->bob".into(),
         plaintext_hex: hex::encode(&pt2),
@@ -220,8 +231,8 @@ pub fn generate_ratchet() -> Result<(), String> {
     // OS-CSPRNG draw with no injection point, and *is* the PCS mechanism, so it is not something
     // to pin. Recorded as a functional round trip only.
     let pt4 = b"hi alice".to_vec();
-    let c4 = bob.encrypt(&pt4).map_err(|e| e.to_string())?;
-    let decrypted4 = alice.decrypt(&c4).map_err(|e| e.to_string())?;
+    let c4 = bob.encrypt(&pt4, no_preamble).map_err(|e| e.to_string())?;
+    let decrypted4 = alice.decrypt(&c4, no_preamble).map_err(|e| e.to_string())?;
     if decrypted4 != pt4 {
         return Err("ratchet vector generation: bob->alice reply did not round-trip".into());
     }

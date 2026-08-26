@@ -1,20 +1,27 @@
 //! Chat session manager (T03): the transport-agnostic glue that turns `mrd.chat/1` payloads into
-//! signed, ratchet-encrypted [`MessageEnvelope`]s and back, and owns the persistable session state.
+//! ratchet-encrypted [`MessageEnvelope`]s and back, and owns the persistable session state.
 //!
 //! This is deliberately I/O-free: it does not touch the network. The CLI (or any shim) fetches
 //! bundles + routes/delivers opaque blobs via [`meridian_signaling`], and calls in here to
 //! seal/open the content. That separation is the point of §4.3: the *same* ratcheted envelopes
 //! ride the relay today and P2P/mailbox later, unchanged.
 //!
-//! Security: every inbound envelope is signature-verified under the sender's claimed identity key
-//! **before** its payload is decrypted (crypto-protocols rule 4), and the claimed key is checked
-//! against the routing `from`. The whole state is sealed at rest under a keystore-derived key.
+//! Security (envelope v2, ADR 0016 C2/C3 — task 6.3): there is no per-message identity-key
+//! signature. Authentication rests entirely on the ratchet AEAD under the canonical
+//! `"mrd.env/2" ‖ AD ‖ preamble ‖ enc_header` AAD: every inbound envelope's decrypt is attempted
+//! *provisionally* (a non-destructive prekey lookup, no session installed yet) and only a
+//! **successful decrypt** commits — consumes the one-time prekey and installs the session. A
+//! failed decrypt leaves no trace (see [`ChatState::open_bytes`]). The claimed sender key is
+//! still checked against the routing `from`. The whole state is sealed at rest under a
+//! keystore-derived key.
 
 use std::collections::BTreeMap;
 
 use meridian_crypto::{at_rest, PrekeyMaterial, Session};
-use meridian_envelope::{ChatContent, MessageEnvelope, Prekey};
-use meridian_identity::{sign, verify, KeyHandle, PublicKey, SecretStore, Signature};
+use meridian_envelope::{
+    preamble_aad_bytes, ChatContent, MessageEnvelope, Prekey, ENVELOPE_VERSION,
+};
+use meridian_identity::{KeyHandle, SecretStore};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
@@ -27,10 +34,16 @@ pub enum ChatError {
     Codec(#[from] meridian_proto::CodecError),
     #[error("keystore error: {0}")]
     Store(#[from] meridian_store::StoreError),
-    /// The envelope's signature did not verify under its claimed sender key — reject, never
-    /// downgrade (anonymity-and-retention "must never" #5).
-    #[error("envelope signature verification failed")]
-    BadSignature,
+    /// (task 6.3, ADR 0016 C5/R5) The envelope's leading `v` field was not [`ENVELOPE_VERSION`].
+    /// **Always a local, unilateral hard reject — never a round-trip, never a negotiated
+    /// fallback.** `v` is sender-declared, not negotiated (see `MessageEnvelope`'s own doc
+    /// comment): a v1/v2 mismatch must never be routed through either of the wire's two *existing*
+    /// version-negotiation mechanisms (the soft `Bundle.v` downgrade-tolerant path, or
+    /// `Hello.streams`' mutual capability discovery) — doing so would reintroduce exactly the
+    /// "malicious server claims your peer only speaks v1" downgrade oracle R5 forbids. This is a
+    /// hard flag day: envelope v1 and v2 never both parse.
+    #[error("unsupported envelope version {0} (expected {ENVELOPE_VERSION})")]
+    UnsupportedEnvelopeVersion(u16),
     /// The sender key inside the envelope did not match the routing `from`.
     #[error("envelope sender does not match routing origin")]
     SenderMismatch,
@@ -47,15 +60,30 @@ pub enum ChatError {
     /// single occurrence is still a hard rejection, exactly like any other failure — the envelope is
     /// dropped and [`open_bytes`](ChatState::open_bytes) itself already tries the one narrow, gated
     /// exception inline (a fresh re-initiation from the same sender — task 4.9's discriminator fix,
-    /// see that method's doc) before ever returning this variant. **That gate is signature
-    /// verification *and* freshness, not signature verification alone** — a valid signature proves
-    /// only that the claimed sender produced these bytes at some point, never that they are fresh;
-    /// see [`open_bytes`](ChatState::open_bytes)'s doc comment for why a signature-valid replay of a
-    /// sender's own past opening envelope must additionally fail a freshness check (checking the
-    /// incoming prekey's `ek_pub` against **every** `ek_pub` that established a still-SPK-valid
-    /// responder session with that sender — not merely the most recent one; see
-    /// [`ChatState::responder_session_ek`] for why a single-value freshness record was itself found
-    /// exploitable) before it is ever allowed to attempt fresh establishment.
+    /// see that method's doc) before ever returning this variant.
+    ///
+    /// **(task 6.3, ADR 0016 C2) That gate is freshness *and* commit-on-successful-decrypt, not
+    /// authenticity alone.** Envelope v2 drops the per-message signature; there is no longer a
+    /// separate "authenticity" check upstream of decryption at all — a provisional X3DH
+    /// establishment either decrypts this exact ciphertext successfully or it doesn't, and only a
+    /// **successful** decrypt is treated as proof the fallback's re-initiation is genuine (nothing
+    /// is ever committed — no OTK consumed, no session installed, no freshness record written — on
+    /// a failed one). But **decrypt success alone is still not sufficient**, for the same reason it
+    /// wasn't under v1: X3DH is deterministic in its public inputs, so a byte-identical replay of a
+    /// sender's own past opening envelope decrypts successfully too (deterministically, every time,
+    /// for OTK-free X3DH) — decrypt success proves the bytes are *authentic* (the claimed sender's
+    /// real material), never that they are *fresh*. The freshness gate therefore still runs
+    /// **first**, strictly before any provisional establishment is even attempted: see
+    /// [`open_bytes`](ChatState::open_bytes)'s doc comment for why a replay of a sender's own past
+    /// opening envelope must fail a freshness check (checking the incoming prekey's `ek_pub` against
+    /// **every** `ek_pub` that established a still-SPK-valid responder session with that sender —
+    /// not merely the most recent one; see [`ChatState::responder_session_ek`] for why a
+    /// single-value freshness record was itself found exploitable) before a provisional
+    /// establish-and-decrypt attempt is ever made at all. The two checks cannot conflict or race:
+    /// freshness is a *precondition* for attempting provisional establishment, and
+    /// commit-on-decrypt is what happens (or doesn't) *inside* an attempt the freshness gate has
+    /// already allowed through — see this task's Outcome section
+    /// (`docs/tasks/phase-6/6.3-envelope-v2-core-cutover.md`) for the full design note.
     ///
     /// **Task 1.18 vs. task 4.9 — what changed, precisely.** Task 1.18 stated flatly that callers
     /// MUST NOT react to `Desync` by resetting or re-keying a session: doing so unconditionally
@@ -84,11 +112,12 @@ pub enum ChatError {
     /// `docs/api/messaging-envelope-v1.md` §3 "Desync recovery" for the full guarded design and the
     /// honest statement of that residual.
     ///
-    /// **This does not discharge [ADR 0016 C7](../../../docs/adr/0016-envelope-deniability.md).**
-    /// Both this classification and `open_bytes`'s discriminator fix are v1-scoped and
-    /// non-wire-breaking (no new AAD, no version field, still `mrd.env/1`, still signed); envelope v2
-    /// will still rewrite `open_bytes` under the new AAD/commit-on-decrypt rules and must re-verify
-    /// this behavior when it does.
+    /// **(task 6.3) `open_bytes` has now been rewritten under envelope v2's AAD/commit-on-decrypt
+    /// rules ([ADR 0016](../../../docs/adr/0016-envelope-deniability.md) C2/C3, and C7's
+    /// short-circuit half), and this task-4.9 discriminator/freshness behavior was re-verified
+    /// (not merely preserved by inspection) under the new provisional control flow** — see this
+    /// task's Outcome section for the design note on exactly how the freshness gate and
+    /// commit-on-decrypt now interact.
     #[error("ratchet desync: header undecryptable under either header key")]
     Desync,
     /// (task 2.10) A first-contact envelope from a sender [`ChatState`] has never seen before was
@@ -445,12 +474,43 @@ impl PrekeyVault {
         }
     }
 
+    /// Non-destructive lookup of the signed-prekey secret for `spk_public` (current or
+    /// grace-window generation) — task 6.3, ADR 0016 C2. Identical to
+    /// [`spk_secret_for`](Self::spk_secret_for): the SPK is never single-use, so that lookup was
+    /// already read-only. This alias exists purely so the provisional-establishment call site
+    /// (`ChatState::establish_responder_session_provisional`) reads symmetrically with
+    /// [`peek_otk_secret`](Self::peek_otk_secret) below, which *is* a genuinely new non-destructive
+    /// counterpart to the destructive [`take_otk_secret`](Self::take_otk_secret).
+    fn peek_spk_secret(&self, spk_public: &[u8; 32]) -> Option<[u8; 32]> {
+        self.spk_secret_for(spk_public)
+    }
+
+    /// Non-destructive counterpart to [`take_otk_secret`](Self::take_otk_secret) (task 6.3, ADR
+    /// 0016 C2): looks up the one-time-prekey secret for `opk_public`, in either generation,
+    /// **without removing it**, so a provisional X3DH establish-and-decrypt attempt can be built
+    /// and tried before the OTK is actually spent. `ChatState::open_bytes` calls this (via
+    /// `establish_responder_session_provisional`) for every establishment attempt, and only calls
+    /// the destructive [`take_otk_secret`](Self::take_otk_secret) (via
+    /// `ChatState::commit_responder_otk`) once that attempt's decrypt has actually succeeded.
+    fn peek_otk_secret(&self, opk_public: &[u8; 32]) -> Option<[u8; 32]> {
+        peek_otk(&self.otks, opk_public).or_else(|| {
+            self.previous
+                .as_ref()
+                .and_then(|p| peek_otk(&p.otks, opk_public))
+        })
+    }
+
     /// Consume the secret for `opk_public`, whichever generation holds it.
     ///
     /// Single-use is enforced *across* generations: the OTK is removed from the current generation
     /// **and** from the retained previous one, so one published one-time prekey can never establish
     /// two sessions (a second attempt with the same public returns `None` →
     /// [`ChatError::UnknownPrekey`]).
+    ///
+    /// **(task 6.3) Only ever called after a successful decrypt.** Before ADR 0016 C2 this ran
+    /// eagerly, as part of establishment, before the resulting session had even attempted to
+    /// decrypt anything — see [`ChatState::commit_responder_otk`], its sole caller now, for the
+    /// commit-on-decrypt discipline that replaced that.
     fn take_otk_secret(&mut self, opk_public: &[u8; 32]) -> Option<[u8; 32]> {
         let from_current = take_otk(&mut self.otks, opk_public);
         let from_prev = self
@@ -459,6 +519,14 @@ impl PrekeyVault {
             .and_then(|p| take_otk(&mut p.otks, opk_public));
         from_current.or(from_prev)
     }
+}
+
+/// Find (without removing) the secret behind `opk_public` in `otks`, if present. Non-destructive
+/// counterpart to [`take_otk`], used by [`PrekeyVault::peek_otk_secret`].
+fn peek_otk(otks: &[Otk], opk_public: &[u8; 32]) -> Option<[u8; 32]> {
+    otks.iter()
+        .find(|o| &o.public == opk_public)
+        .map(|o| o.secret)
 }
 
 /// Remove **every** entry matching `opk_public` from `otks`, returning the first secret found.
@@ -485,8 +553,9 @@ fn take_otk(otks: &mut Vec<Otk>, opk_public: &[u8; 32]) -> Option<[u8; 32]> {
 /// accept/reject decision.
 ///
 /// **What "gated" means here, precisely.** By the time a [`MessageRequest`] exists, the crypto
-/// underneath it is *done*: the envelope's signature verified, X3DH ran (or the existing ratchet
-/// advanced), and a live [`Session`] is already installed in [`ChatState`]'s session map — see the
+/// underneath it is *done*: the envelope's AEAD decrypt succeeded (commit-on-decrypt, ADR 0016
+/// C2), X3DH ran (or the existing ratchet advanced), and a live [`Session`] is already installed
+/// in [`ChatState`]'s session map — see the
 /// gate in [`ChatState::open_inbound`]. What is held back is *delivery/display*, not
 /// authentication: the sender really does hold the private key behind `sender_ik`. The user is
 /// simply being asked whether they want to talk to that (now cryptographically confirmed) key.
@@ -568,8 +637,8 @@ pub struct ChatState {
     /// peer's own original opening envelope byte-for-byte reconstructs a byte-identical initial
     /// ratchet state (this is unconditionally true whenever the referenced signed prekey is still
     /// valid, and *always* true for OTK-free X3DH, since the SPK is never consumed on use — the OTK
-    /// case additionally requires the OTK not yet be spent). A verified signature alone proves
-    /// *authenticity* (the claimed sender really produced these bytes at some point) but says
+    /// case additionally requires the OTK not yet be spent). A successful AEAD decrypt alone
+    /// proves *authenticity* (the claimed sender really produced these bytes at some point) but says
     /// nothing about *freshness* (whether these are the bytes they intend to send *now*). Without
     /// this record, `open_bytes`'s fallback could not tell a hostile replay of the exact prekey
     /// material that established the session currently held apart from a genuine new re-initiation
@@ -640,8 +709,9 @@ pub struct ChatState {
     /// eviction cleanup that stops the ordinary "reject every stranger" case from ever needing it).
     ///
     /// Once an entry's generation is genuinely gone, a replay of that `ek_pub` no longer matches
-    /// anything here — but it is already independently blocked: `establish_responder_session` fails
-    /// with [`ChatError::UnknownPrekey`] (`spk_secret_for` returns `None`), which `open_bytes`'s
+    /// anything here — but it is already independently blocked:
+    /// `establish_responder_session_provisional` fails with [`ChatError::UnknownPrekey`]
+    /// (`spk_secret_for` returns `None`), which `open_bytes`'s
     /// fallback already treats as an ordinary failed recovery attempt (falls through to `Desync`,
     /// state left untouched) — the same fail-closed path a first-contact attempt against an expired
     /// generation already takes today. Pruning cannot reopen this: it only ever removes entries whose
@@ -656,8 +726,9 @@ pub struct ChatState {
     /// currently-held session was established as an *initiator* (we dialled them; they never sent us a
     /// prekey before, so there is nothing of theirs to replay), or because no responder session has
     /// ever been established for them at all — the freshness check cannot fire, so the fallback
-    /// behaves exactly as before either fixup: authenticity (the signature) is the only available gate,
-    /// and the attempt is allowed. This is deliberately not "fixed" further: closing *that* gap would
+    /// behaves exactly as before either fixup: authenticity (a successful AEAD decrypt) is the
+    /// only available gate, and the attempt is allowed. This is deliberately not "fixed" further:
+    /// closing *that* gap would
     /// mean either (a) refusing every fallback with no recorded entry, which would silently regress the
     /// legitimate case of a first prekey envelope ever sent in that direction, or (b) inventing a
     /// freshness signal for initiator-established sessions that this module has no cryptographic basis
@@ -730,7 +801,8 @@ impl ChatState {
     // task).** `self.sessions` — and therefore everything below, including the
     // `responder_session_ek` freshness tracking and the forced-replacement recovery machinery — is
     // shared between this (relay/mailbox) chat path and the P2P session substrate
-    // (`apps/core/src/session.rs`), which calls `open_bytes`/`establish_responder_session` directly
+    // (`apps/core/src/session.rs`), which calls `open_bytes`/`establish_responder_session_provisional`
+    // directly
     // against the exact same `Session` objects, by design ("same ratchet" — see `session.rs`'s
     // module doc). Today the two run as separate command invocations (the CLI's relay/mailbox chat
     // flow and its P2P dial flow are distinct processes or at least distinct, non-overlapping
@@ -995,8 +1067,8 @@ impl ChatState {
     /// caller should now present exactly like any other freshly-received [`ChatContent`].
     ///
     /// The crypto session behind the request was already fully established when it was gated
-    /// (signature verified, X3DH complete); accepting is pure local bookkeeping and re-verifies
-    /// nothing.
+    /// (AEAD decrypt succeeded, X3DH complete); accepting is pure local bookkeeping and
+    /// re-verifies nothing.
     pub fn accept_request(&mut self, sender_ik: &[u8; 32]) -> Option<MessageRequest> {
         let out = self.pending_requests.remove(sender_ik);
         if out.is_some() {
@@ -1122,7 +1194,7 @@ impl ChatState {
         }
     }
 
-    /// Build a signed, ratchet-encrypted envelope for `content` to `peer_ik`. See [`seal_bytes`] for
+    /// Build a ratchet-encrypted envelope for `content` to `peer_ik`. See [`seal_bytes`] for
     /// the generic primitive; this is the `mrd.chat/1` convenience wrapper.
     ///
     /// [`seal_bytes`]: ChatState::seal_bytes
@@ -1137,17 +1209,24 @@ impl ChatState {
         self.seal_bytes(store, handle, our_ik, peer_ik, &content.encode()?)
     }
 
-    /// Seal an **arbitrary** ratchet plaintext into a signed [`MessageEnvelope`] blob on the session
+    /// Seal an **arbitrary** ratchet plaintext into a [`MessageEnvelope`] v2 blob on the session
     /// with `peer_ik`. The same primitive carries `mrd.chat/1` payloads and the P2P substrate's
     /// `SignalContent` (SDP/ICE/ctrl) over one ratchet — the transport-independence of §4.3: the
     /// same envelope bytes are valid over WSS routing, the mailbox, or a data channel.
     ///
     /// The session must already exist (initiator: [`Session::initiate`]; responder: created on first
     /// receive via [`open_bytes`](ChatState::open_bytes)).
+    ///
+    /// **(task 6.3, ADR 0016 C2/C3) No longer signs anything.** `store`/`handle` are accepted for
+    /// call-site symmetry with [`open_bytes`](Self::open_bytes) and its own callers (P2P substrate,
+    /// CLI) and so this method's signature does not need to change if a future authenticated
+    /// operation is ever added here — but this method itself performs no keystore operation today:
+    /// authentication of the outbound message is entirely the ratchet AEAD's job now (`AD` is
+    /// derived from `our_ik`/`peer_ik` once, at session establishment, not re-signed per message).
     pub fn seal_bytes(
         &mut self,
-        store: &dyn SecretStore,
-        handle: &KeyHandle,
+        _store: &dyn SecretStore,
+        _handle: &KeyHandle,
         our_ik: &[u8; 32],
         peer_ik: &[u8; 32],
         plaintext: &[u8],
@@ -1159,16 +1238,11 @@ impl ChatState {
         } else {
             None
         };
-        let sig = sign(
-            store,
-            handle,
-            &MessageEnvelope::signing_input(our_ik, &prekey, &ct),
-        )?;
         let envelope = MessageEnvelope {
+            v: ENVELOPE_VERSION,
             sender_pub: *our_ik,
             prekey,
             ct,
-            sig: *sig.as_bytes(),
         };
         Ok(envelope.to_blob()?)
     }
@@ -1194,10 +1268,13 @@ impl ChatState {
     /// session as a side effect of its own `open_bytes` calls, so this method's own
     /// session-presence check would never see a first contact on that path.
     ///
-    /// **Hard invariant (task 2.10): gating happens after signature verification and session
-    /// establishment.** The check below runs *after* [`open_bytes`] has already verified the
-    /// envelope's signature and (on a first contact) completed X3DH — so a first contact that is
-    /// ultimately rejected still cost the sender's one-time prekey. This is the same class of
+    /// **Hard invariant (task 2.10): gating happens after decryption and session establishment.**
+    /// The check below runs *after* [`open_bytes`] has already decrypted the envelope and (on a
+    /// first contact) completed X3DH — so a first contact that is ultimately rejected still cost
+    /// the sender's one-time prekey (task 6.3, ADR 0016 C2: only on a **successful** decrypt —
+    /// commit-on-decrypt means a forged/mutated first-contact envelope costs nothing, but a
+    /// genuinely-decrypting one that the request-queue subsequently gates still did). This is the
+    /// same class of
     /// already-accepted OTK-consumption behavior recorded in `apps/core/src/session.rs`'s
     /// `ANSWER_TIMEOUT` doc comment (task 1.33) and is not "fixed" here; restructuring the
     /// handshake to avoid it would reintroduce the handshake-order problems those notes exist to
@@ -1235,9 +1312,9 @@ impl ChatState {
     /// flag correctly — every other caller should go through [`open_inbound`](Self::open_inbound).
     ///
     /// Same hard invariant as [`open_inbound`](Self::open_inbound): this still runs *after*
-    /// [`open_bytes`] has verified the signature (and, on first contact, completed X3DH) — gating
+    /// [`open_bytes`] has decrypted the envelope (and, on first contact, completed X3DH) — gating
     /// is delivery-only, never a crypto shortcut, and a rejected first contact still costs whatever
-    /// handshake material (e.g. a one-time prekey) it consumed.
+    /// handshake material (e.g. a one-time prekey) it consumed on the way to a successful decrypt.
     pub(crate) fn open_inbound_gated(
         &mut self,
         store: &dyn SecretStore,
@@ -1291,24 +1368,45 @@ impl ChatState {
         Ok(content)
     }
 
-    /// Verify + decrypt an inbound blob to its raw ratchet plaintext, establishing a responder
-    /// session on a prekey message. The generic counterpart of [`open_inbound`](Self::open_inbound),
-    /// used by the substrate to open `SignalContent` on the same ratchet as chat. Every inbound
-    /// envelope is signature-verified under its claimed sender key **before** decryption, and the
-    /// claimed key is checked against the routing `from` (crypto-protocols rule 4) — this ordering
-    /// is unchanged by task 4.9's discriminator fix below: `verify()` still runs first, unconditionally,
-    /// before either session-establishment branch is even reached.
+    /// Decrypt an inbound blob to its raw ratchet plaintext, establishing a responder session on a
+    /// prekey message. The generic counterpart of [`open_inbound`](Self::open_inbound), used by the
+    /// substrate to open `SignalContent` on the same ratchet as chat.
     ///
-    /// **The task 4.9 discriminator fix.** Before this task, a fresh responder session was only ever
-    /// considered when `!self.sessions.contains_key(&envelope.sender_pub)` — i.e. only on a literal
-    /// first-ever contact. That left a real bug: if the peer holds a **stale** session with the
-    /// sender (the exact desync scenario task 1.18 describes — the identity key hasn't changed, only
-    /// ratchet state diverged, e.g. the sender restored an old backup or wiped its session store and
-    /// genuinely re-ran X3DH as initiator), `contains_key` reads `true`, the fresh-establishment
-    /// branch is skipped entirely, and the incoming, legitimate re-initiation is handed to the
-    /// *stale* session's `decrypt`, which fails and reclassifies as `Desync` again — permanently.
-    /// That defeated task 1.18's own "safe half": the peer that knows it lost state re-initiates, but
-    /// the counterpart could never actually accept it.
+    /// **(task 6.3, ADR 0016 C2/C3/C5) Rewritten for envelope v2: no signature, provisional X3DH,
+    /// commit-on-successful-decrypt.** There is no longer a signature to verify before decryption —
+    /// authentication is entirely the ratchet AEAD's job, under the canonical
+    /// `"mrd.env/2" ‖ AD ‖ prekey_preamble ‖ enc_header` AAD (`AD` baked into the session's ratchet
+    /// at construction; `prekey_preamble` is this method's own `preamble_aad_bytes(&envelope.prekey)`
+    /// — the RECEIVED bytes, never recomputed — passed to `Session::decrypt` on every call below).
+    /// Three checks still run unconditionally, before any crypto/session work, in this order:
+    /// 1. `envelope.v == ENVELOPE_VERSION` — a hard, local, unilateral reject on any other value
+    ///    (`ChatError::UnsupportedEnvelopeVersion`), never a negotiated fallback (C5/R5).
+    /// 2. `envelope.sender_pub == from` (`ChatError::SenderMismatch`) — unchanged from v1.
+    ///
+    /// Everything downstream of those two — establishing a *new* responder session (first contact,
+    /// or the task-4.9 stale-session fallback below) — is now **provisional**: this method builds
+    /// the session and attempts to decrypt `envelope.ct` with it, but only *commits* (consumes the
+    /// referenced one-time prekey, records the freshness entry, installs the session into
+    /// `self.sessions`) once that decrypt has actually succeeded. A mutated/forged preamble on a
+    /// prekey envelope therefore derives a session that fails to decrypt the (also-attacker-supplied
+    /// or genuine, doesn't matter) ciphertext, and the provisional attempt is discarded without a
+    /// trace — see [`establish_responder_session_provisional`](Self::establish_responder_session_provisional)
+    /// and [`commit_responder_otk`](Self::commit_responder_otk), and this task's Outcome section
+    /// (`docs/tasks/phase-6/6.3-envelope-v2-core-cutover.md`) for the full design note on how this
+    /// interacts with the freshness gate below.
+    ///
+    /// **The task 4.9 discriminator fix (re-verified, not merely preserved, under the new
+    /// provisional flow — see the Outcome section above).** Before task 4.9, a fresh responder
+    /// session was only ever considered when `!self.sessions.contains_key(&envelope.sender_pub)` —
+    /// i.e. only on a literal first-ever contact. That left a real bug: if the peer holds a
+    /// **stale** session with the sender (the exact desync scenario task 1.18 describes — the
+    /// identity key hasn't changed, only ratchet state diverged, e.g. the sender restored an old
+    /// backup or wiped its session store and genuinely re-ran X3DH as initiator), `contains_key`
+    /// reads `true`, the fresh-establishment branch is skipped entirely, and the incoming,
+    /// legitimate re-initiation is handed to the *stale* session's `decrypt`, which fails and
+    /// reclassifies as `Desync` again — permanently. That defeated task 1.18's own "safe half": the
+    /// peer that knows it lost state re-initiates, but the counterpart could never actually accept
+    /// it.
     ///
     /// The fix is **not** simply "key off `envelope.prekey.is_some()` instead of `contains_key`", as
     /// a literal reading of task 4.9's scope text might suggest — that alone is unsafe: an
@@ -1322,45 +1420,52 @@ impl ChatState {
     /// the one failure mode a genuine re-initiation actually produces:
     /// [`meridian_crypto::CryptoError::UndecryptableHeader`] (the header opens under neither of the
     /// existing session's header keys — see `DoubleRatchet::decrypt_header`). Only then, and only if
-    /// the envelope actually carries a `prekey` preamble, is a **fresh** responder session attempted
-    /// from that preamble and this same ciphertext re-tried against it:
+    /// the envelope actually carries a `prekey` preamble, is a **fresh, provisional** responder
+    /// session attempted from that preamble and this same ciphertext re-tried against it:
     /// - If establishment fails (e.g. the referenced one-time prekey was already consumed — which is
     ///   exactly what happens for a replayed already-processed opening message, or for an ordinary
     ///   unconfirmed-initiator continuation message once its OTK has already been spent) or the fresh
-    ///   session still fails to decrypt this ciphertext, **nothing is touched**: the stale session is
-    ///   left exactly as it was and this still returns [`ChatError::Desync`] — preserving task 1.18's
-    ///   `undecryptable_envelope_is_rejected_without_touching_the_session` invariant byte-for-byte for
-    ///   every case except a *successful* recovery.
-    /// - Only a full, successful decrypt under the freshly-established session replaces the stale
-    ///   entry.
+    ///   session still fails to decrypt this ciphertext, **nothing is touched**: no OTK is consumed
+    ///   (only *peeked*, never taken — see [`PrekeyVault::peek_otk_secret`]), the stale session is
+    ///   left exactly as it was, and this still returns [`ChatError::Desync`] — preserving task
+    ///   1.18's `undecryptable_envelope_is_rejected_without_touching_the_session` invariant
+    ///   byte-for-byte for every case except a *successful* recovery.
+    /// - Only a full, successful decrypt under the freshly-established session commits: the OTK is
+    ///   consumed, the freshness entry recorded, and the stale session entry replaced — all three
+    ///   atomically, right here, never split across a window where one has happened and not the
+    ///   others.
     ///
-    /// **A verified signature alone is not enough to gate this — it proves authenticity, not
-    /// freshness (review fixup: this doc previously overstated this point).** `verify()` proves the
-    /// envelope's claimed sender produced these bytes *at some point*; it says nothing about whether
-    /// this is the message they intend to send *now*. Because X3DH is deterministic in its public
-    /// inputs, a malicious relay/rendezvous server that has merely observed one of the sender's own
-    /// past opening envelopes can replay it byte-for-byte once the receiver's ratchet has genuinely
-    /// advanced past it (a couple of ordinary round-trips is enough), reconstructing the
-    /// byte-identical initial session and successfully decrypting the also-replayed ciphertext under
-    /// it — deterministically, every time, for OTK-free X3DH (`used_opk: None`, which is legal and
-    /// happens organically whenever a peer's one-time-prekey pool was empty). That would silently
-    /// roll a live, forward-secret-advanced session back to its own initial state, through the
-    /// ordinary `Ok` return path, with no gate and no notice — exactly the "weaker session" outcome
-    /// `docs/security/threat-model.md` goal 6 rules out. What actually closes this is the freshness
-    /// check above: [`responder_session_ek`](Self::responder_session_ek) (this struct's own field; see
-    /// its doc comment for the full reasoning, including a second-round fixup for a real gap the
-    /// first version of this check itself had) records **every** `ek_pub` that established a
-    /// responder session with this peer while its referenced SPK generation is still accepted — not
-    /// just the single most recent one — and the fallback refuses outright whenever the incoming
-    /// prekey's `ek_pub` matches *any* recorded entry — a byte-identical `ek_pub` is exactly what a
-    /// replay of that same opening material looks like, whereas a genuine re-initiator always draws a
-    /// fresh random ephemeral key per [`meridian_crypto::Session::initiate`] call, including the "no
-    /// recorded entry" case that field's doc comment reasons through.
+    /// **A successful decrypt alone is not enough to gate this — it proves authenticity, not
+    /// freshness.** A successful decrypt proves the claimed sender's real X3DH material produced
+    /// these bytes *at some point*; it says nothing about whether this is the message they intend to
+    /// send *now*. Because X3DH is deterministic in its public inputs, a malicious relay/rendezvous
+    /// server that has merely observed one of the sender's own past opening envelopes can replay it
+    /// byte-for-byte once the receiver's ratchet has genuinely advanced past it (a couple of ordinary
+    /// round-trips is enough), reconstructing the byte-identical initial session and successfully
+    /// decrypting the also-replayed ciphertext under it — deterministically, every time, for
+    /// OTK-free X3DH (`used_opk: None`, which is legal and happens organically whenever a peer's
+    /// one-time-prekey pool was empty). That would silently roll a live, forward-secret-advanced
+    /// session back to its own initial state, through the ordinary `Ok` return path, with no gate
+    /// and no notice — exactly the "weaker session" outcome `docs/security/threat-model.md` goal 6
+    /// rules out. What actually closes this is the freshness check below:
+    /// [`responder_session_ek`](Self::responder_session_ek) (this struct's own field; see its doc
+    /// comment for the full reasoning, including a second-round fixup for a real gap the first
+    /// version of this check itself had) records **every** `ek_pub` that established a responder
+    /// session with this peer while its referenced SPK generation is still accepted — not just the
+    /// single most recent one — and the fallback refuses outright, **before attempting any
+    /// provisional establishment at all**, whenever the incoming prekey's `ek_pub` matches *any*
+    /// recorded entry — a byte-identical `ek_pub` is exactly what a replay of that same opening
+    /// material looks like, whereas a genuine re-initiator always draws a fresh random ephemeral key
+    /// per [`meridian_crypto::Session::initiate`] call, including the "no recorded entry" case that
+    /// field's doc comment reasons through.
     ///
-    /// This is v1-scoped and non-wire-breaking: no new AAD, no version field, still `mrd.env/1`,
-    /// still signed. It does **not** discharge [ADR 0016 C7](../../../docs/adr/0016-envelope-deniability.md)
-    /// — envelope v2 will still rewrite this whole function under the new AAD/commit-on-decrypt rules
-    /// and must re-verify this behavior when it does.
+    /// **Ordering: freshness gate strictly precedes provisional establishment; the two cannot
+    /// conflict.** The freshness gate is evaluated purely from `envelope.prekey.ek_pub` and
+    /// `self.responder_session_ek` — it needs no session, no decrypt attempt, and is checked first.
+    /// Only once it has passed does `establish_responder_session_provisional` even run, and only a
+    /// successful decrypt from *that* provisional session ever commits. There is no scenario where
+    /// either check could succeed while the other would refuse: freshness is a *precondition* for
+    /// attempting provisional establishment at all, not a competing or racing gate.
     pub fn open_bytes(
         &mut self,
         store: &dyn SecretStore,
@@ -1370,64 +1475,75 @@ impl ChatState {
         blob: &[u8],
     ) -> Result<Vec<u8>, ChatError> {
         let envelope = MessageEnvelope::from_blob(blob)?;
+        if envelope.v != ENVELOPE_VERSION {
+            // (ADR 0016 C5/R5) Hard, local, unilateral reject — see this method's doc comment and
+            // `ChatError::UnsupportedEnvelopeVersion`'s own doc. Never a negotiated fallback.
+            return Err(ChatError::UnsupportedEnvelopeVersion(envelope.v));
+        }
         if &envelope.sender_pub != from {
             return Err(ChatError::SenderMismatch);
         }
-        let pk = PublicKey::from_bytes(envelope.sender_pub).map_err(|_| ChatError::BadSignature)?;
-        if !verify(
-            &pk,
-            &envelope.signing_bytes(),
-            &Signature::from_bytes(envelope.sig),
-        ) {
-            return Err(ChatError::BadSignature);
-        }
+        let preamble = preamble_aad_bytes(&envelope.prekey);
 
-        // Establish a responder session on the first (prekey) message, if we don't have one at all.
-        // Unconditional and unguarded by the freshness check below — this is the "safe half" (task
-        // 1.18): a peer with no session at all must always accept a fresh, signature-verified
-        // prekey envelope, replay or not, because there is nothing yet to roll back.
+        // No session at all: the "safe half" (task 1.18) — a peer with no session must always
+        // attempt a fresh prekey envelope, replay or not, because there is nothing yet to roll
+        // back. **Now provisional (task 6.3, ADR 0016 C2):** establishment and decrypt are
+        // attempted before anything commits; only a successful decrypt consumes the OTK, records
+        // the freshness entry, and installs the session.
         if !self.sessions.contains_key(&envelope.sender_pub) {
-            let prekey = envelope.prekey.as_ref().ok_or(ChatError::NoSession)?;
-            let ek_pub = prekey.ek_pub;
-            let used_spk = prekey.used_spk;
-            let session = self.establish_responder_session(
+            let prekey = envelope.prekey.clone().ok_or(ChatError::NoSession)?;
+            let mut provisional = self.establish_responder_session_provisional(
                 store,
                 handle,
                 our_ik,
                 &envelope.sender_pub,
-                prekey,
+                &prekey,
             )?;
-            self.sessions.insert(envelope.sender_pub, session);
-            self.record_responder_ek(envelope.sender_pub, ek_pub, used_spk);
+            // Classification choice (task 6.3, deliberate — not carried over from v1): a failed
+            // decrypt on this branch propagates as `ChatError::Crypto` via `?`, never `Desync`.
+            // `Desync`'s own doc frames it as being about an *existing* session's two live header
+            // keys (see `ChatError::Desync`'s doc) — that concept doesn't describe a first-contact
+            // attempt, which has no prior session to have desynced from. `note_desync` is
+            // therefore not called here, so a burst of bogus first-contact envelopes cannot drive
+            // the recovery-recommended threshold; only a genuinely *existing* session repeatedly
+            // failing to decrypt (the fallback branch below) can.
+            let pt = provisional.decrypt(&envelope.ct, &preamble)?;
+            // Reached only on a successful decrypt: commit, atomically, right here.
+            self.commit_responder_otk(&prekey);
+            self.record_responder_ek(envelope.sender_pub, prekey.ek_pub, prekey.used_spk);
+            self.sessions.insert(envelope.sender_pub, provisional);
+            self.reset_desync(&envelope.sender_pub);
+            return Ok(pt);
         }
 
         let session = self
             .sessions
             .get_mut(&envelope.sender_pub)
             .ok_or(ChatError::NoSession)?;
-        match session.decrypt(&envelope.ct) {
+        match session.decrypt(&envelope.ct, &preamble) {
             Ok(pt) => {
                 self.reset_desync(&envelope.sender_pub);
                 Ok(pt)
             }
             Err(meridian_crypto::CryptoError::UndecryptableHeader) => {
-                // (task 4.9, review fixup, fixed a second time) See this method's doc comment above
-                // for the full reasoning, and `responder_session_ek`'s own doc for why this freshness
-                // check exists at all and why it checks a *history*, not a single value. Only a
-                // prekey-carrying envelope is even considered, and only a genuinely successful fresh
-                // establishment + decrypt replaces the stale session — any failure along the way
-                // falls through to the untouched-state `Desync` return below, unchanged from task
-                // 1.18's original behavior.
+                // (task 4.9, re-verified under the v2 provisional flow by task 6.3) See this
+                // method's doc comment above for the full reasoning, and `responder_session_ek`'s
+                // own doc for why this freshness check exists at all and why it checks a *history*,
+                // not a single value. Only a prekey-carrying envelope is even considered, and only a
+                // genuinely successful fresh establishment + decrypt commits — any failure along the
+                // way falls through to the untouched-state `Desync` return below, unchanged from
+                // task 1.18's original behavior, and now with no OTK consumed either (task 6.3).
                 //
-                // **The freshness gate.** Before attempting anything, check the incoming prekey's
-                // `ek_pub` against *every* `ek_pub` recorded as having established a still-SPK-valid
-                // responder session with this peer (if any — see `responder_session_ek`'s doc for the
-                // "no recorded entry" case). A match against any of them means this is a replay of
-                // material that established a session we (still-validly) hold or once held: refuse
-                // the fallback outright, exactly as if no fallback existed at all, rather than let a
-                // signature-valid but stale replay roll the session back to that earlier state. A
-                // verified signature proves authenticity only, never freshness — X3DH is
-                // deterministic in its public inputs, so replaying the same opening envelope
+                // **The freshness gate — runs BEFORE any provisional establishment is attempted.**
+                // Check the incoming prekey's `ek_pub` against *every* `ek_pub` recorded as having
+                // established a still-SPK-valid responder session with this peer (if any — see
+                // `responder_session_ek`'s doc for the "no recorded entry" case). A match against
+                // any of them means this is a replay of material that established a session we
+                // (still-validly) hold or once held: refuse the fallback outright, exactly as if no
+                // fallback existed at all — never even attempt a provisional establishment — rather
+                // than let a decrypt-successful but stale replay roll the session back to that
+                // earlier state. A successful decrypt proves authenticity only, never freshness —
+                // X3DH is deterministic in its public inputs, so replaying the same opening envelope
                 // reconstructs the same initial ratchet state deterministically (always for OTK-free
                 // X3DH, since the SPK is never consumed on use) and would otherwise decrypt this
                 // same, also-replayed ciphertext successfully every time.
@@ -1436,20 +1552,22 @@ impl ChatState {
                 });
                 if !is_replay_of_current_session {
                     if let Some(prekey) = envelope.prekey.clone() {
-                        if let Ok(mut fresh) = self.establish_responder_session(
+                        if let Ok(mut fresh) = self.establish_responder_session_provisional(
                             store,
                             handle,
                             our_ik,
                             &envelope.sender_pub,
                             &prekey,
                         ) {
-                            if let Ok(pt) = fresh.decrypt(&envelope.ct) {
-                                self.sessions.insert(envelope.sender_pub, fresh);
+                            if let Ok(pt) = fresh.decrypt(&envelope.ct, &preamble) {
+                                // Commit, atomically, only now.
+                                self.commit_responder_otk(&prekey);
                                 self.record_responder_ek(
                                     envelope.sender_pub,
                                     prekey.ek_pub,
                                     prekey.used_spk,
                                 );
+                                self.sessions.insert(envelope.sender_pub, fresh);
                                 self.reset_desync(&envelope.sender_pub);
                                 return Ok(pt);
                             }
@@ -1459,8 +1577,9 @@ impl ChatState {
                 // Classify an undecryptable header as `Desync` so callers can *report* it
                 // distinguishably from malformed/tampered input (task 1.18), and record it for task
                 // 4.9's repeated-Desync recovery signal. This changes no rejection decision here: the
-                // envelope is dropped either way and `self.sessions` is left untouched — see
-                // `ChatError::Desync`'s doc comment for the full guard this counter feeds.
+                // envelope is dropped either way and `self.sessions` (and the vault's OTK pool) are
+                // left untouched — see `ChatError::Desync`'s doc comment for the full guard this
+                // counter feeds.
                 self.note_desync(envelope.sender_pub);
                 Err(ChatError::Desync)
             }
@@ -1469,22 +1588,21 @@ impl ChatState {
     }
 
     /// Shared X3DH-responder establishment, used both by [`open_bytes`](Self::open_bytes)'s
-    /// original first-contact branch and by its task-4.9 fallback recovery attempt. Does **not**
-    /// insert the resulting [`Session`] into `self.sessions` — callers decide that (immediately, for
-    /// first contact; only after a successful decrypt, for the recovery fallback).
+    /// first-contact branch and by its task-4.9 fallback recovery attempt.
     ///
-    /// Note the OTK-consumption side effect this shares with the pre-existing first-contact path:
-    /// [`PrekeyVault::take_otk_secret`] removes the referenced one-time prekey as soon as it is
-    /// found, even if the caller goes on to discard the resulting `Session` (e.g. because the
-    /// fallback's subsequent decrypt attempt fails). This mirrors the already-accepted
-    /// OTK-consumption behavior documented on `apps/core/src/session.rs`'s `ANSWER_TIMEOUT` (task
-    /// 1.33) and on this method's own first-contact call site — restructuring to avoid it would
-    /// reintroduce the handshake-ordering problems those notes exist to avoid. It is not a new
-    /// concern for the recovery fallback specifically: a failed fallback attempt can only consume an
-    /// OTK that genuinely exists and is unconsumed, so it costs nothing beyond what an ordinary
-    /// (accepted or rejected) first-contact attempt already costs.
-    fn establish_responder_session(
-        &mut self,
+    /// **(task 6.3, ADR 0016 C2) Provisional and non-destructive.** Looks up the referenced signed
+    /// prekey and (if any) one-time prekey secrets via [`PrekeyVault::peek_spk_secret`]/
+    /// [`PrekeyVault::peek_otk_secret`] — **never** the destructive
+    /// [`PrekeyVault::take_otk_secret`] — and does **not** insert the resulting [`Session`] into
+    /// `self.sessions`. Every caller must attempt a decrypt against the returned session and call
+    /// [`commit_responder_otk`](Self::commit_responder_otk) (and `record_responder_ek`/
+    /// `sessions.insert`) **only after that decrypt has actually succeeded**; a caller that commits
+    /// on anything less reintroduces the exact R3 vulnerability C2 exists to close (a mutated
+    /// preamble burning a one-time prekey and installing a poisoned session before the AEAD ever
+    /// gets a say). See [`open_bytes`](Self::open_bytes)'s own doc comment for the full
+    /// provisional/commit control flow and this task's Outcome section for the design note.
+    fn establish_responder_session_provisional(
+        &self,
         store: &dyn SecretStore,
         handle: &KeyHandle,
         our_ik: &[u8; 32],
@@ -1498,12 +1616,12 @@ impl ChatState {
         };
         let spk_secret = self
             .vault
-            .spk_secret_for(&prekey.used_spk)
+            .peek_spk_secret(&prekey.used_spk)
             .ok_or(ChatError::UnknownPrekey)?;
         let opk_secret = match prekey.used_opk {
             Some(opk) => Some(
                 self.vault
-                    .take_otk_secret(&opk)
+                    .peek_otk_secret(&opk)
                     .ok_or(ChatError::UnknownPrekey)?,
             ),
             None => None,
@@ -1517,6 +1635,24 @@ impl ChatState {
             &spk_secret,
             opk_secret,
         )?)
+    }
+
+    /// The commit half of provisional responder establishment (task 6.3, ADR 0016 C2): actually
+    /// consumes `prekey`'s one-time prekey (if any), via the destructive
+    /// [`PrekeyVault::take_otk_secret`]. Callers MUST only reach this after a provisional session
+    /// built from the same `prekey` (via
+    /// [`establish_responder_session_provisional`](Self::establish_responder_session_provisional))
+    /// has **already successfully decrypted** the envelope in question — see
+    /// [`open_bytes`](Self::open_bytes), the only caller. A no-op (not an error) if the OTK is
+    /// somehow already gone by the time this runs: within one `open_bytes` call there is no
+    /// concurrent mutation of `self.vault` between the provisional peek and this commit (both run
+    /// under the same `&mut self` borrow, single-threaded), so this can only be reached with the
+    /// OTK still present in ordinary operation — this is defense-in-depth, not a path this code
+    /// expects to exercise.
+    fn commit_responder_otk(&mut self, prekey: &Prekey) {
+        if let Some(opk) = prekey.used_opk {
+            let _ = self.vault.take_otk_secret(&opk);
+        }
     }
 
     /// Serialize and seal the whole state under a key derived from the account key in `store`.

@@ -7,6 +7,12 @@
 use meridian_crypto::{CryptoError, DoubleRatchet};
 use x25519_dalek::{PublicKey, StaticSecret};
 
+/// (task 6.3, ADR 0016 C2/C3) `encrypt`/`decrypt` now take an explicit preamble argument, folded
+/// into the v2 AAD. This file exercises ratchet failure-atomicity, not preamble binding (that is
+/// `apps/crypto/src/ratchet.rs`'s own unit tests' job), and never carries an X3DH preamble on any
+/// step here, so every call below consistently uses the empty preamble.
+const NO_PREAMBLE: &[u8] = &[];
+
 fn x25519_pair() -> ([u8; 32], [u8; 32]) {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).unwrap();
@@ -47,18 +53,18 @@ fn failed_decrypt_leaves_ratchet_state_untouched_and_session_survives() {
     let (mut alice, mut bob) = established_pair();
 
     // Establish: alice's first message primes bob's receiving chain (his first DH ratchet step).
-    let c0 = alice.encrypt(b"hello bob").unwrap();
-    assert_eq!(bob.decrypt(&c0).unwrap(), b"hello bob");
+    let c0 = alice.encrypt(b"hello bob", NO_PREAMBLE).unwrap();
+    assert_eq!(bob.decrypt(&c0, NO_PREAMBLE).unwrap(), b"hello bob");
 
     // A genuine second message, consumed normally — this is the one a relay will replay.
-    let c1 = alice.encrypt(b"m1").unwrap();
-    assert_eq!(bob.decrypt(&c1).unwrap(), b"m1");
+    let c1 = alice.encrypt(b"m1", NO_PREAMBLE).unwrap();
+    assert_eq!(bob.decrypt(&c1, NO_PREAMBLE).unwrap(), b"m1");
 
     let before = state_bytes(&bob);
 
     // Replay: hand bob the exact same bytes again.
     let err = bob
-        .decrypt(&c1)
+        .decrypt(&c1, NO_PREAMBLE)
         .expect_err("a byte-identical replay must not decrypt a second time");
     assert!(
         matches!(err, CryptoError::Crypto),
@@ -79,9 +85,9 @@ fn failed_decrypt_leaves_ratchet_state_untouched_and_session_survives() {
     // The session is genuinely still live: a subsequent GENUINE message decrypts fine. Before the
     // fix this would fail with CryptoError::Crypto forever, because bob's `ckr`/`nr` had already
     // been advanced past what alice's actual next message rides.
-    let c2 = alice.encrypt(b"m2").unwrap();
+    let c2 = alice.encrypt(b"m2", NO_PREAMBLE).unwrap();
     assert_eq!(
-        bob.decrypt(&c2).unwrap(),
+        bob.decrypt(&c2, NO_PREAMBLE).unwrap(),
         b"m2",
         "a genuine message after a rejected replay must still decrypt — the rollback must not \
          itself have broken the happy path"
@@ -99,24 +105,24 @@ fn failed_decrypt_during_a_dh_ratchet_catch_up_leaves_no_skipped_key_residue() {
     let (mut alice, mut bob) = established_pair();
 
     // Establish bob's receiving chain (his first DH-ratchet step, off alice's opening message).
-    let c0 = alice.encrypt(b"hello bob").unwrap();
-    bob.decrypt(&c0).unwrap();
+    let c0 = alice.encrypt(b"hello bob", NO_PREAMBLE).unwrap();
+    bob.decrypt(&c0, NO_PREAMBLE).unwrap();
 
     // Alice sends a second message on the SAME chain, but it is held back — bob will only learn
     // about it later, via a skipped-key catch-up on the *old* chain.
-    let c1 = alice.encrypt(b"held-back-old-chain").unwrap();
+    let c1 = alice.encrypt(b"held-back-old-chain", NO_PREAMBLE).unwrap();
 
     // Bob replies. Alice must consume it to advance her own sending ratchet to a fresh chain
     // (the PCS DH step) — this is what makes bob's next receive of an alice message look like a
     // DH-ratchet step from his side.
-    let r0 = bob.encrypt(b"hi alice").unwrap();
-    assert_eq!(alice.decrypt(&r0).unwrap(), b"hi alice");
+    let r0 = bob.encrypt(b"hi alice", NO_PREAMBLE).unwrap();
+    assert_eq!(alice.decrypt(&r0, NO_PREAMBLE).unwrap(), b"hi alice");
 
     // Alice sends two more messages, now on her NEW post-ratchet chain. Bob will only be handed
     // the second — a gap on the OLD chain (c1) plus a gap on the NEW chain (d0) that a single
     // `decrypt` call must catch up through a DH-ratchet step, all before the final AEAD check.
-    let d0 = alice.encrypt(b"held-back-new-chain").unwrap();
-    let d1 = alice.encrypt(b"m3").unwrap();
+    let d0 = alice.encrypt(b"held-back-new-chain", NO_PREAMBLE).unwrap();
+    let d1 = alice.encrypt(b"m3", NO_PREAMBLE).unwrap();
 
     let before = state_bytes(&bob);
 
@@ -129,7 +135,7 @@ fn failed_decrypt_during_a_dh_ratchet_catch_up_leaves_no_skipped_key_residue() {
     *tampered.last_mut().unwrap() ^= 0xFF;
 
     let err = bob
-        .decrypt(&tampered)
+        .decrypt(&tampered, NO_PREAMBLE)
         .expect_err("a tampered ciphertext must not decrypt, even mid catch-up");
     assert!(
         matches!(err, CryptoError::Crypto),
@@ -148,13 +154,19 @@ fn failed_decrypt_during_a_dh_ratchet_catch_up_leaves_no_skipped_key_residue() {
     // The session is still live: delivering the real (untampered) ciphertext runs the identical
     // catch-up for real and must open correctly.
     let opened = bob
-        .decrypt(&d1)
+        .decrypt(&d1, NO_PREAMBLE)
         .expect("the genuine message must still decrypt after a rejected tamper");
     assert_eq!(opened, b"m3");
 
     // And BOTH messages this real catch-up skipped over — one on the old chain, one on the new —
     // are recoverable from their retained skipped keys: proof the entries are present exactly
     // once each (a partial rollback that dropped one but not the other would fail this).
-    assert_eq!(bob.decrypt(&c1).unwrap(), b"held-back-old-chain");
-    assert_eq!(bob.decrypt(&d0).unwrap(), b"held-back-new-chain");
+    assert_eq!(
+        bob.decrypt(&c1, NO_PREAMBLE).unwrap(),
+        b"held-back-old-chain"
+    );
+    assert_eq!(
+        bob.decrypt(&d0, NO_PREAMBLE).unwrap(),
+        b"held-back-new-chain"
+    );
 }

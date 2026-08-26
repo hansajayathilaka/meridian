@@ -92,14 +92,6 @@ impl Party {
             .open_inbound(&self.store, self.account.handle(), &ik, from, blob)
             .err()
     }
-    /// Re-sign a (possibly modified) envelope under this party's identity key, so it is authentic
-    /// rather than merely forged — the signature/sender checks pass and the ratchet is reached.
-    fn resign(&self, mut env: MessageEnvelope) -> Vec<u8> {
-        let sig = meridian_identity::sign(&self.store, self.account.handle(), &env.signing_bytes())
-            .unwrap();
-        env.sig = *sig.as_bytes();
-        env.to_blob().unwrap()
-    }
 }
 
 struct ChatErr;
@@ -152,7 +144,7 @@ fn full_relayed_exchange_with_receipt() {
 }
 
 #[test]
-fn tampered_sender_and_signature_are_rejected() {
+fn tampered_sender_and_ciphertext_are_rejected() {
     let mut alice = Party::new("chat.a");
     let mut bob = Party::new("chat.b");
     let bob_bundle = bob.publish();
@@ -171,11 +163,13 @@ fn tampered_sender_and_signature_are_rejected() {
         },
     );
 
-    // A blob claiming a different routing origin than the signed sender is rejected.
+    // A blob claiming a different routing origin than the envelope's own sender is rejected
+    // (`ChatError::SenderMismatch` — unchanged by envelope v2, checked before any crypto work).
     let wrong_from = [0xABu8; 32];
     assert!(bob.recv(&wrong_from, &blob).is_err());
 
-    // Flipping a ciphertext byte breaks the signature → rejected before any decryption.
+    // Flipping a ciphertext byte breaks the ratchet AEAD tag (v2, ADR 0016 C2/C3 — there is no
+    // longer a signature; authentication is the AEAD's job) → rejected, never decrypted.
     let mut env = MessageEnvelope::from_blob(&blob).unwrap();
     env.ct[0] ^= 0x01;
     let tampered = env.to_blob().unwrap();
@@ -480,15 +474,17 @@ fn undecryptable_envelope_is_rejected_without_touching_the_session() {
 
     let before = state_bytes_excluding_desync_counts(&bob.state);
 
-    // An *authentic* envelope from Alice whose ratchet header opens under neither of Bob's header
-    // keys: mangle a byte inside the encrypted header, then re-sign as Alice so it passes the
-    // signature and sender checks and reaches the ratchet. This is precisely the input a naive
-    // "N undecryptable envelopes => re-handshake" rule would react to. Note this envelope still
-    // carries Alice's (unconfirmed-initiator) prekey preamble — Bob never replied in this test — so
-    // this also exercises task 4.9's `open_bytes` fallback path: it is attempted, but must fail
-    // (the preamble's one-time prekey was already consumed by the opening message above), which is
-    // exactly what keeps the byte-identical assertion below meaningful for this task too, not just
-    // for 1.18's original (pre-4.9) code path.
+    // An envelope from Alice whose ratchet header opens under neither of Bob's header keys: mangle
+    // a byte inside the encrypted header. Envelope v2 has no signature to re-apply — the envelope's
+    // `sender_pub` and routing `from` already match, so this reaches the ratchet unchanged. This is
+    // precisely the input a naive "N undecryptable envelopes => re-handshake" rule would react to.
+    // Note this envelope still carries Alice's (unconfirmed-initiator) prekey preamble — Bob never
+    // replied in this test — so this also exercises task 4.9's `open_bytes` fallback path: it is
+    // attempted (provisionally, task 6.3/ADR 0016 C2), but must fail (the preamble's one-time
+    // prekey was already consumed by the opening message above, so even the non-destructive
+    // `peek_otk_secret` lookup finds nothing), which is exactly what keeps the byte-identical
+    // assertion below meaningful for this task too, not just for 1.18's original (pre-4.9) code
+    // path.
     let mut env = MessageEnvelope::from_blob(&alice.send(
         &bob_ik,
         &ChatContent::Text {
@@ -498,7 +494,7 @@ fn undecryptable_envelope_is_rejected_without_touching_the_session() {
     ))
     .unwrap();
     env.ct[2] ^= 0xFF; // inside enc_header (past the 2-byte length prefix)
-    let mangled = alice.resign(env);
+    let mangled = env.to_blob().unwrap();
 
     match bob.recv_err(&alice_ik, &mangled) {
         Some(e) => assert!(

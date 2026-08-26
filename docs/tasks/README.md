@@ -79,6 +79,14 @@ evaporate:
   GitHub's branch-protection/ruleset config. 3.12 landed the pre-merge docker build gate itself but
   left this one sub-item open by design rather than guessing; check GitHub Settings → Branches/
   Rulesets and update that doc's `TODO: confirm` once observed.
+- **`PrekeyVault::establish_responder_session_provisional`'s peeked SPK/OTK secrets aren't
+  `Zeroizing`-wrapped** (task 6.3's security-reviewer, should-fix, not blocking) — plain `[u8;32]`
+  stack copies, mirroring the pre-existing `spk_secret_for`/`take_otk_secret` pattern, so not a
+  regression 6.3 introduced. But envelope v2's commit-on-decrypt (C2) makes this unscrubbed-copy path
+  routinely attacker-triggerable (every mutated preamble/ciphertext takes it now, not just legitimate
+  publishes). Short-lived stack memory, never logged/persisted, so non-blocking — but no open task
+  currently owns `apps/core/src/chat.rs`'s `PrekeyVault` secret-handling to pick this up; flag for
+  whoever next touches that code or for a future `/plan-phase`.
 
 > **Keep this section short.** Per-task outcomes, review sign-offs, and the decisions behind them
 > live in each task file's **Outcome** section (and the phase README) — not here. This block carries
@@ -355,7 +363,7 @@ consult) that shaped them: [phase-6/README.md](./phase-6/README.md).
 
 **Wave 1 — independent, both unblocked now**
 - [x] **6.1** SPK rotation policy: age tracking + rotation-due predicate (C1, 1/3) — [file](./phase-6/6.1-spk-rotation-age-tracking.md)
-- [~] **6.3** Envelope v2 core cutover: wire shape + canonical AAD + commit-on-decrypt + desync short-circuit fix (C2, C3, C5, C6, C7 short-circuit) — [file](./phase-6/6.3-envelope-v2-core-cutover.md)
+- [x] **6.3** Envelope v2 core cutover: wire shape + canonical AAD + commit-on-decrypt + desync short-circuit fix (C2, C3, C5, C6, C7 short-circuit) — [file](./phase-6/6.3-envelope-v2-core-cutover.md)
 
 **Wave 2**
 - [ ] **6.2** SPK rotation enforcement: trigger + monitoring in both client loops (C1, 2–3/3; depends on 6.1) — [file](./phase-6/6.2-spk-rotation-enforcement.md)

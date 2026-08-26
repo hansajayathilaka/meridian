@@ -20,10 +20,10 @@
 //! **Why the desync itself is forced directly against `ChatState`, not driven over the live P2P
 //! data channel.** `P2pSession` has no raw-channel-send escape hatch by design (every outbound frame
 //! goes through `chat.seal_outbound`/`seal_bytes` — see `send_chat`/`send_chat_content`), so there is
-//! no way to inject a mangled-but-authentically-signed frame through the transport without reaching
-//! into private fields. `recover_from_desync`'s own contract only cares that
+//! no way to inject a mangled ratchet frame through the transport without reaching into private
+//! fields. `recover_from_desync`'s own contract only cares that
 //! `ChatState::recovery_recommended` reads `true` for this session's peer — it does not care *how*
-//! the desync counter got there — so forcing it via the same `mangle_and_resign` technique
+//! the desync counter got there — so forcing it via the same `mangle` technique
 //! `desync_recovery.rs`/`chat_manager.rs` already use, directly against the session's own `ChatState`,
 //! is the honest, minimal way to reach that precondition while still exercising the method under a
 //! **real, already-established** `P2pSession` (real dial/answer, real DTLS-fingerprint-equivalent
@@ -77,7 +77,7 @@ impl Peer {
         self.account.handle().clone()
     }
     /// Seal a legitimate outbound message under this peer's own live session — used both for the
-    /// ordinary before/after health checks and as raw material for [`mangle_and_resign`].
+    /// ordinary before/after health checks and as raw material for [`mangle`].
     fn seal(&mut self, to: &[u8; 32], id: u8, body: &str) -> Vec<u8> {
         let ik = self.ik();
         self.chat
@@ -95,16 +95,13 @@ impl Peer {
     }
 }
 
-/// Mirrors `apps/core/tests/desync_recovery.rs::mangle_and_resign` exactly: corrupt an authentic
-/// envelope's ratchet header (a byte inside `enc_header`, past the 2-byte length prefix) and re-sign
-/// it under the real sender's identity key, so the result is authentic (passes signature
-/// verification) but undecryptable (`ChatError::Desync`) — never a forged sender.
-fn mangle_and_resign(signer_store: &MemorySecretStore, signer: &AccountId, blob: &[u8]) -> Vec<u8> {
+/// Mirrors `apps/core/tests/desync_recovery.rs::mangle` exactly: corrupt an envelope's ratchet
+/// header (a byte inside `enc_header`, past the 2-byte length prefix). Envelope v2 has no signature
+/// to preserve — `sender_pub`/routing `from` are untouched, so the mangled bytes reach the ratchet
+/// unchanged and come back undecryptable (`ChatError::Desync`), never a forged sender.
+fn mangle(blob: &[u8]) -> Vec<u8> {
     let mut env = MessageEnvelope::from_blob(blob).expect("decode envelope");
     env.ct[2] ^= 0xFF;
-    let sig = meridian_core::identity::sign(signer_store, signer.handle(), &env.signing_bytes())
-        .expect("resign");
-    env.sig = *sig.as_bytes();
     env.to_blob().expect("encode envelope")
 }
 
@@ -230,7 +227,7 @@ fn force_desync_threshold(alice: &mut Peer, bob: &mut Peer) {
             "must not fire before the threshold (iteration {i})"
         );
         let noise = bob.seal(&alice_ik, (200 + i) as u8, "noise");
-        let mangled = mangle_and_resign(&bob.store, &bob.account, &noise);
+        let mangled = mangle(&noise);
         let err = alice
             .chat
             .open_inbound(&alice.store, &alice.handle(), &alice_ik, &bob_ik, &mangled)
@@ -259,7 +256,7 @@ async fn recover_from_desync_is_a_noop_below_the_threshold_and_touches_nothing()
     // Only DESYNC_RECOVERY_THRESHOLD - 1 forced desyncs — never crosses the threshold.
     for i in 0..DESYNC_RECOVERY_THRESHOLD - 1 {
         let noise = bob.seal(&alice_ik, (10 + i) as u8, "noise");
-        let mangled = mangle_and_resign(&bob.store, &bob.account, &noise);
+        let mangled = mangle(&noise);
         let _ =
             alice
                 .chat
