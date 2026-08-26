@@ -148,6 +148,29 @@ fn mangle(blob: &[u8]) -> Vec<u8> {
     env.to_blob().unwrap()
 }
 
+/// (task 6.4, ADR 0016 C7 second half) Flip a byte of an envelope's `eid` before replaying it.
+///
+/// This file's replay cells below construct a **byte-for-byte replay of a genuine opening
+/// envelope that has already been successfully decrypted once** — precisely the case task 6.4's
+/// `open_bytes`-level `eid` dedup check now also short-circuits, *before* the
+/// `responder_session_ek` freshness gate these cells are actually named for even runs. Left
+/// unmodified, every one of these replays would be caught by the (new, earlier) dedup check
+/// instead, making the freshness-gate assertions below vacuous — never actually exercising
+/// `responder_session_ek` again once this task landed.
+///
+/// `eid` is unauthenticated outer plaintext with no security property of its own (see
+/// `ChatError::DuplicateEnvelope`'s doc comment) — an attacker with byte access can trivially vary
+/// it, so a replay that changes only `eid` while keeping the X3DH preamble and ciphertext
+/// byte-for-byte identical is, if anything, a *more* attacker-realistic construction than one that
+/// doesn't, not a weaker one. This keeps every cell below proving what it always proved: that the
+/// freshness gate alone — independent of, and not merely masked by, the newer dedup layer — still
+/// safely rejects the replay.
+fn with_different_eid(blob: &[u8]) -> Vec<u8> {
+    let mut env = MessageEnvelope::from_blob(blob).unwrap();
+    env.eid[0] ^= 0xFF;
+    env.to_blob().unwrap()
+}
+
 // -- deliverable 3, bullet 1: end-to-end, both directions --------------------------------------
 
 /// The flagship scenario: Alice's session with Bob *looks* healthy from her own side, but every
@@ -714,8 +737,11 @@ fn replaying_the_original_opening_envelope_after_ratchet_advancement_is_rejected
 
     // The attack: replay Alice's ORIGINAL, unmodified opening envelope byte-for-byte — not
     // corrupted, not mutated, exactly what she sent the very first time and what an on-path relay
-    // could have simply recorded and replayed later.
-    let replay_result = bob.recv_err(&alice_ik, &opening);
+    // could have simply recorded and replayed later. (task 6.4) Give it a different `eid` — see
+    // `with_different_eid`'s own doc comment for why this cell must not rely on the newer,
+    // earlier-running `eid` dedup check to prove the `responder_session_ek` freshness gate itself
+    // still independently rejects the replay.
+    let replay_result = bob.recv_err(&alice_ik, &with_different_eid(&opening));
     assert!(
         matches!(replay_result, Some(ChatError::Desync)),
         "a replayed original opening envelope must be classified as an ordinary Desync — never \
@@ -947,8 +973,10 @@ fn replaying_the_first_of_two_genuine_openers_is_still_rejected_after_the_second
     // THE ATTACK: replay Alice's ORIGINAL (first) opening envelope, captured byte-for-byte, now
     // that Bob's live session has moved on to the second establishment. This is exactly what the
     // pre-fix scalar `responder_session_ek` could no longer catch, since its one slot had already
-    // been overwritten by the second establishment's `ek_pub`.
-    let replay_result = bob.recv_err(&alice_ik, &opening_1);
+    // been overwritten by the second establishment's `ek_pub`. (task 6.4) Different `eid` — see
+    // `with_different_eid`'s doc comment: this cell targets `responder_session_ek` specifically,
+    // not the newer, earlier-running `eid` dedup check.
+    let replay_result = bob.recv_err(&alice_ik, &with_different_eid(&opening_1));
     assert!(
         matches!(replay_result, Some(ChatError::Desync)),
         "a replay of the FIRST genuine opener, after a SECOND genuine establishment has happened \
@@ -1021,8 +1049,10 @@ fn replay_after_the_referenced_spk_generation_genuinely_expires_still_fails_safe
     // `establish_responder_session`'s own `UnknownPrekey` (the vault no longer holds generation 1's
     // secret at all), which `open_bytes`'s fallback already treats as an ordinary failed recovery
     // attempt (falls through to `Desync`, state untouched) — a different, already-safe failure mode,
-    // not a regression.
-    let replay_result = bob.recv_err(&alice_ik, &opening_1);
+    // not a regression. (task 6.4) Different `eid` — see `with_different_eid`'s doc comment: this
+    // cell targets the `UnknownPrekey`-after-pruning fallback specifically, not the newer,
+    // earlier-running `eid` dedup check.
+    let replay_result = bob.recv_err(&alice_ik, &with_different_eid(&opening_1));
     assert!(
         matches!(replay_result, Some(ChatError::Desync)),
         "a replay referencing a genuinely expired SPK generation must still fail closed — got: \
@@ -1264,8 +1294,13 @@ fn responder_session_ek_freshness_protection_survives_sealed_restart() {
     let before = state_bytes_excluding_desync_counts(&bob.state);
 
     // Replay the original opening envelope AFTER the reopen: still rejected — proving the
-    // freshness record's content, not merely the session, survived the round trip.
-    let replay_result = bob.recv_err(&alice_ik, &opening);
+    // freshness record's content, not merely the session, survived the round trip. (task 6.4)
+    // Different `eid` — see `with_different_eid`'s doc comment: this cell targets
+    // `responder_session_ek`'s own at-rest survival specifically. (`seen_eids` also survives the
+    // round trip — it is part of the same sealed `ChatState` — so an unmodified replay would now
+    // be caught by the dedup layer regardless of whether `responder_session_ek` itself made the
+    // trip correctly, which is exactly what this cell must not accidentally rely on.)
+    let replay_result = bob.recv_err(&alice_ik, &with_different_eid(&opening));
     assert!(
         matches!(replay_result, Some(ChatError::Desync)),
         "the freshness protection must survive seal_at_rest/open_at_rest — got: {replay_result:?}"

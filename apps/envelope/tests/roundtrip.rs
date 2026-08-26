@@ -29,6 +29,7 @@ fn message_envelope_roundtrips_and_binds_the_preamble_aad_encoding() {
     let env = MessageEnvelope {
         v: ENVELOPE_VERSION,
         sender_pub: [9u8; 32],
+        eid: [6u8; 16],
         prekey: Some(prekey),
         ct: vec![0xDE, 0xAD, 0xBE, 0xEF],
     };
@@ -72,6 +73,7 @@ fn envelope_version_is_mandatory_and_never_defaulted() {
     let env = MessageEnvelope {
         v: 999, // deliberately not ENVELOPE_VERSION
         sender_pub: [9u8; 32],
+        eid: [1u8; 16],
         prekey: None,
         ct: vec![0x01],
     };

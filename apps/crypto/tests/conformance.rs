@@ -275,6 +275,12 @@ fn envelope_vectors_match_real_encoding() {
         let env = MessageEnvelope {
             v: meridian_envelope::ENVELOPE_VERSION,
             sender_pub,
+            // (task 6.4) This whole test is `#[ignore]`d pending task 6.5's `envelope-v2.json`
+            // regeneration (see the `#[ignore]` reason above) — `envelope-v1.json` predates `eid`
+            // entirely, so there is no fixture value to read here. A fixed placeholder keeps this
+            // obsolete body compiling; it asserts nothing about `eid` and is superseded wholesale by
+            // 6.5's rewrite against the real v2 vectors.
+            eid: [0u8; 16],
             prekey,
             ct,
         };

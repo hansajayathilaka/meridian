@@ -21,6 +21,15 @@
 //!   — it is authenticated instead by feeding the ratchet's X3DH-derived `AD`, which fails closed
 //!   on a substituted key (C3's raw-Ed25519, never-normalized requirement is what keeps a
 //!   sign-flipped key from colliding here; see `apps/crypto/src/x3dh.rs`).
+//! - `eid` (task 6.4, ADR 0016 C7 second half) — a sender-random 128-bit envelope dedup key,
+//!   minted once per `ChatState::seal_bytes` call (`apps/core/src/chat.rs`) and carried **outer
+//!   plaintext**, deliberately outside the C3 canonical AAD (it is a redelivery/duplicate-processing
+//!   convenience, not a security boundary — see that method's own doc comment and this task's
+//!   Outcome section for the full design note; it is fed into no AAD, and
+//!   `apps/crypto/src/ratchet.rs`'s AAD construction is untouched by it). It sits alongside
+//!   `v`/`sender_pub`/`prekey` for exactly that reason: it is never part of the ratchet-encrypted
+//!   `ct`, only of the envelope's own outer, unauthenticated-by-the-AEAD framing — anyone with the
+//!   bytes can already see (and forge) it, same as `sender_pub`/`prekey` before this field existed.
 //! - `prekey` — present only on the opening message(s) of a session: the X3DH preamble the
 //!   responder needs to complete the handshake. Bound into the AAD via [`preamble_aad_bytes`], and
 //!   — per C2 — the responder's X3DH runs *provisionally* against it until decrypt actually
@@ -65,6 +74,11 @@ pub struct MessageEnvelope {
     pub v: u16,
     #[serde(with = "meridian_proto::bytes::b32")]
     pub sender_pub: [u8; 32],
+    /// (task 6.4, ADR 0016 C7 second half) Sender-random 128-bit dedup key — see the module doc's
+    /// `eid` entry. Mandatory (never `Option`/defaulted): every v2 envelope carries one, minted
+    /// fresh by `ChatState::seal_bytes` on every call.
+    #[serde(with = "meridian_proto::bytes::b16")]
+    pub eid: [u8; 16],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prekey: Option<Prekey>,
     #[serde(with = "meridian_proto::bytes::bytes_vec")]

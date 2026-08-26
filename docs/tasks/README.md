@@ -95,7 +95,15 @@ evaporate:
   `tools/metrics-allowlist.txt`/`docs/operations/monitoring.md` — the column already exists
   server-side, nothing about 6.2 forecloses it. No open task owns this; schedule via a future
   `/plan-phase` when devops prioritizes it.
-
+- **T07 (mailbox, still unbuilt)'s planned `mailbox` table uses `eid BLOB` as its row key
+  ([data-model.md](../architecture/data-model.md)) — a naming collision with task 6.4's new
+  `MessageEnvelope::eid` (envelope-level replay-dedup, client-side only) that whoever plans T07 must
+  resolve deliberately, not by accident.** The server's "envelope stays opaque, never decoded"
+  invariant is otherwise absolute; if T07's mailbox PK is meant to be *derived from* the envelope's
+  `eid`, that requires the server to peek one field of an otherwise-opaque blob — a real design
+  question, not a given. If instead the mailbox mints its own independent row key, it should be named
+  to avoid the collision. Flagged by task 6.4's architect review; not 6.4's problem to resolve since
+  T07 doesn't exist in code yet.
 > **Keep this section short.** Per-task outcomes, review sign-offs, and the decisions behind them
 > live in each task file's **Outcome** section (and the phase README) — not here. This block carries
 > only what is *currently actionable* plus obligations no open task owns.
@@ -375,7 +383,7 @@ consult) that shaped them: [phase-6/README.md](./phase-6/README.md).
 
 **Wave 2**
 - [x] **6.2** SPK rotation enforcement: trigger + monitoring in both client loops (C1, 2–3/3; depends on 6.1) — [file](./phase-6/6.2-spk-rotation-enforcement.md)
-- [ ] **6.4** `eid` replay-dedup key (C7, 2/2; depends on 6.3) — [file](./phase-6/6.4-eid-replay-dedup.md)
+- [x] **6.4** `eid` replay-dedup key (C7, 2/2; depends on 6.3) — [file](./phase-6/6.4-eid-replay-dedup.md)
 - [ ] **6.6** Test re-pointing: v1 detector → v2 AEAD + new C3/R1 adversarial cells (depends on 6.3) — [file](./phase-6/6.6-repoint-adversarial-tests.md)
 
 **Wave 3**

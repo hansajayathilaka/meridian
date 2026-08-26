@@ -14,6 +14,14 @@
 //! failed decrypt leaves no trace (see [`ChatState::open_bytes`]). The claimed sender key is
 //! still checked against the routing `from`. The whole state is sealed at rest under a
 //! keystore-derived key.
+//!
+//! (task 6.4, ADR 0016 C7 second half) `MessageEnvelope::eid` — a sender-random, unauthenticated
+//! outer-plaintext dedup key — is checked against a bounded, sealed-at-rest recently-seen set
+//! *before* the AAD/decrypt machinery above ever runs, so a genuinely redelivered envelope is
+//! recognized and dropped without reprocessing it as new. This is strictly a redelivery
+//! convenience layered on top of the AEAD/freshness-gate security properties above, never a
+//! substitute for them — see [`ChatError::DuplicateEnvelope`] and [`ChatState::open_bytes`]'s doc
+//! comment.
 
 use std::collections::BTreeMap;
 
@@ -135,6 +143,32 @@ pub enum ChatError {
     /// intro captured by the first envelope is untouched.
     #[error("sender has a pending message request awaiting accept/reject")]
     RequestPending,
+    /// (task 6.4, ADR 0016 C7 second half) The envelope's `eid` matches one already recorded in
+    /// [`ChatState::seen_eids`] — i.e. this exact envelope was already successfully decrypted and
+    /// delivered/gated once before. **Not an attack classification and not an error in the ordinary
+    /// sense** — reused `Result`'s error channel the same way [`MessageRequest`](ChatError::MessageRequest)
+    /// does, for a non-fatal, but distinguishable, "nothing new to do here" outcome: a genuine
+    /// redelivery (a relay retry, or the sender's own unconfirmed-initiator resend before it has
+    /// seen a reply — see [`ChatState::seal_bytes`]'s doc comment for exactly what "resend" means
+    /// here) is recognized and dropped **without reprocessing it as new** — the content was already
+    /// delivered on the envelope's first, genuine arrival, so silently no-op'ing the duplicate (never
+    /// re-delivering the content a second time, never touching any session/trust/request-queue
+    /// state) is correct, not a downgrade. Checked *before* any provisional establishment or decrypt
+    /// attempt is made ([`ChatState::open_bytes`]'s very first check after the cheap `v`/`sender_pub`
+    /// checks), so a genuinely redelivered envelope costs no crypto work the second time.
+    ///
+    /// **What this does NOT claim (see ADR 0016 R2 and this task's Outcome section).** `eid` is
+    /// unauthenticated outer plaintext with no confidentiality/authenticity property of its own — an
+    /// attacker with byte access can freely omit, vary, or replay any `eid` value. This check is
+    /// therefore a redelivery/duplicate-processing **convenience**, not a pre-crypto DoS filter and
+    /// not an independent security boundary: it never substitutes for the ratchet AEAD's own
+    /// authentication, or for [`ChatState::responder_session_ek`]'s freshness gate, both of which
+    /// remain the actual security-relevant checks and are exercised exactly as before whenever an
+    /// envelope's `eid` has *not* been seen before (including a forged envelope that varies its
+    /// `eid` specifically to evade this check — see this task's Outcome section for why that is not
+    /// a regression).
+    #[error("envelope already processed (duplicate eid)")]
+    DuplicateEnvelope,
 }
 
 /// How long a *superseded* prekey generation stays usable after a republish, in seconds (task 1.31).
@@ -267,6 +301,37 @@ pub const DESYNC_RECOVERY_THRESHOLD: u32 = 5;
 /// free-to-mint identity key) that `MAX_PENDING_REQUESTS` already reasons about at length, and
 /// there's no basis in the design docs for treating the two ceilings differently.
 pub const MAX_RESPONDER_SESSION_EK_PEERS: usize = 256;
+
+/// Hard cap on the number of envelope `eid`s [`ChatState`] remembers as "recently, successfully
+/// processed" (task 6.4, ADR 0016 C7 second half).
+///
+/// [`ChatState::open_bytes`]'s dedup check ([`ChatState::seen_eids`]) records an `eid` **only** on a
+/// *successful* decrypt — see that field's doc comment — so, unlike [`MAX_PENDING_REQUESTS`]/
+/// [`MAX_RESPONDER_SESSION_EK_PEERS`], an attacker cannot grow this set for free with OTK-free
+/// first-contact junk alone: every entry costs the attacker a genuine AEAD success (their own key
+/// material, or a captured genuine ciphertext that still decrypts). It is still bounded, not
+/// literally unbounded, because a flood of **distinct, fresh** identities each completing one
+/// genuine (if otherwise pointless) OTK-free X3DH handshake — exactly [`MAX_PENDING_REQUESTS`]'s own
+/// attack shape, since a first-contact envelope that lands in the gated request queue still commits
+/// per ADR 0016 C2 and therefore still records an `eid` — is a real, if costlier, way to grow this
+/// set; see `apps/core/tests/message_request_flood.rs` for the general shape and this task's own
+/// `apps/core/tests/eid_dedup.rs` for the `eid`-set-specific bound proof.
+///
+/// `TODO: confirm`: no design doc gives a numeric bound here — mirrors `MAX_PENDING_REQUESTS`'s own
+/// precedent for exactly this kind of open threshold (see that constant's doc). Deliberately set to
+/// the *same* value (256) rather than a larger one: `eid` dedup is a **recent-redelivery**
+/// convenience (a relay retry landing twice, or a genuine unconfirmed-initiator resend before a
+/// reply arrives — see [`ChatState::seal_bytes`]'s doc comment for the retransmit semantics this
+/// task settled on), not a permanent replay ledger — R2 already accepts that only a *cheap
+/// pre-filter*, never an unconditional guarantee, is in scope here (see [`ChatError::Desync`]'s doc
+/// and this task's Outcome section). An `eid` evicted by this cap simply falls back to whatever
+/// behavior existed before this task for that specific envelope shape (the ratchet's own
+/// single-use-message-key exhaustion for an ordinary steady-state message, or the
+/// [`responder_session_ek`](ChatState::responder_session_ek) freshness gate for a prekey-carrying
+/// one) — never a silent acceptance. Eviction is oldest-first, mirroring
+/// [`evict_oldest_pending`](ChatState::evict_oldest_pending)'s own insertion-order technique exactly
+/// (see [`ChatState::seen_eid_order`]).
+pub const MAX_SEEN_EIDS: usize = 256;
 
 /// One published one-time prekey's key pair (public + X25519 secret).
 ///
@@ -755,6 +820,42 @@ pub struct ChatState {
     /// `responder_session_ek` right after deserializing.
     #[serde(default)]
     responder_session_ek_order: Vec<[u8; 32]>,
+    /// (task 6.4, ADR 0016 C7 second half) Envelope `eid`s [`open_bytes`](Self::open_bytes) has
+    /// **successfully decrypted** recently — the dedup check that lets a genuinely redelivered
+    /// envelope (relay retry, or a legitimate unconfirmed-initiator resend — see
+    /// [`seal_bytes`](Self::seal_bytes)'s doc comment) be recognized and dropped without
+    /// reprocessing it as new (see [`ChatError::DuplicateEnvelope`]).
+    ///
+    /// **Written only on success, deliberately.** An `eid` is recorded here only once its envelope
+    /// has actually decrypted (via [`record_seen_eid`](Self::record_seen_eid), called from every one
+    /// of `open_bytes`'s three `Ok` return points — first-contact establishment, an existing
+    /// session's ordinary decrypt, and the task-4.9 stale-session recovery fallback) — never
+    /// speculatively, and never for a rejected/failed attempt. This is what keeps the dedup check
+    /// safe to run *before* any crypto work: an attacker cannot pre-poison a legitimate sender's
+    /// future `eid` (128 bits of sender-random entropy — see `seal_bytes`), and cannot use a forged
+    /// envelope carrying someone else's already-seen `eid` to suppress a *distinct*, not-yet-sent
+    /// message, since that future message will carry its own, different, freshly-random `eid` — see
+    /// [`ChatError::DuplicateEnvelope`]'s doc comment for the precise, deliberately narrow security
+    /// claim (none) this check makes.
+    ///
+    /// Bounded by [`MAX_SEEN_EIDS`] — see that constant's doc for why this set, unlike
+    /// `pending_requests`/`responder_session_ek`, is not free for an attacker to grow. No
+    /// `open_at_rest`-time reconciliation is needed against `seen_eid_order` (contrast
+    /// `responder_session_ek_order`/`request_order`, both of which repair drift against a field that
+    /// predates their own order-tracking companion): `seen_eids` and `seen_eid_order` were
+    /// introduced together, in this same task, so there is no pre-existing at-rest blob that could
+    /// have one populated and the other empty — both are simply empty on any blob sealed before this
+    /// task (`#[serde(default)]`), which is already in sync.
+    #[serde(default)]
+    seen_eids: std::collections::BTreeSet<[u8; 16]>,
+    /// Insertion order (oldest first) of the `eid`s currently present in `seen_eids` — the same
+    /// technique `request_order`/`responder_session_ek_order` use, for the same reason (this crate
+    /// is deliberately clock-free; see `request_order`'s doc comment). Maintained in lockstep with
+    /// `seen_eids` by its only writer, [`record_seen_eid`](Self::record_seen_eid), and consulted only
+    /// by [`evict_oldest_seen_eid`](Self::evict_oldest_seen_eid). See `seen_eids`'s own doc comment
+    /// for why no `open_at_rest` reconciliation against this field is needed.
+    #[serde(default)]
+    seen_eid_order: Vec<[u8; 16]>,
 }
 
 impl ChatState {
@@ -975,6 +1076,45 @@ impl ChatState {
         for k in known {
             if !already_ordered.contains(&k) {
                 self.responder_session_ek_order.push(k);
+            }
+        }
+    }
+
+    // -- task 6.4, ADR 0016 C7 second half: the eid replay-dedup set ------------------------
+
+    /// Whether `eid` has already been recorded as a successfully-decrypted envelope — the check
+    /// [`open_bytes`](Self::open_bytes) consults *before* any provisional establishment or decrypt
+    /// attempt. See [`seen_eids`](Self::seen_eids)'s doc comment for the full design note.
+    fn is_seen_eid(&self, eid: &[u8; 16]) -> bool {
+        self.seen_eids.contains(eid)
+    }
+
+    /// Record `eid` as successfully processed, evicting the oldest recorded `eid` first if
+    /// [`seen_eids`](Self::seen_eids) is already at [`MAX_SEEN_EIDS`]. Mirrors
+    /// [`insert_pending_request`](Self::insert_pending_request)'s exact shape (check-then-evict
+    /// before insert, insertion-order tracking alongside the set). Idempotent: called only from
+    /// `open_bytes`'s three success points, each of which has already independently ruled out `eid`
+    /// being present (the dedup check that runs first in the same call), so the `contains` guard
+    /// below is defense-in-depth, not a path this code expects to exercise.
+    fn record_seen_eid(&mut self, eid: [u8; 16]) {
+        if self.seen_eids.contains(&eid) {
+            return;
+        }
+        if self.seen_eids.len() >= MAX_SEEN_EIDS {
+            self.evict_oldest_seen_eid();
+        }
+        self.seen_eids.insert(eid);
+        self.seen_eid_order.push(eid);
+    }
+
+    /// Drop the least-recently-recorded `eid` (and its `seen_eid_order` entry) to make room under
+    /// [`MAX_SEEN_EIDS`]. Mirrors [`evict_oldest_pending`](Self::evict_oldest_pending)'s exact shape,
+    /// including the defense-in-depth `while` loop against a hypothetical order/set desync.
+    fn evict_oldest_seen_eid(&mut self) {
+        while !self.seen_eid_order.is_empty() {
+            let oldest = self.seen_eid_order.remove(0);
+            if self.seen_eids.remove(&oldest) {
+                return;
             }
         }
     }
@@ -1223,6 +1363,34 @@ impl ChatState {
     /// operation is ever added here — but this method itself performs no keystore operation today:
     /// authentication of the outbound message is entirely the ratchet AEAD's job now (`AD` is
     /// derived from `our_ik`/`peer_ik` once, at session establishment, not re-signed per message).
+    ///
+    /// **(task 6.4, ADR 0016 C7 second half) `eid` — minted fresh, every call.** A sender-random
+    /// 128-bit `MessageEnvelope::eid` is generated here, via the same CSPRNG source (`getrandom`)
+    /// and 128-bit width `ChatContent::Text::id` already uses (mirroring that field's own generation
+    /// pattern, per this task's `TODO: confirm` resolution — see the Outcome section in
+    /// `docs/tasks/phase-6/6.4-eid-replay-dedup.md`), and embedded once, outer plaintext, alongside
+    /// `sender_pub`/`v`/`prekey` — never fed into the ratchet AAD (see `MessageEnvelope`'s own module
+    /// doc) and never derived from `plaintext`.
+    ///
+    /// **What "retransmit dedup" means for this primitive, precisely — read before wiring in a
+    /// retry/outbox mechanism.** This method has no notion of "the same logical message" beyond the
+    /// `plaintext` bytes handed to it on any one call: it does not cache, hash, or compare previous
+    /// calls' plaintext. A **genuine unconfirmed-initiator retransmit dedups against itself** exactly
+    /// when the retransmission resends the *exact previously-produced envelope bytes* (the `Vec<u8>`
+    /// this method already returned) — never by calling `seal_bytes` a second time for
+    /// already-sent content. Resent verbatim, those bytes trivially carry the original `eid` (and the
+    /// original prekey preamble, if any — session-unconfirmed re-attachment, an existing, unrelated
+    /// property) unchanged, which is exactly what lets [`open_bytes`](Self::open_bytes)'s dedup check
+    /// recognize the redelivery. This is deliberate, not an oversight: this codebase has no
+    /// persisted-envelope outbox yet (`docs/architecture/data-model.md`'s `outbox/` — "idempotent by
+    /// `eid`" — is a client local-store concern for a future task, ADR 0021), so there is today no
+    /// caller that would re-invoke `seal_bytes` for content already sealed once. If a future
+    /// retry/outbox mechanism instead calls `seal_bytes` again for logically-the-same content (rather
+    /// than replaying stored bytes), it will mint a **fresh, different** `eid` — and, since
+    /// `Session::encrypt` always advances the sending chain, a genuinely different `ct` too — so the
+    /// two envelopes will **not** dedup against each other here; that mechanism would need its own
+    /// reuse strategy, out of this method's scope. See this task's Outcome section for the full
+    /// design note and why a content-comparison cache inside this method was deliberately not built.
     pub fn seal_bytes(
         &mut self,
         _store: &dyn SecretStore,
@@ -1238,9 +1406,12 @@ impl ChatState {
         } else {
             None
         };
+        let mut eid = [0u8; 16];
+        getrandom::fill(&mut eid).map_err(|e| meridian_crypto::CryptoError::Rng(e.to_string()))?;
         let envelope = MessageEnvelope {
             v: ENVELOPE_VERSION,
             sender_pub: *our_ik,
+            eid,
             prekey,
             ct,
         };
@@ -1466,6 +1637,18 @@ impl ChatState {
     /// successful decrypt from *that* provisional session ever commits. There is no scenario where
     /// either check could succeed while the other would refuse: freshness is a *precondition* for
     /// attempting provisional establishment at all, not a competing or racing gate.
+    ///
+    /// **(task 6.4, ADR 0016 C7 second half) The `eid` dedup check runs before ALL of the above.**
+    /// Immediately after the `v`/`sender_pub` checks — strictly before the freshness gate, before
+    /// `self.sessions.contains_key`, before any provisional establishment or decrypt attempt of any
+    /// kind — `envelope.eid` is checked against [`seen_eids`](Self::seen_eids); a match short-circuits
+    /// with [`ChatError::DuplicateEnvelope`] and nothing below this point ever runs. This is a
+    /// **layer added on top of**, never a replacement for, the freshness gate and the ratchet AEAD:
+    /// `eid` is unauthenticated outer plaintext an attacker can freely vary, so a forged/replayed
+    /// envelope that changes only its `eid` reaches every check below completely unaffected by this
+    /// one — see [`ChatError::DuplicateEnvelope`]'s doc comment for the precise, narrow claim this
+    /// check makes (a redelivery convenience, never a security boundary; ADR 0016 R2) and this task's
+    /// Outcome section for the full design note.
     pub fn open_bytes(
         &mut self,
         store: &dyn SecretStore,
@@ -1482,6 +1665,15 @@ impl ChatState {
         }
         if &envelope.sender_pub != from {
             return Err(ChatError::SenderMismatch);
+        }
+        // (task 6.4, ADR 0016 C7 second half) The eid dedup check — runs before ANY session lookup,
+        // provisional establishment, or decrypt attempt, so a genuinely redelivered envelope costs
+        // no crypto work the second time. See `ChatError::DuplicateEnvelope`'s doc comment for the
+        // precise (deliberately narrow) claim this makes, and `seen_eids`'s doc comment for why this
+        // ordering is safe (an `eid` is recorded only on a *successful* decrypt, never speculatively
+        // — an attacker cannot pre-poison a future legitimate `eid`).
+        if self.is_seen_eid(&envelope.eid) {
+            return Err(ChatError::DuplicateEnvelope);
         }
         let preamble = preamble_aad_bytes(&envelope.prekey);
 
@@ -1513,6 +1705,7 @@ impl ChatState {
             self.record_responder_ek(envelope.sender_pub, prekey.ek_pub, prekey.used_spk);
             self.sessions.insert(envelope.sender_pub, provisional);
             self.reset_desync(&envelope.sender_pub);
+            self.record_seen_eid(envelope.eid);
             return Ok(pt);
         }
 
@@ -1523,6 +1716,7 @@ impl ChatState {
         match session.decrypt(&envelope.ct, &preamble) {
             Ok(pt) => {
                 self.reset_desync(&envelope.sender_pub);
+                self.record_seen_eid(envelope.eid);
                 Ok(pt)
             }
             Err(meridian_crypto::CryptoError::UndecryptableHeader) => {
@@ -1569,6 +1763,7 @@ impl ChatState {
                                 );
                                 self.sessions.insert(envelope.sender_pub, fresh);
                                 self.reset_desync(&envelope.sender_pub);
+                                self.record_seen_eid(envelope.eid);
                                 return Ok(pt);
                             }
                         }

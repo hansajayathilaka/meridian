@@ -12,7 +12,7 @@
 //! | mode | attack | asserted here |
 //! |---|---|---|
 //! | `spoof_from` | forge `Deliver.from`, which the server asserts itself | `ChatError::SenderMismatch`, on the recipient |
-//! | `replay` | re-deliver a blob byte-identically | the duplicate is refused by the ratchet |
+//! | `replay` | re-deliver a blob byte-identically | refused early by the `eid` dedup check (task 6.4) |
 //! | `reorder` | release blobs out of order | tolerated: both open, nothing forged |
 //! | `drop` | swallow a blob while acking `delivered: true` | message lost (conceded DoS), nothing forged |
 //! | `cross_deliver` | hand a valid envelope to the wrong recipient | `ChatError::UnknownPrekey` |
@@ -332,26 +332,41 @@ async fn forged_deliver_from_is_rejected_as_sender_mismatch() {
 // -- 2. replay ----------------------------------------------------------------
 
 /// **`replay`.** The relay re-delivers a byte-identical copy of a blob it already forwarded. Nothing
-/// is mutated, so the Ed25519 signature verifies on the duplicate exactly as it did on the original:
-/// this attack reaches the **ratchet**, which is precisely what 1.28 could not do.
+/// is mutated, so the duplicate is byte-for-byte the genuine original, including its `eid`.
+///
+/// **(task 6.4 update, ADR 0016 C7 second half) Rejection point moved earlier, on purpose.** Before
+/// task 6.4 this attack reached the **ratchet** (envelope v1's signature verified identically on
+/// the duplicate; v2 has no signature at all — see 1.32's original framing, preserved in the module
+/// table above only as attack/outcome shape, not detector). Task 6.4 adds a bounded,
+/// sealed-at-rest "recently seen `eid`" check in `ChatState::open_bytes`, consulted *before* any
+/// session lookup or decrypt attempt (see `ChatError::DuplicateEnvelope`'s doc comment) — so a
+/// byte-identical redelivery like this one is now recognized and dropped earlier and more cheaply
+/// than before, without ever reaching the ratchet. This is a **redelivery convenience layered on
+/// top of**, not a replacement for, the ratchet-level replay protection `apps/crypto/tests/
+/// ratchet_replay.rs` covers directly — `eid` is unauthenticated outer plaintext an attacker can
+/// freely vary (see ADR 0016 R2: this is explicitly not a security boundary), so a replay that
+/// forges a *fresh* `eid` on stolen ciphertext would fall through to that unchanged ratchet-level
+/// protection instead, exactly as it did before this task.
 ///
 /// Asserted: the first copy opens (that is the built-in control — it proves the flow works and that
 /// the second copy really is a duplicate of a *delivered* message), and the second copy is
 /// **refused**, not accepted a second time. The rejection class is pinned to
-/// [`ChatError::Crypto`]/[`ChatError::Desync`] — the ratchet layer — because that is where replay
-/// protection has to live; a `SenderMismatch`/`BadSignature` here would mean the duplicate was not
-/// actually byte-identical and the cell is vacuous.
+/// [`ChatError::DuplicateEnvelope`] specifically — precision is the point of this whole file: a
+/// `SenderMismatch` here would mean the duplicate was not actually byte-identical, and a
+/// `Crypto`/`Desync` would mean the new, earlier `eid` check regressed and this replay fell all the
+/// way through to the ratchet again, making the cell's "refused early, no crypto re-run" claim false.
 ///
-/// **Session survival (task 2.13).** A single replay must degrade exactly the one duplicate
-/// message, not the session: `DoubleRatchet::decrypt` (`apps/crypto/src/ratchet.rs`) is now
-/// failure-atomic (stages its mutations on a scratch clone and only commits them once `aead_open`
-/// succeeds), so a rejected duplicate leaves `ckr`/`nr` untouched and a genuine subsequent message
-/// from the same sender still opens. Before that fix `ckr`/`nr` were advanced before `aead_open`
-/// ran and never rolled back on failure, permanently wedging the chain one step ahead of the
-/// sender — an unauthenticated, key-material-free, permanent session DoS mountable by any relay
-/// (and by benign duplicate delivery too). See `apps/crypto/tests/ratchet_replay.rs` for the
-/// ratchet-level regression coverage of that property; this cell is the end-to-end proof through a
-/// real relay.
+/// **Session survival (task 2.13, still verified, now more trivially true).** A single replay must
+/// degrade exactly the one duplicate message, not the session. Before task 6.4 this relied on
+/// `DoubleRatchet::decrypt` (`apps/crypto/src/ratchet.rs`) being failure-atomic (stages its
+/// mutations on a scratch clone and only commits them once `aead_open` succeeds), so a rejected
+/// duplicate left `ckr`/`nr` untouched and a genuine subsequent message from the same sender still
+/// opened. That property still holds and is still exercised directly by
+/// `apps/crypto/tests/ratchet_replay.rs` (for input that *does* reach the ratchet — e.g. a forged
+/// `eid`); this specific byte-identical duplicate no longer reaches `decrypt` at all, so `ckr`/`nr`
+/// are untouched even more directly. Kept as an explicit assertion below regardless, since it is
+/// this file's own end-to-end proof, through a real relay, that a rejected duplicate never wedges
+/// the live session either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replayed_delivery_is_not_accepted_twice() {
     let url = spawn_server(|c| arm_route(c, |s| s.allow_test_route_replay = true));
@@ -377,18 +392,20 @@ async fn replayed_delivery_is_not_accepted_twice() {
     );
 
     let second = bob.recv().await;
-    eprintln!("[1.32/replay] duplicate: {second:?}");
+    eprintln!("[1.32/6.4/replay] duplicate: {second:?}");
     match second {
-        Received::Rejected(ChatError::Crypto(_)) | Received::Rejected(ChatError::Desync) => {}
+        Received::Rejected(ChatError::DuplicateEnvelope) => {}
         Received::Nothing => panic!(
             "the hook did not actually replay anything — this cell would be vacuous. Check that \
              allow_test_route_replay is armed."
         ),
         other => panic!(
-            "a byte-identical replay must be refused BY THE RATCHET (ChatError::Crypto/Desync — the \
-             message key for that counter is gone). `Opened` would be a SECURITY FAILURE: the \
-             application would see the same message twice from one send. A signature/sender error \
-             would mean the duplicate was not byte-identical, making this cell vacuous. Got: {other:?}"
+            "a byte-identical replay must now be refused EARLY, by the task-6.4 `eid` dedup check \
+             (ChatError::DuplicateEnvelope) — before ever reaching the ratchet. `Opened` would be a \
+             SECURITY FAILURE: the application would see the same message twice from one send. A \
+             `SenderMismatch` would mean the duplicate was not byte-identical, making this cell \
+             vacuous; a `Crypto`/`Desync` would mean the new dedup check failed to fire and this \
+             replay fell all the way through to the ratchet again. Got: {other:?}"
         ),
     }
 
