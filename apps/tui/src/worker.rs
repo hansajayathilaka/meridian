@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 use meridian_core::account::{self, AccountDescriptor, StoreKind};
-use meridian_core::chat::{ChatError, ChatState as CoreChatState};
+use meridian_core::chat::{ChatError, ChatState as CoreChatState, SPK_ROTATION_INTERVAL_SECS};
 use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{
     generate_account, FileSecretStore, KeyHandle, MemorySecretStore, OsSecretStore, SecretStore,
@@ -2675,6 +2675,30 @@ pub async fn republish_bundle(
     account_pub: [u8; 32],
     server: &str,
 ) -> Result<(), String> {
+    republish_bundle_at(store, handle, account_pub, server, now_unix()).await
+}
+
+/// The actual implementation behind [`republish_bundle`], parametrized by an explicit `now_unix`
+/// rather than reading the real wall clock itself (task 6.2). [`republish_bundle`] above is now a
+/// thin real-clock wrapper around this — every one of its existing callers/tests is unaffected, byte
+/// for byte, since its own signature and behavior are unchanged (it still reads real time, exactly
+/// as before this task).
+///
+/// [`check_spk_rotation`] calls this directly, with the **same** `now_unix` it used to decide
+/// `rotation_due` in the first place — deliberately not two separate `now_unix()` reads a moment
+/// apart. In production that distinction is immaterial (both would read essentially the same real
+/// instant); it is what makes [`check_spk_rotation`] correctly fake-clock-testable at all: stamping
+/// `spk_published_at` with a *different* clock than the one that decided "due" would make a
+/// fake-`now_unix`-driven simulation of a long session (`tests/spk_rotation.rs`) stamp the vault with
+/// real wall-clock time instead of the simulated one, silently breaking every debounce assertion that
+/// follows.
+async fn republish_bundle_at(
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+    account_pub: [u8; 32],
+    server: &str,
+    now_unix: u64,
+) -> Result<(), String> {
     let mut client = SignalingClient::connect(server, store, handle, account_pub, None, 1)
         .await
         .map_err(|e| format!("connecting to {server}: {e}"))?;
@@ -2712,12 +2736,8 @@ pub async fn republish_bundle(
         let _chat_guard = chat_state_lock().lock().await;
         match load_chat(store, handle) {
             Ok(mut chat) => {
-                chat.vault.set_bundle(
-                    generated.bundle.spk,
-                    *generated.spk_secret,
-                    otks,
-                    now_unix(),
-                );
+                chat.vault
+                    .set_bundle(generated.bundle.spk, *generated.spk_secret, otks, now_unix);
                 save_chat(&chat, store, handle)
             }
             Err(e) => Err(e),
@@ -2726,6 +2746,194 @@ pub async fn republish_bundle(
 
     let _ = client.close().await;
     result
+}
+
+// ---------------------------------------------------------------------------
+// SPK rotation enforcement (task 6.2, ADR 0016 C1/R1 — builds on task 6.1's
+// `PrekeyVault::rotation_due`/`generation_age_secs`/`SPK_ROTATION_INTERVAL_SECS`, none of which are
+// touched here)
+// ---------------------------------------------------------------------------
+
+/// How often [`run_inbound_loop`] checks whether the current SPK generation needs rotating (task
+/// 6.2's own debounce requirement: "fires on a real interval, not every loop tick"). Deliberately
+/// much coarser than the loop's own per-envelope wake-ups — a check costs an at-rest [`load_chat`]
+/// (for a file-backed account, a full age/scrypt unwrap), and [`SPK_ROTATION_INTERVAL_SECS`] (task
+/// 6.1: one week) is on a timescale where hourly polling is already generous headroom: worst case
+/// this adds up to ~1h of extra staleness beyond the target interval before the first check notices,
+/// negligible against R1's already-bounded compromise window. Chosen well clear of
+/// `PREV_GENERATION_GRACE_SECS` (60s) so this check never competes with that reconnect-race window's
+/// own cadence.
+const SPK_ROTATION_CHECK_INTERVAL_SECS: u64 = 3600;
+
+/// How many multiples of [`SPK_ROTATION_INTERVAL_SECS`] a generation may go overdue before this
+/// process starts logging a warning about it (task 6.2, deliverable 2) — distinct from
+/// `rotation_due` itself, which already fires (and a republish attempt is already made) at 1x. 2x
+/// means a single missed/failed rotation attempt (one offline check, one connect failure) does not
+/// itself warn — only a *second* consecutive miss does, giving a full `SPK_ROTATION_INTERVAL_SECS`-
+/// wide grace window before anything is flagged as noteworthy, one level up from
+/// `PREV_GENERATION_GRACE_SECS`'s own "grace before enforcement" shape. See this task's Outcome
+/// section for the full fail-open/escalating-warning design this constant is part of.
+const SPK_ROTATION_WARN_GRACE_MULTIPLE: u64 = 2;
+
+/// Outcome of one [`check_spk_rotation`] call — exists so tests can assert exactly what happened,
+/// not just "no panic", mirroring the non-vacuity bar `apps/tui/tests/republish_bundle.rs` already
+/// holds this module's other worker functions to.
+/// `pub` (not `pub(crate)`), mirroring [`republish_bundle`]/[`inbound_handoff`]/[`run_inbound_loop`]
+/// above: `apps/tui/tests/*.rs` are separate crates that only see this crate's genuine `pub`
+/// surface, and `tests/spk_rotation.rs` (task 6.2) needs to assert on this directly.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SpkRotationOutcome {
+    /// The generation was not yet due for rotation at the checked `now_unix` — no republish
+    /// attempted.
+    NotDue,
+    /// The generation was due and the republish succeeded — `sessions.bin`'s vault now carries a
+    /// fresh `spk_published_at` and the age clock has restarted at zero.
+    Rotated,
+    /// The generation was due but the republish itself failed (e.g. an unreachable server). Per this
+    /// task's fail-open decision (see the Outcome section), the stale generation is left exactly as
+    /// it was and kept in service — this is logged, never propagated as a hard error that would tear
+    /// down the caller's loop.
+    RotationFailed(String),
+    /// `sessions.bin` could not even be loaded to check `rotation_due` — logged, never propagated.
+    LoadFailed(String),
+}
+
+/// The enforcement step [`run_inbound_loop`]'s periodic tick calls (task 6.2): loads the vault,
+/// checks [`meridian_core::chat::PrekeyVault::rotation_due`] against `now_unix`, and — only when
+/// due — republishes via [`republish_bundle_at`], the existing, already-tested [`republish_bundle`]
+/// machinery's own explicit-time entry point (so the republish is stamped with this same `now_unix`,
+/// not a fresh real-clock read — see that function's own doc comment for why that distinction is
+/// what makes this fake-clock-testable at all). Also drives [`warn_if_spk_overdue`], independently of
+/// whether the republish attempt that follows succeeds.
+///
+/// **Never calls `SystemTime::now()` itself** — `now_unix` is an explicit argument, mirroring
+/// `PrekeyVault::rotation_due`/`generation_age_secs`'s own deliberately clock-free, caller-supplies-
+/// time design (`apps/core/src/chat.rs`, task 6.1). This is what makes the function directly
+/// unit-testable with a fake clock (arbitrary `u64` timestamps): no real waiting, no tokio timer,
+/// and no dependency on wall-clock `SystemTime` anywhere in this function or in anything it calls.
+pub async fn check_spk_rotation(
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+    account_pub: [u8; 32],
+    server: &str,
+    now_unix: u64,
+) -> SpkRotationOutcome {
+    let (due, age) = {
+        let _chat_guard = chat_state_lock().lock().await;
+        match load_chat(store, handle) {
+            Ok(chat) => (
+                chat.vault.rotation_due(now_unix),
+                chat.vault.generation_age_secs(now_unix),
+            ),
+            Err(e) => {
+                eprintln!("meridian tui: could not check SPK rotation status: {e}");
+                return SpkRotationOutcome::LoadFailed(e);
+            }
+        }
+    };
+
+    if !due {
+        return SpkRotationOutcome::NotDue;
+    }
+
+    warn_if_spk_overdue(age);
+
+    match republish_bundle_at(store, handle, account_pub, server, now_unix).await {
+        Ok(()) => SpkRotationOutcome::Rotated,
+        Err(e) => {
+            eprintln!(
+                "meridian tui: SPK rotation republish failed, continuing with the stale \
+                 generation (fail-open — see task 6.2's Outcome section): {e}"
+            );
+            SpkRotationOutcome::RotationFailed(e)
+        }
+    }
+}
+
+/// Pure — exactly the threshold decision [`warn_if_spk_overdue`] itself logs, factored out (task 6.2
+/// follow-up, review finding: `warn_if_spk_overdue`'s `eprintln!` alone is not reliably visible in a
+/// `meridian tui` alt-screen session) so [`spk_rotation_status_for_app`] below can ask the identical
+/// question without duplicating — and risking silently drifting from — the threshold math or the
+/// fire condition. `warn_if_spk_overdue`'s own behavior is unchanged by this extraction: same
+/// branches, same values, same two `eprintln!` texts.
+fn spk_overdue_status(age: Option<u64>) -> crate::statusbar::SpkRotationStatus {
+    use crate::statusbar::SpkRotationStatus;
+    let warn_threshold =
+        SPK_ROTATION_INTERVAL_SECS.saturating_mul(SPK_ROTATION_WARN_GRACE_MULTIPLE);
+    match age {
+        None => SpkRotationStatus::UnknownAge,
+        Some(age) if age >= warn_threshold => SpkRotationStatus::Overdue {
+            multiples: age / SPK_ROTATION_INTERVAL_SECS,
+            age_secs: age,
+        },
+        Some(_) => SpkRotationStatus::Healthy,
+    }
+}
+
+/// Logs an escalating warning once `age` is past [`SPK_ROTATION_WARN_GRACE_MULTIPLE`] ×
+/// [`SPK_ROTATION_INTERVAL_SECS`] — the monitoring/warning surface task 6.2's deliverable 2
+/// requires. `age = None` (unknown generation age — never published, or a vault sealed before task
+/// 6.1) always warns: an unknown age is already the fail-safe "due-now" case
+/// (`PrekeyVault::rotation_due`'s own doc comment), and if the republish attempt that follows this
+/// call also fails, the age stays unknown on every subsequent check until one finally succeeds — so
+/// this is the one case that most needs a human to notice, not less.
+fn warn_if_spk_overdue(age: Option<u64>) {
+    use crate::statusbar::SpkRotationStatus;
+    match spk_overdue_status(age) {
+        SpkRotationStatus::UnknownAge => {
+            eprintln!(
+                "meridian tui: SPK generation age is unknown (never published, or a session sealed \
+                 before task 6.1) and due for rotation — continuing with the current key \
+                 (fail-open) while a republish is attempted"
+            );
+        }
+        SpkRotationStatus::Overdue {
+            multiples,
+            age_secs,
+        } => {
+            eprintln!(
+                "meridian tui: SPK generation is {multiples}x overdue for rotation (age \
+                 {age_secs}s, target {SPK_ROTATION_INTERVAL_SECS}s) — continuing with the stale \
+                 key (fail-open) while a republish is attempted"
+            );
+        }
+        SpkRotationStatus::Healthy => {}
+    }
+}
+
+/// Task 6.2 follow-up (combined-reviewer finding): determines the [`crate::statusbar::
+/// SpkRotationStatus`] [`run_inbound_loop`] pushes as [`crate::app::AppEvent::SpkRotationOverdue`],
+/// independently of [`check_spk_rotation`] — that function's own signature, return type
+/// ([`SpkRotationOutcome`]), and behavior are deliberately not touched by this follow-up (`tests/
+/// spk_rotation.rs` calls it directly with today's exact 5-argument shape, and this follow-up's own
+/// task file requires that suite stay untouched), so there is no way to thread a channel through it
+/// or to read the `age` it already computed back out. This re-loads the vault (a second `load_chat`
+/// call alongside `check_spk_rotation`'s own) and asks the identical threshold question via the
+/// shared [`spk_overdue_status`] helper, so the log line and the TUI-visible status can never
+/// silently disagree. Negligible added cost at this function's hourly cadence — the same "hourly
+/// polling is generous headroom" reasoning [`SPK_ROTATION_CHECK_INTERVAL_SECS`]'s own doc comment
+/// already gives for the *first* load applies equally to this second, read-only one.
+///
+/// `None` on a load failure: the caller simply skips sending a status for this tick rather than
+/// fabricating one — fire-and-forget, mirroring `run_inbound_loop`'s own `let _ = check_spk_rotation
+/// (...).await` discipline for the exact same reason (a diagnostics-only read must never interrupt
+/// this loop's real delivery handling).
+async fn spk_rotation_status_for_app(
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+    now_unix: u64,
+) -> Option<crate::statusbar::SpkRotationStatus> {
+    let _chat_guard = chat_state_lock().lock().await;
+    match load_chat(store, handle) {
+        Ok(chat) => Some(spk_overdue_status(chat.vault.generation_age_secs(now_unix))),
+        Err(e) => {
+            eprintln!(
+                "meridian tui: could not compute SPK rotation status for the TUI diagnostics \
+                 pane: {e}"
+            );
+            None
+        }
+    }
 }
 
 /// The persistent inbound-delivery loop itself (task 4.35) — see this section's own module doc for
@@ -2753,6 +2961,19 @@ pub async fn republish_bundle(
 /// so `Arc<dyn SecretStore>` is itself `Send + Sync + 'static`. **No new caching, no new
 /// residency**: the exact same store object is decrypted/signed the same number of times at the
 /// same call sites as before this task — only the thread it runs on changed.
+///
+/// **Task 6.2:** also owns the periodic [`check_spk_rotation`] wake — a
+/// [`tokio::time::interval`] created once, **outside** the outer reconnect `loop`, so its
+/// `SPK_ROTATION_CHECK_INTERVAL_SECS` cadence keeps counting across reconnects rather than
+/// restarting from zero on every drop, and fires (as a third `tokio::select!` arm alongside
+/// `client.next_deliver()`) even during a long stretch with no inbound envelopes at all — a bare
+/// `while let Ok(deliver) = client.next_deliver().await` has no other wake source, so without this
+/// arm a silent peer would mean this session's SPK generation never gets checked, let alone
+/// rotated, however far past `SPK_ROTATION_INTERVAL_SECS` it goes. The check only actually runs
+/// while a connection is live (it needs one to republish), which is the natural place for it: while
+/// disconnected, the reconnect loop below is already retrying on its own short backoff, and the
+/// interval simply keeps ticking in the background, ready to fire again the moment a connection
+/// re-establishes.
 pub async fn run_inbound_loop(
     store: std::sync::Arc<dyn SecretStore>,
     handle: KeyHandle,
@@ -2770,6 +2991,25 @@ pub async fn run_inbound_loop(
         backoff_ms
     };
     let mut attempt: u32 = 0;
+
+    // Task 6.2: the debounced periodic SPK-rotation check — see this function's own doc comment.
+    // `interval_at` with a first deadline one full period out, deliberately **not** plain
+    // `tokio::time::interval` (whose first `tick()` resolves immediately on creation): an immediate
+    // first check would mean every single session start pays a real connect + 101-signature
+    // republish attempt (whenever `rotation_due` happens to read `true` at that instant — e.g. every
+    // test fixture in this crate that seeds `sessions.bin` with a fixed, already-old
+    // `spk_published_at` for unrelated reasons, such as `tests/inbound_delivery.rs::
+    // publish_own_bundle`'s `1_760_000_000`), which is exactly the over-triggering this task's own
+    // file warns against. `MissedTickBehavior::Delay` (rather than the default `Burst`): this is a
+    // staleness check on a week-scale interval, not a deadline that must "catch up" firing
+    // back-to-back after this loop was blocked for a while (e.g. a long reconnect stall) — a single
+    // prompt check once reachable again is exactly what's wanted, never a burst of them.
+    let mut rotation_tick = tokio::time::interval_at(
+        tokio::time::Instant::now()
+            + std::time::Duration::from_secs(SPK_ROTATION_CHECK_INTERVAL_SECS),
+        std::time::Duration::from_secs(SPK_ROTATION_CHECK_INTERVAL_SECS),
+    );
+    rotation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         match SignalingClient::connect_owned(
@@ -2791,20 +3031,54 @@ pub async fn run_inbound_loop(
                     return;
                 }
                 // A connection-level failure (the socket dropped, the server went away, a framing
-                // error) simply ends this `while let`, falling through to the reconnect logic below
+                // error) simply breaks this inner loop, falling through to the reconnect logic below
                 // — never crashes this loop, mirrors every other network call site in this module.
-                while let Ok(deliver) = client.next_deliver().await {
-                    if let Some(event) = process_inbound_delivery(
-                        store.clone(),
-                        handle.clone(),
-                        account_pub,
-                        &mut client,
-                        deliver,
-                    )
-                    .await
-                    {
-                        if replies.send(AppEvent::Inbound(Box::new(event))).is_err() {
-                            return;
+                loop {
+                    tokio::select! {
+                        deliver = client.next_deliver() => {
+                            let Ok(deliver) = deliver else { break };
+                            if let Some(event) = process_inbound_delivery(
+                                store.clone(),
+                                handle.clone(),
+                                account_pub,
+                                &mut client,
+                                deliver,
+                            )
+                            .await
+                            {
+                                if replies.send(AppEvent::Inbound(Box::new(event))).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        _ = rotation_tick.tick() => {
+                            // Same `now_unix` for both the rotation decision and the TUI status
+                            // read below, mirroring `republish_bundle_at`'s own "caller supplies
+                            // now" discipline — not two separate near-simultaneous clock reads.
+                            let tick_now = now_unix();
+                            // Fire-and-forget, like `crate::run_worker`'s own republish call: a
+                            // failed/not-due check must never interrupt this loop's own delivery
+                            // handling — `check_spk_rotation` already logs any failure itself.
+                            let _ = check_spk_rotation(
+                                store.as_ref(),
+                                &handle,
+                                account_pub,
+                                &server,
+                                tick_now,
+                            )
+                            .await;
+                            // Task 6.2 follow-up: the TUI-visible counterpart to the log line
+                            // `check_spk_rotation`/`warn_if_spk_overdue` already emit above — see
+                            // `spk_rotation_status_for_app`'s own doc comment for why this is a
+                            // second, independent read rather than threading `replies` through
+                            // `check_spk_rotation` itself.
+                            if let Some(status) =
+                                spk_rotation_status_for_app(store.as_ref(), &handle, tick_now).await
+                            {
+                                if replies.send(AppEvent::SpkRotationOverdue(status)).is_err() {
+                                    return;
+                                }
+                            }
                         }
                     }
                 }

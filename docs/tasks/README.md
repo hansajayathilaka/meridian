@@ -87,6 +87,14 @@ evaporate:
   publishes). Short-lived stack memory, never logged/persisted, so non-blocking — but no open task
   currently owns `apps/core/src/chat.rs`'s `PrekeyVault` secret-handling to pick this up; flag for
   whoever next touches that code or for a future `/plan-phase`.
+- **A devops-owned server-side SPK-staleness metric/alert is still unbuilt** (task 6.2's Decision 2,
+  architect-reviewed) — client-side enforcement + local warning (task 6.2) satisfies ADR 0016 C1's
+  "monitored" obligation for now, but an operator-side view independent of any single client's own
+  honesty about reporting its staleness (e.g. "count of accounts whose `prekeys.rotated_at` is older
+  than N × the rotation interval") is real, useful follow-up work against `apps/rendezvous`/
+  `tools/metrics-allowlist.txt`/`docs/operations/monitoring.md` — the column already exists
+  server-side, nothing about 6.2 forecloses it. No open task owns this; schedule via a future
+  `/plan-phase` when devops prioritizes it.
 
 > **Keep this section short.** Per-task outcomes, review sign-offs, and the decisions behind them
 > live in each task file's **Outcome** section (and the phase README) — not here. This block carries
@@ -366,7 +374,7 @@ consult) that shaped them: [phase-6/README.md](./phase-6/README.md).
 - [x] **6.3** Envelope v2 core cutover: wire shape + canonical AAD + commit-on-decrypt + desync short-circuit fix (C2, C3, C5, C6, C7 short-circuit) — [file](./phase-6/6.3-envelope-v2-core-cutover.md)
 
 **Wave 2**
-- [~] **6.2** SPK rotation enforcement: trigger + monitoring in both client loops (C1, 2–3/3; depends on 6.1) — [file](./phase-6/6.2-spk-rotation-enforcement.md)
+- [x] **6.2** SPK rotation enforcement: trigger + monitoring in both client loops (C1, 2–3/3; depends on 6.1) — [file](./phase-6/6.2-spk-rotation-enforcement.md)
 - [ ] **6.4** `eid` replay-dedup key (C7, 2/2; depends on 6.3) — [file](./phase-6/6.4-eid-replay-dedup.md)
 - [ ] **6.6** Test re-pointing: v1 detector → v2 AEAD + new C3/R1 adversarial cells (depends on 6.3) — [file](./phase-6/6.6-repoint-adversarial-tests.md)
 

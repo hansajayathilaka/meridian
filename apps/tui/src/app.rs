@@ -34,7 +34,7 @@ use crate::screens::requests::{self, RequestEntry, RequestsState};
 use crate::screens::settings::{self, SettingsState};
 use crate::screens::unlock::{self, UnlockState, Unlocking};
 use crate::screens::verify::{self, VerifyState};
-use crate::statusbar::ConnectionState;
+use crate::statusbar::{ConnectionState, SpkRotationStatus};
 use crate::store::contacts::PolicyOverride;
 use crate::store::history::HistoryEntry;
 use crate::surface::{ExtensionPane, PaletteAction, PaletteCommand, SurfaceRegistry};
@@ -76,6 +76,15 @@ pub enum AppEvent {
     /// [`App::connection_status`], not into any one screen: the connection is session-wide, not
     /// per-conversation.
     ConnectionStatus(ConnectionState),
+    /// `apps/tui/src/worker.rs::run_inbound_loop`'s hourly SPK-rotation check's own TUI-visible
+    /// counterpart to `warn_if_spk_overdue`'s `eprintln!` (task 6.2 follow-up — a combined-reviewer
+    /// finding: an alt-screen TUI session cannot reliably see a stderr line). Routed into
+    /// [`App::spk_rotation_overdue`], not into any one screen: like [`Self::ConnectionStatus`], SPK
+    /// generation staleness is a property of the whole session's own account, never of one
+    /// conversation. Also forwarded to whichever [`Screen::Extension`] pane is currently on top (see
+    /// [`crate::surface::ExtensionPane::sync_spk_rotation_overdue`]) — [`crate::screens::diagnostics::
+    /// DiagnosticsPane`] is the one that renders it.
+    SpkRotationOverdue(SpkRotationStatus),
 }
 
 /// Already-decrypted content pushed live off the wire (task 4.35) — the payload of
@@ -1408,6 +1417,9 @@ pub struct App {
     /// The persistent inbound connection's own state (task 4.35) — session-wide, so it lives on
     /// `App` itself rather than inside any one `Screen`. See [`AppEvent::ConnectionStatus`].
     connection: ConnectionState,
+    /// The current SPK generation's rotation-overdue state (task 6.2 follow-up) — session-wide for
+    /// the same reason [`Self::connection`] is. See [`AppEvent::SpkRotationOverdue`].
+    spk_rotation_overdue: SpkRotationStatus,
 }
 
 impl Default for App {
@@ -1454,6 +1466,7 @@ impl App {
             config,
             pending_inbound_requests: Vec::new(),
             connection: ConnectionState::Disconnected,
+            spk_rotation_overdue: SpkRotationStatus::default(),
         }
     }
 
@@ -1515,6 +1528,12 @@ impl App {
         self.connection
     }
 
+    /// The current SPK generation's rotation-overdue state (task 6.2 follow-up) — see
+    /// [`AppEvent::SpkRotationOverdue`]. `pub` for the same reason as [`App::connection_status`].
+    pub fn spk_rotation_overdue(&self) -> SpkRotationStatus {
+        self.spk_rotation_overdue
+    }
+
     /// How many inbound message requests are queued (task 4.35) waiting for the next
     /// `Screen::Requests` to open — see [`App::pending_inbound_requests`]'s own doc comment. `pub`
     /// for the same reason as [`App::connection_status`].
@@ -1548,6 +1567,16 @@ impl App {
             AppEvent::Inbound(inbound) => self.handle_inbound(*inbound),
             AppEvent::ConnectionStatus(state) => {
                 self.connection = state;
+                Vec::new()
+            }
+            AppEvent::SpkRotationOverdue(status) => {
+                self.spk_rotation_overdue = status;
+                // Also forwarded to whichever pane is current, if any (default no-op for every pane
+                // that has no use for it) — see `ExtensionPane::sync_spk_rotation_overdue`'s own doc
+                // comment for why this is additive to, not a replacement of, storing on `App` above.
+                if let Some(Screen::Extension(pane)) = self.screens.last_mut() {
+                    pane.sync_spk_rotation_overdue(status);
+                }
                 Vec::new()
             }
             AppEvent::Tick | AppEvent::Resize(_, _) | AppEvent::Paste(_) => Vec::new(),
@@ -2023,7 +2052,16 @@ impl App {
         match action {
             PaletteAction::Effect(factory) => vec![factory()],
             PaletteAction::PushPane(factory) => {
-                let pane = factory();
+                let mut pane = factory();
+                // Task 6.2 follow-up: seed the freshly built pane with `App`'s already-known SPK-
+                // rotation status before it ever renders, so a pane opened *after* the status last
+                // changed (the ordinary case — this only pushes on `Ctrl+K` → `Diagnostics`, not on
+                // every status change) starts correct instead of defaulting back to `Healthy`. A
+                // no-op for every pane besides `DiagnosticsPane` (default trait method). If `pane`
+                // turns out to be a duplicate (`already_open` below) it is simply dropped unpushed —
+                // harmless, since the *existing* on-screen pane already tracks this live via
+                // `App::update`'s `AppEvent::SpkRotationOverdue` forwarding.
+                pane.sync_spk_rotation_overdue(self.spk_rotation_overdue);
                 let already_open = matches!(
                     self.current_screen(),
                     Screen::Extension(current) if current.title() == pane.title()
@@ -2789,6 +2827,97 @@ mod tests {
         assert!(app.update(AppEvent::Resize(80, 24)).is_empty());
         assert!(app.update(AppEvent::Paste("hi".into())).is_empty());
         assert!(!app.should_quit());
+    }
+
+    /// Task 6.2 follow-up: `AppEvent::SpkRotationOverdue` is a pure, synchronous state update —
+    /// mirrors [`AppEvent::ConnectionStatus`]'s own contract (no `Effect`s, just stores the value).
+    #[test]
+    fn spk_rotation_overdue_event_updates_app_state_and_emits_no_effects() {
+        let mut app = App::new();
+        assert_eq!(
+            app.spk_rotation_overdue(),
+            crate::statusbar::SpkRotationStatus::Healthy,
+            "the honest starting default before any check has ever run"
+        );
+
+        let effects = app.update(AppEvent::SpkRotationOverdue(
+            crate::statusbar::SpkRotationStatus::Overdue {
+                multiples: 3,
+                age_secs: 10 * 3600,
+            },
+        ));
+        assert!(effects.is_empty());
+        assert_eq!(
+            app.spk_rotation_overdue(),
+            crate::statusbar::SpkRotationStatus::Overdue {
+                multiples: 3,
+                age_secs: 10 * 3600,
+            }
+        );
+
+        // And it can move back to healthy too (a successful rotation clearing a prior warning) —
+        // not a one-way ratchet.
+        app.update(AppEvent::SpkRotationOverdue(
+            crate::statusbar::SpkRotationStatus::Healthy,
+        ));
+        assert_eq!(
+            app.spk_rotation_overdue(),
+            crate::statusbar::SpkRotationStatus::Healthy
+        );
+    }
+
+    /// The same event also reaches whichever `Screen::Extension` pane is current (task 6.2
+    /// follow-up review finding: a log line alone is not visible in an alt-screen TUI session) — the
+    /// built-in `Diagnostics` pane is the one that actually renders it.
+    #[test]
+    fn spk_rotation_overdue_event_is_forwarded_to_the_open_diagnostics_pane() {
+        let mut app = App::new();
+        app.update(AppEvent::Key(key(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+        )));
+        app.update(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(matches!(app.current_screen(), Screen::Extension(_)));
+
+        app.update(AppEvent::SpkRotationOverdue(
+            crate::statusbar::SpkRotationStatus::Overdue {
+                multiples: 4,
+                age_secs: 4 * 3600,
+            },
+        ));
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal.draw(|f| app.render(f)).expect("draw");
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("overdue"));
+        assert!(text.contains("4x"));
+    }
+
+    /// Pushing a fresh `Diagnostics` pane after the status is already known (the ordinary case —
+    /// the status changes on an hourly background tick, not on every palette open) must not lose it
+    /// back to the default `Healthy` — `App::dispatch_palette_action`'s `PushPane` arm seeds the
+    /// freshly built pane with `App`'s own already-known value.
+    #[test]
+    fn a_freshly_opened_diagnostics_pane_is_seeded_with_the_already_known_status() {
+        let mut app = App::new();
+        app.update(AppEvent::SpkRotationOverdue(
+            crate::statusbar::SpkRotationStatus::UnknownAge,
+        ));
+
+        app.update(AppEvent::Key(key(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+        )));
+        app.update(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(matches!(app.current_screen(), Screen::Extension(_)));
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal.draw(|f| app.render(f)).expect("draw");
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("overdue"));
+        assert!(text.contains("unknown"));
     }
 
     /// A worker event with nothing to do with the current screen (e.g. arriving after the screen
