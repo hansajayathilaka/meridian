@@ -387,7 +387,7 @@ consult) that shaped them: [phase-6/README.md](./phase-6/README.md).
 - [x] **6.6** Test re-pointing: v1 detector → v2 AEAD + new C3/R1 adversarial cells (depends on 6.3) — [file](./phase-6/6.6-repoint-adversarial-tests.md)
 
 **Wave 3**
-- [ ] **6.5** Conformance vectors: `ratchet-v2.json` + `envelope-v2.json` (depends on 6.3, 6.4) — [file](./phase-6/6.5-conformance-vectors-v2.md)
+- [x] **6.5** Conformance vectors: `ratchet-v2.json` + `envelope-v2.json` (depends on 6.3, 6.4) — [file](./phase-6/6.5-conformance-vectors-v2.md)
 - [ ] **6.7** Doc-sync: describe envelope v2 as shipped (C4; depends on 6.3, 6.4) — [file](./phase-6/6.7-doc-sync-envelope-v2.md)
 
 **Wave 4 — exit gate**
