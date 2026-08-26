@@ -134,7 +134,7 @@ Goal section for why)
 **Wave 2**
 - [x] **6.2** SPK rotation enforcement: trigger + monitoring in both long-running client loops (C1, parts 2–3/3; depends on 6.1) — [file](./6.2-spk-rotation-enforcement.md)
 - [x] **6.4** `eid` replay-dedup key (C7, second half; depends on 6.3) — [file](./6.4-eid-replay-dedup.md)
-- [ ] **6.6** Test re-pointing: v1 detector → v2 AEAD, plus the new C3/R1 adversarial cells (depends on 6.3) — [file](./6.6-repoint-adversarial-tests.md)
+- [x] **6.6** Test re-pointing: v1 detector → v2 AEAD, plus the new C3/R1 adversarial cells (depends on 6.3) — [file](./6.6-repoint-adversarial-tests.md)
 
 **Wave 3**
 - [ ] **6.5** Conformance vectors: `ratchet-v2.json` + `envelope-v2.json` (depends on 6.3, 6.4) — [file](./6.5-conformance-vectors-v2.md)

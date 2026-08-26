@@ -384,7 +384,7 @@ consult) that shaped them: [phase-6/README.md](./phase-6/README.md).
 **Wave 2**
 - [x] **6.2** SPK rotation enforcement: trigger + monitoring in both client loops (C1, 2–3/3; depends on 6.1) — [file](./phase-6/6.2-spk-rotation-enforcement.md)
 - [x] **6.4** `eid` replay-dedup key (C7, 2/2; depends on 6.3) — [file](./phase-6/6.4-eid-replay-dedup.md)
-- [ ] **6.6** Test re-pointing: v1 detector → v2 AEAD + new C3/R1 adversarial cells (depends on 6.3) — [file](./phase-6/6.6-repoint-adversarial-tests.md)
+- [x] **6.6** Test re-pointing: v1 detector → v2 AEAD + new C3/R1 adversarial cells (depends on 6.3) — [file](./phase-6/6.6-repoint-adversarial-tests.md)
 
 **Wave 3**
 - [ ] **6.5** Conformance vectors: `ratchet-v2.json` + `envelope-v2.json` (depends on 6.3, 6.4) — [file](./phase-6/6.5-conformance-vectors-v2.md)

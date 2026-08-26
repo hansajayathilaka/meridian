@@ -1,11 +1,24 @@
 //! Core chat-session-manager integration: a full relayed exchange (X3DH prekey message → reply →
 //! receipt) driven entirely through opaque blobs, plus tamper rejection and sealed persistence.
 //! No network: the "relay" is just handing blob bytes between two [`ChatState`]s.
+//!
+//! # task 6.6 additions (ADR 0016 "Test obligations": C3 and R1, both OPEN(v2))
+//!
+//! Two adversarial cells live at the bottom of this file, new for envelope v2:
+//!   - [`sign_flipped_sender_pub_is_rejected`] — C3: the v2 AAD must carry the RAW Ed25519
+//!     encodings of both identity keys, never the Montgomery-normalized (X25519) form, or a
+//!     sign-flipped `sender_pub` would be silently accepted once the per-message signature (which
+//!     caught this trivially under v1) is gone.
+//!   - [`kci_forged_first_contact_from_stolen_spk_secret_succeeds_r1_accepted_residual`] — R1: an
+//!     enumerated, ADR-accepted residual (NOT a defect), documented by a PASSING assertion per
+//!     `docs/testing/strategy.md`'s "0 silent successes outside the enumerated accepted residuals"
+//!     rule.
 
 use meridian_core::chat::{ChatError, ChatState, PREV_GENERATION_GRACE_SECS};
 use meridian_envelope::{ChatContent, MessageEnvelope};
 use meridian_identity::{generate_account, AccountId, MemorySecretStore};
 use meridian_signaling::{generate_bundle, GeneratedBundle};
+use meridian_store::{KeyHandle, SecretStore, SignOrDh, StoreError};
 
 struct Party {
     store: MemorySecretStore,
@@ -527,5 +540,284 @@ fn undecryptable_envelope_is_rejected_without_touching_the_session() {
             id: [2u8; 16],
             body: "held back".into()
         }
+    );
+}
+
+// -- task 6.6 / ADR 0016 C3: sign-flipped sender_pub -------------------------
+
+/// C3 (task 6.6, was OPEN(v2)): the v2 AAD is `"mrd.env/2" ‖ AD ‖ prekey_preamble ‖ enc_header`
+/// with `AD` the **raw Ed25519 encodings** of both identity keys, never the Montgomery-normalized
+/// (X25519) form — `apps/crypto/src/x3dh.rs::derive`'s doc comment records exactly why: the
+/// Ed25519→X25519 birational map is defined from the curve's y-coordinate only, so it drops the
+/// sign of x entirely. Concretely: a compressed Ed25519 point's top bit encodes the sign of x; for
+/// any valid point with y-coordinate `y`, `x` and `-x` are BOTH valid roots of the same `x² = c`
+/// equation, so flipping that bit is always a genuinely different, validly-encoded public key `A'`
+/// with the identical `y` and therefore the identical Montgomery `u`.
+///
+/// This test proves the raw-encoding requirement is load-bearing, not decorative. Every X3DH leg
+/// that touches Alice's identity key (`DH1 = DH(IK_A, SPK_B)`, computed on the responder side as
+/// `dh(spk_secret, ed25519_pub_to_x25519(peer_ik))`) is computed from the *converted* form, which
+/// is sign-blind — so `root`/`hka`/`nhkb` come out **bit-identical** whichever sign Alice's claimed
+/// identity key carries. If the AAD were built from that same X25519-normalized form (or from
+/// anything less than the full raw Ed25519 bytes), a sign-flipped `sender_pub` would collide with
+/// the genuine one in the AAD too, and — with no per-message signature left to catch it — this
+/// envelope would decrypt successfully under an identity Alice never asserted. Only the raw-bytes
+/// AAD makes the flip change the AAD (and therefore the AEAD tag) even though the derived keys
+/// don't move.
+#[test]
+fn sign_flipped_sender_pub_is_rejected() {
+    let mut alice = Party::new("signflip.a");
+    let mut bob = Party::new("signflip.b");
+    let bob_bundle = bob.publish();
+    let (bob_ik, alice_ik) = (bob.ik(), alice.ik());
+    alice.start(
+        &bob_ik,
+        &bob_bundle.bundle.spk,
+        Some(bob_bundle.bundle.otks[0]),
+    );
+
+    let blob = alice.send(
+        &bob_ik,
+        &ChatContent::Text {
+            id: [9u8; 16],
+            body: "hi".into(),
+        },
+    );
+
+    // Negate Alice's claimed identity key: flip the sign bit (the top bit of the last byte of the
+    // compressed Edwards encoding). Never a malformed-key rejection — see this test's doc comment
+    // for why the flipped bytes are always a valid, different Ed25519 point.
+    let mut flipped_ik = alice_ik;
+    flipped_ik[31] ^= 0x80;
+    assert_ne!(
+        flipped_ik, alice_ik,
+        "the flip must actually change the key"
+    );
+
+    let mut env = MessageEnvelope::from_blob(&blob).unwrap();
+    env.sender_pub = flipped_ik;
+    let attack = env.to_blob().unwrap();
+
+    // `from` is set to match the mutated `sender_pub` deliberately: this isolates the property
+    // under test to C3's AAD encoding, rather than incidentally tripping the unrelated
+    // `SenderMismatch` check (which fires purely on `sender_pub != from`, before any crypto runs).
+    match bob.recv_err(&flipped_ik, &attack) {
+        Some(ChatError::Crypto(_)) => {}
+        Some(other) => panic!(
+            "a sign-flipped sender_pub must be rejected by the ratchet AEAD (ADR 0016 C3 — the \
+             AAD carries the raw Ed25519 encoding, so the flip changes the AAD even though \
+             root/hka/nhkb are bit-identical to the unflipped key), not by something else. \
+             Got: {other:?}"
+        ),
+        None => panic!(
+            "SECURITY FAILURE: a sign-flipped sender_pub was ACCEPTED — this is exactly the gap \
+             C3 exists to close once the per-message signature is gone"
+        ),
+    }
+
+    // The flip broke nothing but itself: the genuine, unmutated envelope still opens.
+    let got = bob.recv(&alice_ik, &blob).ok().unwrap();
+    assert_eq!(
+        got,
+        ChatContent::Text {
+            id: [9u8; 16],
+            body: "hi".into()
+        }
+    );
+}
+
+// -- task 6.6 / ADR 0016 R1: key-compromise impersonation (KCI), accepted residual --
+
+/// A [`SecretStore`] that answers exactly the ONE Diffie-Hellman query ADR 0016 R1's attacker can
+/// legitimately answer, and honestly refuses every other — modelling the attacker's real
+/// capability rather than a convenient shortcut.
+///
+/// R1's threat model: an attacker who has obtained a responder's **signed-prekey secret** (never
+/// an identity key, of either party) can forge a first-contact session claiming to be from any
+/// sender. The X3DH leg this rests on is `DH1 = DH(IK_sender, SPK_responder)`. Diffie-Hellman is
+/// commutative, so this is equally computable as `DH(SPK_responder_priv, IK_sender_pub)` — exactly
+/// the stolen SPK secret combined with the (public, freely available) claimed sender's identity
+/// key. That is the only leg this store can answer; it is deliberately wired to the *shape* of
+/// that one query (`x3dh::initiate`'s `store_dh(store, handle, peer_spk)`, whose `input` is the
+/// responder's SPK public key) and refuses everything else — in particular
+/// `x3dh::respond`'s `store_dh(store, handle, ek_a)` query (`input` is an ephemeral public key),
+/// which would require the *responder's own identity key* to answer correctly, and which this
+/// attacker structurally cannot compute from a stolen SPK secret alone.
+struct StolenSpkStore {
+    /// The one secret this attacker holds: the responder's signed-prekey PRIVATE key.
+    stolen_spk_secret: [u8; 32],
+    /// The (public) identity key of whoever this attacker is claiming to be. Used only as a DH
+    /// input, never as signing/private key material — this attacker never touches that party's
+    /// private key or store.
+    forged_sender_ik: [u8; 32],
+    /// The only `input` this store will answer for: the responder's real signed-prekey PUBLIC key,
+    /// the shape of `x3dh::initiate`'s DH1 query.
+    expected_input: [u8; 32],
+}
+
+impl SecretStore for StolenSpkStore {
+    fn store(&self, _label: &str, _secret: &[u8]) -> meridian_store::Result<KeyHandle> {
+        unreachable!("this attacker never registers a real account; it only ever performs one DH")
+    }
+
+    fn use_key(
+        &self,
+        _h: &KeyHandle,
+        op: SignOrDh,
+        input: &[u8],
+    ) -> meridian_store::Result<Vec<u8>> {
+        match op {
+            SignOrDh::Dh if input == self.expected_input.as_slice() => {
+                // DH1 = DH(SPK_responder_priv, IK_sender_pub) — the ADR 0016 R1 leg, computable
+                // from the stolen SPK secret and the (public) claimed sender's identity key alone.
+                let ik_x =
+                    meridian_crypto::test_support::ed25519_pub_to_x25519(&self.forged_sender_ik)
+                        .expect("test fixture identity key is a valid Ed25519 point");
+                Ok(meridian_crypto::test_support::dh(&self.stolen_spk_secret, &ik_x).to_vec())
+            }
+            SignOrDh::Dh => Err(StoreError::UnsupportedOp(
+                "this attacker holds only a signed-prekey secret and cannot answer any DH query \
+                 except DH1 against the identity it is forging (ADR 0016 R1)",
+            )),
+            SignOrDh::Sign => Err(StoreError::UnsupportedOp(
+                "envelope v2 needs no per-message signature; this attacker never signs anything",
+            )),
+        }
+    }
+
+    fn nonextractable(&self) -> bool {
+        false
+    }
+
+    fn derive_key(&self, _h: &KeyHandle, _info: &[u8]) -> meridian_store::Result<[u8; 32]> {
+        unreachable!("this attacker never seals anything at rest")
+    }
+}
+
+/// ADR 0016 R1 (task 6.6) — **an enumerated, accepted residual, not a defect.** Dropping the
+/// per-message identity signature makes first-contact authentication rest entirely on X3DH's
+/// `DH1 = DH(IK_A, SPK_B)`. Because DH is commutative, that value is equally computable from
+/// `(SPK_B_priv, IK_A_pub)` as from `(IK_A_priv, SPK_B_pub)` — so an attacker who has obtained
+/// only a responder's signed-prekey SECRET (never that responder's identity key, and never the
+/// impersonated sender's identity key or store) can forge a complete first-contact session
+/// claiming to be from any sender, and the responder will accept and decrypt it exactly as if it
+/// were genuine.
+///
+/// ADR 0016 accepts this residual explicitly (compensating controls: enforced SPK rotation +
+/// keystore-grade SPK handling, C1) — it is **already enumerated**, not newly discovered or
+/// negotiable here. Per `docs/testing/strategy.md`'s "0 silent successes outside the enumerated
+/// accepted residuals" rule, this test's job is to make the residual visible and pinned by a
+/// PASSING assertion, never to imply it is a live bug or something this task is choosing to
+/// accept on its own authority.
+///
+/// It also pins the residual's documented BOUNDARY, so the claim is neither over- nor
+/// understated: the same attacker canNOT decrypt the genuine sender's own real first message
+/// (that leg, `DH2 = DH(EK_A, IK_B)`, needs the RESPONDER's real identity key, which this attacker
+/// never has) — modelled below by [`StolenSpkStore`] honestly refusing that query rather than
+/// fabricating a plausible-looking wrong answer. And safety-number verification — a pure function
+/// of the two public identity keys — does not distinguish the forged session from a genuine one,
+/// because both identity keys really are genuine.
+#[test]
+fn kci_forged_first_contact_from_stolen_spk_secret_succeeds_r1_accepted_residual() {
+    let mut alice = Party::new("kci.alice");
+    let mut bob = Party::new("kci.bob");
+    let bob_bundle = bob.publish();
+    let (bob_ik, alice_ik) = (bob.ik(), alice.ik());
+    let stolen_spk_secret = *bob_bundle.spk_secret;
+
+    // -- Forge: Mallory, holding ONLY Bob's stolen SPK secret, builds a first-contact session
+    // claiming to be Alice, using nothing but that secret and Alice's PUBLIC identity key. She
+    // never touches `alice.store` or any of Alice's private material.
+    let mallory_store = StolenSpkStore {
+        stolen_spk_secret,
+        forged_sender_ik: alice_ik,
+        expected_input: bob_bundle.bundle.spk,
+    };
+    let mallory_handle = KeyHandle::from_label("mallory-stolen-spk");
+
+    let mut forged = ChatState::default();
+    forged
+        .start_initiator_session(
+            &mallory_store,
+            &mallory_handle,
+            &alice_ik,
+            &bob_ik,
+            &bob_bundle.bundle.spk,
+            None, // no OTK compromised — only the SPK secret, per R1's threat model
+        )
+        .expect("Mallory can complete X3DH using only the stolen SPK secret (ADR 0016 R1)");
+    let forged_blob = forged
+        .seal_outbound(
+            &mallory_store,
+            &mallory_handle,
+            &alice_ik,
+            &bob_ik,
+            &ChatContent::Text {
+                id: [0xEEu8; 16],
+                body: "forged by mallory, not alice".into(),
+            },
+        )
+        .unwrap();
+
+    // Bob accepts and decrypts it, believing it genuinely came from Alice — the residual, pinned
+    // by a PASSING assertion (the one enumerated exception to "0 silent successes",
+    // docs/testing/strategy.md), not a silent success: it is enumerated as accepted in ADR 0016 R1
+    // itself.
+    match bob.recv(&alice_ik, &forged_blob) {
+        Ok(ChatContent::Text { body, .. }) => {
+            assert_eq!(body, "forged by mallory, not alice")
+        }
+        Ok(other) => {
+            panic!("forged first-contact message decrypted to unexpected content: {other:?}")
+        }
+        Err(_) => panic!(
+            "ADR 0016 R1 says this forgery SUCCEEDS (an accepted residual, not a defect) — if it \
+             now fails, either the residual has been unexpectedly closed (update ADR 0016 first, \
+             with security-reviewer sign-off, before weakening this assertion) or this test's \
+             attacker model has bit-rotted."
+        ),
+    }
+
+    // -- Boundary: this attacker cannot read Alice's OWN genuine first message. Give
+    // "Mallory-as-Bob" a vault entry for the (also stolen) SPK secret only, no OTKs and no
+    // identity key — the most she could ever legitimately construct — and confirm she still
+    // cannot complete the handshake for a message Alice actually sends.
+    alice.start(&bob_ik, &bob_bundle.bundle.spk, None); // no OTK: isolates the failure to the DH2 leg
+    let genuine_blob = alice.send(
+        &bob_ik,
+        &ChatContent::Text {
+            id: [0xAAu8; 16],
+            body: "alice's real first message".into(),
+        },
+    );
+    let mut mallory_reads_alice = ChatState::default();
+    mallory_reads_alice.vault.set_bundle(
+        bob_bundle.bundle.spk,
+        stolen_spk_secret,
+        vec![],
+        TEST_NOW_UNIX,
+    );
+    let outcome = mallory_reads_alice.open_inbound(
+        &mallory_store,
+        &mallory_handle,
+        &bob_ik, // Mallory would have to play Bob's role to even attempt this
+        &alice_ik,
+        &genuine_blob,
+    );
+    assert!(
+        outcome.is_err(),
+        "the attacker must NOT be able to read Alice's genuine first message with only the \
+         stolen SPK secret — that would be full compromise, not the bounded R1 residual ADR 0016 \
+         accepts. Got: {outcome:?}"
+    );
+
+    // -- Safety numbers do not catch the forgery either: it is a pure function of the two
+    // (genuine) public identity keys, unaffected by which session — forged or real — exists.
+    assert_eq!(
+        bob.state.safety_number(&bob_ik, &alice_ik).unwrap(),
+        meridian_crypto::safety_number(&bob_ik, &alice_ik),
+        "the safety number a user would be shown is identical whether the underlying session is \
+         genuine or Mallory's forgery — ADR 0016 R1's explicit point that verification does not \
+         detect this"
     );
 }
