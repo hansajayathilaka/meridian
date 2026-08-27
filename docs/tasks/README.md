@@ -60,10 +60,18 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   (T07/T14) — F1 is a single new test cell against already-correct code, not a design change, so this
   is not expected to meaningfully delay closure. Full report:
   [phase-7/review-report.md](./phase-7/review-report.md).
-- **NEXT:** `/plan-review-phase` — turn Phase 7's 9 findings into numbered fix-tasks (F1 first, since it
-  gates the next build phase). The Phase-1 adversarial frontier remains an unowned carry-forward for a
-  future `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08 residuals are Phase-4-scoped
-  follow-ups, not envelope-v2 scope, and stay listed below for a future phase.
+- **NOW:** **Phase 7's findings are broken into 6 numbered fix-tasks** (7.1–7.6), planned by the
+  **planner** agent. F1 (blocking) + F2 pair into **7.1** (same untested flag-day hard-reject area); F3 +
+  F4 pair into **7.2** (same `PrekeyVault`/responder-session secret-handling function family); F5–F7 and
+  N1 each get their own task (**7.3**–**7.6**). N2 (the 12-site stale-doc sweep) was **not** converted —
+  deferred to a future `/plan-phase` per the report's own verdict, since it spans many files outside a
+  tight scope and touches no security-critical prose; it stays an unowned carry-forward below. No fix-task
+  has a hard build-order dependency on another; 7.1 is listed first only because it's the blocking item.
+  Full breakdown: [phase-7/README.md](./phase-7/README.md#tasks-todo).
+- **NEXT:** `/next-task` — work the 6 fix-tasks (7.1 first, since it's the blocking item gating the next
+  build phase). The Phase-1 adversarial frontier remains an unowned carry-forward for a future
+  `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08 residuals are Phase-4-scoped follow-ups,
+  not envelope-v2 scope, and stay listed below for a future phase.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -428,7 +436,14 @@ Review phase. Sweeps everything built since the Phase-5 review: Phase 6 — Enve
 No untracked out-of-band PRs landed in this window. [Report](./phase-7/review-report.md): 9 findings —
 **1 blocking** (F1), 6 should-fix (F2–F7), 2 nits (N1–N2). Zero on-the-fly decisions need `/adr`
 ratification. Verdict: **blocked until F1 resolved**, then green for the next build phase (T07/T14).
-Fix-tasks not yet planned — next is `/plan-review-phase`.
+6 fix-tasks planned (7.1 pairs F1+F2, 7.2 pairs F3+F4, 7.3–7.6 cover F5/F6/F7/N1 individually; N2
+deferred to a future `/plan-phase`, not converted here).
+- [ ] **7.1** Flag-day hard-reject test coverage (F1, F2) — [file](./phase-7/7.1-flag-day-hard-reject-coverage.md)
+- [ ] **7.2** Zeroize discarded/peeked OTK and SPK secret copies (F3, F4) — [file](./phase-7/7.2-zeroize-otk-spk-secret-copies.md)
+- [ ] **7.3** Stale v1-signature prose in `route_tamper.rs` (F5) — [file](./phase-7/7.3-route-tamper-stale-signature-prose.md)
+- [ ] **7.4** Property test for `eid` dedup bound + duplicate detection (F6) — [file](./phase-7/7.4-eid-dedup-property-test.md)
+- [ ] **7.5** Boundary-case conformance vectors for `envelope-v2.json` (F7) — [file](./phase-7/7.5-envelope-v2-boundary-vectors.md)
+- [ ] **7.6** Resolve the `eid`/mailbox naming collision before T07 planning (N1) — [file](./phase-7/7.6-eid-mailbox-naming-collision-note.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.

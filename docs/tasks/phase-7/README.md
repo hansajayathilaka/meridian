@@ -43,9 +43,19 @@ phase (T07/T14).
 
 ## Tasks (todo)
 <!-- Filled by /plan-review-phase. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
-(none yet — /plan-review-phase turns the report's findings into numbered fix-tasks)
+Each fix-task is independent (no build-order dependency on another in this batch); 7.1 lands first only
+because it's the blocking item gating the phase verdict, not because of a technical conflict. N2 was
+**not** converted to a task — the report's own verdict defers the 12-site stale-doc sweep to a future
+`/plan-phase` since it spans many files outside a tight scope and none is security-critical prose;
+already recorded as an unowned carry-forward in the master tracker.
+
+- [ ] **7.1** Flag-day hard-reject test coverage (F1 blocking, F2) — [file](./7.1-flag-day-hard-reject-coverage.md)
+- [ ] **7.2** Zeroize discarded/peeked OTK and SPK secret copies (F3, F4) — [file](./7.2-zeroize-otk-spk-secret-copies.md)
+- [ ] **7.3** Stale v1-signature prose in `route_tamper.rs` (F5) — [file](./7.3-route-tamper-stale-signature-prose.md)
+- [ ] **7.4** Property test for `eid` dedup bound + duplicate detection (F6) — [file](./7.4-eid-dedup-property-test.md)
+- [ ] **7.5** Boundary-case conformance vectors for `envelope-v2.json` (F7) — [file](./7.5-envelope-v2-boundary-vectors.md)
+- [ ] **7.6** Resolve the `eid`/mailbox naming collision before T07 planning (N1) — [file](./7.6-eid-mailbox-naming-collision-note.md)
 
 ## Exit criteria
 All fix-tasks `[x]`, tree green, docs synced, findings closed per the report's verdict. Then:
-`/start-review-phase`'s usual successor build phase is picked via `/pick-next-phase` once
-`/plan-review-phase` has drained this phase's findings into tasks and they're done.
+`/pick-next-phase` for the next build phase (T07/T14, unblocked by Phase 6).
