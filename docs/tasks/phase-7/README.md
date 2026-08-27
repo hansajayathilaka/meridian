@@ -3,7 +3,8 @@
 
 # Phase 7 — Review of Phase 6
 
-**Kind:** review · **Status:** in progress · **Reviews phase(s):** Phase 6 (Envelope v2, tasks 6.1–6.8)
+**Kind:** review · **Status:** in progress (sweep complete, fix-tasks not yet planned) · **Reviews
+phase(s):** Phase 6 (Envelope v2, tasks 6.1–6.8)
 
 ## Goal
 Sweep everything built since the Phase-5 review for bugs, gaps, loopholes, and on-the-fly decisions
@@ -35,7 +36,10 @@ rather than the combined `reviewer` agent):
 - **test-engineer** — coverage gaps across the pyramid + adversarial harnesses for the new AEAD-only
   detector and `eid` dedup.
 
-Findings, on-the-fly decisions, and coverage gaps: [review-report.md](./review-report.md).
+Findings, on-the-fly decisions, and coverage gaps: [review-report.md](./review-report.md). **9
+findings — 1 blocking, 6 should-fix, 2 nits.** No on-the-fly decision needs `/adr` ratification.
+Verdict: blocked until F1 (an untested flag-day hard-reject path) lands, then clear for the next build
+phase (T07/T14).
 
 ## Tasks (todo)
 <!-- Filled by /plan-review-phase. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->

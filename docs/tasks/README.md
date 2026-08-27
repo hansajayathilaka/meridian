@@ -42,10 +42,28 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   [6.8's Outcome](./phase-6/6.8-phase-exit-flag-day-demo.md#outcome) and its
   [demo transcript](./phase-6/6.8-demo-transcript.md). This also discharges the standing envelope-v2
   dependency gate — see "Live carry-forwards" below — so **T07 (mailbox) and T14 are now pickable**.
-- **NEXT:** `/start-review-phase` — Phase 6 (a build phase) is closed, so the next command opens the
-  review phase that sweeps it, per the lifecycle. The Phase-1 adversarial frontier remains an unowned
-  carry-forward for a future `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08 residuals
-  are Phase-4-scoped follow-ups, not envelope-v2 scope, and stay listed below for a future phase.
+- **NOW:** **Phase 7 (review of Phase 6) opened — sweep complete, verdict recorded.**
+  [Report](./phase-7/review-report.md): 9 findings — **1 blocking** (F1: the C5/R5 flag-day hard-reject
+  path, `ChatError::UnsupportedEnvelopeVersion`, has zero test proving it actually fires — the
+  enforcement code itself was independently confirmed correct by all four reviewers, so this is a
+  coverage gap, not a live defect), 6 should-fix (F2: the "clean, diagnosable hard error" claim
+  unverified for a genuine v1-shaped blob, which fails earlier at codec decode; F3: a newly-introduced
+  un-zeroized OTK-secret discard in `commit_responder_otk`; F4: the pre-existing peeked-SPK/OTK-secret
+  zeroization carry-forward, now routinely attacker-triggerable under C2, finally given an owning task;
+  F5: stale v1-signature prose in `route_tamper.rs` that 6.7's doc-sync missed inside its own named
+  scope; F6: `eid` dedup has no property/fuzz coverage; F7: conformance vectors cover only one canonical
+  shape), 2 nits (N1: the `eid`/T07-mailbox naming collision needs an explicit note before T07 planning;
+  N2: 12 stale signature-era doc sites outside 6.7's scope, still unowned). Zero on-the-fly decisions
+  need `/adr` ratification — the two candidates checked (the `v:2` non-negotiation constraint, C1's
+  fail-open mechanism) are both correctly scoped as implementation detail within ADR 0016's own
+  accepted-residual framing. **Verdict: blocked until F1 lands, then clear for the next build phase**
+  (T07/T14) — F1 is a single new test cell against already-correct code, not a design change, so this
+  is not expected to meaningfully delay closure. Full report:
+  [phase-7/review-report.md](./phase-7/review-report.md).
+- **NEXT:** `/plan-review-phase` — turn Phase 7's 9 findings into numbered fix-tasks (F1 first, since it
+  gates the next build phase). The Phase-1 adversarial frontier remains an unowned carry-forward for a
+  future `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08 residuals are Phase-4-scoped
+  follow-ups, not envelope-v2 scope, and stay listed below for a future phase.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -404,6 +422,13 @@ consult) that shaped them: [phase-6/README.md](./phase-6/README.md).
 
 **Wave 4 — exit gate**
 - [x] **6.8** Phase exit: flag-day cutover verification + acceptance demo + roadmap unblock (depends on 6.1–6.7) — [file](./phase-6/6.8-phase-exit-flag-day-demo.md)
+
+### Phase 7 — Review of Phase 6 · **in progress** · [details](./phase-7/README.md)
+Review phase. Sweeps everything built since the Phase-5 review: Phase 6 — Envelope v2 (tasks 6.1–6.8).
+No untracked out-of-band PRs landed in this window. [Report](./phase-7/review-report.md): 9 findings —
+**1 blocking** (F1), 6 should-fix (F2–F7), 2 nits (N1–N2). Zero on-the-fly decisions need `/adr`
+ratification. Verdict: **blocked until F1 resolved**, then green for the next build phase (T07/T14).
+Fix-tasks not yet planned — next is `/plan-review-phase`.
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
