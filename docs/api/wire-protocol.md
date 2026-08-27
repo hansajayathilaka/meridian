@@ -25,10 +25,19 @@ Auth handshake: server → `challenge{v, nonce[32], server_time}`; client → `a
 |---|---|---|
 | `publish_bundle` | `{v, spk, spk_sig, otks[], otk_sigs[], device_record}` | all sigs under account key |
 | `fetch_bundle` | `{target: pubkey, hint?}` | exact full key only — no prefix ops exist; `hint` is an optional plain domain string, present when `target` may be a foreign account (T06, [2.3](../tasks/phase-2/2.3-c2s-federation-extension.md)) |
-| `route` | `{to: pubkey, to_hint?, blob: bstr}` | blob is opaque; server code path has no serde on it (lint-enforced); `to_hint` is `fetch_bundle.hint`'s counterpart for routing (T06) |
-| `deliver` | `{from, blob: bstr}` | push to client; `from` is the sender key the envelope claims — for a federated route it is the foreign server's assertion relayed verbatim (ADR 0017), not a new field |
-| `mailbox_ack` | `{envelope_ids[]}` | triggers deletion |
+| `route` | `{to: pubkey, to_hint?, blob: bstr}` | blob is opaque; server code path has no serde on it (lint-enforced); `to_hint` is `fetch_bundle.hint`'s counterpart for routing (T06); reply is `route_ok` (below) or an `err` (`not_connected`, `mailbox_full` — T07) |
+| `route_ok` | `{delivered: bool, queued?: bool}` | reply to `route`; `delivered:true` = pushed to a live connection (`queued` omitted, byte-identical to pre-T07 traffic); `{delivered:false, queued:true}` = accepted into the recipient's offline mailbox instead (T07, [8.3](../tasks/phase-8/8.3-wire-proto-mailbox-fields.md)) — an offline recipient with no mailbox available (`ttl_days == 0`) or over quota is never a `route_ok`, it's an `err` |
+| `deliver` | `{from, blob: bstr, mailbox_id?: uint}` | push to client; `from` is the sender key the envelope claims — for a federated route it is the foreign server's assertion relayed verbatim (ADR 0017), not a new field; `mailbox_id` is present only when this push drains a row from the recipient's offline mailbox (T07) — it is the mailbox's own server-assigned row id, **never** the opaque `eid` inside `blob` (data-model.md's mailbox table note, task 7.6) — absent for a live route, so existing traffic is byte-identical |
+| `mailbox_ack` | `MailboxAck{ids: [uint]}` → `MailboxAckOk{}` | client → server: acknowledge one or more mailbox-drain `deliver` pushes so the server deletes the corresponding rows, keyed by `ids` echoed from `deliver.mailbox_id` (never `eid`); server deletes only rows owned by the authenticated connection's own account. Supersedes the earlier `{envelope_ids[]}` placeholder, which predated the mailbox's actual server-assigned-`id` PK shape (task 7.6) and collided with `MessageEnvelope::eid`'s name (T07, [8.3](../tasks/phase-8/8.3-wire-proto-mailbox-fields.md)) |
 | `turn_cred` | `{}` → `{urls[], username, credential, ttl}` | ephemeral HMAC per session |
+
+**T07 mailbox error code.** `mailbox_full` (c2s `error_codes` and, on the federation side, s2s
+`fed_error_codes`) — a `route`/`fed_route` named a recipient who is offline and whose mailbox is
+already at its size/count quota; the sender gets a synchronous error instead of the envelope being
+silently dropped or accepted past the cap. Distinct from `not_connected`, which means no mailbox is
+available at all (`ttl_days == 0`). [8.3](../tasks/phase-8/8.3-wire-proto-mailbox-fields.md) adds
+the wire types only — the route-handler behaviour that emits `route_ok{queued}`/`mailbox_full`/
+`deliver{mailbox_id}` lands in 8.5–8.7.
 
 ## 3. Envelope (the only thing servers ever route)
 

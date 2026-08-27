@@ -251,6 +251,9 @@ pub async fn handle_fed_route(
     let deliver = Deliver {
         from: req.from,
         blob: req.envelope.clone(),
+        // A live push of a route that just crossed the federation boundary, never a mailbox drain
+        // (T07's federated mailbox enqueue is 8.6/8.7's job) — `mailbox_id` stays absent here.
+        mailbox_id: None,
     };
     let bytes = Frame::new(Op::Deliver, 0, &deliver)
         .and_then(|f| f.to_bytes())

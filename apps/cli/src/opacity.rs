@@ -157,6 +157,7 @@ pub fn run_audit(rounds: usize) -> Result<AuditReport, String> {
             &meridian_core::proto::Deliver {
                 from: alice_ik,
                 blob: OpaqueBlob::new(blob.clone()),
+                mailbox_id: None,
             },
         )
         .unwrap()

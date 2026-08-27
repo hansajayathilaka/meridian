@@ -2,8 +2,8 @@
 //! fields land as compact CBOR byte strings (not integer arrays).
 
 use meridian_proto::{
-    Auth, Bundle, Challenge, Deliver, Fetch, Frame, Op, OpaqueBlob, PrekeyBundle, Publish,
-    RouteBody, BUNDLE_VERSION,
+    error_codes, Auth, Bundle, Challenge, Deliver, Fetch, Frame, MailboxAck, MailboxAckOk, Op,
+    OpaqueBlob, PrekeyBundle, Publish, RouteBody, RouteOk, BUNDLE_VERSION,
 };
 
 fn sample_bundle() -> PrekeyBundle {
@@ -72,6 +72,7 @@ fn frame_and_bodies_roundtrip() {
     let deliver = Deliver {
         from: [1u8; 32],
         blob: OpaqueBlob::new(vec![1, 2, 3]),
+        mailbox_id: None,
     };
     let f = Frame::new(Op::Deliver, 6, &deliver).unwrap();
     assert_eq!(f.decode::<Deliver>().unwrap(), deliver);
@@ -158,6 +159,89 @@ fn bundle_structural_validation() {
     assert!(b.structurally_valid());
     b.otk_sigs.pop(); // mismatched counts
     assert!(!b.structurally_valid());
+}
+
+// --- 8.3: T07 mailbox wire vocabulary --------------------------------------------------------
+
+#[test]
+fn route_ok_delivered_true_no_queued_is_byte_identical_to_pre_8_3_shape() {
+    // The backward-compatibility claim, tested: a `RouteOk{delivered:true}` reply (the shape every
+    // existing client already speaks) must encode with no `queued` key at all — `queued: false`'s
+    // `skip_serializing_if` must actually omit the map key, not merely encode `false`.
+    let ok = RouteOk {
+        delivered: true,
+        queued: false,
+    };
+    let bytes = meridian_proto::encode(&ok).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(!text.contains("queued"));
+    assert_eq!(meridian_proto::decode::<RouteOk>(&bytes).unwrap(), ok);
+}
+
+#[test]
+fn route_ok_queued_true_roundtrips_and_is_present_on_the_wire() {
+    let ok = RouteOk {
+        delivered: false,
+        queued: true,
+    };
+    let bytes = meridian_proto::encode(&ok).unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("queued"));
+    let f = Frame::new(Op::RouteOk, 20, &ok).unwrap();
+    assert_eq!(f.decode::<RouteOk>().unwrap(), ok);
+}
+
+#[test]
+fn deliver_no_mailbox_id_is_byte_identical_to_pre_8_3_shape() {
+    // The backward-compatibility claim, tested: a live-route `Deliver{from, blob}` (no
+    // `mailbox_id`) must encode with no `mailbox_id` key at all.
+    let deliver = Deliver {
+        from: [1u8; 32],
+        blob: OpaqueBlob::new(vec![1, 2, 3]),
+        mailbox_id: None,
+    };
+    let bytes = meridian_proto::encode(&deliver).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(!text.contains("mailbox_id"));
+    assert_eq!(meridian_proto::decode::<Deliver>(&bytes).unwrap(), deliver);
+}
+
+#[test]
+fn deliver_mailbox_id_present_roundtrips() {
+    let deliver = Deliver {
+        from: [1u8; 32],
+        blob: OpaqueBlob::new(vec![1, 2, 3]),
+        mailbox_id: Some(42),
+    };
+    let bytes = meridian_proto::encode(&deliver).unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("mailbox_id"));
+    let f = Frame::new(Op::Deliver, 21, &deliver).unwrap();
+    let decoded = f.decode::<Deliver>().unwrap();
+    assert_eq!(decoded, deliver);
+    assert_eq!(decoded.mailbox_id, Some(42));
+}
+
+#[test]
+fn mailbox_ack_and_ack_ok_roundtrip() {
+    let ack = MailboxAck { ids: vec![1, 2, 3] };
+    let f = Frame::new(Op::MailboxAck, 22, &ack).unwrap();
+    assert_eq!(f.decode::<MailboxAck>().unwrap(), ack);
+
+    let empty = MailboxAck { ids: vec![] };
+    let f = Frame::new(Op::MailboxAck, 23, &empty).unwrap();
+    assert_eq!(f.decode::<MailboxAck>().unwrap(), empty);
+
+    let ack_ok = MailboxAckOk {};
+    let f = Frame::new(Op::MailboxAckOk, 24, &ack_ok).unwrap();
+    assert_eq!(f.decode::<MailboxAckOk>().unwrap(), ack_ok);
+}
+
+#[test]
+fn mailbox_full_error_codes_are_the_expected_strings() {
+    assert_eq!(error_codes::MAILBOX_FULL, "mailbox_full");
+    assert_eq!(
+        meridian_proto::fed_error_codes::MAILBOX_FULL,
+        "mailbox_full"
+    );
 }
 
 // Content-shaped type round-trips (chat, message envelope, ctrl frames, signal content) live in

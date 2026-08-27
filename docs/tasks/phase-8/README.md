@@ -102,7 +102,7 @@ cross-federation acceptance test (8.13) and the phase-exit demo (8.14) come last
 
 **Wave 1 — independent**
 - [x] **8.1** Mailbox store trait + in-memory impl + config surface — [file](./8.1-mailbox-store-trait-config.md)
-- [ ] **8.3** Wire/proto: `RouteOk.queued`, `mailbox_full`, `Deliver.mailbox_id`, `MailboxAck`/`MailboxAckOk` — [file](./8.3-wire-proto-mailbox-fields.md)
+- [x] **8.3** Wire/proto: `RouteOk.queued`, `mailbox_full`, `Deliver.mailbox_id`, `MailboxAck`/`MailboxAckOk` — [file](./8.3-wire-proto-mailbox-fields.md)
 
 **Wave 2**
 - [ ] **8.2** SQLite mailbox migration + `SqliteStore` impl (depends on 8.1) — [file](./8.2-sqlite-mailbox-migration.md)

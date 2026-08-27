@@ -462,7 +462,16 @@ async fn handle_route(
     };
 
     if delivered {
-        send(tx, Op::RouteOk, frame.id, &RouteOk { delivered: true }).await;
+        send(
+            tx,
+            Op::RouteOk,
+            frame.id,
+            &RouteOk {
+                delivered: true,
+                queued: false,
+            },
+        )
+        .await;
     } else {
         // Offline delivery / mailbox is T07; here an offline recipient is an error.
         send_err(
@@ -492,7 +501,16 @@ async fn handle_federated_route(
 ) {
     match route_foreign(state, hint, to, from, blob).await {
         Ok(()) => {
-            send(tx, Op::RouteOk, frame.id, &RouteOk { delivered: true }).await;
+            send(
+                tx,
+                Op::RouteOk,
+                frame.id,
+                &RouteOk {
+                    delivered: true,
+                    queued: false,
+                },
+            )
+            .await;
         }
         Err(e) => {
             let (code, msg) = federated_route_error_reply(hint, &e);
@@ -597,6 +615,9 @@ fn deliver_one(
     let deliver = Deliver {
         from,
         blob: meridian_proto::OpaqueBlob::new(blob),
+        // A live route push, never a mailbox drain (T07's mailbox-drain push is 8.7's job) —
+        // `mailbox_id` stays absent here.
+        mailbox_id: None,
     };
     let bytes = Frame::new(Op::Deliver, 0, &deliver).ok()?.to_bytes().ok()?;
     if state.registry.send_to(to, Message::Binary(bytes)) {

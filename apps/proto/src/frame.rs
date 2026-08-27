@@ -34,6 +34,11 @@ pub enum Op {
     /// server→client: a minted TURN credential, distinct per request (reuse of one credential is
     /// quota-bounded server-side, not rejected outright — see `TurnGrant` doc).
     TurnGrant,
+    /// client→server: acknowledge one or more mailbox-drain `Deliver` pushes so the server can
+    /// delete the corresponding rows (T07).
+    MailboxAck,
+    /// server→client: the `MailboxAck` was processed.
+    MailboxAckOk,
     /// server→client: structured error.
     Err,
 }

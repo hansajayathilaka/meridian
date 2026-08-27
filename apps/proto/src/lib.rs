@@ -31,8 +31,8 @@ pub use fed::{
 };
 pub use frame::{decode, encode, CodecError, Frame, Op};
 pub use msg::{
-    error_codes, Auth, AuthOk, Bundle, Challenge, Deliver, ErrBody, Fetch, Publish, PublishOk,
-    RouteBody, RouteOk, TurnGrant, TurnReq,
+    error_codes, Auth, AuthOk, Bundle, Challenge, Deliver, ErrBody, Fetch, MailboxAck,
+    MailboxAckOk, Publish, PublishOk, RouteBody, RouteOk, TurnGrant, TurnReq,
 };
 
 use serde::de::{self, Visitor};
@@ -96,5 +96,12 @@ impl<'de> Deserialize<'de> for OpaqueBlob {
     }
 }
 
-/// Wire-protocol major version (wire-protocol.md).
-pub const WIRE_VERSION: u8 = 1;
+/// Wire-protocol major version (wire-protocol.md). Bumped `1 -> 2` in task 8.3 (phase-8 architect
+/// consult point 7) to land the T07 mailbox's wire vocabulary — `RouteOk.queued`,
+/// `Deliver.mailbox_id`, `MailboxAck`/`MailboxAckOk`, `mailbox_full` — as one versioned unit, even
+/// though every individual field is additive/optional and old c2s traffic stays byte-identical
+/// (see `apps/proto/tests/roundtrip.rs`'s backward-compatibility tests). Unlike task 2.3's
+/// `Fetch.hint`/`RouteBody.to_hint` addition, which the architect judged did not warrant a bump,
+/// this phase's consult explicitly calls for one; no runtime code currently negotiates on this
+/// constant.
+pub const WIRE_VERSION: u8 = 2;

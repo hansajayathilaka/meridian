@@ -172,4 +172,9 @@ pub mod fed_error_codes {
     pub const NOT_FOUND: &str = "not_found";
     /// Malformed frame or body.
     pub const BAD_REQUEST: &str = "bad_request";
+    /// `FedRoute`'s recipient is offline and their mailbox is already at quota (T07, phase-8
+    /// architect consult point 4) — a legitimate exception to `Route`'s normal fire-and-forget
+    /// silence (federation-protocol-v1.md §2 already reports failure only via `FedErr`); mirrors
+    /// [`crate::msg::error_codes::MAILBOX_FULL`] on the c2s side. No new `FedOp` is needed.
+    pub const MAILBOX_FULL: &str = "mailbox_full";
 }

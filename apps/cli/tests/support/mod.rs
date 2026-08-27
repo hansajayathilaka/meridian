@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use meridian_rendezvous::config::{
-    Config, DiscoveryMode, Federation, FederationPolicyMode, Limits, Server, Turn,
+    Config, DiscoveryMode, Federation, FederationPolicyMode, Limits, Mailbox, Server, Turn,
 };
 use meridian_rendezvous::federation::inbound::{bind_federation, run_federation};
 use meridian_rendezvous::{serve, AppState};
@@ -116,6 +116,7 @@ pub fn base_config(domain: &str) -> Config {
         limits: Limits::default(),
         turn: Turn::default(),
         federation: Federation::default(),
+        mailbox: Mailbox::default(),
     }
 }
 
