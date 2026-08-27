@@ -83,7 +83,7 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   Task-picker's batch stopped here by design: **7.5** needs an architect sign-off on a conformance-
   vector byte-size `TODO: confirm` *before* it can start, so it wasn't cleanly unblocked for this run;
   **7.6** wasn't reached either since fix-tasks are worked in priority order. Draft PR opened carrying
-  all four commits: <PR URL filled after opening>.
+  all four commits: [#82](https://github.com/hansajayathilaka/meridian/pull/82).
 - **NEXT:** `/next-task` — **7.5** needs its architect pre-check (vector byte-size `TODO: confirm`)
   resolved before implementation can start; **7.6** (nit, architect-only, no code) remains fully
   unblocked and could run either before or after 7.5. The Phase-1 adversarial frontier remains an
