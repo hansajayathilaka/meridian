@@ -3,7 +3,7 @@
 
 # Phase 6 — Envelope v2
 
-**Kind:** build · **Status:** in progress · **Reviews phase(s):** n/a (this phase itself gets swept by
+**Kind:** build · **Status:** done · **Reviews phase(s):** n/a (this phase itself gets swept by
 the next review phase, Phase 7)
 
 ## Goal
@@ -141,7 +141,7 @@ Goal section for why)
 - [x] **6.7** Doc-sync: describe envelope v2 as shipped (C4; depends on 6.3, 6.4) — [file](./6.7-doc-sync-envelope-v2.md)
 
 **Wave 4 — exit gate**
-- [ ] **6.8** Phase exit: flag-day cutover verification + acceptance demo + roadmap unblock (depends on 6.1–6.7) — [file](./6.8-phase-exit-flag-day-demo.md)
+- [x] **6.8** Phase exit: flag-day cutover verification + acceptance demo + roadmap unblock (depends on 6.1–6.7) — [file](./6.8-phase-exit-flag-day-demo.md)
 
 ## Exit criteria
 All tasks `- [x]`; tree green (`cargo build --workspace`, `cargo fmt --check`,
