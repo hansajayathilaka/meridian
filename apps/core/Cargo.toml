@@ -48,3 +48,5 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 ciborium = { workspace = true }
 # account.rs tests (task 4.13) need a scratch $MERIDIAN_HOME directory.
 tempfile = { workspace = true }
+# eid_dedup.rs property coverage (task 7.4, review finding F6) — same pin apps/identity already uses.
+proptest = { workspace = true }

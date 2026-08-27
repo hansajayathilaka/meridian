@@ -446,7 +446,7 @@ deferred to a future `/plan-phase`, not converted here).
 - [x] **7.1** Flag-day hard-reject test coverage (F1, F2) — [file](./phase-7/7.1-flag-day-hard-reject-coverage.md)
 - [x] **7.2** Zeroize discarded/peeked OTK and SPK secret copies (F3, F4) — [file](./phase-7/7.2-zeroize-otk-spk-secret-copies.md)
 - [x] **7.3** Stale v1-signature prose in `route_tamper.rs` (F5) — [file](./phase-7/7.3-route-tamper-stale-signature-prose.md)
-- [~] **7.4** Property test for `eid` dedup bound + duplicate detection (F6) — [file](./phase-7/7.4-eid-dedup-property-test.md)
+- [x] **7.4** Property test for `eid` dedup bound + duplicate detection (F6) — [file](./phase-7/7.4-eid-dedup-property-test.md)
 - [ ] **7.5** Boundary-case conformance vectors for `envelope-v2.json` (F7) — [file](./phase-7/7.5-envelope-v2-boundary-vectors.md)
 - [ ] **7.6** Resolve the `eid`/mailbox naming collision before T07 planning (N1) — [file](./phase-7/7.6-eid-mailbox-naming-collision-note.md)
 
