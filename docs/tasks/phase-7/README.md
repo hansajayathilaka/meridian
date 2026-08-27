@@ -3,8 +3,8 @@
 
 # Phase 7 — Review of Phase 6
 
-**Kind:** review · **Status:** in progress (5/6 fix-tasks done — 7.1–7.4, 7.6; 7.5 needs an architect
-pre-check before it can start) · **Reviews phase(s):** Phase 6 (Envelope v2, tasks 6.1–6.8)
+**Kind:** review · **Status:** done — 6/6 fix-tasks closed · **Reviews phase(s):** Phase 6 (Envelope v2,
+tasks 6.1–6.8)
 
 ## Goal
 Sweep everything built since the Phase-5 review for bugs, gaps, loopholes, and on-the-fly decisions
@@ -53,9 +53,17 @@ already recorded as an unowned carry-forward in the master tracker.
 - [x] **7.2** Zeroize discarded/peeked OTK and SPK secret copies (F3, F4) — [file](./7.2-zeroize-otk-spk-secret-copies.md)
 - [x] **7.3** Stale v1-signature prose in `route_tamper.rs` (F5) — [file](./7.3-route-tamper-stale-signature-prose.md)
 - [x] **7.4** Property test for `eid` dedup bound + duplicate detection (F6) — [file](./7.4-eid-dedup-property-test.md)
-- [~] **7.5** Boundary-case conformance vectors for `envelope-v2.json` (F7) — [file](./7.5-envelope-v2-boundary-vectors.md)
+- [x] **7.5** Boundary-case conformance vectors for `envelope-v2.json` (F7) — [file](./7.5-envelope-v2-boundary-vectors.md)
 - [x] **7.6** Resolve the `eid`/mailbox naming collision before T07 planning (N1) — [file](./7.6-eid-mailbox-naming-collision-note.md)
 
 ## Exit criteria
 All fix-tasks `[x]`, tree green, docs synced, findings closed per the report's verdict. Then:
 `/pick-next-phase` for the next build phase (T07/T14, unblocked by Phase 6).
+
+**Met.** All 6 fix-tasks (7.1–7.6) closed, one `/next-task` run each stage, one commit per task, zero
+blocking or should-fix findings surviving any review round. F1 (the phase's sole blocking finding) is
+closed; F2–F7 (should-fix) and N1 (nit) are closed; N2 (the 12-site stale-doc sweep) was deliberately
+not converted to a task per the review report's own verdict, and remains an unowned carry-forward in
+the master tracker for a future `/plan-phase`. Tree green throughout every task
+(`cargo build`/`test`/`fmt`/`clippy` per touched crate). Phase 7 is done —
+[ratified below](../README.md).

@@ -95,12 +95,23 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   invariant, the T07 feature-spec dedup claim, the `one_time_prekeys.id` precedent) rather than
   trusting the stated reasoning. `docs/architecture/data-model.md` and this file's own carry-forward
   updated; `bash tools/check-docs.sh` clean.
-- **NEXT:** `/next-task` — **7.5** (boundary-case conformance vectors, F7) is Phase 7's only remaining
-  fix-task, still gated on an architect pre-check for a vector byte-size `TODO: confirm` before
-  implementation can start; that consult should happen as this task's own first step, not deferred
-  again. The Phase-1 adversarial frontier remains an unowned carry-forward for a future `/plan-phase`
-  if capacity allows; the six Phase-4-named TUI/T08 residuals are Phase-4-scoped follow-ups, not
-  envelope-v2 scope, and stay listed below for a future phase.
+- **NOW:** **Phase 7 (review of Phase 6) is closed — 6/6 fix-tasks done** (7.1–7.6). **7.5** (F7) closed
+  the last one: an architect pre-check (this task's own required first step) decided the boundary-case
+  `ct` size — 65536 bytes, matching the codebase's one existing "large payload" constant (`mrd.file/1`'s
+  64 KiB chunk size) and the first CBOR length-prefix width boundary under RFC 8949 — and the prekey
+  pairing (both new vectors share the already-maximal `prekey-with-opk` preamble). Two vectors
+  (`ct-empty`, `ct-large`) added to `test-vectors/envelope-v2.json` via genuine `xtask` regeneration;
+  the three existing vectors stay byte-identical. Independent architect review re-derived every claim
+  from raw bytes rather than trusting it (confirmed the CBOR length-prefix boundary directly from the
+  vector's hex, independently re-ran the regeneration itself). Zero blocking or should-fix findings
+  survived any of the six tasks' review rounds across this whole phase. Tree green throughout. Draft PR
+  [#82](https://github.com/hansajayathilaka/meridian/pull/82) carries all six commits.
+- **NEXT:** `/pick-next-phase` — Phase 7 is closed with zero findings outstanding (N2 deliberately
+  deferred, not open work), so the next command picks the next build phase. **T07 (mailbox) and T14 are
+  clear to pick** — envelope v2's dependency gate was satisfied in Phase 6, and Phase 7's own review
+  found nothing that reopens or reshapes that. The Phase-1 adversarial frontier remains an unowned
+  carry-forward for a future `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08 residuals
+  are Phase-4-scoped follow-ups and stay listed below for a future phase.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -468,18 +479,19 @@ consult) that shaped them: [phase-6/README.md](./phase-6/README.md).
 **Wave 4 — exit gate**
 - [x] **6.8** Phase exit: flag-day cutover verification + acceptance demo + roadmap unblock (depends on 6.1–6.7) — [file](./phase-6/6.8-phase-exit-flag-day-demo.md)
 
-### Phase 7 — Review of Phase 6 · **in progress** · [details](./phase-7/README.md)
+### Phase 7 — Review of Phase 6 · **done** · [details](./phase-7/README.md)
 Review phase. Sweeps everything built since the Phase-5 review: Phase 6 — Envelope v2 (tasks 6.1–6.8).
 No untracked out-of-band PRs landed in this window. [Report](./phase-7/review-report.md): 9 findings —
 **1 blocking** (F1), 6 should-fix (F2–F7), 2 nits (N1–N2). Zero on-the-fly decisions need `/adr`
-ratification. Verdict: **blocked until F1 resolved**, then green for the next build phase (T07/T14).
-6 fix-tasks planned (7.1 pairs F1+F2, 7.2 pairs F3+F4, 7.3–7.6 cover F5/F6/F7/N1 individually; N2
-deferred to a future `/plan-phase`, not converted here).
+ratification. All 6 fix-tasks (7.1–7.6) closed — F1 (blocking), F2–F7 (should-fix), N1 (nit) all
+resolved with zero should-fix/blocking findings surviving any review round; N2 deliberately not
+converted, deferred to a future `/plan-phase` per the report's own verdict. Tree green throughout.
+**T07/T14 are clear to pick.**
 - [x] **7.1** Flag-day hard-reject test coverage (F1, F2) — [file](./phase-7/7.1-flag-day-hard-reject-coverage.md)
 - [x] **7.2** Zeroize discarded/peeked OTK and SPK secret copies (F3, F4) — [file](./phase-7/7.2-zeroize-otk-spk-secret-copies.md)
 - [x] **7.3** Stale v1-signature prose in `route_tamper.rs` (F5) — [file](./phase-7/7.3-route-tamper-stale-signature-prose.md)
 - [x] **7.4** Property test for `eid` dedup bound + duplicate detection (F6) — [file](./phase-7/7.4-eid-dedup-property-test.md)
-- [~] **7.5** Boundary-case conformance vectors for `envelope-v2.json` (F7) — [file](./phase-7/7.5-envelope-v2-boundary-vectors.md)
+- [x] **7.5** Boundary-case conformance vectors for `envelope-v2.json` (F7) — [file](./phase-7/7.5-envelope-v2-boundary-vectors.md)
 - [x] **7.6** Resolve the `eid`/mailbox naming collision before T07 planning (N1) — [file](./phase-7/7.6-eid-mailbox-naming-collision-note.md)
 
 ## Legend / how to read
