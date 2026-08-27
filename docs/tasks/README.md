@@ -84,12 +84,23 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   vector byte-size `TODO: confirm` *before* it can start, so it wasn't cleanly unblocked for this run;
   **7.6** wasn't reached either since fix-tasks are worked in priority order. Draft PR opened carrying
   all four commits: [#82](https://github.com/hansajayathilaka/meridian/pull/82).
-- **NEXT:** `/next-task` — **7.5** needs its architect pre-check (vector byte-size `TODO: confirm`)
-  resolved before implementation can start; **7.6** (nit, architect-only, no code) remains fully
-  unblocked and could run either before or after 7.5. The Phase-1 adversarial frontier remains an
-  unowned carry-forward for a future `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08
-  residuals are Phase-4-scoped follow-ups, not envelope-v2 scope, and stay listed below for a future
-  phase.
+- **NOW:** **5/6 Phase 7 fix-tasks done** (7.1–7.4, 7.6). **7.6** (N1) resolved the `eid`/mailbox
+  naming collision task-picker judged 7.5 couldn't get to first: the mailbox's planned PK is renamed
+  `id INTEGER PK` (server-assigned sequential, matching `one_time_prekeys.id`'s existing shape),
+  explicitly independent of `MessageEnvelope::eid` — deriving it from the envelope's `eid` would have
+  required the server to decode a field out of the opaque blob it never otherwise touches, a real,
+  structurally-enforced invariant (confirmed: `apps/rendezvous` doesn't even depend on the
+  `meridian-envelope` crate). No ADR needed — resolves ADR 0007's own scope, doesn't invent new
+  architecture. Independent architect sign-off verified every claim against source (the opaque-blob
+  invariant, the T07 feature-spec dedup claim, the `one_time_prekeys.id` precedent) rather than
+  trusting the stated reasoning. `docs/architecture/data-model.md` and this file's own carry-forward
+  updated; `bash tools/check-docs.sh` clean.
+- **NEXT:** `/next-task` — **7.5** (boundary-case conformance vectors, F7) is Phase 7's only remaining
+  fix-task, still gated on an architect pre-check for a vector byte-size `TODO: confirm` before
+  implementation can start; that consult should happen as this task's own first step, not deferred
+  again. The Phase-1 adversarial frontier remains an unowned carry-forward for a future `/plan-phase`
+  if capacity allows; the six Phase-4-named TUI/T08 residuals are Phase-4-scoped follow-ups, not
+  envelope-v2 scope, and stay listed below for a future phase.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -147,15 +158,18 @@ evaporate:
   `tools/metrics-allowlist.txt`/`docs/operations/monitoring.md` — the column already exists
   server-side, nothing about 6.2 forecloses it. No open task owns this; schedule via a future
   `/plan-phase` when devops prioritizes it.
-- **T07 (mailbox, still unbuilt)'s planned `mailbox` table uses `eid BLOB` as its row key
-  ([data-model.md](../architecture/data-model.md)) — a naming collision with task 6.4's new
-  `MessageEnvelope::eid` (envelope-level replay-dedup, client-side only) that whoever plans T07 must
-  resolve deliberately, not by accident.** The server's "envelope stays opaque, never decoded"
-  invariant is otherwise absolute; if T07's mailbox PK is meant to be *derived from* the envelope's
-  `eid`, that requires the server to peek one field of an otherwise-opaque blob — a real design
-  question, not a given. If instead the mailbox mints its own independent row key, it should be named
-  to avoid the collision. Flagged by task 6.4's architect review; not 6.4's problem to resolve since
-  T07 doesn't exist in code yet.
+- **RESOLVED (Phase 7, task 7.6): T07's planned `mailbox` table PK is `id INTEGER PK`** — a
+  server-assigned sequential row id, same shape as `one_time_prekeys.id`, deliberately independent
+  of `MessageEnvelope::eid` (task 6.4's client-side replay-dedup key). The naming collision flagged by
+  task 6.4's architect review is resolved, not just re-flagged: the envelope's `eid` lives inside the
+  opaque `blob` column, which the server never decodes (route's opaque-blob contract, `OpaqueBlob`, the
+  no-serde-on-blob lint) — deriving the mailbox PK from it would have required peeking one field of an
+  otherwise-opaque payload, a real invariant violation, not a nuance. Dedup on redelivery stays a
+  client-side concern only (T07's own feature spec deliverable 2; task 2.8's "no s2s dedup" already
+  stands), so the server never needs to read `eid` at all. No ADR needed — this applies ADR-7's
+  existing mailbox scope and the pre-existing opaque-blob invariant consistently, resolving an
+  accidental naming collision in a not-yet-implemented table, not new binding architecture. See
+  [data-model.md](../architecture/data-model.md)'s mailbox table note.
 - **A residual sweep of stale "envelope signature"/"signed envelope" language remains outside task
   6.7's file scope** — `apps/rendezvous/src/config.rs`, `apps/rendezvous/src/ws.rs`,
   `apps/rendezvous/src/lib.rs`/`main.rs`, `apps/cli/tests/relay_rewrite.rs`,
@@ -466,7 +480,7 @@ deferred to a future `/plan-phase`, not converted here).
 - [x] **7.3** Stale v1-signature prose in `route_tamper.rs` (F5) — [file](./phase-7/7.3-route-tamper-stale-signature-prose.md)
 - [x] **7.4** Property test for `eid` dedup bound + duplicate detection (F6) — [file](./phase-7/7.4-eid-dedup-property-test.md)
 - [ ] **7.5** Boundary-case conformance vectors for `envelope-v2.json` (F7) — [file](./phase-7/7.5-envelope-v2-boundary-vectors.md)
-- [~] **7.6** Resolve the `eid`/mailbox naming collision before T07 planning (N1) — [file](./phase-7/7.6-eid-mailbox-naming-collision-note.md)
+- [x] **7.6** Resolve the `eid`/mailbox naming collision before T07 planning (N1) — [file](./phase-7/7.6-eid-mailbox-naming-collision-note.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.

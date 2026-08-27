@@ -23,9 +23,17 @@ device_records(    -- append-only, ACCOUNT-signed; server stores, never edits
   account_pub, version INT, record BLOB /*signed CBOR*/, PRIMARY KEY(account_pub, version))
 
 mailbox(           -- ADR-7. A7 learns: count, sizes, timestamps. Nothing else.
-  eid BLOB PK, recipient_pub, blob BLOB /*opaque — no-serde lint*/,
+  id INTEGER PK,   -- server-assigned sequential row id (same shape as one_time_prekeys.id).
+                   -- Deliberately independent of MessageEnvelope::eid (task 6.4, ADR 0016 C7):
+                   -- that eid lives inside the opaque `blob` below, which the server never
+                   -- decodes (route's opaque-blob contract; apps/proto's OpaqueBlob; the
+                   -- no-serde-on-blob lint). The shared name was coincidental drafting, resolved
+                   -- by task 7.6 — this is not the same key, and not derived from it. Dedup on
+                   -- redelivery is a client-side concern only (T07 deliverable 2; task 2.8's
+                   -- "no s2s dedup" already stands) — the server never needs to read eid at all.
+  recipient_pub, blob BLOB /*opaque — no-serde lint*/,
   arrived_at, expires_at, size_bytes)
-  -- purge job on expires_at; delete on ack; quota trigger per recipient
+  -- purge job on expires_at; delete on ack (by id); quota trigger per recipient
   -- TTL=0 config ⇒ inserts disabled entirely (pure-P2P mode)
 
 rate_counters(scope TEXT, key_hash BLOB, window_start, count)  -- salted hashes only
