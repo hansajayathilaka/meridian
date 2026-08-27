@@ -12,10 +12,16 @@ across all five targets (CLI/WASM/desktop/mobile). This is the "test" memory of 
   `note` for the determinism boundary), plus a functional header-seal/open round trip.
 - `envelope-v1.json` — `MessageEnvelope` deterministic-CBOR wire-encoding vectors.
 - `safety-numbers-v1.json` — safety-number/fingerprint vectors (T08).
-- `federation-v1.json` — s2s `FedFrame` body wire-encoding vectors (T06 cross-org federation).
+- `federation-v1.json` — s2s `FedFrame` body wire-encoding vectors (T06 cross-org federation),
+  extended in task 8.4 with an `err-mailbox-full` case (`fed_error_codes::MAILBOX_FULL`, task 8.3)
+  alongside the pre-existing `err` (`NOT_FOUND`) case.
 - `c2s-v1.json` — c2s `Fetch.hint`/`RouteBody.to_hint`/federation-error-code wire-encoding vectors
   (task 3.14, review finding F20). Deliberately narrower than the full c2s frame set — see the
   vector's own `note` field and `docs/tasks/phase-3/3.14-c2s-hint-conformance-vectors.md` Scope.
+  Extended in task 8.4 with the T07 mailbox wire fields task 8.3 added (`RouteOk.queued`,
+  `Deliver.mailbox_id`, `MailboxAck`/`MailboxAckOk`, `error_codes::MAILBOX_FULL`) — the pre-8.3
+  vectors stay byte-identical (locked by
+  `apps/proto/tests/conformance.rs::pre_8_3_vectors_are_byte_identical_after_8_4_regeneration`).
 
 `apps/crypto/tests/conformance.rs` re-derives the crypto-derivation vectors (x3dh/ratchet/envelope/
 safety-numbers) from the crate's real code and asserts byte equality — a vector that only "the

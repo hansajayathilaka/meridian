@@ -106,7 +106,7 @@ cross-federation acceptance test (8.13) and the phase-exit demo (8.14) come last
 
 **Wave 2**
 - [x] **8.2** SQLite mailbox migration + `SqliteStore` impl (depends on 8.1) — [file](./8.2-sqlite-mailbox-migration.md)
-- [~] **8.4** Conformance vectors for the mailbox wire fields (depends on 8.3) — [file](./8.4-mailbox-conformance-vectors.md)
+- [x] **8.4** Conformance vectors for the mailbox wire fields (depends on 8.3) — [file](./8.4-mailbox-conformance-vectors.md)
 
 **Wave 3 — route-path integration**
 - [ ] **8.5** `handle_route` local mailbox enqueue, TTL/quota-aware (depends on 8.1, 8.3) — [file](./8.5-local-route-mailbox-enqueue.md)

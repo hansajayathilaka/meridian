@@ -157,11 +157,29 @@ pub fn generate_federation() -> Result<(), String> {
         serde_json::json!({ "code": err.code, "msg": err.msg }),
     )?);
 
+    // 8.4: task 8.3 added `fed_error_codes::MAILBOX_FULL` alongside the c2s `error_codes` twin —
+    // this file already has an error-code vector category (`err` above, `NOT_FOUND`), so this is
+    // an additional case within that existing category, not a new one (8.4 Scope: don't invent a
+    // vector category that doesn't otherwise exist).
+    let err_mailbox_full = FedErr {
+        code: meridian_proto::fed_error_codes::MAILBOX_FULL.into(),
+        msg: "recipient mailbox is full".into(),
+    };
+    vectors.push(build_vector(
+        "err-mailbox-full",
+        FedOp::Err,
+        2,
+        &err_mailbox_full,
+        serde_json::json!({ "code": err_mailbox_full.code, "msg": err_mailbox_full.msg }),
+    )?);
+
     let fixtures = Fixtures {
         version: 1,
         note: "T06 federation (s2s) wire-encoding conformance vectors — deterministic CBOR \
                (fixed byte patterns, no RNG/wall-clock). Regenerate with `cargo run -p xtask -- \
-               vectors`. Spec: docs/api/federation-protocol-v1.md, apps/proto/src/fed.rs."
+               vectors`. Spec: docs/api/federation-protocol-v1.md, apps/proto/src/fed.rs. \
+               Extended in task 8.4 with an `err-mailbox-full` case (task 8.3's \
+               fed_error_codes::MAILBOX_FULL) alongside the existing `err` (NOT_FOUND) case."
             .into(),
         vectors,
     };

@@ -15,7 +15,10 @@
 //! task does not widen into.
 //! Spec: docs/api/wire-protocol.md, docs/api/federation-protocol-v1.md, apps/proto/src/msg.rs.
 
-use meridian_proto::{error_codes, ErrBody, Fetch, Frame, Op, OpaqueBlob, RouteBody};
+use meridian_proto::{
+    error_codes, Deliver, ErrBody, Fetch, Frame, MailboxAck, MailboxAckOk, Op, OpaqueBlob,
+    RouteBody, RouteOk,
+};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -165,6 +168,113 @@ pub fn generate_c2s() -> Result<(), String> {
         )?);
     }
 
+    // --- 8.4: T07 mailbox wire fields (task 8.3's WIRE_VERSION 1->2 bump) --------------------
+    //
+    // RouteOk.queued, Deliver.mailbox_id, MailboxAck/MailboxAckOk, and the mailbox_full error
+    // code, locked byte-for-byte so client/server implementations can't silently drift (8.4).
+
+    // RouteOk — delivered live, no `queued` key at all (the pre-8.3 shape; `queued: false`'s
+    // `skip_serializing_if` must actually omit the map key).
+    let route_ok_delivered = RouteOk {
+        delivered: true,
+        queued: false,
+    };
+    vectors.push(build_vector(
+        "route-ok-delivered",
+        Op::RouteOk,
+        6,
+        &route_ok_delivered,
+        serde_json::json!({
+            "delivered": route_ok_delivered.delivered,
+            "queued": route_ok_delivered.queued,
+        }),
+    )?);
+
+    // RouteOk — queued to the recipient's offline mailbox (`queued` present on the wire).
+    let route_ok_queued = RouteOk {
+        delivered: false,
+        queued: true,
+    };
+    vectors.push(build_vector(
+        "route-ok-queued",
+        Op::RouteOk,
+        7,
+        &route_ok_queued,
+        serde_json::json!({
+            "delivered": route_ok_queued.delivered,
+            "queued": route_ok_queued.queued,
+        }),
+    )?);
+
+    // Deliver — live-route push, no `mailbox_id` key at all (the pre-8.3 shape).
+    let deliver_no_mailbox_id = Deliver {
+        from: [0x55u8; 32],
+        blob: OpaqueBlob::new(vec![0xF0, 0x0D]),
+        mailbox_id: None,
+    };
+    vectors.push(build_vector(
+        "deliver-no-mailbox-id",
+        Op::Deliver,
+        8,
+        &deliver_no_mailbox_id,
+        serde_json::json!({
+            "from_hex": hex::encode(deliver_no_mailbox_id.from),
+            "blob_hex": hex::encode(deliver_no_mailbox_id.blob.as_bytes()),
+            "mailbox_id": null,
+        }),
+    )?);
+
+    // Deliver — mailbox-drain push, `mailbox_id` present.
+    let deliver_with_mailbox_id = Deliver {
+        from: [0x66u8; 32],
+        blob: OpaqueBlob::new(vec![0xF0, 0x0D]),
+        mailbox_id: Some(42),
+    };
+    vectors.push(build_vector(
+        "deliver-with-mailbox-id",
+        Op::Deliver,
+        9,
+        &deliver_with_mailbox_id,
+        serde_json::json!({
+            "from_hex": hex::encode(deliver_with_mailbox_id.from),
+            "blob_hex": hex::encode(deliver_with_mailbox_id.blob.as_bytes()),
+            "mailbox_id": deliver_with_mailbox_id.mailbox_id,
+        }),
+    )?);
+
+    // MailboxAck — non-empty id list.
+    let mailbox_ack = MailboxAck { ids: vec![1, 2, 3] };
+    vectors.push(build_vector(
+        "mailbox-ack",
+        Op::MailboxAck,
+        10,
+        &mailbox_ack,
+        serde_json::json!({ "ids": mailbox_ack.ids }),
+    )?);
+
+    // MailboxAckOk — empty body.
+    let mailbox_ack_ok = MailboxAckOk {};
+    vectors.push(build_vector(
+        "mailbox-ack-ok",
+        Op::MailboxAckOk,
+        11,
+        &mailbox_ack_ok,
+        serde_json::json!({}),
+    )?);
+
+    // Err — mailbox_full, the new c2s error code (mirrors fed_error_codes::MAILBOX_FULL).
+    let err_mailbox_full = ErrBody {
+        code: error_codes::MAILBOX_FULL.into(),
+        msg: "recipient mailbox is full".into(),
+    };
+    vectors.push(build_vector(
+        "err-mailbox-full",
+        Op::Err,
+        12,
+        &err_mailbox_full,
+        serde_json::json!({ "code": err_mailbox_full.code, "msg": err_mailbox_full.msg }),
+    )?);
+
     let fixtures = Fixtures {
         version: 1,
         note: "c2s wire-encoding conformance vectors for the federation-hint extension (F20): \
@@ -174,7 +284,11 @@ pub fn generate_c2s() -> Result<(), String> {
                apps/proto/src/msg.rs. The full historic c2s frame set (Challenge/Auth/Publish/\
                Bundle/Deliver/TurnReq/TurnGrant) is proven only by apps/proto/tests/roundtrip.rs's \
                hand-written round trips, a pre-existing gap this task does not widen into (see \
-               docs/tasks/phase-3/3.14-c2s-hint-conformance-vectors.md Scope)."
+               docs/tasks/phase-3/3.14-c2s-hint-conformance-vectors.md Scope). Extended in task \
+               8.4 with the T07 mailbox wire fields added in 8.3 (RouteOk.queued, \
+               Deliver.mailbox_id, MailboxAck/MailboxAckOk, mailbox_full): the pre-8.3 vectors \
+               above stay byte-identical, and route-ok-delivered/deliver-no-mailbox-id \
+               additionally pin the backward-compatible (field-omitted) shape of RouteOk/Deliver."
             .into(),
         vectors,
     };

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "c2s wire-encoding conformance vectors for the federation-hint extension (F20): Fetch.hint, RouteBody.to_hint, and the new federation error codes — deterministic CBOR (fixed byte patterns, no RNG/wall-clock). Regenerate with `cargo run -p xtask -- vectors`. Spec: docs/api/wire-protocol.md, docs/api/federation-protocol-v1.md, apps/proto/src/msg.rs. The full historic c2s frame set (Challenge/Auth/Publish/Bundle/Deliver/TurnReq/TurnGrant) is proven only by apps/proto/tests/roundtrip.rs's hand-written round trips, a pre-existing gap this task does not widen into (see docs/tasks/phase-3/3.14-c2s-hint-conformance-vectors.md Scope).",
+  "note": "c2s wire-encoding conformance vectors for the federation-hint extension (F20): Fetch.hint, RouteBody.to_hint, and the new federation error codes — deterministic CBOR (fixed byte patterns, no RNG/wall-clock). Regenerate with `cargo run -p xtask -- vectors`. Spec: docs/api/wire-protocol.md, docs/api/federation-protocol-v1.md, apps/proto/src/msg.rs. The full historic c2s frame set (Challenge/Auth/Publish/Bundle/Deliver/TurnReq/TurnGrant) is proven only by apps/proto/tests/roundtrip.rs's hand-written round trips, a pre-existing gap this task does not widen into (see docs/tasks/phase-3/3.14-c2s-hint-conformance-vectors.md Scope). Extended in task 8.4 with the T07 mailbox wire fields added in 8.3 (RouteOk.queued, Deliver.mailbox_id, MailboxAck/MailboxAckOk, mailbox_full): the pre-8.3 vectors above stay byte-identical, and route-ok-delivered/deliver-no-mailbox-id additionally pin the backward-compatible (field-omitted) shape of RouteOk/Deliver.",
   "vectors": [
     {
       "name": "fetch-no-hint",
@@ -75,6 +75,78 @@
         "msg": "no such account at org-b.example"
       },
       "frame_hex": "a3626f70634572726269640564626f6479583ea264636f6465716e6f745f666f756e645f61745f68696e74636d736778206e6f2073756368206163636f756e74206174206f72672d622e6578616d706c65"
+    },
+    {
+      "name": "route-ok-delivered",
+      "op": "RouteOk",
+      "id": 6,
+      "fields": {
+        "delivered": true,
+        "queued": false
+      },
+      "frame_hex": "a3626f7067526f7574654f6b6269640664626f64794ca16964656c697665726564f5"
+    },
+    {
+      "name": "route-ok-queued",
+      "op": "RouteOk",
+      "id": 7,
+      "fields": {
+        "delivered": false,
+        "queued": true
+      },
+      "frame_hex": "a3626f7067526f7574654f6b6269640764626f647954a26964656c697665726564f466717565756564f5"
+    },
+    {
+      "name": "deliver-no-mailbox-id",
+      "op": "Deliver",
+      "id": 8,
+      "fields": {
+        "blob_hex": "f00d",
+        "from_hex": "5555555555555555555555555555555555555555555555555555555555555555",
+        "mailbox_id": null
+      },
+      "frame_hex": "a3626f706744656c697665726269640864626f64795830a26466726f6d5820555555555555555555555555555555555555555555555555555555555555555564626c6f6242f00d"
+    },
+    {
+      "name": "deliver-with-mailbox-id",
+      "op": "Deliver",
+      "id": 9,
+      "fields": {
+        "blob_hex": "f00d",
+        "from_hex": "6666666666666666666666666666666666666666666666666666666666666666",
+        "mailbox_id": 42
+      },
+      "frame_hex": "a3626f706744656c697665726269640964626f6479583da36466726f6d5820666666666666666666666666666666666666666666666666666666666666666664626c6f6242f00d6a6d61696c626f785f6964182a"
+    },
+    {
+      "name": "mailbox-ack",
+      "op": "MailboxAck",
+      "id": 10,
+      "fields": {
+        "ids": [
+          1,
+          2,
+          3
+        ]
+      },
+      "frame_hex": "a3626f706a4d61696c626f7841636b6269640a64626f647949a16369647383010203"
+    },
+    {
+      "name": "mailbox-ack-ok",
+      "op": "MailboxAckOk",
+      "id": 11,
+      "fields": {},
+      "frame_hex": "a3626f706c4d61696c626f7841636b4f6b6269640b64626f647941a0"
+    },
+    {
+      "name": "err-mailbox-full",
+      "op": "Err",
+      "id": 12,
+      "fields": {
+        "code": "mailbox_full",
+        "msg": "recipient mailbox is full"
+      },
+      "frame_hex": "a3626f70634572726269640c64626f64795832a264636f64656c6d61696c626f785f66756c6c636d73677819726563697069656e74206d61696c626f782069732066756c6c"
     }
   ]
 }
