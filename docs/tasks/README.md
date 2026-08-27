@@ -466,7 +466,7 @@ deferred to a future `/plan-phase`, not converted here).
 - [x] **7.3** Stale v1-signature prose in `route_tamper.rs` (F5) — [file](./phase-7/7.3-route-tamper-stale-signature-prose.md)
 - [x] **7.4** Property test for `eid` dedup bound + duplicate detection (F6) — [file](./phase-7/7.4-eid-dedup-property-test.md)
 - [ ] **7.5** Boundary-case conformance vectors for `envelope-v2.json` (F7) — [file](./phase-7/7.5-envelope-v2-boundary-vectors.md)
-- [ ] **7.6** Resolve the `eid`/mailbox naming collision before T07 planning (N1) — [file](./phase-7/7.6-eid-mailbox-naming-collision-note.md)
+- [~] **7.6** Resolve the `eid`/mailbox naming collision before T07 planning (N1) — [file](./phase-7/7.6-eid-mailbox-naming-collision-note.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.

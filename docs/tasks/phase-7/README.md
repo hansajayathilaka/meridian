@@ -54,7 +54,7 @@ already recorded as an unowned carry-forward in the master tracker.
 - [x] **7.3** Stale v1-signature prose in `route_tamper.rs` (F5) — [file](./7.3-route-tamper-stale-signature-prose.md)
 - [x] **7.4** Property test for `eid` dedup bound + duplicate detection (F6) — [file](./7.4-eid-dedup-property-test.md)
 - [ ] **7.5** Boundary-case conformance vectors for `envelope-v2.json` (F7) — [file](./7.5-envelope-v2-boundary-vectors.md)
-- [ ] **7.6** Resolve the `eid`/mailbox naming collision before T07 planning (N1) — [file](./7.6-eid-mailbox-naming-collision-note.md)
+- [~] **7.6** Resolve the `eid`/mailbox naming collision before T07 planning (N1) — [file](./7.6-eid-mailbox-naming-collision-note.md)
 
 ## Exit criteria
 All fix-tasks `[x]`, tree green, docs synced, findings closed per the report's verdict. Then:
