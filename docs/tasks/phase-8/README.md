@@ -4,7 +4,7 @@
 
 # Phase 8 — Offline Ciphertext Mailbox
 
-**Kind:** build · **Status:** planning · **Reviews phase(s):** n/a (build phase)
+**Kind:** build · **Status:** in progress · **Reviews phase(s):** n/a (build phase)
 
 ## Goal
 Ship **[T07 — Offline Ciphertext Mailbox](../../architecture/features/07-offline-mailbox.md)**: deliver
@@ -50,9 +50,81 @@ its review phase clears — not before.
   are deliberately not pulled into this phase's scope — they stay available for a future `/plan-phase` if
   capacity allows.
 
+## Architect consult (wire-shape decisions, settled before task breakdown)
+Because T07 necessarily changes canonical wire contracts (`docs/api/wire-protocol.md`,
+`rendezvous-protocol-v1.md`, `federation-protocol-v1.md`, `apps/proto`), an architect pass ran
+before the planner broke the phase into tasks, so no task has to re-derive these mid-implementation:
+
+1. **`RouteOk` gains one additive optional field, `queued: bool`** (omitted when `false` — existing
+   `delivered:true` traffic stays byte-identical). Outcomes: delivered-live →
+   `RouteOk{delivered:true}`; queued to mailbox → `RouteOk{delivered:false, queued:true}`;
+   TTL=0-and-offline → unchanged `Err{not_connected}`; mailbox full → new `Err{mailbox_full}`
+   (never a `RouteOk`). See [8.3](./8.3-wire-proto-mailbox-fields.md).
+2. **Federated routing needs no `federation-protocol-v1.md` change.** `handle_fed_route` enqueuing
+   on an offline recipient and returning `Ok(())` is still "silent success" — `FedRoute` stays
+   fire-and-forget, "no `FedRouteOk`" stays a settled decision, not reopened. Consequence: a
+   federated sender's `RouteOk` stays optimistic `{delivered:true, queued:false}` even when the
+   foreign server actually queued rather than delivered live — a **widening of the already-accepted
+   `ROUTE_REPLY_GRACE` false-positive residual** (federation-protocol-v1.md §2), not a new one. The
+   feature spec's "queued at org-b" sender-visible message is truthfully achievable only for a
+   **same-server** route; `meridian-admin mailbox dump` at the foreign org is the real proof for the
+   federated case. See [8.6](./8.6-fed-route-mailbox-enqueue.md), [8.13](./8.13-cross-federation-mailbox-acceptance.md), [8.14](./8.14-phase-exit-mailbox-demo.md).
+3. **Delivery-on-reconnect**: queued mail pushes as ordinary `Deliver` frames immediately after
+   `AuthOk`, in `arrived_at`/`id` order. `Deliver` gains one additive optional field,
+   `mailbox_id: Option<u64>` (present only for a mailbox-drain push). The stale
+   `mailbox_ack{envelope_ids[]}` wire-protocol.md placeholder is corrected to `MailboxAck{ids:
+   [uint]}` (mailbox row `id`s, **never** the opaque `eid` inside the blob — see the naming
+   collision task 7.6 already resolved) plus a new `MailboxAckOk{}` reply. Server deletes only rows
+   matching the authenticated connection's own `account_pub`. See [8.3](./8.3-wire-proto-mailbox-fields.md), [8.7](./8.7-mailbox-delivery-reconnect-ack.md).
+4. **Quota**: new error code `mailbox_full` in both `error_codes` and `fed_error_codes`. Local:
+   synchronous `Err{mailbox_full}` instead of queuing. Federated: `FedErr{mailbox_full}` — a
+   legitimate exception to fire-and-forget, since federation-protocol-v1.md §2 already says
+   "failure is reported only via `FedErr`"; no new op. See [8.5](./8.5-local-route-mailbox-enqueue.md), [8.6](./8.6-fed-route-mailbox-enqueue.md).
+5. **`TTL=0`** is purely `config.mailbox.ttl_days == 0` short-circuiting to the existing
+   `not_connected` path — no wire-visible difference, no new type.
+6. **`eid` dedup** stays purely client-side (task 6.4's already-shipped mechanism); the mailbox's
+   own server-assigned `id` plays no role in dedup, only in ack/deletion — matches task 7.6's
+   resolution verbatim.
+7. **No new ADR needed.** Every decision above is additive wire-shape detail inside ADR 0007's
+   already-accepted mailbox scope — it touches no envelope shape (ADR 0016), no trust boundary
+   (ADR 0017), and does not reopen "no `FedRouteOk`." Routed via doc updates + a `meridian-proto`
+   version bump + conformance vectors, not an ADR.
+
 ## Tasks (todo)
 <!-- Filled by /plan-phase. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
-- [ ] **8.1** <title> — [file](./8.1-<slug>.md)
+
+Task breakdown by **planner**, with an **architect** consult run first to settle the wire-shape
+questions the mailbox necessarily raises (recorded in each affected task's Scope/Links). Dependency
+order: storage seam (8.1–8.2) and wire types (8.3–8.4) are independent of each other and of
+everything downstream; route-path integration (8.5–8.6) depends on both; delivery/ack (8.7–8.8)
+depends on route-path integration; purge/X3DH/CLI/audit (8.9–8.12) depend only on storage; the
+cross-federation acceptance test (8.13) and the phase-exit demo (8.14) come last.
+
+**Wave 1 — independent**
+- [ ] **8.1** Mailbox store trait + in-memory impl + config surface — [file](./8.1-mailbox-store-trait-config.md)
+- [ ] **8.3** Wire/proto: `RouteOk.queued`, `mailbox_full`, `Deliver.mailbox_id`, `MailboxAck`/`MailboxAckOk` — [file](./8.3-wire-proto-mailbox-fields.md)
+
+**Wave 2**
+- [ ] **8.2** SQLite mailbox migration + `SqliteStore` impl (depends on 8.1) — [file](./8.2-sqlite-mailbox-migration.md)
+- [ ] **8.4** Conformance vectors for the mailbox wire fields (depends on 8.3) — [file](./8.4-mailbox-conformance-vectors.md)
+
+**Wave 3 — route-path integration**
+- [ ] **8.5** `handle_route` local mailbox enqueue, TTL/quota-aware (depends on 8.1, 8.3) — [file](./8.5-local-route-mailbox-enqueue.md)
+- [ ] **8.6** `handle_fed_route` mailbox enqueue on offline recipient (depends on 8.1, 8.3, 8.5) — [file](./8.6-fed-route-mailbox-enqueue.md)
+
+**Wave 4 — delivery, ack, and independent storage-only follow-ons**
+- [ ] **8.7** Delivery-on-reconnect push + `MailboxAck` handling, server side (depends on 8.1, 8.2, 8.3, 8.5) — [file](./8.7-mailbox-delivery-reconnect-ack.md)
+- [ ] **8.9** TTL expiry purge job (depends on 8.1, 8.2) — [file](./8.9-mailbox-ttl-purge-job.md)
+- [ ] **8.11** `meridian-admin mailbox dump <pubkey>` (depends on 8.1, 8.2) — [file](./8.11-meridian-admin-mailbox-dump.md)
+- [ ] **8.12** Opacity/at-rest audit extension for mailbox rows (depends on 8.2) — [file](./8.12-opacity-audit-mailbox-rows.md)
+
+**Wave 5**
+- [ ] **8.8** Client-side `MailboxAck` send + redelivery-dedup confirmation (depends on 8.7) — [file](./8.8-client-mailbox-ack-dedup.md)
+- [ ] **8.10** X3DH-initial-message-via-mailbox coverage (depends on 8.5, 8.7) — [file](./8.10-x3dh-initial-via-mailbox.md)
+
+**Wave 6 — acceptance + exit**
+- [ ] **8.13** Cross-federation acceptance test: Org A → Org B mailbox → reconnect (depends on 8.6, 8.7, 8.9) — [file](./8.13-cross-federation-mailbox-acceptance.md)
+- [ ] **8.14** Phase exit: full demo script + doc sync (depends on 8.1–8.13) — [file](./8.14-phase-exit-mailbox-demo.md)
 
 ## Exit criteria
 Phase 8 is done when every task is `[x]`, the tree is green (`cargo build --workspace`, `cargo fmt

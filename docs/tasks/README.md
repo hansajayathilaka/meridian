@@ -116,12 +116,24 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   no meaningful subset of T14 is buildable in parallel. **T14 is deferred to the phase after Phase 8
   closes and its review sweep clears.** Dependency check, scope, and the full T14-deferral rationale:
   [phase-8/README.md](./phase-8/README.md).
-- **NEXT:** `/plan-phase` — break T07 down into tasks per its
-  [feature spec](../architecture/features/07-offline-mailbox.md) and
-  [phase-8/README.md](./phase-8/README.md)'s dependency check (note: task 7.6 already pinned the mailbox
-  PK shape, so `/plan-phase` should treat that as decided, not re-open it). The Phase-1 adversarial
-  frontier remains an unowned carry-forward for a future `/plan-phase` if capacity allows; the six
-  Phase-4-named TUI/T08 residuals are Phase-4-scoped follow-ups and stay listed below for a future phase.
+- **NOW:** **Phase 8 planned — 14 tasks (8.1–8.14) across 6 dependency waves.** An architect consult
+  ran first to settle the wire-shape questions T07 necessarily raises (`RouteOk.queued`,
+  `Deliver.mailbox_id`, `MailboxAck`/`MailboxAckOk` correcting the stale `mailbox_ack{envelope_ids[]}`
+  placeholder, a new `mailbox_full` error code, and the federated-route framing correction — the
+  sender-visible "queued at org-b" message is only truthfully achievable for a same-server route, not
+  a federated one, since `FedRoute` stays fire-and-forget with no `FedRouteOk` by settled decision);
+  full record in [phase-8/README.md](./phase-8/README.md#architect-consult-wire-shape-decisions-settled-before-task-breakdown).
+  No new ADR needed — every decision is additive detail inside ADR 0007's existing scope. The planner
+  then broke T07 into: storage seam + wire types (8.1–8.4, independent), route-path integration
+  (8.5–8.6), delivery/ack (8.7–8.8), purge/X3DH-coverage/CLI/opacity-audit (8.9–8.12, storage-only
+  deps), cross-federation acceptance (8.13), and the phase-exit demo (8.14). 8.6 also closes a
+  pre-existing correctness gap found along the way: `handle_fed_route` today silently drops an
+  envelope to an offline federated recipient (`Ok(())` regardless of delivery) — T07 makes that
+  durable instead of lossy. Full breakdown: [phase-8/README.md](./phase-8/README.md#tasks-todo).
+- **NEXT:** `/next-task` — work the 14 fix-tasks in dependency-wave order (8.1/8.3 first, both
+  independent). The Phase-1 adversarial frontier remains an unowned carry-forward for a future
+  `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08 residuals are Phase-4-scoped
+  follow-ups and stay listed below for a future phase.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -504,13 +516,41 @@ converted, deferred to a future `/plan-phase` per the report's own verdict. Tree
 - [x] **7.5** Boundary-case conformance vectors for `envelope-v2.json` (F7) — [file](./phase-7/7.5-envelope-v2-boundary-vectors.md)
 - [x] **7.6** Resolve the `eid`/mailbox naming collision before T07 planning (N1) — [file](./phase-7/7.6-eid-mailbox-naming-collision-note.md)
 
-### Phase 8 — Offline Ciphertext Mailbox · **planning** · [details](./phase-8/README.md)
+### Phase 8 — Offline Ciphertext Mailbox · **in progress** · [details](./phase-8/README.md)
 Build phase. **[T07 — Offline Ciphertext Mailbox](../architecture/features/07-offline-mailbox.md)**
 alone: TTL-bounded, size-capped, ciphertext-only mailbox on the recipient's home rendezvous (ADR 0007),
 with deletion-on-acknowledged-delivery, per-recipient quota, cross-federation delivery, and the
 `meridian-admin mailbox dump` honesty demo. Deps T03 + T06 (both done) plus the envelope-v2 standing gate
 (done, Phase 6/7). **T14 is deliberately not bundled in** — see [phase-8/README.md](./phase-8/README.md)
-for why. Task breakdown not yet started — next command is `/plan-phase`.
+for why. 14 tasks (8.1–8.14) across 6 dependency waves, shaped by an architect consult that settled the
+wire-protocol questions T07 raises before any task started; full record and breakdown:
+[phase-8/README.md](./phase-8/README.md).
+
+**Wave 1 — independent**
+- [ ] **8.1** Mailbox store trait + in-memory impl + config surface — [file](./phase-8/8.1-mailbox-store-trait-config.md)
+- [ ] **8.3** Wire/proto: `RouteOk.queued`, `mailbox_full`, `Deliver.mailbox_id`, `MailboxAck`/`MailboxAckOk` — [file](./phase-8/8.3-wire-proto-mailbox-fields.md)
+
+**Wave 2**
+- [ ] **8.2** SQLite mailbox migration + `SqliteStore` impl — [file](./phase-8/8.2-sqlite-mailbox-migration.md)
+- [ ] **8.4** Conformance vectors for the mailbox wire fields — [file](./phase-8/8.4-mailbox-conformance-vectors.md)
+
+**Wave 3 — route-path integration**
+- [ ] **8.5** `handle_route` local mailbox enqueue, TTL/quota-aware — [file](./phase-8/8.5-local-route-mailbox-enqueue.md)
+- [ ] **8.6** `handle_fed_route` mailbox enqueue on offline recipient — [file](./phase-8/8.6-fed-route-mailbox-enqueue.md)
+
+**Wave 4 — delivery, ack, and storage-only follow-ons**
+- [ ] **8.7** Delivery-on-reconnect push + `MailboxAck` handling, server side — [file](./phase-8/8.7-mailbox-delivery-reconnect-ack.md)
+- [ ] **8.9** TTL expiry purge job — [file](./phase-8/8.9-mailbox-ttl-purge-job.md)
+- [ ] **8.11** `meridian-admin mailbox dump <pubkey>` — [file](./phase-8/8.11-meridian-admin-mailbox-dump.md)
+- [ ] **8.12** Opacity/at-rest audit extension for mailbox rows — [file](./phase-8/8.12-opacity-audit-mailbox-rows.md)
+
+**Wave 5**
+- [ ] **8.8** Client-side `MailboxAck` send + redelivery-dedup confirmation — [file](./phase-8/8.8-client-mailbox-ack-dedup.md)
+- [ ] **8.10** X3DH-initial-message-via-mailbox coverage — [file](./phase-8/8.10-x3dh-initial-via-mailbox.md)
+
+**Wave 6 — acceptance + exit**
+- [ ] **8.13** Cross-federation acceptance test: Org A → Org B mailbox → reconnect — [file](./phase-8/8.13-cross-federation-mailbox-acceptance.md)
+- [ ] **8.14** Phase exit: full demo script + doc sync — [file](./phase-8/8.14-phase-exit-mailbox-demo.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
