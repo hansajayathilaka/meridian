@@ -13,6 +13,20 @@
 //!     enumerated, ADR-accepted residual (NOT a defect), documented by a PASSING assertion per
 //!     `docs/testing/strategy.md`'s "0 silent successes outside the enumerated accepted residuals"
 //!     rule.
+//!
+//! # task 7.1 additions (ADR 0016 C5/R5 flag-day hard-reject, review findings F1/F2)
+//!
+//! Two more cells at the very bottom of this file close the gap phase-7's review found: the
+//! `ChatError::UnsupportedEnvelopeVersion` hard-reject (`ChatState::open_bytes`) was independently
+//! confirmed correct by four review passes but had **zero** test coverage proving it actually
+//! fires.
+//!   - [`wrong_v_on_v2_shaped_envelope_is_hard_rejected_by_open_bytes`] (F1, blocking) — a
+//!     structurally genuine, v2-shaped envelope with only `v` mutated to a non-2 value must be
+//!     rejected by `open_bytes`'s explicit version check, before any prekey lookup or session work.
+//!   - [`genuine_v1_shaped_blob_fails_at_codec_decode_not_the_version_check`] (F2, should-fix) — the
+//!     real flag-day scenario: a genuine v1-shaped blob (`test-vectors/envelope-v1.json`'s
+//!     "no-prekey" vector) has no `v`/`eid` fields at all, so it fails at CBOR codec decode
+//!     (`ChatError::Codec`) and never reaches the version check.
 
 use meridian_core::chat::{ChatError, ChatState, PREV_GENERATION_GRACE_SECS};
 use meridian_envelope::{ChatContent, MessageEnvelope};
@@ -104,6 +118,15 @@ impl Party {
         self.state
             .open_inbound(&self.store, self.account.handle(), &ik, from, blob)
             .err()
+    }
+    /// Drives `ChatState::open_bytes` directly, bypassing `open_inbound`'s task-2.10
+    /// message-request gate entirely (task 7.1) — for tests that must isolate `open_bytes` itself,
+    /// the exact primitive ADR 0016 C5/R5's version hard-reject lives in. Same shape as
+    /// `eid_dedup.rs`'s and `commit_on_decrypt_independent.rs`'s own `recv_raw`.
+    fn recv_raw(&mut self, from: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, ChatError> {
+        let ik = self.ik();
+        self.state
+            .open_bytes(&self.store, self.account.handle(), &ik, from, blob)
     }
 }
 
@@ -820,4 +843,219 @@ fn kci_forged_first_contact_from_stolen_spk_secret_succeeds_r1_accepted_residual
          genuine or Mallory's forgery — ADR 0016 R1's explicit point that verification does not \
          detect this"
     );
+}
+
+// -- task 7.1 / ADR 0016 C5/R5: flag-day hard-reject coverage (review findings F1, F2) ---------
+
+/// The `otks` array length in the vault's canonical CBOR (current generation only — neither new
+/// cell below republishes, so there is never a retained "previous" generation to add in). Same
+/// technique `eid_dedup.rs`'s and `preamble_mutation.rs`'s own `otk_depth` use: read `PrekeyVault`'s
+/// private fields through `ChatState`'s own at-rest CBOR shape rather than widening
+/// `meridian-core`'s public API purely for testability.
+fn otk_depth(state: &ChatState) -> usize {
+    use ciborium::value::Value;
+    let bytes = state_bytes(state);
+    let root: Value = ciborium::from_reader(&bytes[..]).unwrap();
+    let vault = map_get(&root, "vault").expect("chat state has a vault");
+    match map_get(vault, "otks") {
+        Some(Value::Array(items)) => items.len(),
+        _ => 0,
+    }
+}
+
+fn map_get<'a>(v: &'a ciborium::value::Value, key: &str) -> Option<&'a ciborium::value::Value> {
+    let ciborium::value::Value::Map(entries) = v else {
+        return None;
+    };
+    entries
+        .iter()
+        .find(|(k, _)| matches!(k, ciborium::value::Value::Text(t) if t == key))
+        .map(|(_, val)| val)
+}
+
+/// F1 (blocking): a structurally genuine, v2-shaped envelope — real `sender_pub`/`eid`/`prekey`/
+/// `ct` — with ONLY `v` mutated away from [`meridian_envelope::ENVELOPE_VERSION`] must be rejected
+/// by `open_bytes`'s explicit version check (`ChatError::UnsupportedEnvelopeVersion`), before any
+/// prekey lookup or session work — never silently accepted, and never surfacing as some other
+/// error that would mean the check didn't actually fire. Driven directly against `open_bytes`
+/// (task 7.1's `Party::recv_raw`), not `open_inbound`, so the message-request gate cannot be what's
+/// doing the rejecting.
+#[test]
+fn wrong_v_on_v2_shaped_envelope_is_hard_rejected_by_open_bytes() {
+    let mut alice = Party::new("flagday.wrongv.a");
+    let mut bob = Party::new("flagday.wrongv.b");
+    let bob_bundle = bob.publish();
+    let (bob_ik, alice_ik) = (bob.ik(), alice.ik());
+    alice.start(
+        &bob_ik,
+        &bob_bundle.bundle.spk,
+        Some(bob_bundle.bundle.otks[0]),
+    );
+
+    let genuine = alice.send(
+        &bob_ik,
+        &ChatContent::Text {
+            id: [1u8; 16],
+            body: "flag day".into(),
+        },
+    );
+
+    // Decode the genuine envelope, mutate ONLY `v`, and re-encode — the capability of anyone with
+    // the bytes (v2 has no signature to re-apply), never a from-scratch forgery.
+    let mut env = MessageEnvelope::from_blob(&genuine).unwrap();
+    assert_eq!(
+        env.v,
+        meridian_envelope::ENVELOPE_VERSION,
+        "the genuine envelope this attack is built from must actually carry v:2, or the mutation \
+         below is a no-op and this cell proves nothing"
+    );
+    env.v = 1;
+    let attack = env.to_blob().unwrap();
+
+    let depth_before = otk_depth(&bob.state);
+    assert!(
+        depth_before > 0,
+        "the vault must hold one-time prekeys, or 'unchanged' below is trivially true"
+    );
+    let state_before = state_bytes(&bob.state);
+
+    match bob.recv_raw(&alice_ik, &attack) {
+        Err(ChatError::UnsupportedEnvelopeVersion(1)) => {}
+        Ok(pt) => panic!(
+            "SECURITY FAILURE: an envelope with v=1 (otherwise structurally v2-shaped) was \
+             ACCEPTED by open_bytes and decoded to {} bytes of plaintext — ADR 0016 C5/R5's hard \
+             flag-day reject never fired",
+            pt.len()
+        ),
+        Err(other) => panic!(
+            "expected ChatError::UnsupportedEnvelopeVersion(1) — a structurally v2-shaped envelope \
+             carrying a wrong `v` must be caught by open_bytes's own explicit version check before \
+             any other rejection path runs. Got a DIFFERENT error, meaning the version check \
+             either didn't fire or something upstream pre-empted it: {other:?}"
+        ),
+    }
+
+    assert_eq!(
+        otk_depth(&bob.state),
+        depth_before,
+        "F1: the version hard-reject runs before any prekey lookup — a rejected wrong-version \
+         envelope must consume ZERO one-time prekeys"
+    );
+    assert!(
+        !bob.state.has_session(&alice_ik),
+        "F1: a rejected wrong-version envelope must install NO session"
+    );
+    assert_eq!(
+        state_before,
+        state_bytes(&bob.state),
+        "F1: the version check is the very first thing open_bytes does after decoding the blob — \
+         NOTHING in the chat state may change on this path, not even desync bookkeeping"
+    );
+
+    // Positive control: the genuine, unmutated v:2 envelope still opens normally, and consumes
+    // exactly one OTK — proving otk_depth() is sensitive, so 'unchanged' above is not vacuous.
+    let pt = bob.recv_raw(&alice_ik, &genuine).expect(
+        "the genuine v:2 envelope must still open after the wrong-version one was rejected",
+    );
+    assert_eq!(
+        ChatContent::decode(&pt).unwrap(),
+        ChatContent::Text {
+            id: [1u8; 16],
+            body: "flag day".into()
+        }
+    );
+    assert_eq!(
+        otk_depth(&bob.state),
+        depth_before - 1,
+        "the genuine envelope must consume exactly one OTK"
+    );
+}
+
+/// F2 (should-fix): the real-world flag-day scenario is not a mutated v2 envelope but a genuine
+/// v1-shaped blob — `test-vectors/envelope-v1.json`'s committed "no-prekey" vector, produced by the
+/// actual pre-ADR-0016 wire shape (`sender_pub`/`prekey`/`ct`/`sig`, no `v`, no `eid`). This pins
+/// the *actual* diagnostic an operator sees for that case, empirically, rather than assuming it:
+/// `MessageEnvelope` v2's `v`/`eid` fields are mandatory (never `Option`/defaulted — see the
+/// module doc), so strict CBOR struct decoding rejects a v1 blob outright, before `open_bytes`'s
+/// version check is ever reached. The blob is fed to `open_bytes` directly, exactly like a real
+/// inbound delivery.
+#[test]
+fn genuine_v1_shaped_blob_fails_at_codec_decode_not_the_version_check() {
+    let mut bob = Party::new("flagday.v1blob.b");
+    bob.publish();
+    // Arbitrary — the v1 vector's `sender_pub` is test fixture material, not a real party in this
+    // file, and the codec failure this cell targets happens before `from` is ever consulted.
+    let claimed_from = [0x11u8; 32];
+
+    let vectors = load_envelope_v1_vectors();
+    let no_prekey = vectors["vectors"]
+        .as_array()
+        .and_then(|arr| arr.iter().find(|v| v["name"] == "no-prekey"))
+        .expect("test-vectors/envelope-v1.json must have a 'no-prekey' vector");
+    let blob = hex::decode(
+        no_prekey["blob_hex"]
+            .as_str()
+            .expect("blob_hex is a hex string"),
+    )
+    .expect("blob_hex must be valid hex");
+
+    // Confirm the premise directly at the codec boundary too, not just through open_bytes: a
+    // genuine v1 blob must not structurally decode as a v2 MessageEnvelope at all.
+    assert!(
+        MessageEnvelope::from_blob(&blob).is_err(),
+        "a genuine v1-shaped blob unexpectedly decoded as a structurally valid v2 envelope — F2's \
+         premise (codec decode fails before the version check) would be false. That is a real \
+         finding, not something to patch around in this test — see task 7.1's guardrails."
+    );
+
+    let depth_before = otk_depth(&bob.state);
+    assert!(
+        depth_before > 0,
+        "the vault must hold one-time prekeys, or 'unchanged' below is trivially true"
+    );
+    let state_before = state_bytes(&bob.state);
+
+    match bob.recv_raw(&claimed_from, &blob) {
+        Err(ChatError::Codec(_)) => {}
+        Ok(pt) => panic!(
+            "SECURITY FAILURE: a genuine v1-shaped blob was ACCEPTED by open_bytes and decoded to \
+             {} bytes of plaintext",
+            pt.len()
+        ),
+        Err(other) => panic!(
+            "F2: expected ChatError::Codec(_) — a genuine v1-shaped blob has no `v` field to \
+             decode as MessageEnvelope's mandatory u16, so CBOR decoding must fail before \
+             open_bytes's version check is ever reached. Got a DIFFERENT variant, meaning F2's \
+             premise needs re-scoping rather than papering over here: {other:?}"
+        ),
+    }
+
+    assert_eq!(
+        otk_depth(&bob.state),
+        depth_before,
+        "a genuine v1-shaped blob that fails at codec decode must consume ZERO one-time prekeys"
+    );
+    assert!(
+        !bob.state.has_session(&claimed_from),
+        "a genuine v1-shaped blob that fails at codec decode must install NO session"
+    );
+    assert_eq!(
+        state_before,
+        state_bytes(&bob.state),
+        "codec-decode failure happens before open_bytes touches any chat state at all"
+    );
+}
+
+/// Loads the committed `test-vectors/envelope-v1.json` conformance fixture, same technique
+/// `apps/proto/tests/conformance.rs::load` uses (`CARGO_MANIFEST_DIR` is `<root>/apps/core`, so two
+/// `parent()` calls reach the repo root).
+fn load_envelope_v1_vectors() -> serde_json::Value {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("meridian-core lives at <root>/apps/core")
+        .join("test-vectors")
+        .join("envelope-v1.json");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("parsing {}: {e}", path.display()))
 }

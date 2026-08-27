@@ -27,6 +27,8 @@ use meridian_core::chat::{ChatError, ChatState, MAX_SEEN_EIDS};
 use meridian_envelope::ChatContent;
 use meridian_identity::{generate_account, AccountId, MemorySecretStore};
 use meridian_signaling::generate_bundle;
+use proptest::prelude::*;
+use std::collections::HashSet;
 
 struct Party {
     store: MemorySecretStore,
@@ -375,4 +377,109 @@ fn seen_eid_set_is_bounded_under_a_flood_of_distinct_eids() {
         "seen_eids must be capped at MAX_SEEN_EIDS regardless of flood size — this is the \
          assertion that fails outright against an unbounded implementation (it would read `total`)"
     );
+}
+
+// -- 4. property coverage (task 7.4, review finding F6) -----------------------------------------
+//
+// The three cells above are hand-picked scenarios. This block generalizes two of task 6.4's own
+// claims across randomized, proptest-generated sequences instead of the three fixed examples:
+//
+//   1. Exact-duplicate detection holds regardless of arrival order: any envelope not yet delivered
+//      must succeed, and any envelope already delivered — no matter how many other (fresh or
+//      duplicate) envelopes arrived in between, and no matter whether it arrives in-order or
+//      out-of-order relative to the other fresh ones — must be rejected as
+//      `ChatError::DuplicateEnvelope`.
+//   2. `seen_eids_len(&state) <= MAX_SEEN_EIDS` holds at every step of a randomized sequence, well
+//      below the cap (the exact-at-cap boundary is cell 3's job, not this one's) — and, since no
+//      eviction can fire below the cap, `seen_eids_len` must track the number of *distinct*
+//      successfully-delivered envelopes exactly.
+//
+// Cost discipline (this task's own Scope/Out note, and 6.4's Decision 3): growing `seen_eids`
+// costs a genuine successful decrypt per entry, so this harness does exactly ONE X3DH handshake
+// per generated case — alice's opening message plus bob's confirming reply — and then reuses that
+// single confirmed session for every further (cheap, symmetric-ratchet-only) message in the
+// sequence, the same pattern cell 1 uses for its "second"/"third" steady-state messages. Case
+// count and sequence length are kept small per the task's guidance.
+
+/// Build one confirmed alice→bob session (one handshake) and seal `n` distinct steady-state
+/// envelopes from alice to bob, returned in sealing order. `n` is small (never more than a
+/// handful), so this never approaches `MAX_SEEN_EIDS`.
+fn confirmed_session_with_envelopes(n: usize) -> (Party, Party, [u8; 32], Vec<Vec<u8>>) {
+    let mut alice = Party::new("eid.prop.a");
+    let mut bob = Party::new("eid.prop.b");
+    let (bob_ik, alice_ik) = (bob.ik(), alice.ik());
+    let (bob_spk, bob_otks) = bob.publish(1);
+
+    alice.start(&bob_ik, &bob_spk, Some(bob_otks[0]));
+    let opening = alice.seal(&bob_ik, 0, "open");
+    bob.recv_content(&alice_ik, &opening)
+        .expect("the opening handshake message must decrypt");
+    let reply = bob.seal(&alice_ik, 0, "ack");
+    alice
+        .recv_content(&bob_ik, &reply)
+        .expect("bob's reply must confirm alice's session");
+
+    // The opening message itself already occupies index 0 of bob's `seen_eids`; the sequence
+    // below deals only in FURTHER, steady-state envelopes, sealed and handed back distinctly.
+    let envelopes = (0..n)
+        .map(|i| alice.seal(&bob_ik, (i % 256) as u8, &format!("steady-state #{i}")))
+        .collect();
+    (alice, bob, bob_ik, envelopes)
+}
+
+proptest! {
+    // Keep well under a minute: one handshake per case, sequence lengths bounded to a few dozen
+    // entries, nowhere near MAX_SEEN_EIDS (256) — see this block's header comment.
+    #![proptest_config(ProptestConfig::with_cases(12))]
+
+    /// For every `(n, delivery_order)` pair — `n` distinct fresh envelopes and a random sequence of
+    /// indices into them (repeats allowed, any order) — every FIRST occurrence of an index must
+    /// succeed and every REPEAT occurrence must be `Err(ChatError::DuplicateEnvelope)`, regardless
+    /// of where in the sequence it falls. Simultaneously, `seen_eids_len` must never exceed
+    /// `MAX_SEEN_EIDS` and, since `n` never approaches the cap, must track the number of distinct
+    /// indices delivered so far exactly (no spurious growth from duplicates, no spurious eviction).
+    #[test]
+    fn eid_dedup_holds_under_random_interleavings(
+        (n, delivery_order) in (2usize..=6).prop_flat_map(|n| {
+            (Just(n), proptest::collection::vec(0..n, 6..=24))
+        })
+    ) {
+        let (alice, mut bob, _bob_ik, envelopes) = confirmed_session_with_envelopes(n);
+
+        let mut delivered: HashSet<usize> = HashSet::new();
+
+        for idx in delivery_order {
+            let outcome = bob.recv_raw(&alice.ik(), &envelopes[idx]);
+            if delivered.insert(idx) {
+                // First time this index has appeared in the sequence: must be genuinely fresh.
+                prop_assert!(
+                    outcome.is_ok(),
+                    "a not-yet-delivered envelope (index {idx}) must succeed, got {outcome:?}"
+                );
+            } else {
+                // Already delivered earlier in this same sequence: must be rejected as a duplicate,
+                // never reprocessed and never misclassified as some other rejection.
+                prop_assert!(
+                    matches!(outcome, Err(ChatError::DuplicateEnvelope)),
+                    "a redelivery of already-delivered index {idx} must be \
+                     Err(ChatError::DuplicateEnvelope), got {outcome:?}"
+                );
+            }
+
+            let len = seen_eids_len(&bob.state);
+            prop_assert!(
+                len <= MAX_SEEN_EIDS,
+                "seen_eids_len ({len}) must never exceed MAX_SEEN_EIDS ({MAX_SEEN_EIDS})"
+            );
+            // `n` is tiny relative to MAX_SEEN_EIDS, so eviction never fires in this test: the
+            // count of distinct successfully-delivered indices (the handshake entry, plus every
+            // distinct fresh index seen so far) must match `seen_eids_len` exactly.
+            prop_assert_eq!(
+                len,
+                1 + delivered.len(),
+                "below the cap, seen_eids_len must equal exactly one entry per distinct \
+                 successful decrypt (the confirming handshake plus each distinct fresh index)"
+            );
+        }
+    }
 }

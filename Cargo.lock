@@ -2722,6 +2722,7 @@ dependencies = [
  "meridian-signaling",
  "meridian-store",
  "meridian-transport",
+ "proptest",
  "serde",
  "serde_json",
  "tempfile",

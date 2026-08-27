@@ -133,9 +133,10 @@ impl RouteTamper {
             blob
         };
         // Forge the routing origin. Flipping a bit of the authenticated key is enough: the receiver
-        // compares `Deliver.from` against the *signed* `sender_pub` inside the envelope, so any
-        // value other than the real sender's key exercises that check. (The server has no third
-        // party's key to substitute, and needs none.)
+        // compares `Deliver.from` against `sender_pub`, an AEAD-authenticated plaintext field
+        // recovered only on a successful ratchet decrypt, so any value other than the real sender's
+        // key exercises that check. (The server has no third party's key to substitute, and needs
+        // none.)
         let from = if cfg.allow_test_route_spoof_from {
             let mut spoofed = from;
             spoofed[0] ^= 0x01;
@@ -148,9 +149,9 @@ impl RouteTamper {
         let mut deliveries: Vec<Delivery> = Vec::new();
 
         // Cross-delivery: capture the first blob this server ever routes, then inject that captured
-        // envelope — valid, correctly signed, but belonging to a *different* session — ahead of
-        // every subsequent recipient's real traffic. The injected copy keeps its ORIGINAL `from`, so
-        // it is not a `from` forgery: it is a genuine envelope delivered to the wrong person.
+        // envelope — a genuine, AEAD-valid envelope, but belonging to a *different* session — ahead
+        // of every subsequent recipient's real traffic. The injected copy keeps its ORIGINAL `from`,
+        // so it is not a `from` forgery: it is a genuine envelope delivered to the wrong person.
         if cfg.allow_test_route_cross_deliver {
             let mut buf = self.inner.lock().unwrap();
             match &buf.captured {

@@ -273,7 +273,11 @@ routing `from` (`ChatError::SenderMismatch`); (3) if no session and a `prekey` i
 **provisionally** as responder against the locally-held prekey secrets for `used_spk`/`used_opk` — the
 one-time prekey is consumed, and the session installed, only *after* ratchet-decrypt actually succeeds
 (commit-on-successful-decrypt, ADR 0016 C2); (4) ratchet-decrypt `ct` using the preamble bytes actually
-received. Any failure drops the envelope — never a downgrade.
+received. Any failure drops the envelope — never a downgrade. Rule (1)'s clean, diagnosable
+`ChatError::UnsupportedEnvelopeVersion` applies only to a structurally v2-shaped envelope carrying a
+wrong `v` — a genuine v1-shaped blob (no `v`/`eid` fields at all) fails earlier still, at CBOR codec
+decode (`ChatError::Codec`), a distinguishable but different diagnostic (task 7.1, ADR 0016 "Test
+obligations" F2).
 
 ## 5. `mrd.chat/1` payload
 

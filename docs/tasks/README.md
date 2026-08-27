@@ -42,10 +42,76 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   [6.8's Outcome](./phase-6/6.8-phase-exit-flag-day-demo.md#outcome) and its
   [demo transcript](./phase-6/6.8-demo-transcript.md). This also discharges the standing envelope-v2
   dependency gate — see "Live carry-forwards" below — so **T07 (mailbox) and T14 are now pickable**.
-- **NEXT:** `/start-review-phase` — Phase 6 (a build phase) is closed, so the next command opens the
-  review phase that sweeps it, per the lifecycle. The Phase-1 adversarial frontier remains an unowned
+- **NOW:** **Phase 7 (review of Phase 6) opened — sweep complete, verdict recorded.**
+  [Report](./phase-7/review-report.md): 9 findings — **1 blocking** (F1: the C5/R5 flag-day hard-reject
+  path, `ChatError::UnsupportedEnvelopeVersion`, has zero test proving it actually fires — the
+  enforcement code itself was independently confirmed correct by all four reviewers, so this is a
+  coverage gap, not a live defect), 6 should-fix (F2: the "clean, diagnosable hard error" claim
+  unverified for a genuine v1-shaped blob, which fails earlier at codec decode; F3: a newly-introduced
+  un-zeroized OTK-secret discard in `commit_responder_otk`; F4: the pre-existing peeked-SPK/OTK-secret
+  zeroization carry-forward, now routinely attacker-triggerable under C2, finally given an owning task;
+  F5: stale v1-signature prose in `route_tamper.rs` that 6.7's doc-sync missed inside its own named
+  scope; F6: `eid` dedup has no property/fuzz coverage; F7: conformance vectors cover only one canonical
+  shape), 2 nits (N1: the `eid`/T07-mailbox naming collision needs an explicit note before T07 planning;
+  N2: 12 stale signature-era doc sites outside 6.7's scope, still unowned). Zero on-the-fly decisions
+  need `/adr` ratification — the two candidates checked (the `v:2` non-negotiation constraint, C1's
+  fail-open mechanism) are both correctly scoped as implementation detail within ADR 0016's own
+  accepted-residual framing. **Verdict: blocked until F1 lands, then clear for the next build phase**
+  (T07/T14) — F1 is a single new test cell against already-correct code, not a design change, so this
+  is not expected to meaningfully delay closure. Full report:
+  [phase-7/review-report.md](./phase-7/review-report.md).
+- **NOW:** **Phase 7's findings are broken into 6 numbered fix-tasks** (7.1–7.6), planned by the
+  **planner** agent. F1 (blocking) + F2 pair into **7.1** (same untested flag-day hard-reject area); F3 +
+  F4 pair into **7.2** (same `PrekeyVault`/responder-session secret-handling function family); F5–F7 and
+  N1 each get their own task (**7.3**–**7.6**). N2 (the 12-site stale-doc sweep) was **not** converted —
+  deferred to a future `/plan-phase` per the report's own verdict, since it spans many files outside a
+  tight scope and touches no security-critical prose; it stays an unowned carry-forward below. No fix-task
+  has a hard build-order dependency on another; 7.1 is listed first only because it's the blocking item.
+  Full breakdown: [phase-7/README.md](./phase-7/README.md#tasks-todo).
+- **NOW:** **4/6 Phase 7 fix-tasks done** (7.1–7.4), one `/next-task all` batch, one commit each,
+  reviewed and green throughout. **7.1** (F1 blocking + F2) closed the flag-day hard-reject coverage
+  gap with two new `chat_manager.rs` cells plus a one-sentence `messaging-envelope-v1.md` precision
+  edit. **7.2** (F3 + F4) zeroized the discarded/peeked OTK/SPK secret copies in `chat.rs`'s
+  `PrekeyVault`/responder-session code — review surfaced a residual (the copied-out `opk_secret` still
+  crosses `Session::respond`/`x3dh::respond`'s pre-existing by-value signature unzeroized, out of
+  7.2's declared scope) now recorded as a fresh carry-forward below rather than silently dropped.
+  **7.3** (F5) fixed the two stale v1-signature comment sites in `route_tamper.rs` 6.7's doc-sync
+  missed. **7.4** (F6) added a `proptest`-based property test for `eid` dedup, non-vacuity verified
+  twice independently (implementer + test-engineer), both by neutralizing the real dedup guard and
+  confirming a genuine, shrunk failure. Zero blocking or should-fix findings survived across all four
+  tasks' review rounds. Tree green throughout (`cargo test`/`fmt`/`clippy` per touched crate).
+  Task-picker's batch stopped here by design: **7.5** needs an architect sign-off on a conformance-
+  vector byte-size `TODO: confirm` *before* it can start, so it wasn't cleanly unblocked for this run;
+  **7.6** wasn't reached either since fix-tasks are worked in priority order. Draft PR opened carrying
+  all four commits: [#82](https://github.com/hansajayathilaka/meridian/pull/82).
+- **NOW:** **5/6 Phase 7 fix-tasks done** (7.1–7.4, 7.6). **7.6** (N1) resolved the `eid`/mailbox
+  naming collision task-picker judged 7.5 couldn't get to first: the mailbox's planned PK is renamed
+  `id INTEGER PK` (server-assigned sequential, matching `one_time_prekeys.id`'s existing shape),
+  explicitly independent of `MessageEnvelope::eid` — deriving it from the envelope's `eid` would have
+  required the server to decode a field out of the opaque blob it never otherwise touches, a real,
+  structurally-enforced invariant (confirmed: `apps/rendezvous` doesn't even depend on the
+  `meridian-envelope` crate). No ADR needed — resolves ADR 0007's own scope, doesn't invent new
+  architecture. Independent architect sign-off verified every claim against source (the opaque-blob
+  invariant, the T07 feature-spec dedup claim, the `one_time_prekeys.id` precedent) rather than
+  trusting the stated reasoning. `docs/architecture/data-model.md` and this file's own carry-forward
+  updated; `bash tools/check-docs.sh` clean.
+- **NOW:** **Phase 7 (review of Phase 6) is closed — 6/6 fix-tasks done** (7.1–7.6). **7.5** (F7) closed
+  the last one: an architect pre-check (this task's own required first step) decided the boundary-case
+  `ct` size — 65536 bytes, matching the codebase's one existing "large payload" constant (`mrd.file/1`'s
+  64 KiB chunk size) and the first CBOR length-prefix width boundary under RFC 8949 — and the prekey
+  pairing (both new vectors share the already-maximal `prekey-with-opk` preamble). Two vectors
+  (`ct-empty`, `ct-large`) added to `test-vectors/envelope-v2.json` via genuine `xtask` regeneration;
+  the three existing vectors stay byte-identical. Independent architect review re-derived every claim
+  from raw bytes rather than trusting it (confirmed the CBOR length-prefix boundary directly from the
+  vector's hex, independently re-ran the regeneration itself). Zero blocking or should-fix findings
+  survived any of the six tasks' review rounds across this whole phase. Tree green throughout. Draft PR
+  [#82](https://github.com/hansajayathilaka/meridian/pull/82) carries all six commits.
+- **NEXT:** `/pick-next-phase` — Phase 7 is closed with zero findings outstanding (N2 deliberately
+  deferred, not open work), so the next command picks the next build phase. **T07 (mailbox) and T14 are
+  clear to pick** — envelope v2's dependency gate was satisfied in Phase 6, and Phase 7's own review
+  found nothing that reopens or reshapes that. The Phase-1 adversarial frontier remains an unowned
   carry-forward for a future `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08 residuals
-  are Phase-4-scoped follow-ups, not envelope-v2 scope, and stay listed below for a future phase.
+  are Phase-4-scoped follow-ups and stay listed below for a future phase.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -82,14 +148,19 @@ evaporate:
   GitHub's branch-protection/ruleset config. 3.12 landed the pre-merge docker build gate itself but
   left this one sub-item open by design rather than guessing; check GitHub Settings → Branches/
   Rulesets and update that doc's `TODO: confirm` once observed.
-- **`PrekeyVault::establish_responder_session_provisional`'s peeked SPK/OTK secrets aren't
-  `Zeroizing`-wrapped** (task 6.3's security-reviewer, should-fix, not blocking) — plain `[u8;32]`
-  stack copies, mirroring the pre-existing `spk_secret_for`/`take_otk_secret` pattern, so not a
-  regression 6.3 introduced. But envelope v2's commit-on-decrypt (C2) makes this unscrubbed-copy path
-  routinely attacker-triggerable (every mutated preamble/ciphertext takes it now, not just legitimate
-  publishes). Short-lived stack memory, never logged/persisted, so non-blocking — but no open task
-  currently owns `apps/core/src/chat.rs`'s `PrekeyVault` secret-handling to pick this up; flag for
-  whoever next touches that code or for a future `/plan-phase`.
+- **RESOLVED for its declared scope (Phase 7, task 7.2), residual now carried forward:**
+  `PrekeyVault::establish_responder_session_provisional`'s peeked SPK/OTK secrets (flagged by task
+  6.3's security-reviewer) are now `Zeroizing`-wrapped in `apps/core/src/chat.rs` at the point of
+  receipt (F3/F4, [phase-7/7.2](./phase-7/7.2-zeroize-otk-spk-secret-copies.md)). But 7.2's own
+  reviewer found the fix only protects the secret up to the `Session::respond` call boundary: that
+  function and `x3dh::respond` (`apps/crypto/src/session.rs`/`apps/crypto/src/x3dh.rs`) take
+  `opk_secret: Option<[u8; 32]>` **by value**, unchanged by 7.2 (out of its declared `chat.rs`-only
+  scope), so the OTK secret still crosses into and through the crypto layer as a fresh, unzeroized,
+  plain-`Option` duplicate before being dropped. Short-lived stack memory, never logged/persisted, so
+  still non-blocking — but no open task owns `apps/crypto`'s `Session::respond`/`x3dh::respond`
+  signatures to close this end-to-end (e.g. take `Option<&[u8;32]>` matching `spk_secret`'s
+  already-by-reference pattern, or wrap internally in `Zeroizing`). Flag for whoever next touches
+  that boundary or for a future `/plan-phase`.
 - **A devops-owned server-side SPK-staleness metric/alert is still unbuilt** (task 6.2's Decision 2,
   architect-reviewed) — client-side enforcement + local warning (task 6.2) satisfies ADR 0016 C1's
   "monitored" obligation for now, but an operator-side view independent of any single client's own
@@ -98,15 +169,18 @@ evaporate:
   `tools/metrics-allowlist.txt`/`docs/operations/monitoring.md` — the column already exists
   server-side, nothing about 6.2 forecloses it. No open task owns this; schedule via a future
   `/plan-phase` when devops prioritizes it.
-- **T07 (mailbox, still unbuilt)'s planned `mailbox` table uses `eid BLOB` as its row key
-  ([data-model.md](../architecture/data-model.md)) — a naming collision with task 6.4's new
-  `MessageEnvelope::eid` (envelope-level replay-dedup, client-side only) that whoever plans T07 must
-  resolve deliberately, not by accident.** The server's "envelope stays opaque, never decoded"
-  invariant is otherwise absolute; if T07's mailbox PK is meant to be *derived from* the envelope's
-  `eid`, that requires the server to peek one field of an otherwise-opaque blob — a real design
-  question, not a given. If instead the mailbox mints its own independent row key, it should be named
-  to avoid the collision. Flagged by task 6.4's architect review; not 6.4's problem to resolve since
-  T07 doesn't exist in code yet.
+- **RESOLVED (Phase 7, task 7.6): T07's planned `mailbox` table PK is `id INTEGER PK`** — a
+  server-assigned sequential row id, same shape as `one_time_prekeys.id`, deliberately independent
+  of `MessageEnvelope::eid` (task 6.4's client-side replay-dedup key). The naming collision flagged by
+  task 6.4's architect review is resolved, not just re-flagged: the envelope's `eid` lives inside the
+  opaque `blob` column, which the server never decodes (route's opaque-blob contract, `OpaqueBlob`, the
+  no-serde-on-blob lint) — deriving the mailbox PK from it would have required peeking one field of an
+  otherwise-opaque payload, a real invariant violation, not a nuance. Dedup on redelivery stays a
+  client-side concern only (T07's own feature spec deliverable 2; task 2.8's "no s2s dedup" already
+  stands), so the server never needs to read `eid` at all. No ADR needed — this applies ADR-7's
+  existing mailbox scope and the pre-existing opaque-blob invariant consistently, resolving an
+  accidental naming collision in a not-yet-implemented table, not new binding architecture. See
+  [data-model.md](../architecture/data-model.md)'s mailbox table note.
 - **A residual sweep of stale "envelope signature"/"signed envelope" language remains outside task
   6.7's file scope** — `apps/rendezvous/src/config.rs`, `apps/rendezvous/src/ws.rs`,
   `apps/rendezvous/src/lib.rs`/`main.rs`, `apps/cli/tests/relay_rewrite.rs`,
@@ -404,6 +478,21 @@ consult) that shaped them: [phase-6/README.md](./phase-6/README.md).
 
 **Wave 4 — exit gate**
 - [x] **6.8** Phase exit: flag-day cutover verification + acceptance demo + roadmap unblock (depends on 6.1–6.7) — [file](./phase-6/6.8-phase-exit-flag-day-demo.md)
+
+### Phase 7 — Review of Phase 6 · **done** · [details](./phase-7/README.md)
+Review phase. Sweeps everything built since the Phase-5 review: Phase 6 — Envelope v2 (tasks 6.1–6.8).
+No untracked out-of-band PRs landed in this window. [Report](./phase-7/review-report.md): 9 findings —
+**1 blocking** (F1), 6 should-fix (F2–F7), 2 nits (N1–N2). Zero on-the-fly decisions need `/adr`
+ratification. All 6 fix-tasks (7.1–7.6) closed — F1 (blocking), F2–F7 (should-fix), N1 (nit) all
+resolved with zero should-fix/blocking findings surviving any review round; N2 deliberately not
+converted, deferred to a future `/plan-phase` per the report's own verdict. Tree green throughout.
+**T07/T14 are clear to pick.**
+- [x] **7.1** Flag-day hard-reject test coverage (F1, F2) — [file](./phase-7/7.1-flag-day-hard-reject-coverage.md)
+- [x] **7.2** Zeroize discarded/peeked OTK and SPK secret copies (F3, F4) — [file](./phase-7/7.2-zeroize-otk-spk-secret-copies.md)
+- [x] **7.3** Stale v1-signature prose in `route_tamper.rs` (F5) — [file](./phase-7/7.3-route-tamper-stale-signature-prose.md)
+- [x] **7.4** Property test for `eid` dedup bound + duplicate detection (F6) — [file](./phase-7/7.4-eid-dedup-property-test.md)
+- [x] **7.5** Boundary-case conformance vectors for `envelope-v2.json` (F7) — [file](./phase-7/7.5-envelope-v2-boundary-vectors.md)
+- [x] **7.6** Resolve the `eid`/mailbox naming collision before T07 planning (N1) — [file](./phase-7/7.6-eid-mailbox-naming-collision-note.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.

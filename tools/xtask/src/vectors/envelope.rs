@@ -53,8 +53,26 @@ pub fn generate_envelope_v2() -> Result<(), String> {
     let eid = [0x99u8; 16];
     let ct = vec![0x01u8, 2, 3, 4, 5, 6, 7, 8];
 
-    let cases: Vec<(&str, Option<Prekey>)> = vec![
-        ("no-prekey", None),
+    // (task 7.5, review finding F7) Boundary-shape cases beyond the three canonical near-identical-`ct`
+    // vectors above. `ct-empty`/`ct-large` pair with the same maximal preamble as `prekey-with-opk` —
+    // `Prekey`'s fields are fixed-width 32-byte arrays with no interaction bug to catch against `ct`, so
+    // pairing the largest `ct` with the already-maximal preamble produces the single highest-value vector
+    // (the true worst-case envelope) for regression-pinning aggregate size/length-prefix handling.
+    // 65536 (architect-approved, task 7.5) is the existing `mrd.file/1` file-transfer chunk size
+    // (docs/api/stream-types-v1.md:104) and, under ciborium's deterministic CBOR encoding, the first
+    // value requiring a 4-byte length prefix — a real codec-class boundary, not an arbitrary size.
+    const LARGE_CT_LEN: usize = 65536;
+
+    let maximal_prekey = || {
+        Some(Prekey {
+            ek_pub: [0x22u8; 32],
+            used_spk: [0x33u8; 32],
+            used_opk: Some([0x44u8; 32]),
+        })
+    };
+
+    let cases: Vec<(&str, Option<Prekey>, Vec<u8>)> = vec![
+        ("no-prekey", None, ct.clone()),
         (
             "prekey-no-opk",
             Some(Prekey {
@@ -62,19 +80,15 @@ pub fn generate_envelope_v2() -> Result<(), String> {
                 used_spk: [0x33u8; 32],
                 used_opk: None,
             }),
+            ct.clone(),
         ),
-        (
-            "prekey-with-opk",
-            Some(Prekey {
-                ek_pub: [0x22u8; 32],
-                used_spk: [0x33u8; 32],
-                used_opk: Some([0x44u8; 32]),
-            }),
-        ),
+        ("prekey-with-opk", maximal_prekey(), ct.clone()),
+        ("ct-empty", maximal_prekey(), vec![]),
+        ("ct-large", maximal_prekey(), vec![0xABu8; LARGE_CT_LEN]),
     ];
 
     let mut vectors = Vec::with_capacity(cases.len());
-    for (name, prekey) in cases {
+    for (name, prekey, ct) in cases {
         let env = MessageEnvelope {
             v: ENVELOPE_VERSION,
             sender_pub,
