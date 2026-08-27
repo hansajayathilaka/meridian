@@ -3,8 +3,8 @@
 
 # Phase 7 — Review of Phase 6
 
-**Kind:** review · **Status:** in progress (sweep complete, fix-tasks not yet planned) · **Reviews
-phase(s):** Phase 6 (Envelope v2, tasks 6.1–6.8)
+**Kind:** review · **Status:** in progress (4/6 fix-tasks done — 7.1–7.4; 7.5 needs an architect
+pre-check, 7.6 remains) · **Reviews phase(s):** Phase 6 (Envelope v2, tasks 6.1–6.8)
 
 ## Goal
 Sweep everything built since the Phase-5 review for bugs, gaps, loopholes, and on-the-fly decisions

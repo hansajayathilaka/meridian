@@ -68,10 +68,28 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   tight scope and touches no security-critical prose; it stays an unowned carry-forward below. No fix-task
   has a hard build-order dependency on another; 7.1 is listed first only because it's the blocking item.
   Full breakdown: [phase-7/README.md](./phase-7/README.md#tasks-todo).
-- **NEXT:** `/next-task` — work the 6 fix-tasks (7.1 first, since it's the blocking item gating the next
-  build phase). The Phase-1 adversarial frontier remains an unowned carry-forward for a future
-  `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08 residuals are Phase-4-scoped follow-ups,
-  not envelope-v2 scope, and stay listed below for a future phase.
+- **NOW:** **4/6 Phase 7 fix-tasks done** (7.1–7.4), one `/next-task all` batch, one commit each,
+  reviewed and green throughout. **7.1** (F1 blocking + F2) closed the flag-day hard-reject coverage
+  gap with two new `chat_manager.rs` cells plus a one-sentence `messaging-envelope-v1.md` precision
+  edit. **7.2** (F3 + F4) zeroized the discarded/peeked OTK/SPK secret copies in `chat.rs`'s
+  `PrekeyVault`/responder-session code — review surfaced a residual (the copied-out `opk_secret` still
+  crosses `Session::respond`/`x3dh::respond`'s pre-existing by-value signature unzeroized, out of
+  7.2's declared scope) now recorded as a fresh carry-forward below rather than silently dropped.
+  **7.3** (F5) fixed the two stale v1-signature comment sites in `route_tamper.rs` 6.7's doc-sync
+  missed. **7.4** (F6) added a `proptest`-based property test for `eid` dedup, non-vacuity verified
+  twice independently (implementer + test-engineer), both by neutralizing the real dedup guard and
+  confirming a genuine, shrunk failure. Zero blocking or should-fix findings survived across all four
+  tasks' review rounds. Tree green throughout (`cargo test`/`fmt`/`clippy` per touched crate).
+  Task-picker's batch stopped here by design: **7.5** needs an architect sign-off on a conformance-
+  vector byte-size `TODO: confirm` *before* it can start, so it wasn't cleanly unblocked for this run;
+  **7.6** wasn't reached either since fix-tasks are worked in priority order. Draft PR opened carrying
+  all four commits: <PR URL filled after opening>.
+- **NEXT:** `/next-task` — **7.5** needs its architect pre-check (vector byte-size `TODO: confirm`)
+  resolved before implementation can start; **7.6** (nit, architect-only, no code) remains fully
+  unblocked and could run either before or after 7.5. The Phase-1 adversarial frontier remains an
+  unowned carry-forward for a future `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08
+  residuals are Phase-4-scoped follow-ups, not envelope-v2 scope, and stay listed below for a future
+  phase.
 
 
 ### Live carry-forwards (not owned by any open task)
