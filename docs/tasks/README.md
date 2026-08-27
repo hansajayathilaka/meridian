@@ -106,12 +106,22 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   vector's hex, independently re-ran the regeneration itself). Zero blocking or should-fix findings
   survived any of the six tasks' review rounds across this whole phase. Tree green throughout. Draft PR
   [#82](https://github.com/hansajayathilaka/meridian/pull/82) carries all six commits.
-- **NEXT:** `/pick-next-phase` — Phase 7 is closed with zero findings outstanding (N2 deliberately
-  deferred, not open work), so the next command picks the next build phase. **T07 (mailbox) and T14 are
-  clear to pick** — envelope v2's dependency gate was satisfied in Phase 6, and Phase 7's own review
-  found nothing that reopens or reshapes that. The Phase-1 adversarial frontier remains an unowned
-  carry-forward for a future `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08 residuals
-  are Phase-4-scoped follow-ups and stay listed below for a future phase.
+- **NOW:** **Phase 8 (Offline Ciphertext Mailbox) opened — scope is T07 alone, not T07+T14.**
+  Task-picker resolved the tracker's own apparent tension: the prior NEXT note said "T07 and T14 are
+  clear to pick" because both were unblocked by the *same* envelope-v2 gate, but T14's own roadmap
+  dependency row is "T06, T07" ([roadmap.md](../architecture/roadmap.md) line 26) — T07 is exactly the
+  feature this phase builds, so it is pending, not done, and doesn't satisfy T14's dependency yet. Track
+  C's parallel-tracks entry is sequential (`02→06→07→14`, roadmap.md line 70), and T14's own deliverables
+  (mailbox-depth dashboard panel, mailbox-scoped backup runbook) substantively consume T07's output, so
+  no meaningful subset of T14 is buildable in parallel. **T14 is deferred to the phase after Phase 8
+  closes and its review sweep clears.** Dependency check, scope, and the full T14-deferral rationale:
+  [phase-8/README.md](./phase-8/README.md).
+- **NEXT:** `/plan-phase` — break T07 down into tasks per its
+  [feature spec](../architecture/features/07-offline-mailbox.md) and
+  [phase-8/README.md](./phase-8/README.md)'s dependency check (note: task 7.6 already pinned the mailbox
+  PK shape, so `/plan-phase` should treat that as decided, not re-open it). The Phase-1 adversarial
+  frontier remains an unowned carry-forward for a future `/plan-phase` if capacity allows; the six
+  Phase-4-named TUI/T08 residuals are Phase-4-scoped follow-ups and stay listed below for a future phase.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -493,6 +503,14 @@ converted, deferred to a future `/plan-phase` per the report's own verdict. Tree
 - [x] **7.4** Property test for `eid` dedup bound + duplicate detection (F6) — [file](./phase-7/7.4-eid-dedup-property-test.md)
 - [x] **7.5** Boundary-case conformance vectors for `envelope-v2.json` (F7) — [file](./phase-7/7.5-envelope-v2-boundary-vectors.md)
 - [x] **7.6** Resolve the `eid`/mailbox naming collision before T07 planning (N1) — [file](./phase-7/7.6-eid-mailbox-naming-collision-note.md)
+
+### Phase 8 — Offline Ciphertext Mailbox · **planning** · [details](./phase-8/README.md)
+Build phase. **[T07 — Offline Ciphertext Mailbox](../architecture/features/07-offline-mailbox.md)**
+alone: TTL-bounded, size-capped, ciphertext-only mailbox on the recipient's home rendezvous (ADR 0007),
+with deletion-on-acknowledged-delivery, per-recipient quota, cross-federation delivery, and the
+`meridian-admin mailbox dump` honesty demo. Deps T03 + T06 (both done) plus the envelope-v2 standing gate
+(done, Phase 6/7). **T14 is deliberately not bundled in** — see [phase-8/README.md](./phase-8/README.md)
+for why. Task breakdown not yet started — next command is `/plan-phase`.
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
