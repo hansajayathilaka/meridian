@@ -438,7 +438,7 @@ No untracked out-of-band PRs landed in this window. [Report](./phase-7/review-re
 ratification. Verdict: **blocked until F1 resolved**, then green for the next build phase (T07/T14).
 6 fix-tasks planned (7.1 pairs F1+F2, 7.2 pairs F3+F4, 7.3–7.6 cover F5/F6/F7/N1 individually; N2
 deferred to a future `/plan-phase`, not converted here).
-- [~] **7.1** Flag-day hard-reject test coverage (F1, F2) — [file](./phase-7/7.1-flag-day-hard-reject-coverage.md)
+- [x] **7.1** Flag-day hard-reject test coverage (F1, F2) — [file](./phase-7/7.1-flag-day-hard-reject-coverage.md)
 - [ ] **7.2** Zeroize discarded/peeked OTK and SPK secret copies (F3, F4) — [file](./phase-7/7.2-zeroize-otk-spk-secret-copies.md)
 - [ ] **7.3** Stale v1-signature prose in `route_tamper.rs` (F5) — [file](./phase-7/7.3-route-tamper-stale-signature-prose.md)
 - [ ] **7.4** Property test for `eid` dedup bound + duplicate detection (F6) — [file](./phase-7/7.4-eid-dedup-property-test.md)
