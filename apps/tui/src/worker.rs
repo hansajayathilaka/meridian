@@ -3298,10 +3298,12 @@ async fn process_inbound_delivery(
                     }
                     (None, None)
                 }
-                // Everything else — `RequestPending`, `BadSignature`, `SenderMismatch`,
-                // `UnknownPrekey`, `NoSession`, a codec/crypto/store error — dropped, logged,
-                // never trusted. Mirrors `apps/cli/src/chat.rs::handle_inbound`'s own
-                // reject-loudly-never-trust catch-all exactly (this section's own module doc).
+                // Everything else — `RequestPending`, `Crypto` (envelope v2 has no signature to
+                // fail; a decrypt/AEAD failure is what tampering surfaces as now),
+                // `UnsupportedEnvelopeVersion`, `SenderMismatch`, `UnknownPrekey`, `NoSession`, a
+                // codec/store error — dropped, logged, never trusted. Mirrors
+                // `apps/cli/src/chat.rs::handle_inbound`'s own reject-loudly-never-trust catch-all
+                // exactly (this section's own module doc).
                 Err(e) => {
                     eprintln!("meridian tui: dropped an inbound envelope: {e}");
                     (None, None)

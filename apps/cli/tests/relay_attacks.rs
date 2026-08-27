@@ -1,13 +1,13 @@
-//! Task 1.32 — **malicious-relay attacks that PASS the envelope signature check.**
+//! Task 1.32 — **malicious-relay attacks that a byte-flip never reaches.**
 //!
 //! [`relay_rewrite.rs`](./relay_rewrite.rs) (task 1.28) drives the *cheapest* relay attack: flipping
-//! a byte of a routed blob. That attack is provably stopped at the Ed25519 envelope signature —
-//! `MessageEnvelope` has four fields and its signing input covers `sender_pub + prekey + ct` with
-//! `sig` the remainder, so every byte is either signed or is the signature. It therefore never
-//! reaches the ratchet.
+//! a byte of a routed blob. That attack is provably stopped by the ratchet AEAD: envelope v2
+//! ([ADR 0016](../../../docs/adr/0016-envelope-deniability.md)) carries no signature at all — `ct` is
+//! AEAD-authenticated ciphertext under a key only the two ratchet peers hold, so any mutation inside
+//! it fails the tag on decrypt. It therefore never reaches the chat content.
 //!
 //! A routing-only relay has strictly *stronger* attacks that need **no key material at all** and do
-//! **not** touch the bytes, so the signature check waves them straight through:
+//! **not** touch the authenticated bytes, so no AEAD check ever gets a chance to catch them:
 //!
 //! | mode | attack | asserted here |
 //! |---|---|---|
@@ -27,9 +27,10 @@
 //!
 //! **Scope note.** These are the *routing*-layer attacks. Preamble mutation (`used_opk`,
 //! `used_spk`) is deliberately NOT here: a relay cannot mount it — mutating the preamble is
-//! mutating signed bytes, and the server has no envelope types to mutate them with — so it is driven
-//! client-side in `apps/core/tests/preamble_mutation.rs`, which also carries the anti-DoS
-//! (OTK-depth) assertions ADR 0016 asks for.
+//! mutating bytes bound into the ratchet AEAD's associated data (ADR 0016 C3), and the server has no
+//! envelope types to mutate them with — so it is driven client-side in
+//! `apps/core/tests/preamble_mutation.rs`, which also carries the anti-DoS (OTK-depth) assertions ADR
+//! 0016 asks for.
 
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -278,13 +279,14 @@ async fn honest_relay_delivers_faithfully() {
 // -- 1. forged Deliver.from ---------------------------------------------------
 
 /// **`spoof_from`.** The server sets `Deliver.from` itself, so forging it costs nothing and leaves
-/// the signed envelope untouched — the signature check passes. `ChatState::open_bytes` catches it by
-/// comparing the *signed* `sender_pub` against the routing origin.
+/// the envelope untouched — it still decrypts fine (the AEAD has nothing to object to).
+/// `ChatState::open_bytes` catches it by comparing the envelope's own `sender_pub` against the
+/// routing origin.
 ///
 /// Pinned precisely: the RECIPIENT must reject with [`ChatError::SenderMismatch`] specifically.
-/// `BadSignature` or `Crypto` would mean something *else* stopped the blob and this cell is measuring
-/// the wrong thing; `Opened` would be the security failure. Also asserts the two properties the task
-/// calls fail-closed: no session is installed, and nothing is accepted.
+/// `Crypto` (an AEAD/decrypt failure) would mean something *else* stopped the blob and this cell is
+/// measuring the wrong thing; `Opened` would be the security failure. Also asserts the two properties
+/// the task calls fail-closed: no session is installed, and nothing is accepted.
 ///
 /// This is also ADR 0016's "forged prekey envelope claiming `from = Alice`" obligation, mounted by a
 /// real hostile server rather than by hand.
@@ -552,11 +554,12 @@ async fn dropped_delivery_is_lost_but_never_forged() {
 
 // -- 5. cross-delivery --------------------------------------------------------
 
-/// **`cross_deliver`.** The relay captures a genuine, correctly-signed Alice→Bob envelope and hands
-/// it to **Carol**, with its original `from` intact. Nothing is forged: the signature verifies and
-/// the routing origin matches the signed sender, so both of the checks that stop the other cells
-/// wave this through. What stops it is that the X3DH preamble names *Bob's* signed prekey, which
-/// Carol does not hold the secret for → [`ChatError::UnknownPrekey`].
+/// **`cross_deliver`.** The relay captures a genuine Alice→Bob envelope and hands it to **Carol**,
+/// with its original `from` intact. Nothing is forged: the envelope's bytes are exactly as sent, so
+/// there is nothing for the AEAD to object to, and the routing origin matches `sender_pub`, so both
+/// of the checks that stop the other cells wave this through. What stops it is that the X3DH preamble
+/// names *Bob's* signed prekey, which Carol does not hold the secret for →
+/// [`ChatError::UnknownPrekey`].
 ///
 /// The cell carries its own control: the very next delivery is Alice's *real* envelope to Carol,
 /// which must open. So "Carol rejects everything" cannot pass this test.
@@ -593,7 +596,7 @@ async fn cross_delivered_envelope_is_rejected_as_unknown_prekey() {
         ),
         other => panic!(
             "an envelope belonging to a DIFFERENT session must be rejected with \
-             ChatError::UnknownPrekey: it is correctly signed and its `from` matches, so only the \
+             ChatError::UnknownPrekey: its bytes are untouched and its `from` matches, so only the \
              prekey preamble — which names Bob's SPK, not Carol's — can stop it. `Opened` would be a \
              SECURITY FAILURE. Got: {other:?}"
         ),

@@ -21,8 +21,10 @@ description: Use when working on transport, sessions, ICE/STUN/TURN, DTLS-SRTP, 
 1. **Fingerprint binding.** The DTLS fingerprint is carried inside the ratchet-encrypted SDP envelope
    and cross-checked after the handshake; mismatch ⇒ teardown. Never trust the signaling path for media
    auth (design §4.6).
-2. **SDP/ICE never travel in cleartext to the server.** They ride inside signed, encrypted envelopes;
-   the rendezvous routes opaque blobs and must never see or edit SDP.
+2. **SDP/ICE never travel in cleartext to the server.** They ride inside ratchet-encrypted,
+   AEAD-authenticated envelopes — envelope v2 carries no per-message signature
+   ([ADR 0016](../../../docs/adr/0016-envelope-deniability.md)); the rendezvous routes opaque blobs
+   and must never see or edit SDP.
 3. **`relay-only` strips host/srflx candidates before gathering** — not merely deselects them — so peers
    never learn each other's IPs. `direct | prefer-relay | relay-only` is a per-user/contact/org knob
    (design §5.4). Respect it; surface the latency-vs-privacy trade, don't decide it for the operator.

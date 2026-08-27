@@ -138,7 +138,7 @@ Goal section for why)
 
 **Wave 3**
 - [x] **6.5** Conformance vectors: `ratchet-v2.json` + `envelope-v2.json` (depends on 6.3, 6.4) — [file](./6.5-conformance-vectors-v2.md)
-- [ ] **6.7** Doc-sync: describe envelope v2 as shipped (C4; depends on 6.3, 6.4) — [file](./6.7-doc-sync-envelope-v2.md)
+- [x] **6.7** Doc-sync: describe envelope v2 as shipped (C4; depends on 6.3, 6.4) — [file](./6.7-doc-sync-envelope-v2.md)
 
 **Wave 4 — exit gate**
 - [ ] **6.8** Phase exit: flag-day cutover verification + acceptance demo + roadmap unblock (depends on 6.1–6.7) — [file](./6.8-phase-exit-flag-day-demo.md)

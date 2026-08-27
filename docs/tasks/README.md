@@ -104,7 +104,16 @@ evaporate:
   question, not a given. If instead the mailbox mints its own independent row key, it should be named
   to avoid the collision. Flagged by task 6.4's architect review; not 6.4's problem to resolve since
   T07 doesn't exist in code yet.
-> **Keep this section short.** Per-task outcomes, review sign-offs, and the decisions behind them
+- **A residual sweep of stale "envelope signature"/"signed envelope" language remains outside task
+  6.7's file scope** — `apps/rendezvous/src/config.rs`, `apps/rendezvous/src/ws.rs`,
+  `apps/rendezvous/src/lib.rs`/`main.rs`, `apps/cli/tests/relay_rewrite.rs`,
+  `apps/core/tests/preamble_mutation.rs`, `apps/core/tests/desync_recovery.rs`,
+  `apps/store/src/lib.rs`, `apps/proto/src/msg.rs`/`fed.rs`, `apps/signaling/src/lib.rs`/`client.rs`,
+  `apps/cli/src/opacity.rs`. Flagged by 6.7's implementer and spot-checked by its architect review
+  (7 of 12 sites confirmed genuinely stale and genuinely out of 6.7's literal scope; deferring them
+  was judged correct since none blocks anything else in this phase). No task currently owns this;
+  pick up via a future `/plan-phase` doc-sync sweep (not urgent — none is security-critical prose,
+  unlike the sites 6.7 already fixed).
 > live in each task file's **Outcome** section (and the phase README) — not here. This block carries
 > only what is *currently actionable* plus obligations no open task owns.
 
@@ -388,7 +397,7 @@ consult) that shaped them: [phase-6/README.md](./phase-6/README.md).
 
 **Wave 3**
 - [x] **6.5** Conformance vectors: `ratchet-v2.json` + `envelope-v2.json` (depends on 6.3, 6.4) — [file](./phase-6/6.5-conformance-vectors-v2.md)
-- [ ] **6.7** Doc-sync: describe envelope v2 as shipped (C4; depends on 6.3, 6.4) — [file](./phase-6/6.7-doc-sync-envelope-v2.md)
+- [x] **6.7** Doc-sync: describe envelope v2 as shipped (C4; depends on 6.3, 6.4) — [file](./phase-6/6.7-doc-sync-envelope-v2.md)
 
 **Wave 4 — exit gate**
 - [ ] **6.8** Phase exit: flag-day cutover verification + acceptance demo + roadmap unblock (depends on 6.1–6.7) — [file](./phase-6/6.8-phase-exit-flag-day-demo.md)

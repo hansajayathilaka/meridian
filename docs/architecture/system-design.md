@@ -160,7 +160,7 @@ All data-channel payloads (chat, file chunks' content keys, location, control me
 
 1. DTLS protects the *pipe*; the ratchet protects the *messages* — giving FS/PCS at message granularity, which DTLS's session-scoped keys do not.
 2. It makes the security of content independent of the transport path — the same ciphertext can traverse a data channel, the offline mailbox, or a future non-WebRTC transport, unchanged. This is what lets the mailbox exist without violating requirement 1.
-3. It authenticates *the peer's account/device keys*, not just a DTLS certificate. (Deniability: *intended* to rest on MACs rather than signatures on message contents, but envelope **v1 signs every ratchet ciphertext with the sender's identity key**, so v1 is not deniable — [ADR 0016](../adr/0016-envelope-deniability.md) removes that signature at v2. Note the DTLS-fingerprint binding below does **not** depend on the envelope signature: SDP/`dtls_fp` are ratchet plaintext, authenticated by the ratchet AEAD and X3DH.)
+3. It authenticates *the peer's account/device keys*, not just a DTLS certificate, via MACs within ratchet sessions rather than a per-message signature on content. (Deniability: **envelope v2 carries no per-message identity-key signature** — [ADR 0016](../adr/0016-envelope-deniability.md) — so authentication reduces to the ratchet AEAD under keys the recipient also holds, giving weak, Signal-style deniability of authorship, single-hop only (ADR 0016 residual R4; participation via bundle/auth/device signatures remains non-deniable). The now-superseded envelope v1 signed every ratchet ciphertext with the sender's identity key and had no deniability at all. Note the DTLS-fingerprint binding below does **not** depend on any per-message envelope signature — it never did: SDP/`dtls_fp` are ratchet plaintext, authenticated by the ratchet AEAD and X3DH.)
 
 Header encryption (Double Ratchet's encrypted headers variant) is enabled so even ratchet public keys/counters are hidden from anything that ever stores an envelope.
 
@@ -247,14 +247,18 @@ Alice(dev A1)      Rendezvous A            Rendezvous B         Bob(dev B1)
    │ 4. bundle + device record                  │                    │
    │◄───────────────┤   — client VERIFIES sigs under K_B; mismatch ⇒ ABORT
    │ 5. X3DH → root key; init Double Ratchet (per B-device)          │
-   │ 6. Envelope₁ = Sign_{K_A}( ratchet-encrypted { X3DH init, SDP offer,
-   │        DTLS fingerprint, ICE candidates (trickled) } )          │
+   │ 6. Envelope₁ = ratchet-encrypted { X3DH init, SDP offer,
+   │        DTLS fingerprint, ICE candidates (trickled) } — no signature;
+   │        v2 authenticates via the ratchet AEAD under X3DH's AD (ADR 0016)
    ├───────────────►│ 7. route (opaque) ───────►│ 8. deliver (or     │
    │                │                           │    mailbox if      │
    │                │                           │    offline) ──────►│
-   │                │                           │   9. Bob verifies K_A sig,
-   │                │                           │      completes X3DH, decrypts
-   │                │                           │      offer; message-request
+   │                │                           │   9. Bob runs X3DH
+   │                │                           │      provisionally, decrypts
+   │                │                           │      offer — OTK consumed +
+   │                │                           │      session installed only
+   │                │                           │      on success (ADR 0016 C2);
+   │                │                           │      message-request
    │                │                           │      gate if first contact
    │  11. answer envelope (same wrapping), then trickled ICE both ways
    │◄───────────────┼───────────────────────────┼────────────────────┤
@@ -310,7 +314,7 @@ Exported (Prometheus): connection counts, envelope routing rates/latencies, mail
 
 **Failure modes → mitigations.** Home rendezvous down → outbound to other orgs still works via the *sender's* server? No — envelopes to K_B route via B's hint; mitigation: multi-hint IDs (Phase 3) and client retry with jittered backoff; existing live P2P sessions are unaffected (servers are out of the data path). Both peers behind symmetric NAT + no TURN reachable → session fails; mitigation: TURN/TLS-443 last-resort transport, and clear diagnostics (`meridian doctor`) that name the blocked path. Prekey depletion (targeted) → signed-prekey fallback (weakened first-message deniability, not confidentiality) + per-source issuance limits + operator alert. Clock skew breaking prekey/token validity windows → generous windows, server-supplied time hints (authenticated, advisory). Device loss without another linked device → **identity is unrecoverable by design** (no escrow); contacts see a key change and must re-verify — painful, honest, documented; optional user-managed encrypted key backup (age-encrypted file the user stores themselves) is the only softening we offer. Malicious federation partner → bilateral: rate limits, contact-token requirements, allowlist ejection; blast radius is spam/DoS, never content or impersonation. TURN compromise → metadata of relayed flows leaks (IPs, timing, volume); content safe; rotate HMAC secret. Ratchet state desync (restored backup) → sessions fail closed; the peer that *lost* state re-initiates X3DH automatically (it has no session, so it fetches a bundle and handshakes normally), while a peer whose own session is healthy does **not** react to undecryptable traffic — receiver-side automatic renegotiation, with its user-visible notice, is deferred to Feature 08 because reacting to undecryptable input would give an active attacker a session-reset/prekey-depletion oracle before block-on-key-change exists to guard the re-handshake's bundle fetch (task 1.18).
 
-**Known limitations, stated plainly:** (1) metadata per §1.3 — who-talks-to-whom is visible to the involved orgs' servers, and IPs to peers in `direct` mode; (2) offline delivery holds ciphertext server-side (ADR-7) — TTL-bounded, but it exists; (3) no PQ protection until the PQXDH bump lands — harvest-now-decrypt-later applies to v1 traffic; (4) browsers can't pin the app the way binaries can; (5) group properties (Phase ≥2) are weaker than 1:1 until MLS lands, and group *metadata* stays weaker after; (6) air-gapped iOS has no push; (7) deniability: envelope **v1 has none** — every ciphertext is identity-signed, so authorship is third-party-provable, and the mailbox stores those signed ciphertexts for its TTL; [ADR 0016](../adr/0016-envelope-deniability.md) removes the signature at v2, after which it is weak-Signal-grade (authorship only, never participation), not OTR-court-grade. Sealed-sender-style sender hiding from the *recipient's own server* is partial in v1.
+**Known limitations, stated plainly:** (1) metadata per §1.3 — who-talks-to-whom is visible to the involved orgs' servers, and IPs to peers in `direct` mode; (2) offline delivery holds ciphertext server-side (ADR-7) — TTL-bounded, but it exists; (3) no PQ protection until the PQXDH bump lands — harvest-now-decrypt-later applies to v1 traffic; (4) browsers can't pin the app the way binaries can; (5) group properties (Phase ≥2) are weaker than 1:1 until MLS lands, and group *metadata* stays weaker after; (6) air-gapped iOS has no push; (7) deniability: envelope **v2** ([ADR 0016](../adr/0016-envelope-deniability.md)) achieves weak, Signal-grade deniability of *authorship* — message authentication reduces to the ratchet AEAD, so no ciphertext is third-party-provable as any particular sender's — single-hop only; it does not cover *participation* (bundle/auth/device signatures remain identity-key signatures) and the federated case is one hop further, not fully resolved by this ADR alone (ADR 0017). The now-superseded envelope v1 had none — every ciphertext was identity-signed, and the mailbox held those signed ciphertexts for its TTL; v2 reduces that to unattributable bytes, though `sender_pub` is still outer plaintext — sealed-sender-style sender hiding from the *recipient's own server* remains a separate, partial, Phase-3 property.
 
 ---
 
