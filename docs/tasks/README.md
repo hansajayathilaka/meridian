@@ -531,8 +531,8 @@ wire-protocol questions T07 raises before any task started; full record and brea
 - [x] **8.3** Wire/proto: `RouteOk.queued`, `mailbox_full`, `Deliver.mailbox_id`, `MailboxAck`/`MailboxAckOk` — [file](./phase-8/8.3-wire-proto-mailbox-fields.md)
 
 **Wave 2**
-- [ ] **8.2** SQLite mailbox migration + `SqliteStore` impl — [file](./phase-8/8.2-sqlite-mailbox-migration.md)
-- [ ] **8.4** Conformance vectors for the mailbox wire fields — [file](./phase-8/8.4-mailbox-conformance-vectors.md)
+- [x] **8.2** SQLite mailbox migration + `SqliteStore` impl — [file](./phase-8/8.2-sqlite-mailbox-migration.md)
+- [~] **8.4** Conformance vectors for the mailbox wire fields — [file](./phase-8/8.4-mailbox-conformance-vectors.md)
 
 **Wave 3 — route-path integration**
 - [ ] **8.5** `handle_route` local mailbox enqueue, TTL/quota-aware — [file](./phase-8/8.5-local-route-mailbox-enqueue.md)

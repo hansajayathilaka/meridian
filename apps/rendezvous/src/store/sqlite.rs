@@ -10,9 +10,9 @@
 use async_trait::async_trait;
 use meridian_proto::PrekeyBundle;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
-use super::{Store, StoreError, StoreResult};
+use super::{MailboxEntry, Store, StoreError, StoreResult};
 
 fn backend<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(e.to_string())
@@ -50,6 +50,32 @@ impl SqliteStore {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS bundles (\
                 account_pub BLOB PRIMARY KEY, bundle BLOB NOT NULL, otk_count INTEGER NOT NULL)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        // Offline ciphertext mailbox (T07, ADR-7, data-model.md's `mailbox` table) — task 8.2.
+        // `blob` is opaque ciphertext end to end; this crate never deserializes it
+        // (no-serde-on-blob lint, tools/lint-no-serde-on-blob.sh). Columns match data-model.md
+        // byte-for-byte: id (server-assigned sequential row id), recipient_pub, blob, arrived_at,
+        // expires_at, size_bytes — no extra columns (security-reviewer: bounds what A7 learns).
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mailbox (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                recipient_pub BLOB NOT NULL, \
+                blob BLOB NOT NULL, \
+                arrived_at INTEGER NOT NULL, \
+                expires_at INTEGER NOT NULL, \
+                size_bytes INTEGER NOT NULL)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        // `recipient_pub` index: `mailbox_list_for_recipient` (and the size/delete paths, all
+        // scoped by recipient_pub) are the hot path — see data-model.md's mailbox note, updated
+        // alongside this migration.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_mailbox_recipient_pub ON mailbox(recipient_pub)",
         )
         .execute(&self.pool)
         .await
@@ -121,6 +147,109 @@ impl Store for SqliteStore {
             .map_err(backend)?;
         Ok(row.0.max(0) as u64)
     }
+
+    async fn mailbox_enqueue(
+        &self,
+        recipient_pub: [u8; 32],
+        blob: Vec<u8>,
+        arrived_at: u64,
+        expires_at: u64,
+    ) -> StoreResult<u64> {
+        // `size_bytes` is derived here from `blob.len()`, never trusted from a caller — mirrors
+        // the in-memory backend (task 8.1) and data-model.md's `size_bytes` column.
+        let size_bytes = blob.len() as i64;
+        let result = sqlx::query(
+            "INSERT INTO mailbox (recipient_pub, blob, arrived_at, expires_at, size_bytes) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(recipient_pub.as_slice())
+        .bind(blob)
+        .bind(arrived_at as i64)
+        .bind(expires_at as i64)
+        .bind(size_bytes)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(result.last_insert_rowid() as u64)
+    }
+
+    async fn mailbox_list_for_recipient(
+        &self,
+        recipient_pub: &[u8; 32],
+    ) -> StoreResult<Vec<MailboxEntry>> {
+        let rows: Vec<(i64, Vec<u8>, Vec<u8>, i64, i64, i64)> = sqlx::query_as(
+            "SELECT id, recipient_pub, blob, arrived_at, expires_at, size_bytes FROM mailbox \
+             WHERE recipient_pub = ?1 ORDER BY arrived_at ASC, id ASC",
+        )
+        .bind(recipient_pub.as_slice())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.into_iter().map(row_to_entry).collect()
+    }
+
+    async fn mailbox_delete_by_ids(
+        &self,
+        recipient_pub: &[u8; 32],
+        ids: &[u64],
+    ) -> StoreResult<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        // Scoped by BOTH recipient_pub AND id: an id naming another recipient's row is a silent
+        // no-op, never an error and never a cross-recipient deletion (8.7's `MailboxAck` handler
+        // depends on this being safe to call with client-supplied ids — same contract as the
+        // in-memory backend, task 8.1).
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new("DELETE FROM mailbox WHERE recipient_pub = ");
+        qb.push_bind(recipient_pub.as_slice());
+        qb.push(" AND id IN (");
+        let mut separated = qb.separated(", ");
+        for id in ids {
+            separated.push_bind(*id as i64);
+        }
+        separated.push_unseparated(")");
+        let result = qb.build().execute(&self.pool).await.map_err(backend)?;
+        Ok(result.rows_affected())
+    }
+
+    async fn mailbox_purge_expired(&self, now: u64) -> StoreResult<u64> {
+        let result = sqlx::query("DELETE FROM mailbox WHERE expires_at <= ?1")
+            .bind(now as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(result.rows_affected())
+    }
+
+    async fn mailbox_size_bytes_for_recipient(&self, recipient_pub: &[u8; 32]) -> StoreResult<u64> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM mailbox WHERE recipient_pub = ?1",
+        )
+        .bind(recipient_pub.as_slice())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(row.0.max(0) as u64)
+    }
+}
+
+/// Convert one raw SQLite row tuple into a [`MailboxEntry`], validating `recipient_pub`'s length
+/// (it is stored as `BLOB`, not a fixed-size SQL type). `blob` is passed through untouched —
+/// never deserialized (no-serde-on-blob discipline).
+fn row_to_entry(row: (i64, Vec<u8>, Vec<u8>, i64, i64, i64)) -> StoreResult<MailboxEntry> {
+    let (id, recipient_pub, blob, arrived_at, expires_at, size_bytes) = row;
+    let recipient_pub: [u8; 32] = recipient_pub
+        .try_into()
+        .map_err(|_| backend("mailbox row recipient_pub is not 32 bytes"))?;
+    Ok(MailboxEntry {
+        id: id as u64,
+        recipient_pub,
+        blob,
+        arrived_at: arrived_at as u64,
+        expires_at: expires_at as u64,
+        size_bytes: size_bytes as u64,
+    })
 }
 
 #[cfg(test)]
@@ -160,5 +289,209 @@ mod tests {
         // Republish replaces (and updates the pool depth).
         store.put_bundle(bundle(key, 3)).await.unwrap();
         assert_eq!(store.total_otks().await.unwrap(), 3);
+    }
+
+    // -- Offline ciphertext mailbox (task 8.2) ---------------------------------------------------
+    //
+    // Mirrors store.rs's `MemoryStore` mailbox test set exactly (task 8.1), so both backends are
+    // provably interchangeable.
+
+    #[tokio::test]
+    async fn mailbox_enqueue_then_list_returns_in_arrival_order() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let recipient = [7u8; 32];
+
+        let id_a = store
+            .mailbox_enqueue(recipient, vec![1, 2, 3], 100, 200)
+            .await
+            .unwrap();
+        let id_b = store
+            .mailbox_enqueue(recipient, vec![4, 5], 150, 250)
+            .await
+            .unwrap();
+
+        let entries = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, id_a);
+        assert_eq!(entries[0].blob, vec![1, 2, 3]);
+        assert_eq!(entries[0].size_bytes, 3);
+        assert_eq!(entries[0].arrived_at, 100);
+        assert_eq!(entries[0].expires_at, 200);
+        assert_eq!(entries[1].id, id_b);
+        assert_eq!(entries[1].blob, vec![4, 5]);
+    }
+
+    #[tokio::test]
+    async fn mailbox_list_orders_by_arrived_at_then_id_for_ties() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let recipient = [1u8; 32];
+
+        // Same `arrived_at`: tie-break must fall back to `id` (assignment order).
+        let id_a = store
+            .mailbox_enqueue(recipient, vec![0], 500, 600)
+            .await
+            .unwrap();
+        let id_b = store
+            .mailbox_enqueue(recipient, vec![1], 500, 600)
+            .await
+            .unwrap();
+
+        let entries = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![id_a, id_b]
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_delete_by_ids_removes_only_the_matching_row_for_the_matching_recipient() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let alice = [1u8; 32];
+        let bob = [2u8; 32];
+
+        let alice_id = store
+            .mailbox_enqueue(alice, vec![9, 9], 10, 20)
+            .await
+            .unwrap();
+        let bob_id = store
+            .mailbox_enqueue(bob, vec![8, 8], 10, 20)
+            .await
+            .unwrap();
+
+        // A delete request scoped to `bob` naming `alice`'s row id must be a silent no-op: no
+        // error, and alice's row survives untouched.
+        let deleted = store
+            .mailbox_delete_by_ids(&bob, &[alice_id])
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(
+            store
+                .mailbox_list_for_recipient(&alice)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.mailbox_list_for_recipient(&bob).await.unwrap().len(),
+            1
+        );
+
+        // The correctly-scoped delete (bob deleting his own row) succeeds and only affects bob.
+        let deleted = store.mailbox_delete_by_ids(&bob, &[bob_id]).await.unwrap();
+        assert_eq!(deleted, 1);
+        assert!(store
+            .mailbox_list_for_recipient(&bob)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .mailbox_list_for_recipient(&alice)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_delete_by_ids_for_unknown_recipient_is_a_no_op() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        // No mailbox has ever been created for this recipient at all.
+        let stranger = [3u8; 32];
+
+        let deleted = store
+            .mailbox_delete_by_ids(&stranger, &[1, 2, 3])
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn mailbox_purge_expired_removes_only_rows_past_their_deadline() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let recipient = [4u8; 32];
+
+        let fresh_id = store
+            .mailbox_enqueue(recipient, vec![1], 0, 1_000)
+            .await
+            .unwrap();
+        let expired_id = store
+            .mailbox_enqueue(recipient, vec![2], 0, 500)
+            .await
+            .unwrap();
+
+        let purged = store.mailbox_purge_expired(500).await.unwrap();
+        assert_eq!(purged, 1);
+
+        let remaining = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, fresh_id);
+        assert_ne!(remaining[0].id, expired_id);
+    }
+
+    #[tokio::test]
+    async fn mailbox_size_bytes_for_recipient_sums_per_recipient() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let alice = [5u8; 32];
+        let bob = [6u8; 32];
+
+        store
+            .mailbox_enqueue(alice, vec![0; 100], 0, 1_000)
+            .await
+            .unwrap();
+        store
+            .mailbox_enqueue(alice, vec![0; 50], 0, 1_000)
+            .await
+            .unwrap();
+        store
+            .mailbox_enqueue(bob, vec![0; 7], 0, 1_000)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .mailbox_size_bytes_for_recipient(&alice)
+                .await
+                .unwrap(),
+            150
+        );
+        assert_eq!(
+            store.mailbox_size_bytes_for_recipient(&bob).await.unwrap(),
+            7
+        );
+        // A recipient with no mailbox at all sums to zero, not an error.
+        assert_eq!(
+            store
+                .mailbox_size_bytes_for_recipient(&[9u8; 32])
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_row_survives_a_reconnect_to_the_same_file_backed_db() {
+        // Durability across a "restart": a file-backed DB (not `:memory:`) must retain rows
+        // across independent `SqliteStore::connect` calls — the actual point of task 8.2.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mailbox-durability.db");
+        let url = format!("sqlite://{}", path.display());
+        let recipient = [8u8; 32];
+
+        {
+            let store = SqliteStore::connect(&url).await.unwrap();
+            store
+                .mailbox_enqueue(recipient, vec![42, 43], 1, 1_000)
+                .await
+                .unwrap();
+        } // pool dropped here — simulates process exit.
+
+        let store = SqliteStore::connect(&url).await.unwrap();
+        let entries = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].blob, vec![42, 43]);
     }
 }

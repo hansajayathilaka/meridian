@@ -33,6 +33,9 @@ mailbox(           -- ADR-7. A7 learns: count, sizes, timestamps. Nothing else.
                    -- "no s2s dedup" already stands) — the server never needs to read eid at all.
   recipient_pub, blob BLOB /*opaque — no-serde lint*/,
   arrived_at, expires_at, size_bytes)
+  -- INDEX(recipient_pub): list-for-recipient (and the delete/size paths, both scoped by
+  -- recipient_pub) are the hot path; added in the SQLite migration (task 8.2), named here per
+  -- Definition of Task §6 sync-docs-on-schema-change.
   -- purge job on expires_at; delete on ack (by id); quota trigger per recipient
   -- TTL=0 config ⇒ inserts disabled entirely (pure-P2P mode)
 
