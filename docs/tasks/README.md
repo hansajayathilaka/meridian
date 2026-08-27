@@ -527,7 +527,7 @@ wire-protocol questions T07 raises before any task started; full record and brea
 [phase-8/README.md](./phase-8/README.md).
 
 **Wave 1 — independent**
-- [ ] **8.1** Mailbox store trait + in-memory impl + config surface — [file](./phase-8/8.1-mailbox-store-trait-config.md)
+- [x] **8.1** Mailbox store trait + in-memory impl + config surface — [file](./phase-8/8.1-mailbox-store-trait-config.md)
 - [ ] **8.3** Wire/proto: `RouteOk.queued`, `mailbox_full`, `Deliver.mailbox_id`, `MailboxAck`/`MailboxAckOk` — [file](./phase-8/8.3-wire-proto-mailbox-fields.md)
 
 **Wave 2**

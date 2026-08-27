@@ -101,7 +101,7 @@ depends on route-path integration; purge/X3DH/CLI/audit (8.9–8.12) depend only
 cross-federation acceptance test (8.13) and the phase-exit demo (8.14) come last.
 
 **Wave 1 — independent**
-- [ ] **8.1** Mailbox store trait + in-memory impl + config surface — [file](./8.1-mailbox-store-trait-config.md)
+- [x] **8.1** Mailbox store trait + in-memory impl + config surface — [file](./8.1-mailbox-store-trait-config.md)
 - [ ] **8.3** Wire/proto: `RouteOk.queued`, `mailbox_full`, `Deliver.mailbox_id`, `MailboxAck`/`MailboxAckOk` — [file](./8.3-wire-proto-mailbox-fields.md)
 
 **Wave 2**

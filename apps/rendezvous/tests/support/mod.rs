@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use meridian_identity::{generate_account, KeyHandle, MemorySecretStore};
 use meridian_rendezvous::config::{
-    Config, DiscoveryMode, Federation, FederationPolicyMode, Limits, Server, Turn,
+    Config, DiscoveryMode, Federation, FederationPolicyMode, Limits, Mailbox, Server, Turn,
 };
 use meridian_rendezvous::federation::inbound::{bind_federation, run_federation};
 use meridian_rendezvous::federation::link::build_client_tls_config;
@@ -185,6 +185,7 @@ pub fn config_with_federation(domain: &str, federation: Federation) -> Config {
         limits: Limits::default(),
         turn: Turn::default(),
         federation,
+        mailbox: Mailbox::default(),
     }
 }
 
