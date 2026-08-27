@@ -351,8 +351,9 @@ async fn dial_times_out_when_the_peer_never_answers() {
         Err(e) => e,
         Ok(_) => panic!("dial must not succeed when the peer never answers"),
     };
-    // Distinguishable from tampering (`Chat(ChatError::BadSignature)`) and every other
-    // `SessionError` variant — that's the whole diagnosability point of this task.
+    // Distinguishable from tampering (`Chat(ChatError::Crypto)` — a byte that *did* arrive but
+    // failed the ratchet AEAD) and every other `SessionError` variant — that's the whole
+    // diagnosability point of this task.
     assert!(
         matches!(err, SessionError::AnswerTimeout(_)),
         "expected SessionError::AnswerTimeout, got a different variant: {err}"
@@ -414,7 +415,7 @@ async fn answer_times_out_when_no_offer_ever_arrives() {
         Err(e) => e,
         Ok(_) => panic!("answer must not succeed when no offer ever arrives"),
     };
-    // Distinguishable from tampering (`Chat(ChatError::BadSignature)`), from `AnswerTimeout` (the
+    // Distinguishable from tampering (`Chat(ChatError::Crypto)`), from `AnswerTimeout` (the
     // opposite side of the handshake), and from every other `SessionError` variant.
     assert!(
         matches!(err, SessionError::OfferTimeout(_)),

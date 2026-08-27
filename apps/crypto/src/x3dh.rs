@@ -54,6 +54,16 @@ fn store_dh(
     Ok(Zeroizing::new(arr))
 }
 
+/// Builds `root`/`hka`/`nhkb` from the DH-derived `ikm`, plus `ad = initiator_ik || responder_ik`.
+///
+/// **ADR 0016 C3 note (task 6.3):** `ad` is built here from `initiator_ik`/`responder_ik` exactly
+/// as received — the raw 32-byte Ed25519 encodings — never converted to their Montgomery (X25519)
+/// form and never otherwise "normalized". This already satisfies C3's requirement that the v2 AAD
+/// carry the raw Ed25519 encodings of both identity keys: the Ed25519→X25519 birational map drops
+/// the sign bit (`A` and `-A` convert to the same Montgomery `u` and yield an identical root), so
+/// carrying anything less than the full Ed25519 encoding here would let a sign-flipped
+/// `sender_pub` collide in the AAD once the per-message signature (which caught this in v1) is
+/// gone. No behavior change was needed for this task — `derive` already did the right thing.
 fn derive(ikm: &[u8], initiator_ik: &[u8; 32], responder_ik: &[u8; 32]) -> X3dhResult {
     let okm: [u8; 96] = hkdf(&[0u8; 32], ikm, X3DH_INFO);
     let mut root = [0u8; 32];

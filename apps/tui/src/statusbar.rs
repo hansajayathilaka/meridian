@@ -60,6 +60,41 @@ pub enum ConnectionState {
     },
 }
 
+/// How overdue the current SPK generation is for rotation, if at all (task 6.2 follow-up: the
+/// review-flagged gap where `apps/tui/src/worker.rs::warn_if_spk_overdue`'s `eprintln!` alone is not
+/// reliably visible to a `meridian tui` user — `apps/tui/src/terminal.rs`'s alternate-screen mode
+/// means a stderr line mid-session is either invisible or corrupts the display, the exact defect
+/// class `docs/architecture/tui-client.md:549` already documents). Mirrors [`ConnectionState`]'s own
+/// shape: a small closed enum rather than a raw string, so a caller cannot accidentally render
+/// inconsistent wording, and the exact same threshold `warn_if_spk_overdue` itself logs at (never
+/// duplicated/redefined here — see `apps/tui/src/worker.rs::spk_overdue_status`, the single shared
+/// pure helper both the log line and this status are computed from).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpkRotationStatus {
+    /// Not overdue: either never checked yet this session, or the most recent check found the
+    /// generation's age under `SPK_ROTATION_WARN_GRACE_MULTIPLE` x `SPK_ROTATION_INTERVAL_SECS`.
+    /// Also what a *successful* rotation leaves behind — the generation's age resets to ~0, so the
+    /// next status computed from it reads `Healthy` again, clearing any prior warning.
+    Healthy,
+    /// The generation's age is unknown (never published, or a vault sealed before task 6.1) and due
+    /// for rotation — mirrors `warn_if_spk_overdue`'s own "unknown age always warns" fail-safe case.
+    UnknownAge,
+    /// Overdue past `SPK_ROTATION_WARN_GRACE_MULTIPLE` x `SPK_ROTATION_INTERVAL_SECS`. `multiples`
+    /// is the same "Nx overdue" figure `warn_if_spk_overdue`'s own log line reports; `age_secs` is
+    /// the raw generation age in seconds.
+    Overdue { multiples: u64, age_secs: u64 },
+}
+
+impl Default for SpkRotationStatus {
+    /// The honest "nothing overdue observed yet" state — mirrors [`ConnectionState`]'s own
+    /// `Disconnected` default (never renders an optimistic/fabricated warning-free state the loop
+    /// has not actually confirmed; this is simply what a session that has not yet run its first
+    /// hourly check starts as).
+    fn default() -> Self {
+        Self::Healthy
+    }
+}
+
 /// Which path a session is using, if any — tui-client.md §2's `P2P direct` / relay wording.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportPath {
@@ -206,6 +241,11 @@ mod tests {
         let text = render_to_text(&info);
         assert!(text.contains("turn.example.test"));
         assert!(text.contains("relay-only"));
+    }
+
+    #[test]
+    fn spk_rotation_status_default_is_honestly_healthy() {
+        assert_eq!(SpkRotationStatus::default(), SpkRotationStatus::Healthy);
     }
 
     #[test]

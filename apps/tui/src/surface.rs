@@ -37,6 +37,7 @@ use ratatui::text::Line;
 use ratatui::Frame;
 
 use crate::app::{Effect, Screen, WorkerEvent};
+use crate::statusbar::SpkRotationStatus;
 use crate::store::history::HistoryEntry;
 
 // ---------------------------------------------------------------------------
@@ -399,6 +400,14 @@ pub trait ExtensionPane: Send + Sync {
     /// Handle a worker event completing/failing an effect this pane dispatched. Mirrors
     /// `crate::screens::*::handle_worker`'s contract.
     fn handle_worker(&mut self, event: WorkerEvent) -> Vec<Effect>;
+    /// Ambient, session-wide state a pane may want to reflect without owning the channel/event
+    /// machinery that produces it itself (task 6.2 follow-up: `crate::app::AppEvent::
+    /// SpkRotationOverdue`). Default no-op — most panes have no use for this; `crate::screens::
+    /// diagnostics::DiagnosticsPane` is the first (and, today, only) override. Called by
+    /// `crate::app::App::update` on whichever pane is current every time a new status arrives, and
+    /// once more, with `App`'s already-known value, the moment a pane is freshly pushed (`App::
+    /// dispatch_palette_action`'s `PushPane` arm) — see those call sites' own doc comments.
+    fn sync_spk_rotation_overdue(&mut self, _status: SpkRotationStatus) {}
     /// Pure view function — no I/O, no `.await`, same contract as every other `render` in this
     /// crate.
     fn render(&self, frame: &mut Frame<'_>);

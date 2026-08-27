@@ -31,25 +31,21 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   not new components/dependencies/wire changes. Tree green (`cargo build --workspace`, `cargo fmt
   --check`, `cargo clippy --workspace --all-targets -- -D warnings` all clean). Full closure summary:
   [phase-5/README.md](./phase-5/README.md#exit-criteria).
-- **NOW:** **Phase 6 (Envelope v2) planned — 8 tasks (6.1–6.8), none started.** A **planner** pass and
-  an independent **architect** pass over the actual code (not just ADR 0016's text) refined the
-  ADR-derived scope before task files were written — see
-  [Phase 6's "`/plan-phase` refinements" section](./phase-6/README.md#plan-phase-refinements-planner--architect-consult-before-task-files-were-written)
-  for what changed: C2+C3 (+C5/C6/C7's short-circuit half) must land as one un-splittable task (6.3,
-  reviewed by architect + security-reviewer independently, not the combined `reviewer` agent, mirroring
-  this exact function's task-1.18 review history); C4's doc-sync scope widened to two `apps/rendezvous`
-  files and one `apps/core` file with now-stale v1-specific security reasoning; and 6.3 carries an
-  explicit constraint never to route `v: 2` through either existing version-negotiation mechanism
-  (Bundle `v:1`/`v:2`, `Hello.streams[].ver`), which R5 forbids for message authentication. Full task
-  list, dependency waves, and the four `TODO: confirm` items routed to architect (SPK-rotation interval
-  and unknown-age semantics in 6.1; the C1 "monitored" server-metric question and fail-open/fail-closed
-  choice in 6.2; `eid`'s generation scheme and dedup-store bound in 6.4; the v2 AEAD-failure error
-  variant re-pointed tests must assert in 6.6): [Phase 6's README](./phase-6/README.md).
-- **NEXT:** `/next-task` — Wave 1 (6.1 SPK-rotation age-tracking, 6.3 the core AAD/commit-on-decrypt
-  cutover) is unblocked now and the two tasks are independent of each other. The Phase-1 adversarial
-  frontier remains an unowned carry-forward for a future `/plan-phase` if capacity allows; the six
-  Phase-4-named TUI/T08 residuals are Phase-4-scoped follow-ups, not envelope-v2 scope, and stay listed
-  below for a future phase.
+- **NOW:** **Phase 6 (Envelope v2) is closed — 8/8 tasks done** (6.1–6.8). The per-message Ed25519
+  identity-key signature is gone from `MessageEnvelope`; authentication now rests on the ratchet AEAD +
+  X3DH `DH1` under the canonical v2 AAD (ADR 0016 C1–C7), with enforced/monitored SPK rotation,
+  commit-on-successful-decrypt, a leading `v: 2` field, the `eid` replay-dedup key, and
+  `ratchet-v2.json`/`envelope-v2.json` conformance vectors all shipped. 6.8's exit gate confirmed a
+  green full-workspace build/fmt/clippy/test run, a live two-party CLI demo proving only `v: 2`
+  envelopes exist on the wire, and a clean grep sweep for any remaining live-path `mrd.env/1` reference.
+  Zero blocking findings across every task's review. Full closure summary:
+  [6.8's Outcome](./phase-6/6.8-phase-exit-flag-day-demo.md#outcome) and its
+  [demo transcript](./phase-6/6.8-demo-transcript.md). This also discharges the standing envelope-v2
+  dependency gate — see "Live carry-forwards" below — so **T07 (mailbox) and T14 are now pickable**.
+- **NEXT:** `/start-review-phase` — Phase 6 (a build phase) is closed, so the next command opens the
+  review phase that sweeps it, per the lifecycle. The Phase-1 adversarial frontier remains an unowned
+  carry-forward for a future `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08 residuals
+  are Phase-4-scoped follow-ups, not envelope-v2 scope, and stay listed below for a future phase.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -57,12 +53,19 @@ Phase 4 is now closed; its own unowned findings live in
 [phase-4/README.md](./phase-4/README.md#exit-criteria)'s "Findings with no task yet" sections, for
 `/plan-phase` to pick up in a future build phase. These are the standing exceptions that would otherwise
 evaporate:
-- **Envelope v2 is now a standing, mechanically-checked dependency gate**, not prose. See
-  [roadmap.md](../architecture/roadmap.md) (T07's deps row + the note beneath the table) and
-  [Phase 4's README](./phase-4/README.md#envelope-v2-re-deferred--the-concrete-trigger). It must still carry the
-  replay-dedup obligation from Phase 2 (2.13 bounds a replay's harm to one failed decrypt; full dedup
-  via envelope v2's `eid` per [ADR 0016](../adr/0016-envelope-deniability.md) C7) into whatever build
-  phase implements it.
+- **RESOLVED (Phase 6, task 6.8): envelope v2's standing dependency gate is now satisfied.** The gate
+  itself — encoded mechanically in [roadmap.md](../architecture/roadmap.md) (T07's deps row + the note
+  beneath the table) per [Phase 4's README](./phase-4/README.md#envelope-v2-re-deferred--the-concrete-trigger)
+  — required a tracker task/phase named "envelope v2" to exist with status done before T07 (and,
+  transitively, T14) could be picked. [Phase 6 — Envelope v2](./phase-6/README.md) (6.1–6.8) is that
+  phase, closed with a green full-workspace gate, a live two-party CLI demo, and a grep-confirmed sweep
+  showing no live-path `mrd.env/1`/v1 reference remains — see
+  [6.8's Outcome](./phase-6/6.8-phase-exit-flag-day-demo.md#outcome) and its
+  [demo transcript](./phase-6/6.8-demo-transcript.md). The replay-dedup obligation this bullet used to
+  carry forward from Phase 2 (2.13 bounded a replay's harm to one failed decrypt) was discharged in the
+  same phase by [task 6.4](./phase-6/6.4-eid-replay-dedup.md)'s `eid` dedup key
+  ([ADR 0016](../adr/0016-envelope-deniability.md) C7). **T07 and T14 are now pickable** by a future
+  `/pick-next-phase` like any other feature whose numbered dependencies are done.
 - **The adversarial frontier carried from Phase 1** — SPK grace-window aging, stale-bundle replay on
   the fetch path, same-OTK-to-many-fetchers, reflection, per-device delivery, skipped-key exhaustion.
   Listed in [phase-3/README.md](./phase-3/README.md#findings-with-no-task-and-why); not a Phase-2
@@ -79,8 +82,41 @@ evaporate:
   GitHub's branch-protection/ruleset config. 3.12 landed the pre-merge docker build gate itself but
   left this one sub-item open by design rather than guessing; check GitHub Settings → Branches/
   Rulesets and update that doc's `TODO: confirm` once observed.
-
-> **Keep this section short.** Per-task outcomes, review sign-offs, and the decisions behind them
+- **`PrekeyVault::establish_responder_session_provisional`'s peeked SPK/OTK secrets aren't
+  `Zeroizing`-wrapped** (task 6.3's security-reviewer, should-fix, not blocking) — plain `[u8;32]`
+  stack copies, mirroring the pre-existing `spk_secret_for`/`take_otk_secret` pattern, so not a
+  regression 6.3 introduced. But envelope v2's commit-on-decrypt (C2) makes this unscrubbed-copy path
+  routinely attacker-triggerable (every mutated preamble/ciphertext takes it now, not just legitimate
+  publishes). Short-lived stack memory, never logged/persisted, so non-blocking — but no open task
+  currently owns `apps/core/src/chat.rs`'s `PrekeyVault` secret-handling to pick this up; flag for
+  whoever next touches that code or for a future `/plan-phase`.
+- **A devops-owned server-side SPK-staleness metric/alert is still unbuilt** (task 6.2's Decision 2,
+  architect-reviewed) — client-side enforcement + local warning (task 6.2) satisfies ADR 0016 C1's
+  "monitored" obligation for now, but an operator-side view independent of any single client's own
+  honesty about reporting its staleness (e.g. "count of accounts whose `prekeys.rotated_at` is older
+  than N × the rotation interval") is real, useful follow-up work against `apps/rendezvous`/
+  `tools/metrics-allowlist.txt`/`docs/operations/monitoring.md` — the column already exists
+  server-side, nothing about 6.2 forecloses it. No open task owns this; schedule via a future
+  `/plan-phase` when devops prioritizes it.
+- **T07 (mailbox, still unbuilt)'s planned `mailbox` table uses `eid BLOB` as its row key
+  ([data-model.md](../architecture/data-model.md)) — a naming collision with task 6.4's new
+  `MessageEnvelope::eid` (envelope-level replay-dedup, client-side only) that whoever plans T07 must
+  resolve deliberately, not by accident.** The server's "envelope stays opaque, never decoded"
+  invariant is otherwise absolute; if T07's mailbox PK is meant to be *derived from* the envelope's
+  `eid`, that requires the server to peek one field of an otherwise-opaque blob — a real design
+  question, not a given. If instead the mailbox mints its own independent row key, it should be named
+  to avoid the collision. Flagged by task 6.4's architect review; not 6.4's problem to resolve since
+  T07 doesn't exist in code yet.
+- **A residual sweep of stale "envelope signature"/"signed envelope" language remains outside task
+  6.7's file scope** — `apps/rendezvous/src/config.rs`, `apps/rendezvous/src/ws.rs`,
+  `apps/rendezvous/src/lib.rs`/`main.rs`, `apps/cli/tests/relay_rewrite.rs`,
+  `apps/core/tests/preamble_mutation.rs`, `apps/core/tests/desync_recovery.rs`,
+  `apps/store/src/lib.rs`, `apps/proto/src/msg.rs`/`fed.rs`, `apps/signaling/src/lib.rs`/`client.rs`,
+  `apps/cli/src/opacity.rs`. Flagged by 6.7's implementer and spot-checked by its architect review
+  (7 of 12 sites confirmed genuinely stale and genuinely out of 6.7's literal scope; deferring them
+  was judged correct since none blocks anything else in this phase). No task currently owns this;
+  pick up via a future `/plan-phase` doc-sync sweep (not urgent — none is security-critical prose,
+  unlike the sites 6.7 already fixed).
 > live in each task file's **Outcome** section (and the phase README) — not here. This block carries
 > only what is *currently actionable* plus obligations no open task owns.
 
@@ -345,7 +381,7 @@ round — see [phase-5/README.md](./phase-5/README.md#exit-criteria) for the clo
 - [x] **5.3** Fix `contacts.json` trust staleness + cover `export_json` (F3; depends on 5.4) — [file](./phase-5/5.3-fix-contacts-trust-staleness-export.md)
 - [x] **5.6** Federated mitm-sim cell: verified-contact key-change block (F6; depends on 5.5) — [file](./phase-5/5.6-federated-verified-key-change-mitm-cell.md)
 
-### Phase 6 — Envelope v2 · **in progress** · [details](./phase-6/README.md)
+### Phase 6 — Envelope v2 · **done** · [details](./phase-6/README.md)
 Build phase. **Envelope v2** — [ADR 0016](../adr/0016-envelope-deniability.md) (binding), not a
 numbered feature: drops the per-message identity-key signature from `MessageEnvelope`, relying on the
 ratchet AEAD + X3DH `DH1` for authentication. Deps: T03 (done), ADR 0016 (accepted). This is the
@@ -354,20 +390,20 @@ and, transitively, T14. 8 tasks; dependency waves and the `/plan-phase` refineme
 consult) that shaped them: [phase-6/README.md](./phase-6/README.md).
 
 **Wave 1 — independent, both unblocked now**
-- [ ] **6.1** SPK rotation policy: age tracking + rotation-due predicate (C1, 1/3) — [file](./phase-6/6.1-spk-rotation-age-tracking.md)
-- [ ] **6.3** Envelope v2 core cutover: wire shape + canonical AAD + commit-on-decrypt + desync short-circuit fix (C2, C3, C5, C6, C7 short-circuit) — [file](./phase-6/6.3-envelope-v2-core-cutover.md)
+- [x] **6.1** SPK rotation policy: age tracking + rotation-due predicate (C1, 1/3) — [file](./phase-6/6.1-spk-rotation-age-tracking.md)
+- [x] **6.3** Envelope v2 core cutover: wire shape + canonical AAD + commit-on-decrypt + desync short-circuit fix (C2, C3, C5, C6, C7 short-circuit) — [file](./phase-6/6.3-envelope-v2-core-cutover.md)
 
 **Wave 2**
-- [ ] **6.2** SPK rotation enforcement: trigger + monitoring in both client loops (C1, 2–3/3; depends on 6.1) — [file](./phase-6/6.2-spk-rotation-enforcement.md)
-- [ ] **6.4** `eid` replay-dedup key (C7, 2/2; depends on 6.3) — [file](./phase-6/6.4-eid-replay-dedup.md)
-- [ ] **6.6** Test re-pointing: v1 detector → v2 AEAD + new C3/R1 adversarial cells (depends on 6.3) — [file](./phase-6/6.6-repoint-adversarial-tests.md)
+- [x] **6.2** SPK rotation enforcement: trigger + monitoring in both client loops (C1, 2–3/3; depends on 6.1) — [file](./phase-6/6.2-spk-rotation-enforcement.md)
+- [x] **6.4** `eid` replay-dedup key (C7, 2/2; depends on 6.3) — [file](./phase-6/6.4-eid-replay-dedup.md)
+- [x] **6.6** Test re-pointing: v1 detector → v2 AEAD + new C3/R1 adversarial cells (depends on 6.3) — [file](./phase-6/6.6-repoint-adversarial-tests.md)
 
 **Wave 3**
-- [ ] **6.5** Conformance vectors: `ratchet-v2.json` + `envelope-v2.json` (depends on 6.3, 6.4) — [file](./phase-6/6.5-conformance-vectors-v2.md)
-- [ ] **6.7** Doc-sync: describe envelope v2 as shipped (C4; depends on 6.3, 6.4) — [file](./phase-6/6.7-doc-sync-envelope-v2.md)
+- [x] **6.5** Conformance vectors: `ratchet-v2.json` + `envelope-v2.json` (depends on 6.3, 6.4) — [file](./phase-6/6.5-conformance-vectors-v2.md)
+- [x] **6.7** Doc-sync: describe envelope v2 as shipped (C4; depends on 6.3, 6.4) — [file](./phase-6/6.7-doc-sync-envelope-v2.md)
 
 **Wave 4 — exit gate**
-- [ ] **6.8** Phase exit: flag-day cutover verification + acceptance demo + roadmap unblock (depends on 6.1–6.7) — [file](./phase-6/6.8-phase-exit-flag-day-demo.md)
+- [x] **6.8** Phase exit: flag-day cutover verification + acceptance demo + roadmap unblock (depends on 6.1–6.7) — [file](./phase-6/6.8-phase-exit-flag-day-demo.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.

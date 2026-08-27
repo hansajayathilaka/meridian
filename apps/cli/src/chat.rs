@@ -34,7 +34,7 @@
 //! `meridian_core::desync::attempt_recovery` — the receiver-side half task 1.18 deferred to this
 //! feature. See `docs/api/messaging-envelope-v1.md` §3 "Desync recovery" for the full guarded design.
 
-use meridian_core::chat::{ChatError, ChatState};
+use meridian_core::chat::{ChatError, ChatState, SPK_ROTATION_INTERVAL_SECS};
 use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{KeyHandle, SecretStore};
 use meridian_core::signaling::{SignalingClient, DEFAULT_OTK_COUNT};
@@ -42,6 +42,138 @@ use meridian_core::trust::{SendGate, TrustStore};
 use tokio::sync::mpsc;
 
 use crate::account;
+
+/// How often `run`'s main loop checks whether the current SPK generation needs rotating (task 6.2,
+/// ADR 0016 C1/R1). Mirrors `apps/tui/src/worker.rs::SPK_ROTATION_CHECK_INTERVAL_SECS` exactly —
+/// same reasoning (`SPK_ROTATION_INTERVAL_SECS` is week-scale, so hourly polling is generous
+/// headroom without checking on every typed line or inbound envelope) — but implemented separately
+/// per this task's own scope: `meridian-cli` and `meridian-tui` are separate crates with no shared
+/// "long-running client loop" module to hang one common implementation off, so this is genuinely new
+/// work in both, not a shared change.
+const SPK_ROTATION_CHECK_INTERVAL_SECS: u64 = 3600;
+
+/// Mirrors `apps/tui/src/worker.rs::SPK_ROTATION_WARN_GRACE_MULTIPLE` exactly — see that constant's
+/// own doc comment for the reasoning.
+const SPK_ROTATION_WARN_GRACE_MULTIPLE: u64 = 2;
+
+/// Outcome of one [`rotate_spk_if_due`] call — exists so tests can assert exactly what happened,
+/// mirroring `apps/tui/src/worker.rs::SpkRotationOutcome` (kept as a separate type per this file's
+/// own scope, not shared — see [`SPK_ROTATION_CHECK_INTERVAL_SECS`]'s doc comment).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SpkRotationOutcome {
+    /// The generation was not yet due for rotation at the checked `now_unix` — no republish
+    /// attempted.
+    NotDue,
+    /// The generation was due and the republish succeeded — `state.vault` now carries a fresh
+    /// publish timestamp; `run`'s own post-select `save_state` call persists it exactly like any
+    /// other in-loop mutation of `state`.
+    Rotated,
+    /// The generation was due but the republish itself failed (e.g. an unreachable server). Per
+    /// this task's fail-open decision (see `docs/tasks/phase-6/6.2-spk-rotation-enforcement.md`'s
+    /// Outcome section), `state.vault` is left exactly as it was and the stale generation is kept in
+    /// service — logged, never propagated as a hard error that would tear the chat session down.
+    RotationFailed(String),
+}
+
+/// The enforcement step `run`'s periodic tick calls (task 6.2): checks
+/// `state.vault.rotation_due` against `now_unix` and, if due, republishes a fresh bundle.
+///
+/// **Deliberately opens its own short-lived connection to `server`** rather than reusing `run`'s
+/// own persistent `client` — mirrors `apps/tui/src/worker.rs::republish_bundle`'s identical choice.
+/// A second, independent connection alongside the primary one is not a new risk: the rendezvous
+/// server already supports multiple simultaneous connections per account (`apps/rendezvous/src/
+/// state.rs`'s own multi-device connection list, "a routed envelope is pushed to all of them") — a
+/// fresh connection here costs one extra handshake roughly once a week (whenever the generation is
+/// actually due), which is negligible, and keeps this function testable the same proven way
+/// `republish_bundle`'s own unreachable-server test already is, without needing to force a failure
+/// on `run`'s live, already-open connection mid-loop (that connection's `close()` takes `self` by
+/// value, so it cannot be "broken and later reused" from inside a running loop anyway).
+///
+/// **Never calls `SystemTime::now()` itself** — `now_unix` is an explicit argument, mirroring
+/// `PrekeyVault::rotation_due`/`generation_age_secs`'s own deliberately clock-free, caller-supplies-
+/// time design (`apps/core/src/chat.rs`, task 6.1) — so tests drive this with a fake clock, no real
+/// waiting involved.
+pub(crate) async fn rotate_spk_if_due(
+    server: &str,
+    state: &mut ChatState,
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+    account_pub: [u8; 32],
+    now_unix: u64,
+) -> SpkRotationOutcome {
+    if !state.vault.rotation_due(now_unix) {
+        return SpkRotationOutcome::NotDue;
+    }
+
+    warn_if_spk_overdue(state.vault.generation_age_secs(now_unix));
+
+    let mut client =
+        match SignalingClient::connect(server, store, handle, account_pub, None, 1).await {
+            Ok(client) => client,
+            Err(e) => {
+                let message = format!("connecting to {server}: {e}");
+                eprintln!(
+                    "meridian chat: SPK rotation republish failed, continuing with the stale \
+                 generation (fail-open — see task 6.2's Outcome section): {message}"
+                );
+                return SpkRotationOutcome::RotationFailed(message);
+            }
+        };
+    let result = client
+        .publish_bundle(store, handle, DEFAULT_OTK_COUNT)
+        .await;
+    let _ = client.close().await;
+
+    match result {
+        Ok(generated) => {
+            let otks: Vec<([u8; 32], [u8; 32])> = generated
+                .bundle
+                .otks
+                .iter()
+                .zip(generated.otk_secrets.iter())
+                .map(|(p, s)| (*p, **s))
+                .collect();
+            state
+                .vault
+                .set_bundle(generated.bundle.spk, *generated.spk_secret, otks, now_unix);
+            SpkRotationOutcome::Rotated
+        }
+        Err(e) => {
+            let message = e.to_string();
+            eprintln!(
+                "meridian chat: SPK rotation republish failed, continuing with the stale \
+                 generation (fail-open — see task 6.2's Outcome section): {message}"
+            );
+            SpkRotationOutcome::RotationFailed(message)
+        }
+    }
+}
+
+/// Logs an escalating warning once `age` is past [`SPK_ROTATION_WARN_GRACE_MULTIPLE`] ×
+/// `SPK_ROTATION_INTERVAL_SECS` — mirrors `apps/tui/src/worker.rs::warn_if_spk_overdue` exactly,
+/// including the `age = None` "always warn" case (see that function's own doc comment for why).
+fn warn_if_spk_overdue(age: Option<u64>) {
+    let warn_threshold =
+        SPK_ROTATION_INTERVAL_SECS.saturating_mul(SPK_ROTATION_WARN_GRACE_MULTIPLE);
+    match age {
+        None => {
+            eprintln!(
+                "meridian chat: SPK generation age is unknown (never published, or a session \
+                 sealed before task 6.1) and due for rotation — continuing with the current key \
+                 (fail-open) while a republish is attempted"
+            );
+        }
+        Some(age) if age >= warn_threshold => {
+            let multiples = age / SPK_ROTATION_INTERVAL_SECS;
+            eprintln!(
+                "meridian chat: SPK generation is {multiples}x overdue for rotation (age {age}s, \
+                 target {SPK_ROTATION_INTERVAL_SECS}s) — continuing with the stale key (fail-open) \
+                 while a republish is attempted"
+            );
+        }
+        Some(_) => {}
+    }
+}
 
 /// Everything `cmd_chat` gathers before entering the async loop.
 pub struct ChatArgs<'a> {
@@ -177,6 +309,25 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
     let mut pending_key_change_ack: Vec<String> = Vec::new();
     let mut awaiting_key_change_ack = false;
 
+    // Task 6.2: the debounced periodic SPK-rotation check — a `tokio::time::interval_at` created
+    // once, outside the loop below, so this is a real recurring wake independent of stdin/inbound
+    // traffic (a session sitting fully idle for a week — no typed lines, no inbound envelopes —
+    // would otherwise never re-enter `tokio::select!` at all, and so never get a chance to rotate).
+    // Deliberately `interval_at` with a first deadline one full period out, not plain
+    // `tokio::time::interval` (whose first `tick()` resolves immediately): an immediate first check
+    // would mean every `chat` invocation pays a check (and, whenever `rotation_due` happens to read
+    // `true` right at startup, a full republish) on top of the bundle `run` already just published
+    // moments earlier — exactly the over-triggering this task's own file warns against.
+    // `MissedTickBehavior::Delay` (not the default `Burst`): a week-scale staleness check has no
+    // "catch up" obligation after a stall; one prompt check once this loop is live again is what's
+    // wanted, never a burst of them.
+    let mut rotation_tick = tokio::time::interval_at(
+        tokio::time::Instant::now()
+            + std::time::Duration::from_secs(SPK_ROTATION_CHECK_INTERVAL_SECS),
+        std::time::Duration::from_secs(SPK_ROTATION_CHECK_INTERVAL_SECS),
+    );
+    rotation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             maybe_line = rx.recv() => {
@@ -205,6 +356,12 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
             delivered = client.next_deliver() => {
                 let deliver = delivered.map_err(|e| format!("receiving: {e}"))?;
                 handle_inbound(&mut client, &mut state, &mut trust, store, handle, &account_pub, &deliver, &peer_hint, &peer_label, json, &mut pending, &mut awaiting_request, &mut pending_key_change_ack, &mut awaiting_key_change_ack).await?;
+            }
+            _ = rotation_tick.tick() => {
+                // Fire-and-forget, like every other best-effort call this loop already makes
+                // (`route_tolerant`'s own `let _ = ...` sends): a not-due or failed check must never
+                // interrupt ordinary chat handling — `rotate_spk_if_due` already logs any failure.
+                let _ = rotate_spk_if_due(&server, &mut state, store, handle, account_pub, crate::now_unix()).await;
             }
         }
         save_state(&state, store, handle)?;
@@ -1220,5 +1377,283 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // (task 6.2) `rotate_spk_if_due` — mirrors `apps/tui/tests/spk_rotation.rs` exactly (same
+    // three properties, same fake-clock design: `now_unix` is an explicit argument this function
+    // never derives from `SystemTime::now()` itself, so every check below is driven by arbitrary
+    // `u64` timestamps with no real waiting). `meridian-cli` is a binary-only crate with no `lib`
+    // target (see `apps/cli/Cargo.toml`), so — unlike `meridian-tui`, whose `tests/*.rs` integration
+    // files can depend on it as a library — this is the only place these can live: a real,
+    // in-process `meridian-rendezvous` server (the `meridian-rendezvous` dev-dependency this crate's
+    // other integration tests already use) plus a plain `MemorySecretStore` account, driven directly
+    // through `rotate_spk_if_due` with no CLI subprocess, no stdin/stdout, and no `sessions.bin` at
+    // all (`rotate_spk_if_due` only ever mutates the `ChatState` it's handed in memory — `run`'s own
+    // post-select `save_state` is what persists that in the real loop, and is out of scope here).
+    //
+    // 1. [`rotation_never_republishes_while_the_generation_is_under_the_interval`] — the "session
+    //    under the interval never triggers an extra publish" half.
+    // 2. [`rotation_republishes_once_due_then_not_again_immediately_after_and_again_next_interval`]
+    //    — a simulated long session (two full `SPK_ROTATION_INTERVAL_SECS` periods, fake-clock
+    //    driven) that republishes with no user action, and the debounce/no-over-triggering property:
+    //    a republish resets the age clock, so the very next check must read `NotDue`.
+    // 3. [`rotation_failure_leaves_the_stale_generation_in_service_fail_open`] — the fail-open
+    //    decision recorded in this task's Outcome section: a due-but-unreachable republish must not
+    //    clear or corrupt the existing (stale) vault entry.
+    fn spawn_rotation_test_server() -> String {
+        let store = std::sync::Arc::new(meridian_rendezvous::MemoryStore::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let config = meridian_rendezvous::Config::default();
+                let state = meridian_rendezvous::AppState::new(config, store);
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                tx.send(addr).unwrap();
+                let _ = meridian_rendezvous::serve(state, listener).await;
+            });
+        });
+        let addr = rx.recv().unwrap();
+        format!("ws://{addr}")
+    }
+
+    /// A fresh account, registered against `server` by the real challenge–response `connect`
+    /// handshake (`SignalingClient::connect` registers on first contact) — mirrors
+    /// `apps/tui/tests/spk_rotation.rs::onboard` exactly. `MemorySecretStore` throughout:
+    /// `rotate_spk_if_due`'s own store handling is generic over `SecretStore`, so a bare in-memory
+    /// store is the simplest faithful fixture.
+    async fn onboard_rotation_test_account(
+        server: &str,
+    ) -> (
+        meridian_core::identity::MemorySecretStore,
+        KeyHandle,
+        [u8; 32],
+    ) {
+        let store = meridian_core::identity::MemorySecretStore::new();
+        let account =
+            meridian_core::identity::generate_account(&store, "self.example").expect("account");
+        let handle = account.handle().clone();
+        let account_pub = *account.public_key().as_bytes();
+        let client = SignalingClient::connect(server, &store, &handle, account_pub, None, 1)
+            .await
+            .expect("connect registers the account");
+        let _ = client.close().await;
+        (store, handle, account_pub)
+    }
+
+    /// A `ChatState` whose vault already carries `published_at` — the fake-clock baseline every
+    /// test below starts from, rather than the unknown-age (`None`) case task 6.1 already covers.
+    fn seeded_state(published_at: u64) -> ChatState {
+        let mut state = ChatState::default();
+        state
+            .vault
+            .set_bundle([1u8; 32], [2u8; 32], Vec::new(), published_at);
+        state
+    }
+
+    /// `state.vault`'s own `spk_published_at` is exactly `expected` — asserted the same way
+    /// `apps/tui/tests/spk_rotation.rs::assert_vault_published_at_is` does (there is no direct
+    /// accessor for the raw timestamp; `generation_age_secs(expected) == Some(0)` holds if and only
+    /// if the vault's own publish timestamp is exactly `expected`).
+    fn assert_state_published_at_is(state: &ChatState, expected: u64, context: &str) {
+        // (test-engineer fix) mirrors the identical fix in `apps/tui/tests/spk_rotation.rs::
+        // assert_vault_published_at_is` — see that function's own doc comment for the full
+        // reasoning. `generation_age_secs(expected) == Some(0)` only proves `published_at >=
+        // expected`: it silently saturates to `Some(0)`, not a mismatch, whenever the vault's real
+        // `published_at` has moved *past* `expected`, exactly what an erroneous extra/early
+        // republish would do — making every caller of this helper vacuous in the direction that
+        // matters. Anchored instead against a sentinel `check_now` far beyond any value this test
+        // suite could ever stamp, so the subtraction never saturates and pins `published_at` down
+        // to an exact value.
+        let check_now: u64 = u64::MAX / 2;
+        assert_eq!(
+            state.vault.generation_age_secs(check_now),
+            Some(check_now - expected),
+            "{context}: expected spk_published_at == {expected}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_never_republishes_while_the_generation_is_under_the_interval() {
+        let server = spawn_rotation_test_server();
+        let (store, handle, account_pub) = onboard_rotation_test_account(&server).await;
+
+        let published_at: u64 = 1_000_000;
+        let mut state = seeded_state(published_at);
+
+        for offset in [
+            0,
+            1,
+            SPK_ROTATION_INTERVAL_SECS / 2,
+            SPK_ROTATION_INTERVAL_SECS - 1,
+        ] {
+            let now = published_at + offset;
+            let outcome =
+                rotate_spk_if_due(&server, &mut state, &store, &handle, account_pub, now).await;
+            assert_eq!(
+                outcome,
+                SpkRotationOutcome::NotDue,
+                "offset={offset} must not be due yet"
+            );
+        }
+
+        assert_state_published_at_is(
+            &state,
+            published_at,
+            "no check under the interval may have touched spk_published_at",
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_republishes_once_due_then_not_again_immediately_after_and_again_next_interval(
+    ) {
+        let server = spawn_rotation_test_server();
+        let (store, handle, account_pub) = onboard_rotation_test_account(&server).await;
+
+        let published_at: u64 = 2_000_000;
+        let mut state = seeded_state(published_at);
+
+        // Just before the first threshold: not due yet.
+        let just_before = published_at + SPK_ROTATION_INTERVAL_SECS - 1;
+        assert_eq!(
+            rotate_spk_if_due(
+                &server,
+                &mut state,
+                &store,
+                &handle,
+                account_pub,
+                just_before
+            )
+            .await,
+            SpkRotationOutcome::NotDue
+        );
+        assert_state_published_at_is(
+            &state,
+            published_at,
+            "the not-due check just before the threshold must not have republished",
+        );
+
+        // At the threshold: due, and the republish succeeds with no user action — task 6.2's
+        // headline property.
+        let first_due = published_at + SPK_ROTATION_INTERVAL_SECS;
+        assert_eq!(
+            rotate_spk_if_due(&server, &mut state, &store, &handle, account_pub, first_due).await,
+            SpkRotationOutcome::Rotated
+        );
+        assert_state_published_at_is(
+            &state,
+            first_due,
+            "a successful rotation must stamp the new spk_published_at at the check's own now_unix",
+        );
+
+        // The debounce / no-over-triggering property: immediately after rotating, the generation's
+        // age clock has restarted at zero, so the very next check must read NotDue and must not
+        // touch `state.vault` again.
+        assert_eq!(
+            rotate_spk_if_due(
+                &server,
+                &mut state,
+                &store,
+                &handle,
+                account_pub,
+                first_due + 1
+            )
+            .await,
+            SpkRotationOutcome::NotDue,
+            "a republish must not be immediately followed by another one at the very next check"
+        );
+        assert_state_published_at_is(
+            &state,
+            first_due,
+            "the immediately-following not-due check must not have moved spk_published_at again",
+        );
+
+        // Still not due partway through the second interval.
+        let mid_second_interval = first_due + SPK_ROTATION_INTERVAL_SECS - 1;
+        assert_eq!(
+            rotate_spk_if_due(
+                &server,
+                &mut state,
+                &store,
+                &handle,
+                account_pub,
+                mid_second_interval
+            )
+            .await,
+            SpkRotationOutcome::NotDue
+        );
+
+        // A full second interval later: due again, and rotates again — proving this is a real
+        // recurring check across a simulated multi-week session, not a one-shot fuse.
+        let second_due = first_due + SPK_ROTATION_INTERVAL_SECS;
+        assert_eq!(
+            rotate_spk_if_due(
+                &server,
+                &mut state,
+                &store,
+                &handle,
+                account_pub,
+                second_due
+            )
+            .await,
+            SpkRotationOutcome::Rotated
+        );
+        assert_state_published_at_is(
+            &state,
+            second_due,
+            "the second rotation must stamp the second check's own now_unix",
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_failure_leaves_the_stale_generation_in_service_fail_open() {
+        // `server` is only needed to onboard a real, registered account; `rotate_spk_if_due` itself
+        // is then handed a deliberately unreachable address instead (mirrors
+        // `apps/tui/tests/spk_rotation.rs`'s own `"ws://127.0.0.1:1"` trick) rather than tearing a
+        // real server down mid-test.
+        let real_server = spawn_rotation_test_server();
+        let (store, handle, account_pub) = onboard_rotation_test_account(&real_server).await;
+
+        let published_at: u64 = 3_000_000;
+        let mut state = seeded_state(published_at);
+        let due_now = published_at + SPK_ROTATION_INTERVAL_SECS;
+
+        let outcome = rotate_spk_if_due(
+            "ws://127.0.0.1:1",
+            &mut state,
+            &store,
+            &handle,
+            account_pub,
+            due_now,
+        )
+        .await;
+        match outcome {
+            SpkRotationOutcome::RotationFailed(message) => {
+                assert!(
+                    message.contains("connecting to"),
+                    "expected a connect-stage error message, got {message:?}"
+                );
+            }
+            other => panic!("expected RotationFailed against an unreachable server, got {other:?}"),
+        }
+
+        // Fail-open, the falsifiable half: the stale generation is untouched, not cleared or
+        // corrupted — still exactly the one seeded above, still usable.
+        assert_state_published_at_is(
+            &state,
+            published_at,
+            "a failed republish must leave the existing (stale) generation exactly as it was",
+        );
+        // And the predicate still reports "due" afterward — the next check (whenever connectivity
+        // allows) will try again, rather than this failure permanently suppressing future attempts.
+        assert!(
+            state.vault.rotation_due(due_now),
+            "a failed rotation attempt must not mark the generation as no-longer-due"
+        );
     }
 }

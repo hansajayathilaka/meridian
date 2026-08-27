@@ -74,24 +74,44 @@ fn establish() -> (Session, Session) {
     (sess_a, sess_b)
 }
 
+/// Seal `plaintext` on `s`, returning the framed ciphertext together with the exact preamble bytes
+/// [`Session::encrypt`] bound into its AAD (ADR 0016 C3) — the `(ct, preamble)` pair a real caller
+/// would get from `encrypt()` plus a `MessageEnvelope`'s own `prekey` field. This file drives
+/// `Session` directly, with no `MessageEnvelope`/wire layer to carry the preamble across, so it is
+/// threaded explicitly instead. Captured via [`Session::outbound_preamble_bytes`] *before* `encrypt`
+/// runs — harmless either way, since `encrypt` never mutates the prekey/confirmed state that method
+/// reads, only `decrypt` does.
+fn seal(s: &mut Session, plaintext: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let preamble = s.outbound_preamble_bytes();
+    let ct = s.encrypt(plaintext).unwrap();
+    (ct, preamble)
+}
+
 #[test]
 fn bidirectional_conversation_with_receipts() {
     let (mut a, mut b) = establish();
 
-    // Alice's first message must be decryptable by Bob (carries the initial ratchet step).
-    let c0 = a.encrypt(b"hello bob").unwrap();
-    assert_eq!(b.decrypt(&c0).unwrap(), b"hello bob");
+    // Alice's first message must be decryptable by Bob (carries the initial ratchet step, and the
+    // real X3DH prekey preamble — she is still unconfirmed).
+    let (c0, c0_pre) = seal(&mut a, b"hello bob");
+    assert_eq!(b.decrypt(&c0, &c0_pre).unwrap(), b"hello bob");
 
     // Bob can now reply (his sending chain is established after the first receive).
-    let r0 = b.encrypt(b"hi alice (delivery receipt)").unwrap();
-    assert_eq!(a.decrypt(&r0).unwrap(), b"hi alice (delivery receipt)");
+    let (r0, r0_pre) = seal(&mut b, b"hi alice (delivery receipt)");
+    assert_eq!(
+        a.decrypt(&r0, &r0_pre).unwrap(),
+        b"hi alice (delivery receipt)"
+    );
 
     // Several back-and-forth turns exercise repeated DH ratchets.
     for i in 0..5u8 {
-        let ca = a.encrypt(&[i; 8]).unwrap();
-        assert_eq!(b.decrypt(&ca).unwrap(), vec![i; 8]);
-        let cb = b.encrypt(&[i.wrapping_add(100); 8]).unwrap();
-        assert_eq!(a.decrypt(&cb).unwrap(), vec![i.wrapping_add(100); 8]);
+        let (ca, ca_pre) = seal(&mut a, &[i; 8]);
+        assert_eq!(b.decrypt(&ca, &ca_pre).unwrap(), vec![i; 8]);
+        let (cb, cb_pre) = seal(&mut b, &[i.wrapping_add(100); 8]);
+        assert_eq!(
+            a.decrypt(&cb, &cb_pre).unwrap(),
+            vec![i.wrapping_add(100); 8]
+        );
     }
 }
 
@@ -99,28 +119,29 @@ fn bidirectional_conversation_with_receipts() {
 fn out_of_order_delivery_decrypts() {
     let (mut a, mut b) = establish();
     // Prime Bob's receiving chain with the first message (establishes his ratchet).
-    let c0 = a.encrypt(b"m0").unwrap();
-    assert_eq!(b.decrypt(&c0).unwrap(), b"m0");
+    let (c0, c0_pre) = seal(&mut a, b"m0");
+    assert_eq!(b.decrypt(&c0, &c0_pre).unwrap(), b"m0");
 
-    // Alice sends three more; the server shuffles them.
-    let c1 = a.encrypt(b"m1").unwrap();
-    let c2 = a.encrypt(b"m2").unwrap();
-    let c3 = a.encrypt(b"m3").unwrap();
+    // Alice sends three more; the server shuffles them. All three ride the SAME (empty, since she
+    // is now confirmed) preamble, but each is captured at its own send for clarity/robustness.
+    let (c1, c1_pre) = seal(&mut a, b"m1");
+    let (c2, c2_pre) = seal(&mut a, b"m2");
+    let (c3, c3_pre) = seal(&mut a, b"m3");
 
     // Deliver 3, 1, 2 — skipped-message keys must cover the gaps.
-    assert_eq!(b.decrypt(&c3).unwrap(), b"m3");
-    assert_eq!(b.decrypt(&c1).unwrap(), b"m1");
-    assert_eq!(b.decrypt(&c2).unwrap(), b"m2");
+    assert_eq!(b.decrypt(&c3, &c3_pre).unwrap(), b"m3");
+    assert_eq!(b.decrypt(&c1, &c1_pre).unwrap(), b"m1");
+    assert_eq!(b.decrypt(&c2, &c2_pre).unwrap(), b"m2");
 }
 
 #[test]
 fn forward_secrecy_snapshot_cannot_decrypt_past() {
     let (mut a, mut b) = establish();
-    let c0 = a.encrypt(b"secret-0").unwrap();
-    let c1 = a.encrypt(b"secret-1").unwrap();
+    let (c0, c0_pre) = seal(&mut a, b"secret-0");
+    let (c1, c1_pre) = seal(&mut a, b"secret-1");
 
-    assert_eq!(b.decrypt(&c0).unwrap(), b"secret-0");
-    assert_eq!(b.decrypt(&c1).unwrap(), b"secret-1");
+    assert_eq!(b.decrypt(&c0, &c0_pre).unwrap(), b"secret-0");
+    assert_eq!(b.decrypt(&c1, &c1_pre).unwrap(), b"secret-1");
 
     // Snapshot Bob's state *after* consuming c0/c1, then try to re-decrypt c0. The message key was
     // derived and dropped, so the snapshot cannot recover message 0 — forward secrecy.
@@ -128,7 +149,7 @@ fn forward_secrecy_snapshot_cannot_decrypt_past() {
     ciborium::into_writer(&b, &mut snapshot).unwrap();
     let mut restored: Session = ciborium::from_reader(&snapshot[..]).unwrap();
     assert!(
-        restored.decrypt(&c0).is_err(),
+        restored.decrypt(&c0, &c0_pre).is_err(),
         "a post-N snapshot must not decrypt message <N"
     );
 }
@@ -136,8 +157,8 @@ fn forward_secrecy_snapshot_cannot_decrypt_past() {
 #[test]
 fn post_compromise_security_heals_after_round_trip() {
     let (mut a, mut b) = establish();
-    let c0 = a.encrypt(b"m0").unwrap();
-    b.decrypt(&c0).unwrap();
+    let (c0, c0_pre) = seal(&mut a, b"m0");
+    b.decrypt(&c0, &c0_pre).unwrap();
 
     // Attacker steals Bob's full ratchet state here (Bob currently holds ratchet key b1).
     let mut stolen: Vec<u8> = Vec::new();
@@ -146,30 +167,33 @@ fn post_compromise_security_heals_after_round_trip() {
     // Healing requires Bob to rotate in a *fresh* ratchet key the attacker never saw, and Alice to
     // adopt it — i.e. one full DH-ratchet round trip. Bob injects a fresh key only when he next
     // receives Alice's new ratchet key, so drive one round trip in each direction:
-    let rb = b.encrypt(b"bob-1").unwrap(); // still on the compromised key b1
-    a.decrypt(&rb).unwrap(); // Alice ratchets, generates A2
-    let ra = a.encrypt(b"alice-1").unwrap();
-    b.decrypt(&ra).unwrap(); // Bob ratchets to A2, generates fresh b2 (attacker lacks it)
-    let rb2 = b.encrypt(b"bob-2").unwrap(); // carries B2
-    a.decrypt(&rb2).unwrap(); // Alice adopts B2 → her root now mixes the fresh b2
+    let (rb, rb_pre) = seal(&mut b, b"bob-1"); // still on the compromised key b1
+    a.decrypt(&rb, &rb_pre).unwrap(); // Alice ratchets, generates A2
+    let (ra, ra_pre) = seal(&mut a, b"alice-1");
+    b.decrypt(&ra, &ra_pre).unwrap(); // Bob ratchets to A2, generates fresh b2 (attacker lacks it)
+    let (rb2, rb2_pre) = seal(&mut b, b"bob-2"); // carries B2
+    a.decrypt(&rb2, &rb2_pre).unwrap(); // Alice adopts B2 → her root now mixes the fresh b2
 
     // Alice's next message rides a chain the attacker can no longer reconstruct.
-    let c_future = a.encrypt(b"post-heal secret").unwrap();
+    let (c_future, c_future_pre) = seal(&mut a, b"post-heal secret");
 
     let mut thief: Session = ciborium::from_reader(&stolen[..]).unwrap();
     assert!(
-        thief.decrypt(&c_future).is_err(),
+        thief.decrypt(&c_future, &c_future_pre).is_err(),
         "stolen state must not decrypt messages sent after the healing round trip"
     );
     // The legitimate peer stays in sync.
-    assert_eq!(b.decrypt(&c_future).unwrap(), b"post-heal secret");
+    assert_eq!(
+        b.decrypt(&c_future, &c_future_pre).unwrap(),
+        b"post-heal secret"
+    );
 }
 
 #[test]
 fn session_survives_persistence_restart() {
     let (mut a, mut b) = establish();
-    let c0 = a.encrypt(b"before restart").unwrap();
-    b.decrypt(&c0).unwrap();
+    let (c0, c0_pre) = seal(&mut a, b"before restart");
+    b.decrypt(&c0, &c0_pre).unwrap();
 
     // Persist Bob's session (as the encrypted store would), drop it, reload, and keep chatting.
     let mut sealed = Vec::new();
@@ -177,8 +201,8 @@ fn session_survives_persistence_restart() {
     drop(b);
     let mut b2: Session = ciborium::from_reader(&sealed[..]).unwrap();
 
-    let c1 = a.encrypt(b"after restart").unwrap();
-    assert_eq!(b2.decrypt(&c1).unwrap(), b"after restart");
-    let r = b2.encrypt(b"still here").unwrap();
-    assert_eq!(a.decrypt(&r).unwrap(), b"still here");
+    let (c1, c1_pre) = seal(&mut a, b"after restart");
+    assert_eq!(b2.decrypt(&c1, &c1_pre).unwrap(), b"after restart");
+    let (r, r_pre) = seal(&mut b2, b"still here");
+    assert_eq!(a.decrypt(&r, &r_pre).unwrap(), b"still here");
 }

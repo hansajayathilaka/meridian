@@ -26,5 +26,7 @@ pub mod signal;
 
 pub use chat::{ChatContent, MessageId};
 pub use ctrl::{ChanCfgWire, CtrlFrame, Direction, Limits, StreamAdvert, CTRL_VERSION};
-pub use envelope::{MessageEnvelope, Prekey, ENVELOPE_DOMAIN};
+pub use envelope::{
+    preamble_aad_bytes, MessageEnvelope, Prekey, ENVELOPE_DOMAIN, ENVELOPE_VERSION,
+};
 pub use signal::SignalContent;

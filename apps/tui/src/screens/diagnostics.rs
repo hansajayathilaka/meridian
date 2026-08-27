@@ -99,7 +99,7 @@ use crate::app::{
     RepairableContact, RunDoctorEffect, RunDoctorRequest, ScanRepairableContactsEffect,
     ScanRepairableContactsRequest, WorkerEvent,
 };
-use crate::statusbar::{self, StatusBarInfo};
+use crate::statusbar::{self, SpkRotationStatus, StatusBarInfo};
 use crate::surface::ExtensionPane;
 
 /// The binary every real construction of this screen invokes — resolved via `PATH`, never an
@@ -164,6 +164,13 @@ pub struct DiagnosticsState {
     pub status_bar: StatusBarInfo,
     /// See the module doc's "repairable-contacts affordance" section.
     pub repair: RepairStatus,
+    /// The SPK generation's rotation-overdue status (task 6.2 follow-up) — unlike `status_bar`
+    /// above, this genuinely is live: `crate::app::App::update` forwards
+    /// `AppEvent::SpkRotationOverdue` into whichever pane is current (see
+    /// `crate::surface::ExtensionPane::sync_spk_rotation_overdue`), and this screen's own `ExtensionPane`
+    /// impl below stores it here. Defaults to `SpkRotationStatus::Healthy`, the same honest
+    /// "nothing overdue observed yet" default that type itself defines.
+    pub spk_rotation_overdue: SpkRotationStatus,
 }
 
 impl DiagnosticsState {
@@ -172,6 +179,7 @@ impl DiagnosticsState {
             status: DiagnosticsStatus::Idle,
             status_bar: StatusBarInfo::default(),
             repair: RepairStatus::Idle,
+            spk_rotation_overdue: SpkRotationStatus::default(),
         }
     }
 }
@@ -361,6 +369,12 @@ pub fn render(state: &DiagnosticsState, frame: &mut Frame<'_>) {
 
 fn body_lines(state: &DiagnosticsState) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from("")];
+    lines.push(Line::from(Span::styled(
+        "spk rotation (adr 0016 c1)",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(spk_rotation_line(state.spk_rotation_overdue));
+    lines.push(Line::from(""));
     match &state.status {
         DiagnosticsStatus::Idle => {
             lines.push(Line::from("press r to run `meridian doctor --json`"));
@@ -476,6 +490,36 @@ fn short_label(pubkey_hex: &str) -> String {
     pubkey_hex.chars().take(12).collect()
 }
 
+/// The SPK-rotation status line (task 6.2 follow-up) — styled `Color::Red` for `Overdue`/
+/// `UnknownAge` (mirroring `DiagnosticsStatus::Error`/`RepairStatus::Error`'s own warning-color
+/// choice elsewhere in this same file, so this screen never invents a second visual language for
+/// "something needs attention") and `Modifier::DIM` for the healthy case (mirroring the footer
+/// hint's own dim styling for unremarkable/no-action-needed text).
+fn spk_rotation_line(status: SpkRotationStatus) -> Line<'static> {
+    match status {
+        SpkRotationStatus::Healthy => Line::from(Span::styled(
+            "on schedule",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+        SpkRotationStatus::UnknownAge => Line::from(Span::styled(
+            "overdue: generation age unknown (never published, or a pre-task-6.1 session) — due \
+             for rotation, continuing with the current key (fail-open)",
+            Style::default().fg(Color::Red),
+        )),
+        SpkRotationStatus::Overdue {
+            multiples,
+            age_secs,
+        } => Line::from(Span::styled(
+            format!(
+                "overdue: {multiples}x the target rotation interval (~{}h stale) — continuing \
+                 with the stale key (fail-open)",
+                age_secs / 3600
+            ),
+            Style::default().fg(Color::Red),
+        )),
+    }
+}
+
 fn mark(ok: bool) -> &'static str {
     if ok {
         "ok"
@@ -533,6 +577,10 @@ impl ExtensionPane for DiagnosticsPane {
 
     fn handle_worker(&mut self, event: WorkerEvent) -> Vec<Effect> {
         handle_worker(&mut self.state, event)
+    }
+
+    fn sync_spk_rotation_overdue(&mut self, status: SpkRotationStatus) {
+        self.state.spk_rotation_overdue = status;
     }
 
     fn render(&self, frame: &mut Frame<'_>) {
@@ -1090,6 +1138,7 @@ mod tests {
                 status,
                 status_bar: StatusBarInfo::default(),
                 repair: RepairStatus::Idle,
+                spk_rotation_overdue: SpkRotationStatus::default(),
             };
             let backend = TestBackend::new(80, 24);
             let mut terminal = Terminal::new(backend).expect("test backend");
@@ -1132,6 +1181,7 @@ mod tests {
                 status: DiagnosticsStatus::Idle,
                 status_bar: StatusBarInfo::default(),
                 repair,
+                spk_rotation_overdue: SpkRotationStatus::default(),
             };
             let backend = TestBackend::new(80, 24);
             let mut terminal = Terminal::new(backend).expect("test backend");
@@ -1146,5 +1196,65 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test backend");
         terminal.draw(|f| pane.render(f)).expect("draw");
+    }
+
+    // -----------------------------------------------------------------------
+    // spk rotation status (task 6.2 follow-up)
+    // -----------------------------------------------------------------------
+
+    fn render_to_text(state: &DiagnosticsState) -> String {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal.draw(|f| render(state, f)).expect("draw");
+        format!("{}", terminal.backend())
+    }
+
+    #[test]
+    fn healthy_spk_rotation_status_renders_no_overdue_warning() {
+        let mut state = DiagnosticsState::new();
+        state.spk_rotation_overdue = SpkRotationStatus::Healthy;
+        let text = render_to_text(&state);
+        assert!(text.contains("on schedule"));
+        assert!(!text.to_lowercase().contains("overdue"));
+    }
+
+    #[test]
+    fn overdue_spk_rotation_status_renders_the_multiple_and_age() {
+        let mut state = DiagnosticsState::new();
+        state.spk_rotation_overdue = SpkRotationStatus::Overdue {
+            multiples: 3,
+            age_secs: 10 * 3600,
+        };
+        let text = render_to_text(&state);
+        assert!(text.contains("overdue"));
+        assert!(text.contains("3x"));
+        assert!(text.contains("10h"));
+    }
+
+    #[test]
+    fn unknown_age_spk_rotation_status_renders_an_honest_overdue_warning() {
+        let mut state = DiagnosticsState::new();
+        state.spk_rotation_overdue = SpkRotationStatus::UnknownAge;
+        let text = render_to_text(&state);
+        assert!(text.contains("overdue"));
+        assert!(text.contains("unknown"));
+    }
+
+    /// [`ExtensionPane::sync_spk_rotation_overdue`] actually reaches this screen's own state (the
+    /// conduit `App::update`/`App::dispatch_palette_action` both call into) — mirrors this crate's
+    /// existing `handle_key`/`handle_worker` direct-call test shape, just for the new method.
+    #[test]
+    fn sync_spk_rotation_overdue_updates_the_pane_and_is_reflected_on_render() {
+        let mut pane = DiagnosticsPane::new();
+        pane.sync_spk_rotation_overdue(SpkRotationStatus::Overdue {
+            multiples: 5,
+            age_secs: 5 * 3600,
+        });
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal.draw(|f| pane.render(f)).expect("draw");
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("overdue"));
+        assert!(text.contains("5x"));
     }
 }

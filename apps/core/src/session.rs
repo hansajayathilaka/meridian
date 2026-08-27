@@ -6,18 +6,19 @@
 //! machine in `docs/architecture/diagrams/session-state-machine.mermaid`.
 //!
 //! ## The load-bearing security property: fingerprint binding (§4.6)
-//! SDP and the DTLS fingerprint travel **inside** ratchet-encrypted, identity-signed envelopes
-//! ([`SignalContent`]), so the rendezvous only ever routes opaque blobs — it can neither read nor
-//! rewrite an offer. After the handshake the substrate cross-checks the transport's *negotiated*
-//! remote fingerprint against the one the peer *asserted* in its encrypted envelope; any mismatch
-//! tears the session down before a byte of content flows. A relay that only sees opaque ciphertext
-//! cannot read or forge the inner SDP (that opacity is a property of the envelope encryption itself,
-//! independent of transport backend), and a MITM that terminates DTLS presents a fingerprint that
-//! fails the check. An automated test actively mounting a relay-rewrite attempt against a real
-//! rendezvous now exists (task 1.28: `apps/cli/tests/relay_rewrite.rs`, run by
-//! `harnesses/mitm-sim/run.sh`) — a server rewriting routed blobs is detected at the envelope
-//! signature check and no session establishes. This is why we can put the servers out of the data
-//! path and still trust it.
+//! SDP and the DTLS fingerprint travel **inside** ratchet-encrypted, AEAD-authenticated envelopes
+//! ([`SignalContent`]) — envelope v2 carries no per-message signature at all
+//! ([ADR 0016](../../docs/adr/0016-envelope-deniability.md)) — so the rendezvous only ever routes
+//! opaque blobs — it can neither read nor rewrite an offer. After the handshake the substrate
+//! cross-checks the transport's *negotiated* remote fingerprint against the one the peer *asserted*
+//! in its encrypted envelope; any mismatch tears the session down before a byte of content flows. A
+//! relay that only sees opaque ciphertext cannot read or forge the inner SDP (that opacity is a
+//! property of the envelope encryption itself, independent of transport backend), and a MITM that
+//! terminates DTLS presents a fingerprint that fails the check. An automated test actively mounting a
+//! relay-rewrite attempt against a real rendezvous now exists (task 1.28: `apps/cli/tests/
+//! relay_rewrite.rs`, run by `harnesses/mitm-sim/run.sh`) — a server rewriting routed blobs is
+//! detected by the ratchet AEAD (the mutated ciphertext fails to decrypt) and no session establishes.
+//! This is why we can put the servers out of the data path and still trust it.
 //!
 //! One honest residual that test surfaced: the *responder* rejects a rewritten offer immediately,
 //! but the **dialer** then waits indefinitely for an answer that never comes — a hostile relay can
@@ -85,11 +86,18 @@ const CHAT_SID: u64 = 1;
 /// boundary — firing early only costs a spurious `AnswerTimeout` on an unusually slow-but-honest
 /// peer, never a weaker session (fail-closed is unaffected either way).
 ///
-/// Note for the record (not a new invariant): by the time `dial` reaches this wait, X3DH has already
-/// consumed one of the peer's one-time prekeys from the fetched bundle. A hostile relay that repeats
-/// this rewrite-and-drop pattern on every dial attempt is therefore an OTK-depletion amplifier — the
-/// server-side per-source bound on OTK issuance (§3.5) already caps that, so this is not a new hole,
-/// just worth being on record now that the failure mode is diagnosable instead of silent.
+/// Note for the record (not a new invariant, and improved since task 6.3): by the time `dial` reaches
+/// this wait, the offer already asserts one of the peer's one-time prekeys (`used_opk` in the X3DH
+/// preamble) — but that reference alone no longer guarantees the prekey is destroyed. Since task
+/// 6.3's commit-on-successful-decrypt fix (ADR 0016 C2), the peer's vault only removes an OTK secret
+/// after a decrypt against it actually *succeeds* (`take_otk_secret` runs only post-decrypt; the
+/// provisional path uses the non-destructive `peek_otk_secret`). So a hostile relay that
+/// rewrites-and-drops this offer (corrupting the ciphertext or preamble so the peer's decrypt fails)
+/// no longer burns the peer's real one-time prekey the way an equivalent pre-6.3 attack would have —
+/// the peer's vault entry survives intact for a genuine subsequent attempt. This closes the
+/// "OTK-depletion amplifier" reading of this residual for the rewrite-and-drop case specifically;
+/// what remains is the ordinary, already-bounded per-source OTK-issuance limit (§3.5) covering
+/// *legitimate* fetches, which is not a new hole.
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// (2.17) How long [`answer_with_config`] will wait for the offer envelope before giving up, on
@@ -174,21 +182,22 @@ pub enum SessionError {
     RelayOnlyViolation { candidate: String },
     /// (1.33) The dialer's bounded wait (see [`ANSWER_TIMEOUT`]) for the peer's answer expired. The
     /// connection is torn down when this fires (no session, never a degraded one) — distinguishable
-    /// from `Chat(ChatError::BadSignature)` (tampering detected) and from `Relay`/`SignalingEnded`
-    /// (the relay itself misbehaved/vanished): this specifically means "the peer never answered",
-    /// whether because it's offline or because a hostile relay silently dropped/rewrote the offer.
+    /// from `Chat(ChatError::Crypto)` (a byte that *did* arrive but failed the ratchet AEAD, i.e.
+    /// tampering detected) and from `Relay`/`SignalingEnded` (the relay itself misbehaved/vanished):
+    /// this specifically means "the peer never answered", whether because it's offline or because a
+    /// hostile relay silently dropped/rewrote the offer.
     #[error("timed out after {0:?} waiting for the peer's answer")]
     AnswerTimeout(Duration),
     /// (2.17) The answerer's bounded wait (see [`OFFER_TIMEOUT`]) for the dialer's offer expired —
     /// mirrors [`SessionError::AnswerTimeout`] on the opposite side of the handshake. Fires on either
     /// of `answer_with_config`'s `recv_sdp` calls: the initial offer wait, or the 1.29 relay-fallback
     /// second wait for the dialer's retried offer. No session is ever established when this fires
-    /// (fail-closed, never a degraded one) — distinguishable from `Chat(ChatError::BadSignature)`
-    /// (tampering detected on a byte that *did* arrive) and from `Relay`/`SignalingEnded` (the relay
-    /// itself misbehaved/vanished): this specifically means "no offer ever arrived", whether because
-    /// the dialer is offline, a hostile relay silently dropped it, or (2.9+, federation) the route was
-    /// rejected server-side — closed policy, allowlist miss, rate limit — before any offer could ever
-    /// reach us.
+    /// (fail-closed, never a degraded one) — distinguishable from `Chat(ChatError::Crypto)` (tampering
+    /// detected — a byte that *did* arrive but failed the ratchet AEAD) and from `Relay`/
+    /// `SignalingEnded` (the relay itself misbehaved/vanished): this specifically means "no offer ever
+    /// arrived", whether because the dialer is offline, a hostile relay silently dropped it, or
+    /// (2.9+, federation) the route was rejected server-side — closed policy, allowlist miss, rate
+    /// limit — before any offer could ever reach us.
     #[error("timed out after {0:?} waiting for the peer's offer")]
     OfferTimeout(Duration),
     /// (2.9) A federated signaling request was refused by the peer org's own admission policy —
@@ -636,7 +645,7 @@ impl<T: Transport> P2pSession<T> {
                     // relay path (`ChatError::MessageRequest` propagates through
                     // `SessionError::Chat` via `?`, same as it did before this frame was gated) —
                     // clear the flag so subsequent frames (post accept/reject) use the ordinary,
-                    // session-presence-based check. Any *other* error (bad signature, desync, …)
+                    // session-presence-based check. Any *other* error (bad decrypt, desync, …)
                     // leaves the flag set: a hostile/garbled first frame must not let a later,
                     // genuine first frame slip through ungated.
                     match chat.open_inbound_gated(
@@ -1064,7 +1073,8 @@ async fn dial_established<T: Transport>(
         .add_data_channel(&conn, ChannelCfg::reliable_ordered(CHAT_LABEL))
         .await?;
 
-    // Seal SDP offer + our fingerprint + candidates inside a signed, ratchet-encrypted envelope.
+    // Seal SDP offer + our fingerprint + candidates inside a ratchet-encrypted, AEAD-authenticated
+    // envelope (no per-message signature — envelope v2, ADR 0016).
     let offer = transport.local_description(&conn)?;
     let local_fp = transport.local_fingerprint(&conn)?;
     let ice = candidate_strings(transport, &conn).await?;
@@ -1519,7 +1529,8 @@ async fn recv_sdp(
 }
 
 /// The §4.6 cross-check: the transport's negotiated remote fingerprint MUST equal the fingerprint
-/// the peer asserted inside its identity-signed envelope. Mismatch ⇒ teardown, fail closed.
+/// the peer asserted inside its ratchet-encrypted, AEAD-authenticated envelope. Mismatch ⇒ teardown,
+/// fail closed.
 async fn verify_fingerprint<T: Transport>(
     transport: &Arc<T>,
     conn: &SessionHandle,

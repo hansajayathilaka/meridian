@@ -16,7 +16,11 @@ description: Use when implementing or changing anything that crosses the wire (e
    than breaking silently. A downgrade below a contact's previously-seen version must warn
    (anti-rollback).
 3. **Envelopes stay opaque to servers.** Routing paths treat bodies as bytes — no serde on content.
-   Recipients verify the signature before touching the payload.
+   Envelope v2 carries no per-message signature
+   ([ADR 0016](../../../docs/adr/0016-envelope-deniability.md)): recipients authenticate via the
+   ratchet AEAD (fails closed on tamper) plus the `sender_pub`/`v` cross-checks before trusting the
+   payload. Prekey bundles and device records remain identity-key-signed and are verified before use —
+   that requirement is unaffected.
 4. **The public traits are semver-stable from Phase 1:** `Transport`, `SecretStore`, `StreamType`.
    Additive stream types use `register_stream_type` only — no edits to core crates.
 5. **DTLS-SRTP fingerprint** travels inside the encrypted envelope and is cross-checked post-handshake.

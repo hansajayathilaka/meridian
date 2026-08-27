@@ -2758,6 +2758,7 @@ dependencies = [
 name = "meridian-envelope"
 version = "0.0.0"
 dependencies = [
+ "ciborium",
  "hex",
  "meridian-proto",
  "serde",

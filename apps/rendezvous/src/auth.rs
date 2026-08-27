@@ -117,20 +117,23 @@ pub fn substitute_bundle(original: &PrekeyBundle) -> PrekeyBundle {
 /// **Do not read this as "the strongest attack a relay has".** It is not — it is the *cheapest*,
 /// chosen because it needs no envelope knowledge whatsoever. Scope it precisely:
 ///
-/// * A byte flip is stopped at the **signature** check, strictly *earlier* than the ratchet AEAD and
-///   the §4.6 fingerprint cross-check, which this path never reaches.
-/// * That is not a gap but an **impossibility**: `MessageEnvelope` has exactly four fields, and
-///   `signing_input` covers `sender_pub + prekey + ct` with `sig` the remainder — so *every* byte is
-///   either signed or is the signature, and any single-byte mutation must fail CBOR decode or
-///   `verify`. A rewrite that *survives* the signature check is unreachable for this server anyway:
-///   no `meridian-envelope` dependency, no sender identity key, no ratchet state.
+/// * A byte flip lands inside `ct` (see below) and is stopped **by the ratchet AEAD itself** — under
+///   envelope v2 ([ADR 0016](../../../docs/adr/0016-envelope-deniability.md)) there is no earlier
+///   signature check any more: a mutated ciphertext fails the AEAD tag on decrypt, never reaching the
+///   §4.6 fingerprint cross-check.
+/// * That is not a gap but an **impossibility for this server to do anything else**: `ct` is
+///   AEAD-authenticated ciphertext under a key only the two ratchet peers hold, so this crate has
+///   neither the key nor the plaintext needed to construct a rewrite that would still decrypt — it
+///   can only flip bytes blind, which fails closed at the recipient. A rewrite that *survives*
+///   decryption is unreachable for this server anyway: no `meridian-envelope` dependency, no sender
+///   identity key, no ratchet state.
 /// * Strictly stronger relay attacks exist and are all now covered **on the routing path**: bundle
 ///   substitution
 ///   ([`substitute_bundle`], right above — the server ends up holding real ratchet state with both
 ///   peers) → `tampered_bundle_is_rejected` + T08; transport-level fingerprint MITM →
-///   `p2p_session.rs::fingerprint_mismatch_tears_down`; and the key-material-free attacks that
-///   *pass* the signature check because they never touch the bytes — a forged `Deliver.from` (the
-///   server asserts that field itself, so forging it is free), **replay / reorder / drop /
+///   `p2p_session.rs::fingerprint_mismatch_tears_down`; and the key-material-free attacks that reach
+///   the recipient because they never touch the AEAD-authenticated bytes — a forged `Deliver.from`
+///   (the server asserts that field itself, so forging it is free), **replay / reorder / drop /
 ///   cross-delivery** — which task **1.32** added as their own modes in
 ///   [`crate::route_tamper`], driven by `apps/cli/tests/relay_attacks.rs`. Those are the ones that
 ///   probe deeper: the forged origin reaches `ChatError::SenderMismatch`, the replay reaches the
@@ -148,9 +151,9 @@ pub fn substitute_bundle(original: &PrekeyBundle) -> PrekeyBundle {
 ///   delivery**, splitting a multi-device user's view. (5) **Skipped-key exhaustion** (ADR 0016 R2)
 ///   and (6) **delay past the SPK grace window**, which reorder does not reach.
 /// * Still out of reach for *any* server-side hook, by construction: mutating the X3DH preamble
-///   (`used_opk`/`used_spk`) is mutating signed bytes and needs envelope types this crate does not
-///   have. ADR 0016's obligations for it are discharged client-side, in
-///   `apps/core/tests/preamble_mutation.rs`.
+///   (`used_opk`/`used_spk`) is mutating bytes bound into the ratchet AEAD's associated data (ADR
+///   0016 C3) and needs envelope types this crate does not have. ADR 0016's obligations for it are
+///   discharged client-side, in `apps/core/tests/preamble_mutation.rs`.
 ///
 /// Compiled in only under the `test-tamper-hook` cargo feature (off by default, absent from release
 /// binaries — F17); additionally gated at runtime by `allow_test_tamper && allow_test_route_tamper`
@@ -162,8 +165,9 @@ pub fn rewrite_routed_blob(original: &[u8]) -> Vec<u8> {
         return out;
     }
     // Middle byte: lands inside `ct` for any realistic envelope. Per the note above, *which* byte is
-    // not actually load-bearing — every byte is either signed or is the signature — but hitting `ct`
-    // keeps the simulated attack a plausible "rewrite the SDP" rather than CBOR framing damage.
+    // not actually load-bearing — any mutation inside the AEAD-authenticated `ct` fails the tag on
+    // decrypt regardless — but hitting `ct` keeps the simulated attack a plausible "rewrite the SDP"
+    // rather than CBOR framing damage.
     let idx = out.len() / 2;
     out[idx] ^= 0xFF;
     out

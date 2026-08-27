@@ -14,12 +14,16 @@ The **key property** this proves: content security does not depend on the transp
 relay today (T03), a WebRTC data channel later (T04), and the offline mailbox later still (T07) —
 **unchanged**. The server only ever sees an [`OpaqueBlob`](./rendezvous-protocol-v1.md).
 
-> **Versioning.** Domain tags below carry `/v1`. Any change to the KDF labels, DH ordering, header
-> layout, or signing input is a wire break requiring a new version and an ADR — not an edit here.
-> **v2 is already decided** ([ADR 0016](../adr/0016-envelope-deniability.md)): it drops the
-> per-message identity-key signature so that transcripts become deniable, moves the domain tag and
-> prekey preamble into the ratchet AAD, and adds the leading `v` field this format currently lacks.
-> Implementation is a separate build task; everything below describes v1 as shipped.
+> **Versioning.** The X3DH/ratchet KDF domain tags below (`Meridian/X3DH/v1`,
+> `Meridian/RatchetRoot/HE/v1`, `Meridian/MsgKey/v1` — §1–§3) are unchanged by envelope versioning;
+> any change to the KDF labels, DH ordering, or header layout is a separate wire break requiring a new
+> version and an ADR, not an edit here. **The envelope itself is now v2, shipped**
+> ([ADR 0016](../adr/0016-envelope-deniability.md)): it drops the per-message identity-key signature
+> (transcripts are deniable — see §4), moves the domain tag (`mrd.env/2`) and the X3DH preamble into
+> the ratchet AAD, and carries a mandatory leading `v: 2` field. §4 below describes the shipped v2
+> envelope shape. This file keeps its `v1` name for link/history stability — it predates ADR 0016 —
+> but is not describing a still-live v1 wire format: v1 and v2 do not interoperate and there is no
+> negotiation (ADR 0016 R5, a hard flag day); v1 no longer ships.
 > Bundle `v:2` (PQXDH) folds an ML-KEM leg into X3DH per [wire-protocol §7](./wire-protocol.md#7-versioning--pq-slot).
 
 ## 1. Cryptographic building blocks
@@ -58,9 +62,10 @@ AD = IK_initiator ‖ IK_responder                                              
 ```
 
 `EK_A` is the initiator's ephemeral X25519 key. `root` seeds the ratchet; `hk_ab`/`hk_ba` are the
-initial header keys (one per direction); `AD` is bound into every message AEAD. The initiator
-transmits the **prekey preamble** (`EK_A`, `used_spk`, `used_opk`) in the envelope until it receives
-a reply, so a lost opening message cannot strand the session.
+initial header keys (one per direction); `AD` is bound into every message AEAD via the ratchet's fixed
+AAD prefix `"mrd.env/2" ‖ AD`, baked in once at session construction (ADR 0016 C3; see §3). The
+initiator transmits the **prekey preamble** (`EK_A`, `used_spk`, `used_opk`) in the envelope until it
+receives a reply, so a lost opening message cannot strand the session.
 
 ## 3. Double Ratchet with header encryption
 
@@ -83,7 +88,13 @@ message key     = HKDF-SHA256(salt = 0*32, ikm = MK, info = "Meridian/MsgKey/v1"
 - **Header** (plaintext, 40 bytes): `ratchet_pub(32) ‖ PN:u32-be ‖ N:u32-be`. Encrypted under the
   current header key with a random 24-byte nonce (`nonce ‖ AEAD_ct`), so counters and ratchet public
   keys are never visible to a relay/store.
-- **Message AEAD**: `XChaCha20Poly1305(key, nonce, plaintext, aad = AD ‖ enc_header)`.
+- **Message AEAD**: `XChaCha20Poly1305(key, nonce, plaintext, aad = "mrd.env/2" ‖ AD ‖ prekey_preamble ‖ enc_header)`
+  (the canonical ADR 0016 C3 formula). The domain tag and `AD` are baked into the ratchet's fixed `ad`
+  field once, at session construction; the per-message `prekey_preamble` (present only on the opening
+  message(s) — the presence-flagged encoding of `Prekey` from §4) is threaded through per call. The
+  decrypt side MUST use the preamble bytes actually received on the wire, never a value it locally
+  recomputes, or preamble-mutation detection silently breaks (see `apps/crypto/src/ratchet.rs`'s
+  module doc for the negative-test regression this guards).
 - **Skipped keys**: retained keyed by `(header_key, N)`; bounded by `MAX_SKIP = 1000` per chain and
   `MAX_SKIPPED_STORED = 2000` overall (out-of-order / dropped-message delivery).
 - **Desync recovery (v1).** An `enc_header` that opens under neither `HKr` nor `NHKr` is rejected and
@@ -213,37 +224,56 @@ len(enc_header):u16-be ‖ enc_header ‖ ciphertext
 
 ## 4. The envelope (what the server relays)
 
-`Sign_IK{ ratchet_ct }` with the sender key inside (system-design §7.1 step 6). Deterministic CBOR,
-carried verbatim as the routing [`OpaqueBlob`](./rendezvous-protocol-v1.md):
+Envelope **v2** ([ADR 0016](../adr/0016-envelope-deniability.md)): no per-message signature —
+authentication comes entirely from the ratchet AEAD over `ct` (§3), keyed by the X3DH-derived `AD`
+baked into the session at construction. Deterministic CBOR, carried verbatim as the routing
+[`OpaqueBlob`](./rendezvous-protocol-v1.md):
 
-> **Deniability: v1 envelopes are NOT deniable.** This per-message identity-key signature makes
-> authorship of every v1 message third-party-provable, so threat-model goal 4 is **unmet for v1**.
-> [ADR 0016](../adr/0016-envelope-deniability.md) decides to drop the signature at **envelope v2**
-> (the ratchet AEAD plus the X3DH `AD = IK_initiator ‖ IK_responder` binding already authenticate
-> both identity keys). v2 is a wire break with binding preconditions — commit-on-successful-decrypt,
-> a canonical AAD carrying the prekey preamble, a leading `v: 2`, and enforced signed-prekey
-> rotation. Read that ADR before touching this section.
+> **Deniability: v2 envelopes achieve weak, Signal-grade deniability of *authorship*, single-hop
+> only** (ADR 0016 residual R4). Message authentication reduces to symmetric AEAD under keys the
+> recipient also holds, so no ciphertext is third-party-verifiable as any particular sender's, and any
+> transcript can be forged by the recipient. This does **not** cover *participation*: prekey-bundle
+> signatures, the domain-bound rendezvous auth signature, and account-signed device records all remain
+> identity-key signatures proving a key was live at a given server at a given time — nor does it
+> defeat *server testimony* (the routing `from` is taken from the authenticated WebSocket session, so
+> an operator can attest a blob arrived on a given account's connection). This is true single-hop; the
+> federated case is one hop further and is **not** fully resolved by this ADR alone — see
+> [ADR 0017](../adr/0017-federation-trust-boundary.md). There is no online/interactive deniability, and
+> this is not OTR-/court-grade. (The now-superseded envelope v1 signed every ratchet ciphertext with
+> the sender's identity key and had no deniability property at all.)
 >
-> Note also what the signature does **not** cover: `SignalContent` (SDP/ICE/`dtls_fp`) is ratchet
-> *plaintext*, so the DTLS-fingerprint binding of §4.6 rests on the ratchet AEAD and X3DH, never on
-> this signature. Code comments claiming otherwise are wrong.
+> Note also what authentication does **not** rest on: `SignalContent` (SDP/ICE/`dtls_fp`) is ratchet
+> *plaintext*, so the DTLS-fingerprint binding of §4.6 rests on the ratchet AEAD and X3DH — this was
+> already true under v1 and is unaffected by dropping the signature.
 
 ```
 MessageEnvelope {
-  sender_pub : bytes(32),         # sender Ed25519 account key (inside, and signed)
-  prekey     : Prekey?,           # present only on opening message(s)
-  ct         : bytes,             # the ratchet message from §3
-  sig        : bytes(64),         # Ed25519(sender) over signing_input
+  v          : u16,               # mandatory, always 2 — sender-declared, never negotiated; any
+                                   # other value (or its absence) is a hard local reject (ADR 0016
+                                   # C5/R5), never a downgrade
+  sender_pub : bytes(32),         # sender Ed25519 account key (inside). No longer signed over —
+                                   # authenticated instead by the ratchet AEAD's AD
+                                   # (X3DH IK_initiator ‖ IK_responder), which fails closed on a
+                                   # substituted key
+  eid        : bytes(16),         # sender-random 128-bit dedup key, minted fresh per
+                                   # `ChatState::seal_bytes` call (task 6.4, ADR 0016 C7). Outer
+                                   # plaintext, deliberately outside the AAD — a redelivery/duplicate-
+                                   # processing convenience, not a security boundary
+  prekey     : Prekey?,           # present only on opening message(s); bound into the AAD (§3) via
+                                   # the bytes actually received, never a locally recomputed value
+  ct         : bytes,             # the ratchet message from §3 — AEAD-authenticated, no separate
+                                   # signature
 }
 Prekey { ek_pub: bytes(32), used_spk: bytes(32), used_opk: bytes(32)? }
-
-signing_input = "mrd.env/1" ‖ sender_pub ‖ prekey_flag ‖ [ek_pub ‖ used_spk ‖ opk_flag ‖ used_opk?] ‖ ct
 ```
 
-**Receiver rules (in order):** (1) `sender_pub` MUST equal the routing `from`; (2) verify `sig`
-under `sender_pub` **before** any decryption; (3) if no session and a `prekey` is present, run X3DH
-as responder using the locally-held prekey secrets for `used_spk`/`used_opk` (one-time prekey
-consumed); (4) ratchet-decrypt `ct`. Any failure drops the envelope — never a downgrade.
+**Receiver rules (in order):** (1) decode and check `v == 2` exactly — any other value is a hard
+reject (`ChatError::UnsupportedEnvelopeVersion`), never a downgrade; (2) `sender_pub` MUST equal the
+routing `from` (`ChatError::SenderMismatch`); (3) if no session and a `prekey` is present, run X3DH
+**provisionally** as responder against the locally-held prekey secrets for `used_spk`/`used_opk` — the
+one-time prekey is consumed, and the session installed, only *after* ratchet-decrypt actually succeeds
+(commit-on-successful-decrypt, ADR 0016 C2); (4) ratchet-decrypt `ct` using the preamble bytes actually
+received. Any failure drops the envelope — never a downgrade.
 
 ## 5. `mrd.chat/1` payload
 

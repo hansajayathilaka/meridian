@@ -32,40 +32,51 @@ Auth handshake: server → `challenge{v, nonce[32], server_time}`; client → `a
 
 ## 3. Envelope (the only thing servers ever route)
 
-**As implemented** (canonical: [messaging-envelope-v1.md §4](./messaging-envelope-v1.md), type in
-[`apps/envelope`](../../apps/envelope)):
+**As implemented — envelope v2** (canonical: [messaging-envelope-v1.md §4](./messaging-envelope-v1.md),
+type in [`apps/envelope`](../../apps/envelope)). [ADR 0016](../adr/0016-envelope-deniability.md) shipped
+this cutover: no per-message signature; authentication comes entirely from the ratchet AEAD.
 
 ```
 MessageEnvelope = {
-  sender_pub : bstr[32],    ; Ed25519 sender account key (inside, and signed)
-  prekey     : Prekey?,     ; present only on opening message(s)
-  ct         : bstr,        ; ratchet ciphertext, ENCRYPTED HEADERS
-  sig        : bstr[64]     ; Ed25519(sender) over signing_input
+  v          : u16,          ; mandatory, always 2 — sender-declared, never negotiated; any other
+                              ; value (or its absence) is a hard local reject (ADR 0016 C5/R5)
+  sender_pub : bstr[32],     ; Ed25519 sender account key (inside). No longer signed over.
+  eid        : bstr[16],     ; sender-random 128-bit dedup key, minted fresh per envelope
+                              ; (task 6.4, ADR 0016 C7)
+  prekey     : Prekey?,      ; present only on opening message(s)
+  ct         : bstr,         ; ratchet ciphertext, ENCRYPTED HEADERS — AEAD-authenticated
 }
-signing_input = "mrd.env/1" ‖ sender_pub ‖ prekey_flag ‖ [ek_pub ‖ used_spk ‖ opk_flag ‖ used_opk?] ‖ ct
 ```
 
-Recipients verify `sig` before touching `ct`, and check `sender_pub` against the routing `from`.
-`ct` plaintext (post-ratchet) is a `Content` union: `x3dh_init`, `sdp_offer{sdp, dtls_fp, ice[]}`,
-`sdp_answer{…}`, `ice_trickle{…}`, `chat{…}`, `ring{stream_type, params}`, `receipt{…}`.
+The v2 message AEAD's associated data is the canonical C3 formula:
+`aad = "mrd.env/2" ‖ AD ‖ prekey_preamble ‖ enc_header`, where `AD = IK_initiator ‖ IK_responder` (the
+raw Ed25519 encodings, never normalized to Montgomery form) is baked into the ratchet session's fixed
+`ad` field once at construction, and `prekey_preamble` is the presence-flagged encoding of `Prekey`
+from the envelope actually received (never a locally recomputed value — see
+[messaging-envelope-v1.md §3](./messaging-envelope-v1.md)).
 
-> **Two known deviations from §1's rules, recorded rather than hidden** (both are
-> [ADR 0016](../adr/0016-envelope-deniability.md) v2 obligations, not edits to make here):
-> 1. **No leading `v` field.** This envelope's version exists only as the `mrd.env/1` domain tag
->    inside `signing_input`, which violates §1's "every versioned object carries a leading `v`".
->    v2 adds `v: 2`.
-> 2. **No `eid`.** The dedup/replay key described in §1 is specified but not implemented, so v1 has
->    no envelope-level replay protection. v2 is the cheap moment to add it.
+Recipients check `v == 2` (hard reject on any other value, never a downgrade), cross-check
+`sender_pub` against the routing `from`, and authenticate+decrypt `ct` via the ratchet AEAD — there is
+no separate signature-verify step. `ct` plaintext (post-ratchet) is a `Content` union: `x3dh_init`,
+`sdp_offer{sdp, dtls_fp, ice[]}`, `sdp_answer{…}`, `ice_trickle{…}`, `chat{…}`,
+`ring{stream_type, params}`, `receipt{…}`.
+
+> **Two former known deviations from §1's rules — now closed:**
+> 1. **Leading `v` field.** The now-superseded v1 envelope had none — its version existed only as the
+>    `mrd.env/1` domain tag inside a signing input that no longer exists. v2 carries the mandatory
+>    `v: 2` field §1 requires.
+> 2. **`eid`.** v1 specified but never implemented an envelope-level dedup/replay key. v2 carries one
+>    (task 6.4, ADR 0016 C7), minted fresh per `ChatState::seal_bytes` call.
 >
-> An earlier revision of this section specified a *different* envelope (`v`/`eid`, and a signing
-> input of `v ‖ eid ‖ payload` that omitted `sender_pub`). That contradicted both the canonical spec
-> and the implementation, and its missing `sender_pub` was a key-substitution weakness in the spec
-> itself. It is corrected above.
+> (An earlier revision of this section specified a *different, since-corrected* envelope — see
+> [ADR 0016](../adr/0016-envelope-deniability.md)'s Consequences for the record.)
 
-Sealed-sender wrapping (hiding `sender_pub` from the recipient's server) is a Phase-3 layer on this
-format; [ADR 0016](../adr/0016-envelope-deniability.md)'s removal of the outer plaintext signature is
-its prerequisite. **Deniability:** v1's identity-key signature makes authorship third-party-provable —
-threat-model goal 4 is unmet until v2.
+Sealed-sender wrapping (hiding `sender_pub` from the recipient's server) remains a Phase-3 layer on
+this format; [ADR 0016](../adr/0016-envelope-deniability.md)'s removal of the outer plaintext signature
+was its prerequisite, now shipped. **Deniability:** dropping the per-message signature makes authorship
+no longer third-party-provable — weak, Signal-grade, single-hop, authorship-only (ADR 0016 residual
+R4); it does not cover participation (bundle/auth/device signatures) or the federated case, which is
+one hop further (ADR 0017).
 
 **Invariant (test-enforced):** the same Envelope bytes are valid whether carried over WSS routing, the mailbox, s2s federation, or a data channel — transport-independence per design §4.3.
 

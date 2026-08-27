@@ -1635,21 +1635,13 @@ fn write_trust(handle: &KeyHandle, trust: &TrustStore) {
     std::fs::write(&path, sealed).expect("write trust.bin");
 }
 
-/// Corrupts an authentic envelope's ratchet header (a byte inside `enc_header`, past the 2-byte
-/// length prefix) and re-signs it under the real sender's identity key — mirrors
-/// `apps/core/tests/desync_recovery.rs::mangle_and_resign` exactly: authentic (passes signature
-/// verification) but undecryptable (`ChatError::Desync`), never a forged sender.
-fn mangle_and_resign(
-    peer_store: &MemorySecretStore,
-    peer_account: &AccountId,
-    blob: &[u8],
-) -> Vec<u8> {
+/// Corrupts an envelope's ratchet header (a byte inside `enc_header`, past the 2-byte length
+/// prefix) — mirrors `apps/core/tests/desync_recovery.rs::mangle` exactly. Envelope v2 has no
+/// signature to preserve: `sender_pub`/routing `from` are untouched, so the mangled bytes reach the
+/// ratchet unchanged and come back undecryptable (`ChatError::Desync`), never a forged sender.
+fn mangle(blob: &[u8]) -> Vec<u8> {
     let mut env = MessageEnvelope::from_blob(blob).expect("decode envelope");
     env.ct[2] ^= 0xFF;
-    let sig =
-        meridian_core::identity::sign(peer_store, peer_account.handle(), &env.signing_bytes())
-            .expect("resign");
-    env.sig = *sig.as_bytes();
     env.to_blob().expect("encode envelope")
 }
 
@@ -1715,7 +1707,7 @@ async fn repeated_desync_against_an_already_blocked_contact_never_bypasses_can_s
                 },
             )
             .expect("peer seal_outbound");
-        let mangled = mangle_and_resign(&peer_store, &peer_account, &blob);
+        let mangled = mangle(&blob);
         peer_client
             .route_with_hint(us_pub, None, mangled)
             .await
@@ -1873,7 +1865,7 @@ async fn repeated_desync_against_an_ordinary_pinned_contact_reaches_recovery_and
                 },
             )
             .expect("peer seal_outbound");
-        let mangled = mangle_and_resign(&peer_store, &peer_account, &blob);
+        let mangled = mangle(&blob);
         peer_client
             .route_with_hint(us_pub, None, mangled)
             .await

@@ -3,7 +3,7 @@
 
 # Phase 6 — Envelope v2
 
-**Kind:** build · **Status:** in progress · **Reviews phase(s):** n/a (this phase itself gets swept by
+**Kind:** build · **Status:** done · **Reviews phase(s):** n/a (this phase itself gets swept by
 the next review phase, Phase 7)
 
 ## Goal
@@ -128,20 +128,20 @@ not as a new binding decision that would contradict or extend an accepted ADR.
 **Wave 1 — parallel tracks** (rotation enforcement and the core cutover touch disjoint code and can be
 developed independently; the AAD/commit-on-decrypt rewrite must not be split further — see 6.3's own
 Goal section for why)
-- [ ] **6.1** SPK rotation policy: age tracking + rotation-due predicate (C1, part 1/3) — [file](./6.1-spk-rotation-age-tracking.md)
-- [ ] **6.3** Envelope v2 core cutover: wire shape + canonical AAD + commit-on-decrypt + desync short-circuit fix (C2, C3, C5, C6, C7 short-circuit) — [file](./6.3-envelope-v2-core-cutover.md)
+- [x] **6.1** SPK rotation policy: age tracking + rotation-due predicate (C1, part 1/3) — [file](./6.1-spk-rotation-age-tracking.md)
+- [x] **6.3** Envelope v2 core cutover: wire shape + canonical AAD + commit-on-decrypt + desync short-circuit fix (C2, C3, C5, C6, C7 short-circuit) — [file](./6.3-envelope-v2-core-cutover.md)
 
 **Wave 2**
-- [ ] **6.2** SPK rotation enforcement: trigger + monitoring in both long-running client loops (C1, parts 2–3/3; depends on 6.1) — [file](./6.2-spk-rotation-enforcement.md)
-- [ ] **6.4** `eid` replay-dedup key (C7, second half; depends on 6.3) — [file](./6.4-eid-replay-dedup.md)
-- [ ] **6.6** Test re-pointing: v1 detector → v2 AEAD, plus the new C3/R1 adversarial cells (depends on 6.3) — [file](./6.6-repoint-adversarial-tests.md)
+- [x] **6.2** SPK rotation enforcement: trigger + monitoring in both long-running client loops (C1, parts 2–3/3; depends on 6.1) — [file](./6.2-spk-rotation-enforcement.md)
+- [x] **6.4** `eid` replay-dedup key (C7, second half; depends on 6.3) — [file](./6.4-eid-replay-dedup.md)
+- [x] **6.6** Test re-pointing: v1 detector → v2 AEAD, plus the new C3/R1 adversarial cells (depends on 6.3) — [file](./6.6-repoint-adversarial-tests.md)
 
 **Wave 3**
-- [ ] **6.5** Conformance vectors: `ratchet-v2.json` + `envelope-v2.json` (depends on 6.3, 6.4) — [file](./6.5-conformance-vectors-v2.md)
-- [ ] **6.7** Doc-sync: describe envelope v2 as shipped (C4; depends on 6.3, 6.4) — [file](./6.7-doc-sync-envelope-v2.md)
+- [x] **6.5** Conformance vectors: `ratchet-v2.json` + `envelope-v2.json` (depends on 6.3, 6.4) — [file](./6.5-conformance-vectors-v2.md)
+- [x] **6.7** Doc-sync: describe envelope v2 as shipped (C4; depends on 6.3, 6.4) — [file](./6.7-doc-sync-envelope-v2.md)
 
 **Wave 4 — exit gate**
-- [ ] **6.8** Phase exit: flag-day cutover verification + acceptance demo + roadmap unblock (depends on 6.1–6.7) — [file](./6.8-phase-exit-flag-day-demo.md)
+- [x] **6.8** Phase exit: flag-day cutover verification + acceptance demo + roadmap unblock (depends on 6.1–6.7) — [file](./6.8-phase-exit-flag-day-demo.md)
 
 ## Exit criteria
 All tasks `- [x]`; tree green (`cargo build --workspace`, `cargo fmt --check`,

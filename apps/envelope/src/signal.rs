@@ -1,18 +1,20 @@
 //! `SignalContent` — the P2P session-establishment payloads that ride inside the *same*
-//! ratchet-encrypted, identity-signed [`MessageEnvelope`](crate::MessageEnvelope) as chat
-//! (wire-protocol §3 `Content` union; system-design §7.1 step 6). Because they are sealed exactly
-//! like chat, SDP and ICE candidates **never travel to a server in cleartext** (webrtc-nat-traversal
-//! invariant 2) — the rendezvous routes opaque blobs and can neither read nor edit an SDP offer.
+//! ratchet-encrypted [`MessageEnvelope`](crate::MessageEnvelope) as chat (wire-protocol §3 `Content`
+//! union; system-design §7.1 step 6). Envelope v2 ([ADR 0016](../../../docs/adr/0016-envelope-deniability.md))
+//! carries no per-message signature at all — authentication rests entirely on the ratchet AEAD.
+//! Because these payloads are sealed exactly like chat, SDP and ICE candidates **never travel to a
+//! server in cleartext** (webrtc-nat-traversal invariant 2) — the rendezvous routes opaque blobs and
+//! can neither read nor edit an SDP offer.
 //!
 //! The DTLS fingerprint is carried *inside* the offer/answer here, so it is bound to the sender's
-//! identity. **What binds it is the ratchet, not the envelope signature**: `SignalContent` is
-//! ratchet *plaintext*, and the envelope's Ed25519 signature covers only the ciphertext — so the
-//! fingerprint's authentication comes from the message AEAD, whose AAD carries
-//! `AD = IK_initiator ‖ IK_responder`, and (on first contact) from X3DH's `DH1`. This distinction is
-//! load-bearing: it is why [ADR 0016](../../../docs/adr/0016-envelope-deniability.md)'s removal of
-//! the per-message signature at envelope v2 is a no-op for fingerprint binding. After the handshake
-//! the substrate cross-checks the transport's negotiated fingerprint against [`dtls_fp`] — a
-//! mismatch tears the session down (§4.6).
+//! identity. **What binds it is the ratchet AEAD, not an envelope signature — there is no envelope
+//! signature to bind it**: `SignalContent` is ratchet *plaintext*, and the AEAD's authentication
+//! comes from its AAD, which carries `AD = IK_initiator ‖ IK_responder`, and (on first contact) from
+//! X3DH's `DH1`. This is exactly why ADR 0016's removal of the per-message signature at envelope v2
+//! is a no-op for fingerprint binding: binding never depended on a signature that has since been
+//! removed, only on the AEAD/AD construction that is still fully in place. After the handshake the
+//! substrate cross-checks the transport's negotiated fingerprint against [`dtls_fp`] — a mismatch
+//! tears the session down (§4.6).
 //!
 //! [`dtls_fp`]: SignalContent::SdpOffer
 
@@ -26,7 +28,7 @@ use meridian_proto::{decode, encode, CodecError};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SignalContent {
     /// The dialing side's offer: the opaque SDP, the asserted DTLS fingerprint (identity-bound by
-    /// the ratchet AEAD's `AD = IK_initiator ‖ IK_responder`, *not* by the envelope signature — see
+    /// the ratchet AEAD's `AD = IK_initiator ‖ IK_responder` — there is no envelope signature; see
     /// the module doc), and any already-gathered ICE candidates.
     SdpOffer {
         #[serde(with = "meridian_proto::bytes::bytes_vec")]

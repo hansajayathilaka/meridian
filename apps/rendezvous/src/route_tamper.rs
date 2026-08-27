@@ -3,11 +3,14 @@
 //!
 //! # Why this module exists
 //!
-//! 1.28's rewrite is provably stopped at the Ed25519 envelope signature: `MessageEnvelope` has four
-//! fields and its signing input covers `sender_pub + prekey + ct`, with `sig` the remainder, so
-//! *every* byte is either signed or is the signature and any mutation must fail CBOR decode or
-//! `verify`. A routing-only relay nevertheless has strictly stronger attacks that need **no key
-//! material** and **do** pass the signature check, because they never touch the bytes:
+//! 1.28's rewrite is provably stopped by the ratchet AEAD: envelope v2
+//! ([ADR 0016](../../../docs/adr/0016-envelope-deniability.md)) carries no signature at all — `ct`
+//! is authenticated ciphertext under a key only the two ratchet peers hold, with AAD covering the
+//! X3DH preamble and encrypted header (`"mrd.env/2" ‖ AD ‖ prekey_preamble ‖ enc_header`, C3), so any
+//! mutation lands inside AEAD-protected bytes and fails the tag on decrypt (surfacing as
+//! `ChatError::Crypto`) rather than being caught by a separate verify step. A routing-only relay
+//! nevertheless has strictly stronger attacks that need **no key material** and **do** reach the
+//! recipient, because they never touch the authenticated bytes at all:
 //!
 //! * **`spoof_from`** — `Deliver.from` is asserted by the *server*, not by the client, so forging it
 //!   is free. Probes `ChatError::SenderMismatch`.
@@ -196,8 +199,8 @@ impl RouteTamper {
         }
 
         // Replay: emit the same bytes a second time, to the same recipient, with the same `from`.
-        // A byte-identical duplicate is the whole attack — no mutation, so it passes the signature
-        // check and reaches the ratchet.
+        // A byte-identical duplicate is the whole attack — no mutation, so the AEAD authenticates it
+        // fine; it is the `eid` dedup check (task 6.4) that catches it, not decryption.
         if cfg.allow_test_route_replay {
             deliveries.push(current);
         }

@@ -37,7 +37,9 @@ pub fn generate() -> Result<(), String> {
     identity::generate_identity()?;
     x3dh::generate_x3dh()?;
     ratchet::generate_ratchet()?;
+    ratchet::generate_ratchet_v2()?;
     envelope::generate_envelope()?;
+    envelope::generate_envelope_v2()?;
     safety_numbers::generate_safety_numbers()?;
     federation::generate_federation()?;
     c2s::generate_c2s()?;

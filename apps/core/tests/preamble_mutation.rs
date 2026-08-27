@@ -11,37 +11,48 @@
 //! [`ChatState::open_inbound`], which is where the defence lives, standing in for any on-path
 //! attacker with byte access to a genuine envelope.
 //!
-//! # What is asserted, and why the v1 answer is "the signature"
+//! # What is asserted, and what actually stops preamble mutation (v1 vs. v2)
 //!
-//! ADR 0016 records preamble integrity (R3) as enforced only *implicitly*: `ek_pub`, `used_spk` and
-//! `used_opk` appear in no AEAD AAD, and the AEAD fails closed **late** — `take_otk_secret` and
-//! `sessions.insert` both run before `session.decrypt()`. In envelope **v1** the thing that actually
-//! stops preamble mutation is therefore the Ed25519 envelope signature, whose input covers
-//! `sender_pub + prekey + ct`: mutate any preamble field and `verify` fails *before* the vault is
-//! touched at all. ADR 0016 flagged this as a **live gap even in v1** —
+//! ADR 0016 records preamble integrity (R3) as enforced only *implicitly* by the ratchet AEAD:
+//! `ek_pub`, `used_spk` and `used_opk` are never authenticated directly, only indirectly (they feed
+//! X3DH's key derivation, so a wrong value derives a session that fails to decrypt). Under **v1**
+//! the thing that actually stopped preamble mutation was the Ed25519 envelope signature, whose
+//! input covered `sender_pub + prekey + ct`: mutate any preamble field and `verify` failed *before*
+//! the vault was touched at all — with the AEAD's own implicit protection never even exercised,
+//! because `take_otk_secret`/`sessions.insert` ran eagerly, before decrypt, and would have been
+//! unsafe on their own (ADR 0016 R3). ADR 0016 flagged this as a **live gap even in v1** —
 //! `apps/core/tests/chat_manager.rs` covers wrong-`from` and a ciphertext byte-flip but never a
-//! preamble mutation. These cells close that.
+//! preamble mutation. These cells closed that gap for v1, and (task 6.3) now exercise the **v2**
+//! mechanism directly: no signature exists any more, so it is the ratchet AEAD's implicit
+//! protection — now safely exercisable *before* anything commits, per commit-on-decrypt (C2) — that
+//! must, and does, stop every cell below.
 //!
 //! Each cell asserts all four properties ADR 0016 lists, not merely "it errored":
-//!   1. the rejection is [`ChatError::BadSignature`] **specifically** — the signature, not a
-//!      downstream accident;
+//!   1. the rejection is a ratchet-AEAD failure ([`ChatError::Crypto`]) **specifically** — the
+//!      provisional session derived from the mutated preamble is a *structurally valid* X3DH
+//!      establishment against real prekey material in every cell below (never `UnknownPrekey`),
+//!      which is what makes the AEAD failure — not a shortcut earlier in the pipeline — the actual
+//!      thing under test;
 //!   2. the **OTK pool depth is unchanged** (counted, in [`otk_depth`]);
 //!   3. **no session is installed** — and in fact the whole `ChatState` is byte-identical;
 //!   4. the genuine envelope **subsequently still opens**, which is what proves (2) and (3) were not
 //!      achieved by breaking the honest path.
 //!
 //! Together (2)+(4) are the anti-DoS property task 1.32 names: a rejected prekey envelope consumes
-//! no one-time prekey and installs no session, because `open_bytes` verifies before
-//! `take_otk_secret`. Without it, any on-path attacker could burn a peer's whole OTK pool and
-//! permanently block the real sender with a poisoned responder session.
+//! no one-time prekey and installs no session. Under v1 that was because `open_bytes` verified the
+//! signature before `take_otk_secret`; under v2 (task 6.3) it is because `open_bytes` runs X3DH
+//! *provisionally* and only commits (`take_otk_secret`, `sessions.insert`) on a **successful**
+//! decrypt (ADR 0016 C2) — a mutated preamble derives a session that fails to decrypt the genuine
+//! ciphertext, and the provisional attempt is discarded without a trace. Without C2, any on-path
+//! attacker could burn a peer's whole OTK pool and permanently block the real sender with a
+//! poisoned responder session — exactly the R3 residual C2 exists to close.
 //!
-//! # v2 note (do not delete these cells at the cutover)
+//! # v2 note (task 6.3 re-pointed these cells; task 6.6 owns new adversarial cells)
 //!
-//! Envelope v2 drops the signature, so property (1) moves to the ratchet AEAD and these cells must
-//! be re-pointed — **not** deleted. That is exactly why ADR 0016 makes C2
-//! (commit-on-successful-decrypt: provisional X3DH, decrypt, and only then consume the OTK and
-//! install the session) *normative*: without it, v2 would turn every cell below from "rejected, cost
-//! nothing" into "rejected, burned an OTK and installed a poisoned session".
+//! Envelope v2 drops the signature, so property (1)'s detector moved from the signature to the
+//! ratchet AEAD (this file, task 6.3) — these cells were re-pointed, **not** deleted, per ADR
+//! 0016's own "Test obligations" section. Designing *new* C3/R1 adversarial cells (e.g. a
+//! sign-flipped `sender_pub`) is task 6.6's job, not this re-pointing pass's.
 
 use meridian_core::chat::{ChatError, ChatState, PREV_GENERATION_GRACE_SECS};
 use meridian_envelope::{ChatContent, MessageEnvelope};
@@ -174,12 +185,11 @@ fn array_len(v: Option<&ciborium::value::Value>) -> usize {
     }
 }
 
-/// Decode a blob, hand its envelope to `mutate`, and re-encode **without re-signing** — the
-/// capability of an on-path attacker, who has the bytes but not the sender's identity key.
-///
-/// Re-signing would be a different (and uninteresting) scenario: only Alice can re-sign, and a
-/// sender consuming a prekey of her own choosing is her prerogative, not an attack.
-fn mutate_unsigned(blob: &[u8], mutate: impl FnOnce(&mut MessageEnvelope)) -> Vec<u8> {
+/// Decode a blob, hand its envelope to `mutate`, and re-encode — the capability of an on-path
+/// attacker, who has the bytes but (envelope v2 has no signature at all — anyone with the bytes can
+/// mutate the preamble; the only question is whether the ratchet AEAD then rejects it) not the
+/// sender's session key material needed to make the mutation actually decrypt.
+fn mutate_preamble(blob: &[u8], mutate: impl FnOnce(&mut MessageEnvelope)) -> Vec<u8> {
     let mut env = MessageEnvelope::from_blob(blob).unwrap();
     let before = env.prekey.clone();
     mutate(&mut env);
@@ -191,8 +201,9 @@ fn mutate_unsigned(blob: &[u8], mutate: impl FnOnce(&mut MessageEnvelope)) -> Ve
     env.to_blob().unwrap()
 }
 
-/// The shared assertion block: reject with [`ChatError::BadSignature`], touch nothing, and let the
-/// genuine envelope through afterwards.
+/// The shared assertion block: reject via the ratchet AEAD ([`ChatError::Crypto`], task 6.3's
+/// commit-on-decrypt re-point of the v1 signature detector), touch nothing, and let the genuine
+/// envelope through afterwards.
 fn assert_rejected_for_free(
     bob: &mut Party,
     alice_ik: &[u8; 32],
@@ -208,15 +219,17 @@ fn assert_rejected_for_free(
     let before = state_bytes(&bob.state);
 
     match bob.recv(alice_ik, attack_blob) {
-        Err(ChatError::BadSignature) => {}
+        Err(ChatError::Crypto(_)) => {}
         Ok(content) => panic!(
             "SECURITY FAILURE: a mutated X3DH preamble was ACCEPTED and decrypted: {content:?}"
         ),
         Err(other) => panic!(
-            "a mutated preamble must be rejected by the ENVELOPE SIGNATURE (the v1 defence — its \
-             signing input covers `prekey`), before the vault is touched. A different error means \
-             the rejection happened somewhere else, and the 'consumed nothing' assertions below \
-             would not be evidence for the property this cell claims. Got: {other:?}"
+            "a mutated preamble must be rejected by the RATCHET AEAD (ADR 0016 C2/C3 — the \
+             provisional session it derives fails to decrypt the genuine ciphertext), never by \
+             something upstream like UnknownPrekey (every mutation here still names real prekey \
+             material Bob holds — see this file's own module doc). A different error means the \
+             rejection happened somewhere else, and the 'consumed nothing' assertions below would \
+             not be evidence for the property this cell claims. Got: {other:?}"
         ),
     }
 
@@ -328,7 +341,7 @@ fn forged_prekey_envelope_claiming_alice_costs_bob_nothing() {
 #[test]
 fn preamble_mutation_used_opk_to_none_is_rejected_for_free() {
     let (_alice, mut bob, alice_ik, _bundle, genuine) = opening_envelope("opk-none");
-    let attack = mutate_unsigned(&genuine, |env| {
+    let attack = mutate_preamble(&genuine, |env| {
         let p = env
             .prekey
             .as_mut()
@@ -350,7 +363,7 @@ fn preamble_mutation_used_opk_to_another_held_otk_is_rejected_for_free() {
         other_otk, bundle.bundle.otks[0],
         "the batch must contain a second, distinct one-time prekey"
     );
-    let attack = mutate_unsigned(&genuine, |env| {
+    let attack = mutate_preamble(&genuine, |env| {
         env.prekey.as_mut().unwrap().used_opk = Some(other_otk);
     });
     assert_rejected_for_free(&mut bob, &alice_ik, &attack, &genuine, "genuine");
@@ -389,7 +402,7 @@ fn preamble_mutation_used_spk_to_previous_generation_is_rejected_for_free() {
 
     alice.start(&bob_ik, &gen_n1.bundle.spk, Some(gen_n1.bundle.otks[0]));
     let genuine = alice.send(&bob_ik, 1, "genuine");
-    let attack = mutate_unsigned(&genuine, |env| {
+    let attack = mutate_preamble(&genuine, |env| {
         env.prekey.as_mut().unwrap().used_spk = gen_n.bundle.spk;
     });
 

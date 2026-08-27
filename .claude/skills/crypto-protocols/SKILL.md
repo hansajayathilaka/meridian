@@ -26,9 +26,15 @@ description: Use when writing or reviewing ANY cryptographic code — key genera
 3. **Message protection is application-layer, inside transport.** Double Ratchet with **header
    encryption** wraps every data-channel payload *in addition to* DTLS — this is what makes content
    security independent of the transport path (design §4.3). Never rely on DTLS alone for content.
-4. **Verify before you decrypt/deserialize.** Check the identity signature on an envelope before
-   touching its payload. Verify prekey bundles under the *requested* key before use — a mismatch is a
-   hard failure, never a downgrade (design §3.3, §4.2).
+4. **Verify before you decrypt/deserialize.** Envelope v2 carries **no per-message signature**
+   ([ADR 0016](../../../docs/adr/0016-envelope-deniability.md)) — a message envelope's authenticity
+   comes from the ratchet AEAD (fails closed on any tamper) plus `ChatState::open_bytes`'s
+   `sender_pub == routing from` and `v == 2` checks, never from a signature-verify step. That
+   narrowing is **only** about the per-message envelope; it does not extend to bundles, device
+   records, or the rendezvous auth challenge — those remain fully load-bearing identity-key
+   signatures, untouched by ADR 0016: **verify prekey bundles under the *requested* key before use** —
+   a mismatch is a hard failure, never a downgrade (design §3.3, §4.2) — and device-record/auth
+   signatures are checked before any of their claims are trusted.
 5. **Media auth is identity-bound.** DTLS-SRTP fingerprints travel inside the encrypted envelope and
    are cross-checked post-handshake; a mismatch tears the session down (design §4.6).
 6. **Keys live in the keystore.** Account keys use the OS keystore/secure enclave via the

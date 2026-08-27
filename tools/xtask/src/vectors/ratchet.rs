@@ -30,6 +30,7 @@
 
 use meridian_crypto::test_support::{dh, kdf_ck, kdf_rk};
 use meridian_crypto::DoubleRatchet;
+use meridian_envelope::{preamble_aad_bytes, Prekey};
 use serde::Serialize;
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 
@@ -148,11 +149,22 @@ pub fn generate_ratchet() -> Result<(), String> {
 
     let mut transcript = Vec::new();
 
+    // (task 6.3, ADR 0016 C2/C3) `encrypt`/`decrypt` now take a preamble argument, folded into the
+    // v2 AAD. This generator never carries an X3DH preamble on any step (its ratchets are built
+    // directly, not via a fresh X3DH handshake), so every call below consistently uses the empty
+    // preamble — this does not change any pinned value: ciphertext is never byte-pinned (see the
+    // module doc), `ad_hex` is recorded from the local `ad` variable directly (not read back
+    // through the now domain-tag-baked `DoubleRatchet::associated_data()`), and chain/message-key
+    // derivation never depended on the AAD in the first place.
+    let no_preamble: &[u8] = &[];
+
     // Step 0: Alice -> Bob, N=0. Establishes Bob's receiving chain (his first DH-ratchet step).
     let (ck_before, ck_after, mk) = alice_send.advance();
     let pt0 = b"hello bob".to_vec();
-    let c0 = alice.encrypt(&pt0).map_err(|e| e.to_string())?;
-    bob.decrypt(&c0).map_err(|e| e.to_string())?;
+    let c0 = alice
+        .encrypt(&pt0, no_preamble)
+        .map_err(|e| e.to_string())?;
+    bob.decrypt(&c0, no_preamble).map_err(|e| e.to_string())?;
     transcript.push(Step {
         direction: "alice->bob".into(),
         plaintext_hex: hex::encode(&pt0),
@@ -171,14 +183,14 @@ pub fn generate_ratchet() -> Result<(), String> {
     let mut steps = Vec::new();
     for pt in [b"m1".to_vec(), b"m2".to_vec(), b"m3".to_vec()] {
         let (ck_before, ck_after, mk) = alice_send.advance();
-        let ct = alice.encrypt(&pt).map_err(|e| e.to_string())?;
+        let ct = alice.encrypt(&pt, no_preamble).map_err(|e| e.to_string())?;
         steps.push((pt, ck_before, ck_after, mk, ct));
     }
     let (pt1, ck1b, ck1a, mk1, ct1) = steps.remove(0);
     let (pt2, ck2b, ck2a, mk2, ct2) = steps.remove(0);
     let (pt3, ck3b, ck3a, mk3, ct3) = steps.remove(0);
 
-    bob.decrypt(&ct3).map_err(|e| e.to_string())?; // delivered first: N=3, out of order
+    bob.decrypt(&ct3, no_preamble).map_err(|e| e.to_string())?; // delivered first: N=3, out of order
     transcript.push(Step {
         direction: "alice->bob".into(),
         plaintext_hex: hex::encode(&pt3),
@@ -190,7 +202,7 @@ pub fn generate_ratchet() -> Result<(), String> {
         ck_after_hex: Some(hex::encode(ck3a)),
         mk_hex: Some(hex::encode(mk3)),
     });
-    bob.decrypt(&ct1).map_err(|e| e.to_string())?; // N=1, arrives after N=3 (skipped-key path)
+    bob.decrypt(&ct1, no_preamble).map_err(|e| e.to_string())?; // N=1, arrives after N=3 (skipped-key path)
     transcript.push(Step {
         direction: "alice->bob".into(),
         plaintext_hex: hex::encode(&pt1),
@@ -202,7 +214,7 @@ pub fn generate_ratchet() -> Result<(), String> {
         ck_after_hex: Some(hex::encode(ck1a)),
         mk_hex: Some(hex::encode(mk1)),
     });
-    bob.decrypt(&ct2).map_err(|e| e.to_string())?; // N=2, also a stored skipped key
+    bob.decrypt(&ct2, no_preamble).map_err(|e| e.to_string())?; // N=2, also a stored skipped key
     transcript.push(Step {
         direction: "alice->bob".into(),
         plaintext_hex: hex::encode(&pt2),
@@ -220,8 +232,8 @@ pub fn generate_ratchet() -> Result<(), String> {
     // OS-CSPRNG draw with no injection point, and *is* the PCS mechanism, so it is not something
     // to pin. Recorded as a functional round trip only.
     let pt4 = b"hi alice".to_vec();
-    let c4 = bob.encrypt(&pt4).map_err(|e| e.to_string())?;
-    let decrypted4 = alice.decrypt(&c4).map_err(|e| e.to_string())?;
+    let c4 = bob.encrypt(&pt4, no_preamble).map_err(|e| e.to_string())?;
+    let decrypted4 = alice.decrypt(&c4, no_preamble).map_err(|e| e.to_string())?;
     if decrypted4 != pt4 {
         return Err("ratchet vector generation: bob->alice reply did not round-trip".into());
     }
@@ -288,4 +300,276 @@ fn encode_header_for_vector(dh_pub: &[u8; 32], pn: u32, n: u32) -> [u8; 40] {
     out[32..36].copy_from_slice(&pn.to_be_bytes());
     out[36..40].copy_from_slice(&n.to_be_bytes());
     out
+}
+
+// == v2 (task 6.5, ADR 0016 C2/C3): `ratchet-v2.json` =========================================
+//
+// Same transcript shape as v1, plus the v2 AAD construction (`"mrd.env/2" ‖ AD ‖ prekey_preamble
+// ‖ enc_header`, ADR 0016 C3): every step now threads a real (possibly non-empty) preamble
+// through `encrypt`/`decrypt`, and the fixture pins two new, fully-deterministic quantities that
+// are byte-pinnable *unlike* the message ciphertext/header (see the v1 module doc's determinism
+// boundary — that boundary is unchanged in v2, since it comes from `dh_ratchet`'s CSPRNG draw and
+// `header_seal`'s random nonce, neither of which this task touches):
+//   - `initial_state.baked_ad_hex` — the fixed AAD component both sides bake in at construction,
+//     `"mrd.env/2" ‖ AD`, read back via the real, public `DoubleRatchet::associated_data()` getter
+//     (never reimplemented/guessed here).
+//   - `transcript[].aad_prefix_hex` — `baked_ad ‖ preamble` for that step. This is deterministic
+//     for every step regardless of `chain_key_pinned`, because it depends on neither the random
+//     DH-ratchet keypair draw nor the header's random nonce — only on the fixed baked AAD and the
+//     (locally chosen, hence known) preamble bytes for that message. It stops short of the full
+//     per-message AAD (`aad_prefix ‖ enc_header`) only because `enc_header` itself is
+//     non-deterministic (random nonce), same reason ciphertext is never pinned.
+// New separate structs (`Step2`/`InitialState2`/`Fixtures2`/`HeaderRoundTrip2`) so the v1
+// generator's structs, and therefore `ratchet-v1.json`'s exact shape, are untouched.
+
+#[derive(Serialize)]
+struct FixturesV2 {
+    version: u32,
+    note: String,
+    initial_state: InitialStateV2,
+    transcript: Vec<StepV2>,
+    header_round_trip: HeaderRoundTripV2,
+}
+
+#[derive(Serialize)]
+struct InitialStateV2 {
+    root_hex: String,
+    hk_ab_hex: String,
+    hk_ba_hex: String,
+    ad_hex: String,
+    /// `"mrd.env/2" ‖ ad_hex` — the fixed per-session AAD component both `DoubleRatchet` instances
+    /// bake in at construction (ADR 0016 C3), read back via the real
+    /// [`meridian_crypto::DoubleRatchet::associated_data`].
+    baked_ad_hex: String,
+    alice_dhs_priv_hex: String,
+    alice_dhs_pub_hex: String,
+    bob_dhs_priv_hex: String,
+    bob_dhs_pub_hex: String,
+    alice_initial_root_hex: String,
+    alice_initial_cks_hex: String,
+    alice_initial_nhks_hex: String,
+}
+
+#[derive(Serialize)]
+struct StepV2 {
+    direction: String,
+    plaintext_hex: String,
+    n: u32,
+    dh_ratchet_step: bool,
+    delivered_out_of_order: bool,
+    chain_key_pinned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ck_before_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ck_after_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mk_hex: Option<String>,
+    /// The [`meridian_envelope::preamble_aad_bytes`]-shaped preamble bytes threaded through
+    /// `encrypt`/`decrypt` for this step (empty on every step but the session-opening one, which
+    /// carries a stand-in X3DH preamble — see the module doc above).
+    preamble_hex: String,
+    /// `baked_ad ‖ preamble_hex` for this step (see the module doc above) — deterministic and
+    /// pinned for every step, independent of `chain_key_pinned`.
+    aad_prefix_hex: String,
+}
+
+#[derive(Serialize)]
+struct HeaderRoundTripV2 {
+    note: String,
+    hk_hex: String,
+    header_plaintext_hex: String,
+}
+
+/// `test-vectors/ratchet-v2.json`. See the module doc above for what's new relative to v1.
+pub fn generate_ratchet_v2() -> Result<(), String> {
+    let root = [0xAAu8; 32];
+    let hk_ab = [0xBBu8; 32];
+    let hk_ba = [0xCCu8; 32];
+    let ad: Vec<u8> = (0u8..16).collect();
+
+    let alice_dhs_priv = [0xEEu8; 32];
+    let alice_dhs_pub = x25519_pub(&alice_dhs_priv);
+    let bob_dhs_priv = [0xDDu8; 32];
+    let bob_dhs_pub = x25519_pub(&bob_dhs_priv);
+
+    let alice_dh0 = dh(&alice_dhs_priv, &bob_dhs_pub);
+    let (alice_root0, alice_cks0, alice_nhks0) = kdf_rk(&root, &alice_dh0);
+
+    let mut alice = DoubleRatchet::init_initiator_with_keypair(
+        root,
+        alice_dhs_priv,
+        bob_dhs_pub,
+        hk_ab,
+        hk_ba,
+        ad.clone(),
+    );
+    let mut bob =
+        DoubleRatchet::init_responder(root, bob_dhs_priv, bob_dhs_pub, hk_ab, hk_ba, ad.clone());
+
+    // Real code, via the public getter — never reimplemented. Both sides must agree.
+    let baked_ad = alice.associated_data().to_vec();
+    if baked_ad != bob.associated_data() {
+        return Err("ratchet v2 vector generation: alice/bob baked AAD diverged".into());
+    }
+
+    let aad_prefix = |preamble: &[u8]| -> Vec<u8> {
+        let mut out = baked_ad.clone();
+        out.extend_from_slice(preamble);
+        out
+    };
+
+    let mut alice_send = ChainCursor { ck: alice_cks0 };
+    let mut transcript = Vec::new();
+
+    // Step 0: Alice -> Bob, N=0, the session-opening message. Carries a real, non-empty
+    // preamble, built via the actual `meridian_envelope::preamble_aad_bytes` encoder (xtask can
+    // and does depend on `meridian-envelope` — see envelope.rs's own generator in this same
+    // directory) rather than hand-reproduced bytes, so the fixture can never silently diverge from
+    // production's presence-flag encoding. `meridian-crypto` itself still cannot take this
+    // dependency (F15) — its own copy in `apps/crypto/src/session.rs::preamble_bytes` stays a
+    // byte-identical hand-kept twin, pinned in lockstep by this same vector.
+    let preamble0: Vec<u8> = preamble_aad_bytes(&Some(Prekey {
+        ek_pub: [0x55u8; 32],
+        used_spk: [0x66u8; 32],
+        used_opk: None,
+    }));
+    let (ck_before, ck_after, mk) = alice_send.advance();
+    let pt0 = b"hello bob".to_vec();
+    let c0 = alice.encrypt(&pt0, &preamble0).map_err(|e| e.to_string())?;
+    bob.decrypt(&c0, &preamble0).map_err(|e| e.to_string())?;
+    transcript.push(StepV2 {
+        direction: "alice->bob".into(),
+        plaintext_hex: hex::encode(&pt0),
+        n: 0,
+        dh_ratchet_step: true,
+        delivered_out_of_order: false,
+        chain_key_pinned: true,
+        ck_before_hex: Some(hex::encode(ck_before)),
+        ck_after_hex: Some(hex::encode(ck_after)),
+        mk_hex: Some(hex::encode(mk)),
+        preamble_hex: hex::encode(&preamble0),
+        aad_prefix_hex: hex::encode(aad_prefix(&preamble0)),
+    });
+
+    // Steps N=1,2,3 on Alice's same chain, delivered out of order (3, 1, 2). No further preamble
+    // (continuation messages on an already-open session carry none).
+    let no_preamble: &[u8] = &[];
+    let mut steps = Vec::new();
+    for pt in [b"m1".to_vec(), b"m2".to_vec(), b"m3".to_vec()] {
+        let (ck_before, ck_after, mk) = alice_send.advance();
+        let ct = alice.encrypt(&pt, no_preamble).map_err(|e| e.to_string())?;
+        steps.push((pt, ck_before, ck_after, mk, ct));
+    }
+    let (pt1, ck1b, ck1a, mk1, ct1) = steps.remove(0);
+    let (pt2, ck2b, ck2a, mk2, ct2) = steps.remove(0);
+    let (pt3, ck3b, ck3a, mk3, ct3) = steps.remove(0);
+
+    bob.decrypt(&ct3, no_preamble).map_err(|e| e.to_string())?;
+    transcript.push(StepV2 {
+        direction: "alice->bob".into(),
+        plaintext_hex: hex::encode(&pt3),
+        n: 3,
+        dh_ratchet_step: false,
+        delivered_out_of_order: true,
+        chain_key_pinned: true,
+        ck_before_hex: Some(hex::encode(ck3b)),
+        ck_after_hex: Some(hex::encode(ck3a)),
+        mk_hex: Some(hex::encode(mk3)),
+        preamble_hex: hex::encode(no_preamble),
+        aad_prefix_hex: hex::encode(aad_prefix(no_preamble)),
+    });
+    bob.decrypt(&ct1, no_preamble).map_err(|e| e.to_string())?;
+    transcript.push(StepV2 {
+        direction: "alice->bob".into(),
+        plaintext_hex: hex::encode(&pt1),
+        n: 1,
+        dh_ratchet_step: false,
+        delivered_out_of_order: true,
+        chain_key_pinned: true,
+        ck_before_hex: Some(hex::encode(ck1b)),
+        ck_after_hex: Some(hex::encode(ck1a)),
+        mk_hex: Some(hex::encode(mk1)),
+        preamble_hex: hex::encode(no_preamble),
+        aad_prefix_hex: hex::encode(aad_prefix(no_preamble)),
+    });
+    bob.decrypt(&ct2, no_preamble).map_err(|e| e.to_string())?;
+    transcript.push(StepV2 {
+        direction: "alice->bob".into(),
+        plaintext_hex: hex::encode(&pt2),
+        n: 2,
+        dh_ratchet_step: false,
+        delivered_out_of_order: true,
+        chain_key_pinned: true,
+        ck_before_hex: Some(hex::encode(ck2b)),
+        ck_after_hex: Some(hex::encode(ck2a)),
+        mk_hex: Some(hex::encode(mk2)),
+        preamble_hex: hex::encode(no_preamble),
+        aad_prefix_hex: hex::encode(aad_prefix(no_preamble)),
+    });
+
+    // Step 4: Bob -> Alice, his first send — rides a chain seeded by a keypair Bob's own
+    // `dh_ratchet` generated internally via the OS CSPRNG (the PCS mechanism), so `ck`/`mk` are
+    // not pinned (see the v1 module doc's determinism boundary), but `aad_prefix_hex` still is.
+    let pt4 = b"hi alice".to_vec();
+    let c4 = bob.encrypt(&pt4, no_preamble).map_err(|e| e.to_string())?;
+    let decrypted4 = alice.decrypt(&c4, no_preamble).map_err(|e| e.to_string())?;
+    if decrypted4 != pt4 {
+        return Err("ratchet v2 vector generation: bob->alice reply did not round-trip".into());
+    }
+    transcript.push(StepV2 {
+        direction: "bob->alice".into(),
+        plaintext_hex: hex::encode(&pt4),
+        n: 0,
+        dh_ratchet_step: true,
+        delivered_out_of_order: false,
+        chain_key_pinned: false,
+        ck_before_hex: None,
+        ck_after_hex: None,
+        mk_hex: None,
+        preamble_hex: hex::encode(no_preamble),
+        aad_prefix_hex: hex::encode(aad_prefix(no_preamble)),
+    });
+
+    let fixtures = FixturesV2 {
+        version: 2,
+        note: "Double Ratchet (header-encrypted) conformance vectors, v2 (ADR 0016 C2/C3). \
+               Regenerate with `cargo run -p xtask -- vectors`. Adds the v2 AAD construction \
+               (\"mrd.env/2\" || AD || prekey_preamble || enc_header) on top of the v1 fixture \
+               shape: `initial_state.baked_ad_hex` is the fixed \"mrd.env/2\" || AD component both \
+               sides bake in at construction (real `DoubleRatchet::associated_data()`); each \
+               transcript step's `preamble_hex`/`aad_prefix_hex` record the per-message preamble \
+               and `baked_ad || preamble` — deterministic and pinned on every step regardless of \
+               `chain_key_pinned`, since neither depends on the DH-ratchet's random keypair draw or \
+               the header's random nonce. Chain-key/message-key values, header ciphertext, and the \
+               full per-message AAD (which additionally includes the non-deterministic \
+               `enc_header`) follow the exact same determinism boundary as v1 — see that fixture's \
+               `note` field. Construction: docs/adr/0016-envelope-deniability.md, \
+               apps/crypto/src/ratchet.rs."
+            .into(),
+        initial_state: InitialStateV2 {
+            root_hex: hex::encode(root),
+            hk_ab_hex: hex::encode(hk_ab),
+            hk_ba_hex: hex::encode(hk_ba),
+            ad_hex: hex::encode(&ad),
+            baked_ad_hex: hex::encode(&baked_ad),
+            alice_dhs_priv_hex: hex::encode(alice_dhs_priv),
+            alice_dhs_pub_hex: hex::encode(alice_dhs_pub),
+            bob_dhs_priv_hex: hex::encode(bob_dhs_priv),
+            bob_dhs_pub_hex: hex::encode(bob_dhs_pub),
+            alice_initial_root_hex: hex::encode(alice_root0),
+            alice_initial_cks_hex: hex::encode(alice_cks0),
+            alice_initial_nhks_hex: hex::encode(alice_nhks0),
+        },
+        transcript,
+        header_round_trip: HeaderRoundTripV2 {
+            note: "header_seal draws a random nonce, so ciphertext is never pinned. A conforming \
+                   implementation must satisfy: header_open(hk, header_seal(hk, header)) == \
+                   Some(header) for these fixed inputs."
+                .into(),
+            hk_hex: hex::encode(hk_ab),
+            header_plaintext_hex: hex::encode(encode_header_for_vector(&bob_dhs_pub, 0, 0)),
+        },
+    };
+
+    super::write_json(&super::vector_path("ratchet-v2.json"), &fixtures)
 }
