@@ -108,14 +108,19 @@ evaporate:
   GitHub's branch-protection/ruleset config. 3.12 landed the pre-merge docker build gate itself but
   left this one sub-item open by design rather than guessing; check GitHub Settings → Branches/
   Rulesets and update that doc's `TODO: confirm` once observed.
-- **`PrekeyVault::establish_responder_session_provisional`'s peeked SPK/OTK secrets aren't
-  `Zeroizing`-wrapped** (task 6.3's security-reviewer, should-fix, not blocking) — plain `[u8;32]`
-  stack copies, mirroring the pre-existing `spk_secret_for`/`take_otk_secret` pattern, so not a
-  regression 6.3 introduced. But envelope v2's commit-on-decrypt (C2) makes this unscrubbed-copy path
-  routinely attacker-triggerable (every mutated preamble/ciphertext takes it now, not just legitimate
-  publishes). Short-lived stack memory, never logged/persisted, so non-blocking — but no open task
-  currently owns `apps/core/src/chat.rs`'s `PrekeyVault` secret-handling to pick this up; flag for
-  whoever next touches that code or for a future `/plan-phase`.
+- **RESOLVED for its declared scope (Phase 7, task 7.2), residual now carried forward:**
+  `PrekeyVault::establish_responder_session_provisional`'s peeked SPK/OTK secrets (flagged by task
+  6.3's security-reviewer) are now `Zeroizing`-wrapped in `apps/core/src/chat.rs` at the point of
+  receipt (F3/F4, [phase-7/7.2](./phase-7/7.2-zeroize-otk-spk-secret-copies.md)). But 7.2's own
+  reviewer found the fix only protects the secret up to the `Session::respond` call boundary: that
+  function and `x3dh::respond` (`apps/crypto/src/session.rs`/`apps/crypto/src/x3dh.rs`) take
+  `opk_secret: Option<[u8; 32]>` **by value**, unchanged by 7.2 (out of its declared `chat.rs`-only
+  scope), so the OTK secret still crosses into and through the crypto layer as a fresh, unzeroized,
+  plain-`Option` duplicate before being dropped. Short-lived stack memory, never logged/persisted, so
+  still non-blocking — but no open task owns `apps/crypto`'s `Session::respond`/`x3dh::respond`
+  signatures to close this end-to-end (e.g. take `Option<&[u8;32]>` matching `spk_secret`'s
+  already-by-reference pattern, or wrap internally in `Zeroizing`). Flag for whoever next touches
+  that boundary or for a future `/plan-phase`.
 - **A devops-owned server-side SPK-staleness metric/alert is still unbuilt** (task 6.2's Decision 2,
   architect-reviewed) — client-side enforcement + local warning (task 6.2) satisfies ADR 0016 C1's
   "monitored" obligation for now, but an operator-side view independent of any single client's own
@@ -439,7 +444,7 @@ ratification. Verdict: **blocked until F1 resolved**, then green for the next bu
 6 fix-tasks planned (7.1 pairs F1+F2, 7.2 pairs F3+F4, 7.3–7.6 cover F5/F6/F7/N1 individually; N2
 deferred to a future `/plan-phase`, not converted here).
 - [x] **7.1** Flag-day hard-reject test coverage (F1, F2) — [file](./phase-7/7.1-flag-day-hard-reject-coverage.md)
-- [~] **7.2** Zeroize discarded/peeked OTK and SPK secret copies (F3, F4) — [file](./phase-7/7.2-zeroize-otk-spk-secret-copies.md)
+- [x] **7.2** Zeroize discarded/peeked OTK and SPK secret copies (F3, F4) — [file](./phase-7/7.2-zeroize-otk-spk-secret-copies.md)
 - [ ] **7.3** Stale v1-signature prose in `route_tamper.rs` (F5) — [file](./phase-7/7.3-route-tamper-stale-signature-prose.md)
 - [ ] **7.4** Property test for `eid` dedup bound + duplicate detection (F6) — [file](./phase-7/7.4-eid-dedup-property-test.md)
 - [ ] **7.5** Boundary-case conformance vectors for `envelope-v2.json` (F7) — [file](./phase-7/7.5-envelope-v2-boundary-vectors.md)

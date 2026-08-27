@@ -31,7 +31,7 @@ use meridian_envelope::{
 };
 use meridian_identity::{KeyHandle, SecretStore};
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Errors from the chat session manager.
 #[derive(Debug, thiserror::Error)]
@@ -1809,16 +1809,17 @@ impl ChatState {
             used_spk: prekey.used_spk,
             used_opk: prekey.used_opk,
         };
-        let spk_secret = self
-            .vault
-            .peek_spk_secret(&prekey.used_spk)
-            .ok_or(ChatError::UnknownPrekey)?;
-        let opk_secret = match prekey.used_opk {
-            Some(opk) => Some(
+        let spk_secret: Zeroizing<[u8; 32]> = Zeroizing::new(
+            self.vault
+                .peek_spk_secret(&prekey.used_spk)
+                .ok_or(ChatError::UnknownPrekey)?,
+        );
+        let opk_secret: Option<Zeroizing<[u8; 32]>> = match prekey.used_opk {
+            Some(opk) => Some(Zeroizing::new(
                 self.vault
                     .peek_otk_secret(&opk)
                     .ok_or(ChatError::UnknownPrekey)?,
-            ),
+            )),
             None => None,
         };
         Ok(Session::respond(
@@ -1828,7 +1829,10 @@ impl ChatState {
             peer_ik,
             &material,
             &spk_secret,
-            opk_secret,
+            // `Session::respond` needs an owned `Option<[u8; 32]>`; copy the bytes out of the
+            // `Zeroizing` wrapper (itself still zeroized on drop at the end of this scope) rather
+            // than unwrapping it, so the wrapper keeps clearing its own stack copy.
+            opk_secret.as_ref().map(|z| **z),
         )?)
     }
 
@@ -1846,7 +1850,9 @@ impl ChatState {
     /// expects to exercise.
     fn commit_responder_otk(&mut self, prekey: &Prekey) {
         if let Some(opk) = prekey.used_opk {
-            let _ = self.vault.take_otk_secret(&opk);
+            if let Some(mut secret) = self.vault.take_otk_secret(&opk) {
+                secret.zeroize();
+            }
         }
     }
 
