@@ -179,7 +179,7 @@ RS
   fi
   rm -rf "$ml_dir"
   echo "-- selftest: expect PASS on the real tree (no false positives on legitimate decodes) --"
-  if ! lint_paths apps/proto apps/rendezvous; then
+  if ! lint_paths apps/proto apps/rendezvous apps/admin; then
     echo "SELFTEST FAILED: lint has false positives on the clean tree."
     exit 1
   fi
@@ -187,7 +187,7 @@ RS
   exit 0
 fi
 
-if lint_paths apps/proto apps/rendezvous; then
+if lint_paths apps/proto apps/rendezvous apps/admin; then
   FAIL=0
 else
   FAIL=$?

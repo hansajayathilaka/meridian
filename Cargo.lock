@@ -2681,6 +2681,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "meridian-admin"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "hex",
+ "meridian-rendezvous",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "meridian-cli"
 version = "0.0.0"
 dependencies = [
