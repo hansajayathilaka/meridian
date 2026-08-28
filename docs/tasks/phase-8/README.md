@@ -4,7 +4,7 @@
 
 # Phase 8 — Offline Ciphertext Mailbox
 
-**Kind:** build · **Status:** in progress · **Reviews phase(s):** n/a (build phase)
+**Kind:** build · **Status:** closed — 17/17 tasks done (8.1–8.17) · **Reviews phase(s):** n/a (build phase)
 
 ## Goal
 Ship **[T07 — Offline Ciphertext Mailbox](../../architecture/features/07-offline-mailbox.md)**: deliver
@@ -127,13 +127,23 @@ cross-federation acceptance test (8.13) and the phase-exit demo (8.14) come last
 - [x] **8.15** Client surfaces the mailbox-queued outcome (fix-task found during 8.14's live demo prep; depends on 8.5, 8.6) — [file](./8.15-client-surfaces-mailbox-queued-outcome.md)
 - [x] **8.16** `meridian register` persists its published bundle's prekey secrets (fix-task found during 8.14's live demo) — [file](./8.16-cli-register-persists-prekey-secrets.md)
 - [x] **8.17** Mailbox-drained messages arriving before a first-contact request is accepted must not be silently lost (fix-task found during 8.14's live demo; depends on 8.7, 8.8) — [file](./8.17-mailbox-ack-must-not-swallow-pending-request-messages.md)
-- [ ] **8.14** Phase exit: full demo script + doc sync (depends on 8.1–8.13, 8.15–8.17) — [file](./8.14-phase-exit-mailbox-demo.md)
+- [x] **8.14** Phase exit: full demo script + doc sync (depends on 8.1–8.13, 8.15–8.17) — [file](./8.14-phase-exit-mailbox-demo.md)
 
 ## Exit criteria
-Phase 8 is done when every task is `[x]`, the tree is green (`cargo build --workspace`, `cargo fmt
---check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run`), docs are synced,
-and the feature spec's acceptance demo runs end-to-end: TTL-bounded/size-capped mailbox delivery on
-reconnect, ordered + ratchet-intact decryption of queued envelopes, deletion-on-acknowledged-delivery,
-`meridian-admin mailbox dump` showing only opaque ciphertext (the A7 honesty demo), quota-exceeded
-surfaced to the sender, `TTL=0` genuinely disabling the store, and it working across federation (Org A
-sender → Org B mailbox). Then the next command is `/start-review-phase`.
+**Met — Phase 8 closed.** All 17 tasks (8.1–8.17) are `[x]`. The tree is green (`cargo build
+--workspace --all-targets --features sqlite`, `cargo fmt --check`, `cargo clippy --workspace
+--all-targets --features sqlite -- -D warnings`, full `cargo test --workspace --all-targets --features
+sqlite` — 1125 tests across 112 binaries, zero failures), docs are synced (see
+[8.14's Status section](./8.14-phase-exit-mailbox-demo.md#status) and
+[8.14's demo transcript](./8.14-demo-transcript.md)), and the feature spec's acceptance demo ran
+end-to-end: TTL-bounded/size-capped mailbox delivery on reconnect, ordered + ratchet-intact decryption
+of queued envelopes, deletion-on-acknowledged-delivery, `meridian-admin mailbox dump` showing only
+opaque ciphertext (the A7 honesty demo), quota-exceeded surfaced to the sender, `TTL=0` genuinely
+disabling the store, and it working across federation (Org A sender → Org B mailbox, with the
+sender-optimistic-ack framing correction demonstrated live per the phase's architect consult point 2).
+Two real defects found during the live demo were fixed and landed as their own reviewed tasks (8.16,
+8.17) before the exit demo was re-run clean — matching this project's established phase-exit
+discipline (phases 4/6/7). One structural, non-defect finding (a brand-new contact's queued burst
+needs two reconnects to fully arrive) is recorded in 8.14's and 8.17's Status sections as a bounded,
+correctly-understood property, with an on-demand-re-drain-after-accept enhancement noted as future
+backlog, out of this phase's scope. Next command: `/start-review-phase`.

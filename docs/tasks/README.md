@@ -130,10 +130,22 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   pre-existing correctness gap found along the way: `handle_fed_route` today silently drops an
   envelope to an offline federated recipient (`Ok(())` regardless of delivery) — T07 makes that
   durable instead of lossy. Full breakdown: [phase-8/README.md](./phase-8/README.md#tasks-todo).
-- **NEXT:** `/next-task` — work the 14 fix-tasks in dependency-wave order (8.1/8.3 first, both
-  independent). The Phase-1 adversarial frontier remains an unowned carry-forward for a future
-  `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08 residuals are Phase-4-scoped
-  follow-ups and stay listed below for a future phase.
+- **NOW:** **Phase 8 (Offline Ciphertext Mailbox) closed — 17/17 tasks done** (8.1–8.13, 8.15–8.17;
+  8.14 was the phase-exit demo + doc sync). Three fix-tasks (8.15, 8.16, 8.17) were opened and landed
+  mid-phase after 8.14's live demo prep found real gaps — a client-visible copy gap for the
+  optimistic-ack framing (8.15), `meridian register` discarding its own published prekey secrets
+  (8.16), and mailbox-drained messages silently lost when they arrived before a first-contact request
+  was accepted (8.17) — each fixed, reviewed PASS with zero blocking findings, and landed as its own
+  commit before the exit demo was re-run clean. Full acceptance demo (same-server + cross-federation,
+  with the sender-optimistic-ack framing correction demonstrated live) ran end-to-end; transcript:
+  [phase-8/8.14-demo-transcript.md](./phase-8/8.14-demo-transcript.md). Tree green throughout
+  (`cargo build --workspace`, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D
+  warnings`, full test suite — 1125 tests across 112 binaries, zero failures). Full closure summary:
+  [phase-8/README.md](./phase-8/README.md#exit-criteria).
+- **NEXT:** `/start-review-phase` — sweep Phase 8 for bugs/gaps/loopholes before T14 becomes pickable.
+  The Phase-1 adversarial frontier remains an unowned carry-forward for a future `/plan-phase` if
+  capacity allows; the six Phase-4-named TUI/T08 residuals are Phase-4-scoped follow-ups and stay
+  listed below for a future phase.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -540,7 +552,7 @@ converted, deferred to a future `/plan-phase` per the report's own verdict. Tree
 - [x] **7.5** Boundary-case conformance vectors for `envelope-v2.json` (F7) — [file](./phase-7/7.5-envelope-v2-boundary-vectors.md)
 - [x] **7.6** Resolve the `eid`/mailbox naming collision before T07 planning (N1) — [file](./phase-7/7.6-eid-mailbox-naming-collision-note.md)
 
-### Phase 8 — Offline Ciphertext Mailbox · **in progress** · [details](./phase-8/README.md)
+### Phase 8 — Offline Ciphertext Mailbox · **closed — 17/17 done** · [details](./phase-8/README.md)
 Build phase. **[T07 — Offline Ciphertext Mailbox](../architecture/features/07-offline-mailbox.md)**
 alone: TTL-bounded, size-capped, ciphertext-only mailbox on the recipient's home rendezvous (ADR 0007),
 with deletion-on-acknowledged-delivery, per-recipient quota, cross-federation delivery, and the
@@ -577,7 +589,7 @@ wire-protocol questions T07 raises before any task started; full record and brea
 - [x] **8.15** Client surfaces the mailbox-queued outcome (fix-task found during 8.14's live demo prep) — [file](./phase-8/8.15-client-surfaces-mailbox-queued-outcome.md)
 - [x] **8.16** `meridian register` persists its published bundle's prekey secrets (fix-task found during 8.14's live demo) — [file](./phase-8/8.16-cli-register-persists-prekey-secrets.md)
 - [x] **8.17** Mailbox-drained messages arriving before a first-contact request is accepted must not be silently lost (fix-task found during 8.14's live demo) — [file](./phase-8/8.17-mailbox-ack-must-not-swallow-pending-request-messages.md)
-- [ ] **8.14** Phase exit: full demo script + doc sync — [file](./phase-8/8.14-phase-exit-mailbox-demo.md)
+- [x] **8.14** Phase exit: full demo script + doc sync — [file](./phase-8/8.14-phase-exit-mailbox-demo.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
