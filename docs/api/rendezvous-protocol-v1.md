@@ -159,6 +159,11 @@ urls = [                         # the candidate ladder, preference order
   "turns:127.0.0.1:443?transport=tcp",
 ]
 ttl_secs = 120                   # credential lifetime (short); reuse bounded by coturn user-quota
+
+[mailbox]                        # offline ciphertext mailbox (T07, ADR 0007) — see §4
+ttl_days = 14                    # 0 disables the mailbox entirely (pure-P2P mode)
+quota_mb = 50                    # per-recipient quota, in MiB -- TODO: confirm (no design-doc default)
+purge_interval_secs = 3600       # how often the expired-row purge job sweeps (task 8.9)
 ```
 
 ## 6. Metrics

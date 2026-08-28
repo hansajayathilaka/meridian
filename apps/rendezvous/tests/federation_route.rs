@@ -316,6 +316,7 @@ async fn federated_route_to_offline_recipient_over_quota_is_rejected() {
     let mailbox = Mailbox {
         ttl_days: 14,
         quota_mb: 0, // any non-empty enqueue immediately exceeds a zero quota
+        ..Mailbox::default()
     };
     let bob = [0x44u8; 32];
     let req = FedRoute {

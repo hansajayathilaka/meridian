@@ -15,6 +15,7 @@ pub mod config;
 /// proxy/VIP (ADR 0017 C7). See `federation::mod` for the full scope boundary.
 pub mod federation;
 pub mod logid;
+pub mod mailbox_purge;
 pub mod metrics;
 pub mod ratelimit;
 /// TEST HOOK (task 1.32): malicious-relay attacks on the routed path that pass the envelope
