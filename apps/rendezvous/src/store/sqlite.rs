@@ -25,6 +25,13 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    /// Uses sqlx's default `journal_mode` (`DELETE`), not WAL — deliberately never call
+    /// `.journal_mode(SqliteJournalMode::Wal)` here without also checking
+    /// `apps/cli/src/opacity.rs::run_mailbox_at_rest_audit` (task 8.12): that audit reads the raw
+    /// `.db` file directly via `std::fs::read` after a single autocommit insert, which only sees
+    /// recent writes because they land synchronously in the main file under `DELETE` mode. Under
+    /// WAL, a fresh write can live in a separate `<path>-wal` side file the audit never scans,
+    /// letting an at-rest plaintext leak pass the audit vacuously.
     pub async fn connect(url: &str) -> StoreResult<Self> {
         let opts: SqliteConnectOptions = url.parse().map_err(backend)?;
         let opts = opts.create_if_missing(true);

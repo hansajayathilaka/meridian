@@ -566,7 +566,7 @@ wire-protocol questions T07 raises before any task started; full record and brea
 - [x] **8.7** Delivery-on-reconnect push + `MailboxAck` handling, server side — [file](./phase-8/8.7-mailbox-delivery-reconnect-ack.md)
 - [x] **8.9** TTL expiry purge job — [file](./phase-8/8.9-mailbox-ttl-purge-job.md)
 - [x] **8.11** `meridian-admin mailbox dump <pubkey>` — [file](./phase-8/8.11-meridian-admin-mailbox-dump.md)
-- [ ] **8.12** Opacity/at-rest audit extension for mailbox rows — [file](./phase-8/8.12-opacity-audit-mailbox-rows.md)
+- [x] **8.12** Opacity/at-rest audit extension for mailbox rows — [file](./phase-8/8.12-opacity-audit-mailbox-rows.md)
 
 **Wave 5**
 - [ ] **8.8** Client-side `MailboxAck` send + redelivery-dedup confirmation — [file](./phase-8/8.8-client-mailbox-ack-dedup.md)

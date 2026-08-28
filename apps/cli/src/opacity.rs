@@ -410,6 +410,132 @@ pub fn run_federated_audit(rounds: usize) -> Result<AuditReport, String> {
     })
 }
 
+/// Task 8.12: at-rest opacity audit for **mailbox rows** (the offline ciphertext mailbox, T07 —
+/// `apps/rendezvous/src/store/sqlite.rs`'s `mailbox` table, task 8.2).
+///
+/// The task file's literal Scope ("extend the existing per-table raw-page scanner... the same
+/// technique the harness already applies to other tables") does not match this codebase: there is
+/// no `prekeys`/`device_records` table, and no existing raw-DB-page scanner anywhere — [`run_audit`]
+/// above is the only precedent, and it scans a **wire transcript**, not on-disk bytes. This function
+/// applies [`run_audit`]'s technique (seal a real envelope carrying an unmistakable marker, then
+/// scan captured bytes for it) to the genuinely new "at rest" case instead: a real, file-backed
+/// `SqliteStore` (task 8.2), read back as raw file bytes exactly as an admin with filesystem access
+/// would see them (threat A7).
+///
+/// Also proves the header-encryption claim (Double Ratchet's encrypted-headers variant,
+/// system-design §4.3) holds for a **mailbox-queued** envelope exactly as [`run_audit`]'s own probe
+/// already proves it for a live-routed one: two identical-content envelopes are sealed and enqueued,
+/// and their stored blobs (read back via `Store::mailbox_list_for_recipient`, not merely the
+/// in-memory bytes we sent in) must differ.
+///
+/// `#[cfg(test)]`-only, unlike [`run_audit`]/[`run_federated_audit`] above: it needs a real
+/// `SqliteStore`, and `meridian-rendezvous` is only a dev-dependency of this crate
+/// (`apps/cli/Cargo.toml`, `sqlite` feature) — never linked into the release `meridian` binary.
+#[cfg(test)]
+async fn run_mailbox_at_rest_audit() -> Result<AuditReport, String> {
+    use meridian_rendezvous::store::SqliteStore;
+    use meridian_rendezvous::Store;
+
+    let marker = b"AT-REST-SECRET-DO-NOT-LEAK-TO-DISK".to_vec();
+
+    let mut alice = Party::new("at-rest.a");
+    let mut bob = Party::new("at-rest.b");
+    let (alice_ik, bob_ik) = (alice.ik(), bob.ik());
+
+    let bob_bundle = generate_bundle(&bob.store, &bob.handle(), bob_ik, 10)
+        .map_err(|e| format!("generate_bundle: {e}"))?;
+    let otks: Vec<([u8; 32], [u8; 32])> = bob_bundle
+        .bundle
+        .otks
+        .iter()
+        .zip(bob_bundle.otk_secrets.iter())
+        .map(|(p, s)| (*p, **s))
+        .collect();
+    bob.state.vault.set_bundle(
+        bob_bundle.bundle.spk,
+        *bob_bundle.spk_secret,
+        otks,
+        crate::now_unix(),
+    );
+    alice
+        .state
+        .start_initiator_session(
+            &alice.store,
+            &alice.handle(),
+            &alice_ik,
+            &bob_ik,
+            &bob_bundle.bundle.spk,
+            bob_bundle.bundle.otks.first().copied(),
+        )
+        .map_err(|e| format!("start_initiator_session: {e}"))?;
+
+    // Two REAL sealed envelopes carrying IDENTICAL content — the header-encryption probe, adapted
+    // to the mailbox-queued case (mirrors run_audit's "equal plaintext ⇒ different ciphertext").
+    let content = ChatContent::Text {
+        id: [0xA1u8; 16],
+        body: String::from_utf8(marker.clone()).expect("marker is valid utf8"),
+    };
+    let blob1 = alice.seal(&bob_ik, &content);
+    let blob2 = alice.seal(&bob_ik, &content);
+
+    let now = crate::now_unix();
+    let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+    let db_path = dir.path().join("mailbox-at-rest-audit.db");
+    let url = format!("sqlite://{}", db_path.display());
+
+    let stored = {
+        // Scoped so the `SqliteStore` (and its `SqlitePool`) is dropped — closing the connection —
+        // before we read the file's raw bytes below.
+        let store = SqliteStore::connect(&url)
+            .await
+            .map_err(|e| format!("SqliteStore::connect: {e}"))?;
+        let id1 = store
+            .mailbox_enqueue(bob_ik, blob1.clone(), now, now + 3600)
+            .await
+            .map_err(|e| format!("mailbox_enqueue: {e}"))?;
+        let id2 = store
+            .mailbox_enqueue(bob_ik, blob2.clone(), now, now + 3600)
+            .await
+            .map_err(|e| format!("mailbox_enqueue: {e}"))?;
+        let mut entries = store
+            .mailbox_list_for_recipient(&bob_ik)
+            .await
+            .map_err(|e| format!("mailbox_list_for_recipient: {e}"))?;
+        entries.retain(|e| e.id == id1 || e.id == id2);
+        entries
+    };
+
+    if stored.len() != 2 {
+        return Err(format!(
+            "expected 2 stored mailbox rows for the recipient, found {}",
+            stored.len()
+        ));
+    }
+    if stored[0].blob == stored[1].blob {
+        return Err(
+            "header/counter leak: two identical-content mailbox-queued envelopes stored \
+             identical blobs"
+                .into(),
+        );
+    }
+
+    let raw = std::fs::read(&db_path).map_err(|e| format!("read mailbox db file: {e}"))?;
+
+    if contains(&raw, &marker) {
+        return Err(format!(
+            "at-rest plaintext leak: marker string found in raw mailbox .db bytes ({} bytes scanned)",
+            raw.len()
+        ));
+    }
+
+    Ok(AuditReport {
+        envelopes: 2,
+        leaks: 0,
+        // Repurposed for this at-rest case: the raw on-disk `.db` file bytes, not a wire transcript.
+        transcript: raw,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +578,59 @@ mod tests {
         assert!(
             contains(&fed_transcript, &secret),
             "the scan must be able to see a leak that ONLY appears in the federated transcript"
+        );
+    }
+
+    /// Task 8.12: opacity audit coverage for **mailbox rows** — the at-rest counterpart to
+    /// [`opacity_audit_passes`] above. See [`run_mailbox_at_rest_audit`]'s doc comment for why this
+    /// is a genuinely new check, not an extension of an existing per-table scanner.
+    #[tokio::test]
+    async fn mailbox_at_rest_audit_passes() {
+        let report = run_mailbox_at_rest_audit()
+            .await
+            .expect("mailbox at-rest audit must pass");
+        assert_eq!(report.leaks, 0);
+        assert_eq!(report.envelopes, 2);
+        assert!(!report.transcript.is_empty());
+    }
+
+    /// Non-vacuity (task 8.12 deliverable 2, this task's load-bearing part per its own Risks
+    /// section — matching the discipline 7.4/8.9 already established): prove the at-rest scan
+    /// actually detects a planted-plaintext regression, using the SAME mechanism
+    /// [`run_mailbox_at_rest_audit`] relies on (a real, file-backed `SqliteStore`, read back as raw
+    /// bytes off disk, scanned with the same [`contains`] helper) — not merely the in-memory
+    /// `contains` unit check `federated_opacity_scan_is_sensitive_to_a_fed_only_leak` already does
+    /// for the federated case above.
+    ///
+    /// The planted row bypasses sealing entirely — it calls the general-purpose, production
+    /// `Store::mailbox_enqueue` directly with a raw, literally-unencrypted blob, skipping the
+    /// client-side sealing step a real caller always performs first — simulating what a real
+    /// header-encryption/opacity regression in the mailbox storage path would actually look like.
+    #[tokio::test]
+    async fn mailbox_at_rest_audit_catches_a_planted_plaintext_regression() {
+        use meridian_rendezvous::store::SqliteStore;
+        use meridian_rendezvous::Store;
+
+        let planted = b"PLANTED-PLAINTEXT-MARKER".to_vec();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("planted-plaintext.db");
+        let url = format!("sqlite://{}", db_path.display());
+
+        {
+            // Dropped at the end of this block, closing the connection before the raw read below.
+            let store = SqliteStore::connect(&url).await.expect("connect");
+            store
+                .mailbox_enqueue([0xEEu8; 32], planted.clone(), 0, 1_000_000)
+                .await
+                .expect("mailbox_enqueue");
+        }
+
+        let raw = std::fs::read(&db_path).expect("read mailbox db file");
+        assert!(
+            contains(&raw, &planted),
+            "non-vacuity failure: the at-rest scan must detect a literally-unencrypted mailbox \
+             row planted directly via mailbox_enqueue's test-only path — if this assertion can't \
+             be made to fail, the scan proves nothing"
         );
     }
 }
