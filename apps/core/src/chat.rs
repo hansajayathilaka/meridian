@@ -1458,7 +1458,27 @@ impl ChatState {
         from: &[u8; 32],
         blob: &[u8],
     ) -> Result<ChatContent, ChatError> {
-        self.open_inbound_gated(store, handle, our_ik, from, blob, false)
+        self.open_inbound_gated(store, handle, our_ik, from, blob, false, false)
+    }
+
+    /// (task 8.8, ADR 0024) Like [`open_inbound`](Self::open_inbound), but for a **mailbox-drained**
+    /// [`Deliver`](meridian_proto::Deliver) (`mailbox_id.is_some()`, task 8.7): `from` is the
+    /// server's `[0u8; 32]` placeholder, never a real routing-layer identity, so the
+    /// `envelope.sender_pub != from` defense-in-depth check is skipped — see
+    /// [`open_bytes`](Self::open_bytes)'s own doc comment for the full reasoning. Callers must use
+    /// this instead of [`open_inbound`](Self::open_inbound) precisely when, and only when,
+    /// `deliver.mailbox_id.is_some()`; every live or federated-live delivery
+    /// (`mailbox_id: None`) keeps going through the ordinary [`open_inbound`](Self::open_inbound),
+    /// which still performs today's exact sender check, unweakened.
+    pub fn open_inbound_from_mailbox(
+        &mut self,
+        store: &dyn SecretStore,
+        handle: &KeyHandle,
+        our_ik: &[u8; 32],
+        from: &[u8; 32],
+        blob: &[u8],
+    ) -> Result<ChatContent, ChatError> {
+        self.open_inbound_gated(store, handle, our_ik, from, blob, false, true)
     }
 
     /// (task 2.14) Like [`open_inbound`](Self::open_inbound), but lets the caller assert that this
@@ -1486,6 +1506,7 @@ impl ChatState {
     /// [`open_bytes`] has decrypted the envelope (and, on first contact, completed X3DH) — gating
     /// is delivery-only, never a crypto shortcut, and a rejected first contact still costs whatever
     /// handshake material (e.g. a one-time prekey) it consumed on the way to a successful decrypt.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_inbound_gated(
         &mut self,
         store: &dyn SecretStore,
@@ -1494,13 +1515,29 @@ impl ChatState {
         from: &[u8; 32],
         blob: &[u8],
         force_first_contact: bool,
+        mailbox_drained: bool,
     ) -> Result<ChatContent, ChatError> {
+        // (task 8.8, ADR 0024) Every piece of *local bookkeeping* below (the pending-request gate,
+        // first-contact detection, and the queued request's own key) is keyed by
+        // `envelope.sender_pub`, never the routing-layer `from` — on the live path the two are
+        // enforced equal by `open_bytes`'s own check below, so this is behaviorally identical
+        // there; on a mailbox-drained path `from` is only the server's `[0u8; 32]` placeholder and
+        // carries no identity information at all, so keying bookkeeping off it would silently
+        // misfile every mailbox-drained first contact under the same meaningless zero key instead
+        // of the real sender. This decode is the same cheap, non-cryptographic parse `open_bytes`
+        // performs a moment later on its own copy of `blob` — reading `sender_pub` this early is
+        // safe precisely because nothing here is trusted as *authenticated* until `open_bytes`
+        // below actually succeeds: a forged `sender_pub` at this stage can only cause a wrong map
+        // lookup, never a state mutation, since nothing downstream commits before a successful
+        // AEAD decrypt.
+        let sender_pub = MessageEnvelope::from_blob(blob)?.sender_pub;
+
         // A sender with an undecided pending request is refused outright, before touching crypto
         // state at all: their first envelope already ran X3DH and installed the session (and the
         // OTK-consumption cost above), so there is nothing further to establish, and refusing here
         // means a still-gated sender cannot force extra ratchet-skipped-key churn by re-sending
         // while awaiting a decision. Never merges into the existing request (task 2.10 deliverable).
-        if self.pending_requests.contains_key(from) {
+        if self.pending_requests.contains_key(&sender_pub) {
             return Err(ChatError::RequestPending);
         }
 
@@ -1510,9 +1547,9 @@ impl ChatState {
         // that already knows independently (2.14: `session.rs`) that this is first contact — even
         // though a session now sits in `self.sessions` from its own earlier handshake — forces the
         // gate to fire via `force_first_contact` regardless of that local presence check.
-        let is_first_contact = force_first_contact || !self.sessions.contains_key(from);
+        let is_first_contact = force_first_contact || !self.sessions.contains_key(&sender_pub);
 
-        let plaintext = self.open_bytes(store, handle, our_ik, from, blob)?;
+        let plaintext = self.open_bytes(store, handle, our_ik, from, blob, mailbox_drained)?;
         let content = ChatContent::decode(&plaintext)?;
 
         if is_first_contact {
@@ -1520,15 +1557,15 @@ impl ChatState {
             // delivering it. `unwrap_or_default` only guards a same-call race that cannot actually
             // happen (the session was just installed by `open_bytes`, above, under this same `&mut
             // self` borrow) — never a silent downgrade of a real safety-number mismatch.
-            let safety_number = self.safety_number(our_ik, from).unwrap_or_default();
+            let safety_number = self.safety_number(our_ik, &sender_pub).unwrap_or_default();
             // (task 3.10 / F5) Bound the intro's storage contribution before it ever lands in the
             // queue; `plaintext.len()` is the already-measured encoded size of `content`, so this
             // avoids a redundant re-encode purely to check it.
             let intro = cap_intro(content, plaintext.len());
             self.insert_pending_request(
-                *from,
+                sender_pub,
                 MessageRequest {
-                    sender_ik: *from,
+                    sender_ik: sender_pub,
                     safety_number,
                     intro,
                 },
@@ -1649,6 +1686,18 @@ impl ChatState {
     /// one — see [`ChatError::DuplicateEnvelope`]'s doc comment for the precise, narrow claim this
     /// check makes (a redelivery convenience, never a security boundary; ADR 0016 R2) and this task's
     /// Outcome section for the full design note.
+    ///
+    /// **(task 8.8, ADR 0024) `from` is not checked against `envelope.sender_pub` when
+    /// `mailbox_drained` is true.** A mailbox-drained [`Deliver`](meridian_proto::Deliver) carries
+    /// a fixed `[0u8; 32]` placeholder as `from` (`meridian_proto::MAILBOX_DRAIN_FROM_PLACEHOLDER`)
+    /// — never a real, persisted sender identity, per the server-side invariant ADR 0024 records
+    /// (never materialize a server-side contact graph). The server cannot honestly assert a routing
+    /// origin for a message it isn't relaying live, so this check — a defense-in-depth comparison
+    /// against a routing-layer claim, never the actual trust boundary — has nothing meaningful to
+    /// compare against on that path; authentication rests entirely on `envelope.sender_pub` plus
+    /// the ratchet AEAD succeeding, exactly as it always has for every other path. Every **live** or
+    /// federated-live call (`mailbox_drained: false`, from `session.rs`'s P2P substrate and
+    /// `open_inbound`'s ordinary relay path) keeps today's exact check, unchanged.
     pub fn open_bytes(
         &mut self,
         store: &dyn SecretStore,
@@ -1656,6 +1705,7 @@ impl ChatState {
         our_ik: &[u8; 32],
         from: &[u8; 32],
         blob: &[u8],
+        mailbox_drained: bool,
     ) -> Result<Vec<u8>, ChatError> {
         let envelope = MessageEnvelope::from_blob(blob)?;
         if envelope.v != ENVELOPE_VERSION {
@@ -1663,7 +1713,7 @@ impl ChatState {
             // `ChatError::UnsupportedEnvelopeVersion`'s own doc. Never a negotiated fallback.
             return Err(ChatError::UnsupportedEnvelopeVersion(envelope.v));
         }
-        if &envelope.sender_pub != from {
+        if !mailbox_drained && &envelope.sender_pub != from {
             return Err(ChatError::SenderMismatch);
         }
         // (task 6.4, ADR 0016 C7 second half) The eid dedup check — runs before ANY session lookup,

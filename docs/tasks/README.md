@@ -569,7 +569,7 @@ wire-protocol questions T07 raises before any task started; full record and brea
 - [x] **8.12** Opacity/at-rest audit extension for mailbox rows — [file](./phase-8/8.12-opacity-audit-mailbox-rows.md)
 
 **Wave 5**
-- [ ] **8.8** Client-side `MailboxAck` send + redelivery-dedup confirmation — [file](./phase-8/8.8-client-mailbox-ack-dedup.md)
+- [x] **8.8** Client-side `MailboxAck` send + redelivery-dedup confirmation — [file](./phase-8/8.8-client-mailbox-ack-dedup.md)
 - [ ] **8.10** X3DH-initial-message-via-mailbox coverage — [file](./phase-8/8.10-x3dh-initial-via-mailbox.md)
 
 **Wave 6 — acceptance + exit**

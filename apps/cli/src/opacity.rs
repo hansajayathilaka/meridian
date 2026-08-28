@@ -254,7 +254,14 @@ pub fn run_audit(rounds: usize) -> Result<AuditReport, String> {
     // envelope — not merely padding — while the server still saw only ciphertext.
     let opened = bob
         .state
-        .open_bytes(&bob.store, &bob.handle(), &bob_ik, &alice_ik, &offer_blob)
+        .open_bytes(
+            &bob.store,
+            &bob.handle(),
+            &bob_ik,
+            &alice_ik,
+            &offer_blob,
+            false,
+        )
         .expect("open offer");
     assert_eq!(SignalContent::decode(&opened).unwrap(), offer);
 

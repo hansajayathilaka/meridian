@@ -655,6 +655,7 @@ impl<T: Transport> P2pSession<T> {
                         &self.peer_ik,
                         &blob,
                         true,
+                        false,
                     ) {
                         Ok(content) => {
                             // Structurally unreachable while `force_first_contact` is `true` (that
@@ -805,7 +806,7 @@ impl<T: Transport> P2pSession<T> {
         chat: &mut ChatState,
         blob: &[u8],
     ) -> Result<CtrlFrame, SessionError> {
-        let plaintext = chat.open_bytes(store, handle, &self.our_ik, &self.peer_ik, blob)?;
+        let plaintext = chat.open_bytes(store, handle, &self.our_ik, &self.peer_ik, blob, false)?;
         match SignalContent::decode(&plaintext)? {
             SignalContent::Ctrl { frame } => Ok(CtrlFrame::decode(&frame)?),
             _ => Err(SessionError::UnexpectedSignal { phase: "ctrl" }),
@@ -1510,7 +1511,7 @@ async fn recv_sdp(
         if &from != peer_ik {
             continue; // not our peer; ignore
         }
-        let plaintext = chat.open_bytes(store, handle, our_ik, peer_ik, &blob)?;
+        let plaintext = chat.open_bytes(store, handle, our_ik, peer_ik, &blob, false)?;
         match SignalContent::decode(&plaintext)? {
             SignalContent::SdpOffer { sdp, dtls_fp, ice } if want_offer => {
                 return Ok((sdp, dtls_fp, ice))

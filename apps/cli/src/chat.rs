@@ -366,6 +366,17 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
         }
         save_state(&state, store, handle)?;
         save_trust(&trust, store, handle)?;
+        // (task 8.8, ADR 0024) Flush any mailbox row id `client.next_deliver()` accumulated this
+        // iteration — never before `save_state` above has durably persisted whatever this
+        // delivery's `handle_inbound` call mutated. `?` on `save_state`/`save_trust` above already
+        // ends this loop before reaching here on a write failure, so an ack is only ever sent once
+        // processing genuinely made it to disk — matches
+        // `apps/tui/src/worker.rs::process_inbound_delivery`'s identical `persisted`-gated
+        // reasoning. A no-op (no network I/O) on every iteration that wasn't a `next_deliver`
+        // branch, or that delivered a live (non-mailbox) envelope — best-effort like every other
+        // network call in this loop (`route_tolerant`'s own pattern): a failed ack just means the
+        // row gets redrained (and harmlessly re-processed, per `eid` dedup) on the next reconnect.
+        let _ = client.ack_pending_mailbox().await;
     }
 
     save_state(&state, store, handle)?;
@@ -752,13 +763,58 @@ async fn handle_inbound(
     // retirement.
     state.expire_previous_generation(crate::now_unix());
 
-    match state.open_inbound(
-        store,
-        handle,
-        account_pub,
-        &deliver.from,
-        deliver.blob.as_bytes(),
-    ) {
+    // (task 8.8, review finding 1 — blocking) `deliver.from` is the wire value ChatState's own
+    // sender check consumes, but it is NOT the real peer identity for a mailbox-drained push: it
+    // is always `MAILBOX_DRAIN_FROM_PLACEHOLDER`. Everything below that treats "the sender" as an
+    // identity — the message-request lookup, `deliver_content`'s display/routing target, and
+    // `maybe_attempt_recovery`'s peer gating — needs the REAL sender, or (as verified: this used
+    // to panic on `pending_request(&deliver.from).expect(...)` for a mailbox-drained first
+    // contact, and crash the whole process via `seal_outbound`'s unguarded `?` on `NoSession` for
+    // a mailbox-drained continuation message from an existing session) this misbehaves outright.
+    // `effective_from` is the real identity: for a mailbox-drained delivery, `envelope.sender_pub`,
+    // read via the same cheap, non-cryptographic parse `open_bytes`/`open_inbound_gated` already
+    // perform on their own copy of `blob` — safe to read before authentication succeeds for
+    // exactly the reason `open_inbound_gated`'s own early decode is safe (see that method's doc
+    // comment): it can only affect map lookups and routing here, never a state mutation, since
+    // nothing commits before `open_inbound_from_mailbox`'s own successful AEAD decrypt. A blob too
+    // malformed to parse falls back to `deliver.from` — harmless, since `open_inbound_from_mailbox`
+    // will independently fail to decode it too, landing in the catch-all `Err(e)` arm below, which
+    // never uses `effective_from`.
+    let effective_from = if deliver.mailbox_id.is_some() {
+        meridian_core::envelope::MessageEnvelope::from_blob(deliver.blob.as_bytes())
+            .map(|env| env.sender_pub)
+            .unwrap_or(deliver.from)
+    } else {
+        deliver.from
+    };
+
+    // (task 8.8, ADR 0024) A mailbox-drained push (`mailbox_id.is_some()`, task 8.7) carries the
+    // `[0u8; 32]` `from` placeholder, never a real routing-layer identity —
+    // `open_inbound_from_mailbox` authenticates via `envelope.sender_pub` alone instead of
+    // comparing against it. Every live/federated-live delivery (`mailbox_id: None`) keeps going
+    // through the ordinary `open_inbound`, unchanged. This call still passes the literal
+    // `deliver.from` (the placeholder, on a mailbox-drained push) — not `effective_from` — since
+    // that parameter is the wire value the sender-mismatch check itself reasons about (and
+    // ignores, on this path); `effective_from` is for every OTHER use of "the peer's identity"
+    // below.
+    let open_result = if deliver.mailbox_id.is_some() {
+        state.open_inbound_from_mailbox(
+            store,
+            handle,
+            account_pub,
+            &deliver.from,
+            deliver.blob.as_bytes(),
+        )
+    } else {
+        state.open_inbound(
+            store,
+            handle,
+            account_pub,
+            &deliver.from,
+            deliver.blob.as_bytes(),
+        )
+    };
+    match open_result {
         Ok(content) => {
             deliver_content(
                 client,
@@ -767,7 +823,7 @@ async fn handle_inbound(
                 store,
                 handle,
                 account_pub,
-                &deliver.from,
+                &effective_from,
                 peer_hint,
                 peer_label,
                 json,
@@ -784,7 +840,7 @@ async fn handle_inbound(
         // "message request from mrd1:<alice>… — accept? y".
         Err(ChatError::MessageRequest) => {
             let req = state
-                .pending_request(&deliver.from)
+                .pending_request(&effective_from)
                 .expect("open_inbound just inserted this request");
             if json {
                 println!(
@@ -825,7 +881,7 @@ async fn handle_inbound(
                 store,
                 handle,
                 account_pub,
-                &deliver.from,
+                &effective_from,
                 peer_hint,
                 peer_label,
                 json,

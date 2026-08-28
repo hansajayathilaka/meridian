@@ -119,7 +119,7 @@ cross-federation acceptance test (8.13) and the phase-exit demo (8.14) come last
 - [x] **8.12** Opacity/at-rest audit extension for mailbox rows (depends on 8.2) — [file](./8.12-opacity-audit-mailbox-rows.md)
 
 **Wave 5**
-- [ ] **8.8** Client-side `MailboxAck` send + redelivery-dedup confirmation (depends on 8.7) — [file](./8.8-client-mailbox-ack-dedup.md)
+- [x] **8.8** Client-side `MailboxAck` send + redelivery-dedup confirmation (depends on 8.7) — [file](./8.8-client-mailbox-ack-dedup.md)
 - [ ] **8.10** X3DH-initial-message-via-mailbox coverage (depends on 8.5, 8.7) — [file](./8.10-x3dh-initial-via-mailbox.md)
 
 **Wave 6 — acceptance + exit**

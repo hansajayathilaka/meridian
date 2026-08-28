@@ -6,8 +6,8 @@ use std::collections::VecDeque;
 use futures_util::{SinkExt, StreamExt};
 use meridian_identity::{sign, KeyHandle, SecretStore};
 use meridian_proto::{
-    Auth, AuthOk, Bundle, Challenge, Deliver, Fetch, Frame, Op, OpaqueBlob, PrekeyBundle, Publish,
-    PublishOk, RouteBody, RouteOk, TurnGrant, TurnReq,
+    Auth, AuthOk, Bundle, Challenge, Deliver, Fetch, Frame, MailboxAck, MailboxAckOk, Op,
+    OpaqueBlob, PrekeyBundle, Publish, PublishOk, RouteBody, RouteOk, TurnGrant, TurnReq,
 };
 use serde::Serialize;
 use tokio::net::TcpStream;
@@ -44,6 +44,14 @@ pub struct SignalingClient {
     server_domain: String,
     /// Server-pushed [`Deliver`] frames that arrived while awaiting a request reply.
     pending_delivers: VecDeque<Deliver>,
+    /// (task 8.8) Mailbox row ids collected off [`Deliver::mailbox_id`] as each mailbox-drained
+    /// frame is handed to the caller via [`next_deliver`](Self::next_deliver), not yet covered by
+    /// a [`MailboxAck`]. Flushed as one batched wire frame by
+    /// [`ack_pending_mailbox`](Self::ack_pending_mailbox) — never sent automatically, so a caller
+    /// controls exactly when "this envelope's processing is durable enough to ack" is true. See
+    /// that method's own doc comment for the crash-safety reasoning (ack-after-processing, never
+    /// ack-on-receipt).
+    pending_mailbox_acks: Vec<u64>,
 }
 
 impl SignalingClient {
@@ -180,6 +188,7 @@ impl SignalingClient {
             account_pub,
             server_domain: String::new(),
             pending_delivers: VecDeque::new(),
+            pending_mailbox_acks: Vec::new(),
         };
 
         // The server speaks first with a single-use challenge.
@@ -229,6 +238,7 @@ impl SignalingClient {
             account_pub,
             server_domain: String::new(),
             pending_delivers: VecDeque::new(),
+            pending_mailbox_acks: Vec::new(),
         };
 
         // The server speaks first with a single-use challenge.
@@ -376,19 +386,86 @@ impl SignalingClient {
     }
 
     /// Await the next envelope delivered to this client.
+    ///
+    /// (task 8.8) If the returned [`Deliver`] carries a [`Deliver::mailbox_id`] (a mailbox-drained
+    /// push, task 8.7), that id is recorded internally as soon as this method hands the frame back
+    /// — never sent over the wire yet. Call [`ack_pending_mailbox`](Self::ack_pending_mailbox),
+    /// once the caller has durably processed everything it has received so far, to actually flush
+    /// a `MailboxAck` covering every id accumulated since the last flush.
     pub async fn next_deliver(&mut self) -> Result<Deliver> {
-        if let Some(d) = self.pending_delivers.pop_front() {
-            return Ok(d);
+        let deliver = if let Some(d) = self.pending_delivers.pop_front() {
+            d
+        } else {
+            let frame = self.recv_frame().await?;
+            match frame.op {
+                Op::Deliver => frame.decode()?,
+                Op::Err => return Err(SignalError::Server(frame.decode()?)),
+                other => {
+                    return Err(SignalError::Unexpected {
+                        got: other,
+                        expected: "deliver",
+                    })
+                }
+            }
+        };
+        if let Some(id) = deliver.mailbox_id {
+            self.pending_mailbox_acks.push(id);
         }
-        let frame = self.recv_frame().await?;
-        match frame.op {
-            Op::Deliver => Ok(frame.decode()?),
-            Op::Err => Err(SignalError::Server(frame.decode()?)),
-            other => Err(SignalError::Unexpected {
-                got: other,
-                expected: "deliver",
-            }),
+        Ok(deliver)
+    }
+
+    /// (task 8.8, ADR 0024) Flush a `MailboxAck` covering every mailbox row id accumulated by
+    /// [`next_deliver`](Self::next_deliver) since the last call to this method — one wire frame
+    /// for the whole accumulated batch, not one per envelope. A no-op (no network I/O at all) when
+    /// nothing is pending.
+    ///
+    /// **Callers must call this only once every accumulated envelope has been durably
+    /// processed** — the local session/persistence state mutation each one caused (installing a
+    /// session, advancing a ratchet, consuming a one-time prekey) must already be saved to disk —
+    /// **never merely "received"**. The server deletes the acked rows unconditionally; acking
+    /// before the corresponding processing is durable would lose the message forever on a crash
+    /// between the ack and that persistence. This is why accumulation ([`next_deliver`]) and
+    /// flushing (this method) are two separate steps instead of one: the caller, not this client,
+    /// is the only party that knows when "processed" has actually become durable.
+    ///
+    /// On a request failure, the accumulated ids are restored (not dropped) so a caller that keeps
+    /// using this same client can retry the flush later; a genuinely torn-down connection drops
+    /// this in-memory state anyway once the caller reconnects with a fresh `SignalingClient` — the
+    /// unacked rows simply get redrained on that reconnect (task 8.7's own guarantee), which is
+    /// exactly the intended fail-safe, not a bug.
+    pub async fn ack_pending_mailbox(&mut self) -> Result<()> {
+        if self.pending_mailbox_acks.is_empty() {
+            return Ok(());
         }
+        let ids = std::mem::take(&mut self.pending_mailbox_acks);
+        let body = MailboxAck { ids: ids.clone() };
+        match self
+            .request(Op::MailboxAck, &body, Op::MailboxAckOk, "mailbox_ack_ok")
+            .await
+        {
+            Ok(reply) => {
+                let _ok: MailboxAckOk = reply.decode()?;
+                Ok(())
+            }
+            Err(e) => {
+                self.pending_mailbox_acks.extend(ids);
+                Err(e)
+            }
+        }
+    }
+
+    /// (task 8.8, review finding 2) Remove `id` from the pending-ack accumulator without sending
+    /// anything, if it is still queued there — for a caller that discovers, after
+    /// [`next_deliver`](Self::next_deliver) already accumulated a mailbox-tagged delivery's id,
+    /// that THIS delivery's own processing did not durably persist (e.g. a local `sessions.bin`
+    /// write failure). Without this, a later, unrelated delivery's own successful
+    /// [`ack_pending_mailbox`](Self::ack_pending_mailbox) flush would sweep up this still-queued
+    /// id and delete its mailbox row even though its local processing was never made durable —
+    /// reproducing exactly the crash-between-ack-and-processing loss this task exists to avoid,
+    /// just via the batch accumulator rather than a single-message race. A no-op if `id` is not
+    /// currently queued (already flushed, or this delivery never carried a `mailbox_id` at all).
+    pub fn discard_pending_mailbox_ack(&mut self, id: u64) {
+        self.pending_mailbox_acks.retain(|&x| x != id);
     }
 
     /// Close the WebSocket cleanly.
