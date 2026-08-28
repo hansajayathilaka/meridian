@@ -30,6 +30,7 @@ are the stack/repo decisions (extracted from [stack](../architecture/stack.md) �
 | [0021](./0021-client-local-store-config-formats.md) | TUI local store sealed via `at_rest::seal` (except `config.toml`/`state.json`); `config.toml` via figment; `--export-json` as the only unsealed export (Accepted) | Phase-4 planning, task 4.2 |
 | [0022](./0022-release-binary-distribution.md) | **Superseded by 0023** (wrong binary — server, not client): rolling `rendezvous-latest` GitHub Release with Linux + Windows `x86_64` **server** executables, built on the same trigger as the Docker image | executable-pipeline task, original scope |
 | [0023](./0023-cli-tui-binary-distribution.md) | Rolling `cli-latest` GitHub Release with Linux + Windows `x86_64` **`meridian` CLI/TUI** executables, own dependency-graph trigger (Accepted); signing deferred, same trigger as 0019's residual | executable-pipeline task, corrected scope |
+| [0024](./0024-mailbox-drain-from-attestation.md) | Mailbox-drained `Deliver.from`: no server-side sender persistence (no contact graph), a fixed `[0u8;32]` placeholder instead; client-side `SenderMismatch` is relaxed for `mailbox_id.is_some()` (Accepted; scope-corrects 0016 R4 for the mailbox-drain case) | Phase-8 planning, task 8.7 |
 
 **Previously-open decisions, now resolved at handoff:** [0011 ratchet library](./0011-ratchet-library.md)
 X3DH layer → hand-wired over RustCrypto primitives (unchanged); Double Ratchet mechanism → composed

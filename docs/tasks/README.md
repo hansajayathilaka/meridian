@@ -137,6 +137,19 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 
 ### Live carry-forwards (not owned by any open task)
+- **`MailboxAck`'s 4096-id cap is reachable, not merely theoretical** (task 8.7's review): quota
+  (`config.mailbox.quota_mb`) bounds bytes only, `Op::Route` has no per-message rate limit, and no
+  per-recipient row-count cap exists anywhere in 8.1/8.2/8.5/8.6 — a connected account can
+  legitimately enqueue far more than 4096 tiny envelopes against one victim recipient while
+  staying under the byte quota. `handle_mailbox_ack` (`apps/rendezvous/src/ws.rs`) silently
+  truncates an oversized ack batch to the first 4096 ids and still replies `MailboxAckOk{}`, with
+  no signal to the client that part of its ack didn't take effect. Fails safe (the undeleted rows
+  persist and get redrained on the next reconnect; `eid` dedup, task 6.4, prevents any
+  duplicate-processing harm), so non-blocking, but a real correctness surprise. No open task owns
+  the fix — candidates: have the ack reply report the actual-deleted count (8.8, which builds the
+  client-side ack loop that would consume it), or add a per-recipient row-count cap alongside the
+  byte quota (8.9, which already owns quota/purge tuning). Flag for a future `/plan-phase` if not
+  picked up by either.
 - **Mailbox quota check is a TOCTOU race under concurrent routes to the same recipient** (task 8.5's
   review): `queue_to_mailbox`'s quota check (`mailbox_size_bytes_for_recipient` then
   `mailbox_enqueue`) is read-then-write across two unserialized `Store` calls — neither
@@ -550,7 +563,7 @@ wire-protocol questions T07 raises before any task started; full record and brea
 - [x] **8.6** `handle_fed_route` mailbox enqueue on offline recipient — [file](./phase-8/8.6-fed-route-mailbox-enqueue.md)
 
 **Wave 4 — delivery, ack, and storage-only follow-ons**
-- [ ] **8.7** Delivery-on-reconnect push + `MailboxAck` handling, server side — [file](./phase-8/8.7-mailbox-delivery-reconnect-ack.md)
+- [x] **8.7** Delivery-on-reconnect push + `MailboxAck` handling, server side — [file](./phase-8/8.7-mailbox-delivery-reconnect-ack.md)
 - [ ] **8.9** TTL expiry purge job — [file](./phase-8/8.9-mailbox-ttl-purge-job.md)
 - [ ] **8.11** `meridian-admin mailbox dump <pubkey>` — [file](./phase-8/8.11-meridian-admin-mailbox-dump.md)
 - [ ] **8.12** Opacity/at-rest audit extension for mailbox rows — [file](./phase-8/8.12-opacity-audit-mailbox-rows.md)

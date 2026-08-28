@@ -141,6 +141,20 @@ pub struct RouteOk {
 /// ([ADR 0016](../../../docs/adr/0016-envelope-deniability.md) residual R4, scope-corrected).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deliver {
+    /// The routing server's own assertion of who sent this — a live connection's authenticated
+    /// `account_pub` for a same-server route, a federated `FedRoute.from` for a cross-org one.
+    /// Server testimony only (ADR 0016 residual R4), never the cryptographic trust boundary (the
+    /// ratchet AEAD over `envelope.sender_pub`, embedded in `blob` itself, is).
+    ///
+    /// **When `mailbox_id.is_some()` (a mailbox-drained push, task 8.7), this is
+    /// [`MAILBOX_DRAIN_FROM_PLACEHOLDER`] — never a real, persisted sender identity.** The
+    /// original sender's connection may have closed days earlier; the server has no live
+    /// assertion left to make, and persisting one at enqueue time would be a durable, queryable
+    /// server-side contact graph — forbidden outright (`docs/security/anonymity-and-retention.md`'s
+    /// must-never list, item 2; `docs/adr/0024-mailbox-drain-from-attestation.md`).
+    /// Client-side reception of a mailbox-drained `Deliver` must derive the real sender from
+    /// `envelope.sender_pub` alone (already recoverable from `blob` without the server's help),
+    /// never by comparing this field against it.
     #[serde(with = "crate::bytes::b32")]
     pub from: [u8; 32],
     pub blob: OpaqueBlob,
@@ -154,6 +168,13 @@ pub struct Deliver {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mailbox_id: Option<u64>,
 }
+
+/// `Deliver.from`'s value on every mailbox-drained push (`mailbox_id.is_some()`) — a fixed sentinel
+/// meaning "no server assertion available," never a real account key. `[0u8; 32]` cannot collide
+/// with any ADR-0001 self-certifying account key (real key material), unlike e.g. the recipient's
+/// own key, which could look like a genuine self-send. See [`Deliver`]'s own doc comment and
+/// `docs/adr/0024-mailbox-drain-from-attestation.md` for the full reasoning.
+pub const MAILBOX_DRAIN_FROM_PLACEHOLDER: [u8; 32] = [0u8; 32];
 
 /// Client → server: acknowledge receipt of one or more mailbox-drain [`Deliver`] pushes so the
 /// server can delete the corresponding rows (T07). `ids` are the mailbox's own server-assigned row

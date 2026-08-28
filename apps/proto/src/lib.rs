@@ -33,6 +33,7 @@ pub use frame::{decode, encode, CodecError, Frame, Op};
 pub use msg::{
     error_codes, Auth, AuthOk, Bundle, Challenge, Deliver, ErrBody, Fetch, MailboxAck,
     MailboxAckOk, Publish, PublishOk, RouteBody, RouteOk, TurnGrant, TurnReq,
+    MAILBOX_DRAIN_FROM_PLACEHOLDER,
 };
 
 use serde::de::{self, Visitor};

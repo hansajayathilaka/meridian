@@ -8,8 +8,9 @@ use std::sync::Arc;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use meridian_proto::{
-    error_codes, Auth, AuthOk, Bundle, Challenge, Deliver, ErrBody, Fetch, Frame, Op, Publish,
-    PublishOk, RouteBody, RouteOk, TurnReq,
+    error_codes, Auth, AuthOk, Bundle, Challenge, Deliver, ErrBody, Fetch, Frame, MailboxAck,
+    MailboxAckOk, Op, Publish, PublishOk, RouteBody, RouteOk, TurnReq,
+    MAILBOX_DRAIN_FROM_PLACEHOLDER,
 };
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -86,14 +87,20 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<AppState>, peer_ip: IpA
         }
     };
 
-    // 3) Serve the authenticated session.
+    // 3) Drain any queued mailbox mail (task 8.7), before this connection is registered as
+    // reachable — so a live route arriving concurrently on another connection can never race with
+    // (and interleave ahead of or behind) this drain. "Before any other traffic" per this task's
+    // own Deliverable 3.
+    drain_mailbox(&state, &tx, &account_pub).await;
+
+    // 4) Serve the authenticated session.
     let conn_id = state.next_conn_id();
     state.registry.add(account_pub, conn_id, tx.clone());
     state.metrics.conn_opened();
 
     serve(&state, &mut stream, &tx, &account_pub).await;
 
-    // 4) Teardown.
+    // 5) Teardown.
     state.registry.remove(&account_pub, conn_id);
     state.metrics.conn_closed();
     drop(tx);
@@ -178,9 +185,85 @@ async fn serve(
             Op::Fetch => handle_fetch(state, tx, account_pub, &frame).await,
             Op::Route => handle_route(state, tx, account_pub, &frame).await,
             Op::TurnReq => handle_turn(state, tx, account_pub, &frame).await,
+            Op::MailboxAck => handle_mailbox_ack(state, tx, account_pub, &frame).await,
             _ => send_err(tx, frame.id, error_codes::BAD_REQUEST, "unexpected op").await,
         }
     }
+}
+
+/// Task 8.7: push every row currently queued for `account_pub`, in `arrived_at`/`id` order, as
+/// `Deliver{from: MAILBOX_DRAIN_FROM_PLACEHOLDER, blob, mailbox_id: Some(id)}` — before this
+/// connection is registered as reachable (see the caller), so nothing else can interleave with the
+/// drain. Best-effort: a store failure here drops the connection to neither a half-drained mailbox
+/// state nor a stuck handshake — it's logged nowhere (no client-id logging) and simply skips the
+/// drain, exactly like every other `Store` failure in this module already fails closed to "try
+/// again next time" rather than wedging the connection.
+async fn drain_mailbox(state: &Arc<AppState>, tx: &mpsc::Sender<Message>, account_pub: &[u8; 32]) {
+    let Ok(rows) = state.store.mailbox_list_for_recipient(account_pub).await else {
+        return;
+    };
+    for row in rows {
+        send(
+            tx,
+            Op::Deliver,
+            0,
+            &Deliver {
+                from: MAILBOX_DRAIN_FROM_PLACEHOLDER,
+                blob: meridian_proto::OpaqueBlob::new(row.blob),
+                mailbox_id: Some(row.id),
+            },
+        )
+        .await;
+    }
+}
+
+/// The maximum number of ids accepted in one `MailboxAck` — caps the SQL `IN (...)` clause
+/// `mailbox_delete_by_ids` builds so a very large, attacker-controlled `ids` list can't approach
+/// SQLite's `SQLITE_MAX_VARIABLE_NUMBER` (carried forward from task 8.2's review). **Not actually
+/// bounded by `config.mailbox.quota_mb` today** (task 8.7's review, should-fix, non-blocking):
+/// quota is byte-based only, `Op::Route` has no per-message rate limit, and no per-recipient row
+/// count cap exists anywhere in 8.1/8.2/8.5/8.6 — a connected account can legitimately enqueue far
+/// more than this many tiny envelopes against one victim recipient while staying under the byte
+/// quota. When a batch exceeds this cap, the excess ids are silently dropped and `MailboxAckOk{}`
+/// is still sent, with no signal to the client that part of its ack didn't take effect. This
+/// fails safe (an unacked row simply persists and gets redrained on the next reconnect — `eid`
+/// dedup at the client, task 6.4, prevents any duplicate-processing harm from that), so it is not
+/// blocking, but is a real, reachable correctness surprise, not a merely theoretical one — see
+/// `docs/tasks/README.md`'s Live carry-forwards for the tracked fix (report actual-deleted-count,
+/// or add a row-count cap alongside the byte quota).
+const MAILBOX_ACK_MAX_IDS: usize = 4096;
+
+/// Task 8.7: `MailboxAck{ids}` → delete exactly those rows, scoped to the authenticated
+/// connection's own `account_pub` — never trusting `ids` alone. The safety property this relies on
+/// is 8.1's `mailbox_delete_by_ids` contract: an id naming another account's row is a silent no-op,
+/// never an error and never a cross-account deletion, so a connected account acking ids it was
+/// never sent (the attack shape, not just a same-account partial ack) simply deletes nothing beyond
+/// its own rows. Always replies `MailboxAckOk{}`, even for an empty or all-foreign id set — acking
+/// is not a query, so there is nothing to distinguish an existence oracle out of here.
+async fn handle_mailbox_ack(
+    state: &Arc<AppState>,
+    tx: &mpsc::Sender<Message>,
+    account_pub: &[u8; 32],
+    frame: &Frame,
+) {
+    let ack: MailboxAck = match frame.decode() {
+        Ok(a) => a,
+        Err(_) => return send_err(tx, frame.id, error_codes::BAD_REQUEST, "malformed").await,
+    };
+    let ids = if ack.ids.len() > MAILBOX_ACK_MAX_IDS {
+        &ack.ids[..MAILBOX_ACK_MAX_IDS]
+    } else {
+        &ack.ids[..]
+    };
+    if state
+        .store
+        .mailbox_delete_by_ids(account_pub, ids)
+        .await
+        .is_err()
+    {
+        return send_err(tx, frame.id, error_codes::BAD_REQUEST, "store failed").await;
+    }
+    send(tx, Op::MailboxAckOk, frame.id, &MailboxAckOk {}).await;
 }
 
 async fn handle_publish(
