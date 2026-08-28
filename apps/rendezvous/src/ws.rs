@@ -22,7 +22,7 @@ use crate::federation::outbound::{
 };
 use crate::state::AppState;
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -492,16 +492,12 @@ async fn handle_route(
     }
 }
 
-/// `MB` in `config.mailbox.quota_mb` means MiB (binary), matching this codebase's one other
-/// documented size convention (`mrd.file/1`'s 64 KiB chunk size, task 7.5) — no design doc pins
-/// this down explicitly (`TODO: confirm` already carried on `Mailbox::quota_mb`'s own doc comment,
-/// task 8.1), so this is a reasonable disambiguation, not an invented requirement.
-const MAILBOX_QUOTA_BYTES_PER_MB: u64 = 1024 * 1024;
-
 /// The offline+mailbox-enabled branch of `handle_route` (T07, phase-8 architect consult point 4):
 /// enqueue the recipient's ciphertext into their mailbox for later delivery-on-reconnect (8.7),
 /// unless doing so would exceed their configured quota. Never a `RouteOk` on the quota-exceeded
-/// path — a distinct `mailbox_full` error, per the wire consult 8.3 already shipped.
+/// path — a distinct `mailbox_full` error, per the wire consult 8.3 already shipped. Quota math
+/// itself lives in [`crate::store::mailbox_enqueue_with_quota`], shared with the federated route
+/// path (task 8.6, `federation::inbound::handle_fed_route`).
 async fn queue_to_mailbox(
     state: &Arc<AppState>,
     tx: &mpsc::Sender<Message>,
@@ -509,33 +505,17 @@ async fn queue_to_mailbox(
     recipient: [u8; 32],
     blob: Vec<u8>,
 ) {
-    let quota_bytes = state.config.mailbox.quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
-    let current_bytes = match state
-        .store
-        .mailbox_size_bytes_for_recipient(&recipient)
-        .await
-    {
-        Ok(n) => n,
-        Err(_) => return send_err(tx, frame.id, error_codes::BAD_REQUEST, "store failed").await,
-    };
-    if current_bytes + blob.len() as u64 > quota_bytes {
-        return send_err(
-            tx,
-            frame.id,
-            error_codes::MAILBOX_FULL,
-            "recipient's mailbox is full",
-        )
-        .await;
-    }
-
-    let now = now_secs();
-    let ttl_secs = state.config.mailbox.ttl_days as u64 * 86_400;
-    match state
-        .store
-        .mailbox_enqueue(recipient, blob, now, now + ttl_secs)
-        .await
-    {
-        Ok(_id) => {
+    let outcome = crate::store::mailbox_enqueue_with_quota(
+        state.store.as_ref(),
+        recipient,
+        blob,
+        now_secs(),
+        state.config.mailbox.ttl_days,
+        state.config.mailbox.quota_mb,
+    )
+    .await;
+    match outcome {
+        Ok(crate::store::MailboxEnqueueOutcome::Queued(_id)) => {
             send(
                 tx,
                 Op::RouteOk,
@@ -544,6 +524,15 @@ async fn queue_to_mailbox(
                     delivered: false,
                     queued: true,
                 },
+            )
+            .await;
+        }
+        Ok(crate::store::MailboxEnqueueOutcome::QuotaExceeded) => {
+            send_err(
+                tx,
+                frame.id,
+                error_codes::MAILBOX_FULL,
+                "recipient's mailbox is full",
             )
             .await;
         }
@@ -646,6 +635,12 @@ fn federated_route_error_reply(hint: &str, e: &RouteForeignError) -> (&'static s
                 error_codes::FED_DENIED
             } else if fed_err.code == fed_error_codes::RATE_LIMITED {
                 error_codes::RATE_LIMITED
+            } else if fed_err.code == fed_error_codes::MAILBOX_FULL {
+                // Task 8.6: B's own mailbox quota is exhausted for this recipient — a genuine,
+                // distinct outcome from "unreachable," not squashed into the generic connectivity
+                // fallback below. `Route`'s local (same-server, task 8.5) and federated paths now
+                // surface the identical client-visible code for the identical condition.
+                error_codes::MAILBOX_FULL
             } else {
                 // `bad_request` from the peer, or any future/unknown fed error code: no existing
                 // local code fits precisely, so fail closed to the generic connectivity/protocol
@@ -762,5 +757,35 @@ fn admission_label(state: &Arc<AppState>) -> &'static str {
     match state.config.server.admission {
         crate::config::Admission::Open => "open",
         crate::config::Admission::Invite => "invite",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use meridian_proto::FedErr;
+
+    /// Task 8.6: proves the `federated_route_error_reply`/`fed_error_codes::MAILBOX_FULL` mapping
+    /// directly, since the real A-to-B wire path can't deterministically reach it (the same
+    /// pre-check-vs-delivery race `federation_route.rs`'s task-8.6 tests document) — this is the
+    /// unit-level half of "A gets `Err{mailbox_full}` end-to-end": the store/enqueue half is
+    /// covered there (`federated_route_to_offline_recipient_over_quota_is_rejected`), and this
+    /// covers the pure mapping `RouteForeignError::Fed(FedErr{mailbox_full}) -> error_codes::MAILBOX_FULL`
+    /// that turns B's genuine `FedErr` into the client-visible code A's own sender actually sees.
+    #[test]
+    fn federated_route_error_reply_maps_fed_mailbox_full_to_local_mailbox_full() {
+        let fed_err = FedErr {
+            code: meridian_proto::fed_error_codes::MAILBOX_FULL.to_string(),
+            msg: "recipient's mailbox is full".to_string(),
+        };
+        let (code, _msg) =
+            federated_route_error_reply("org-b.test", &RouteForeignError::Fed(fed_err));
+        assert_eq!(
+            code,
+            error_codes::MAILBOX_FULL,
+            "a genuine FedErr{{mailbox_full}} from B must surface as the identical client-visible \
+             code the local (same-server) route path already produces for the same condition \
+             (task 8.5) — never squashed into the generic fed_unreachable fallback"
+        );
     }
 }

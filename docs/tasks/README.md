@@ -547,7 +547,7 @@ wire-protocol questions T07 raises before any task started; full record and brea
 
 **Wave 3 — route-path integration**
 - [x] **8.5** `handle_route` local mailbox enqueue, TTL/quota-aware — [file](./phase-8/8.5-local-route-mailbox-enqueue.md)
-- [ ] **8.6** `handle_fed_route` mailbox enqueue on offline recipient — [file](./phase-8/8.6-fed-route-mailbox-enqueue.md)
+- [x] **8.6** `handle_fed_route` mailbox enqueue on offline recipient — [file](./phase-8/8.6-fed-route-mailbox-enqueue.md)
 
 **Wave 4 — delivery, ack, and storage-only follow-ons**
 - [ ] **8.7** Delivery-on-reconnect push + `MailboxAck` handling, server side — [file](./phase-8/8.7-mailbox-delivery-reconnect-ack.md)

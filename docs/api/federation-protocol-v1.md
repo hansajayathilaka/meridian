@@ -113,6 +113,30 @@ verbatim, not redefined for federation.
 failure is reported only via `FedErr` echoing the route's `id`. There is deliberately no
 `FedRouteOk` — do not add one.
 
+**An offline recipient at the receiving org is now a durable queue, not a drop**
+([T07](../architecture/features/07-offline-mailbox.md)/[8.6](../tasks/phase-8/8.6-fed-route-mailbox-enqueue.md)).
+Before task 8.6, `handle_fed_route` returned `Ok(())` unconditionally, regardless of whether the
+target was actually connected — a route to an offline recipient was silent, permanent message
+loss. It now enqueues into the recipient's ciphertext mailbox (same TTL/quota-aware logic as the
+local route path, [8.5](../tasks/phase-8/8.5-local-route-mailbox-enqueue.md)) and still
+returns `Ok(())` — this is **not** a wire change and does **not** reopen "no `FedRouteOk`": the
+receiving org's own `mailbox.ttl_days`/`quota_mb` config decides the outcome, invisibly to the
+sending org, exactly like every other server-local policy this protocol already keeps opaque to
+the peer. Two consequences, deliberately accepted:
+- **Sender-visible framing gap.** The dialing side's own client sees the same optimistic
+  `RouteOk{delivered:true, queued:false}` whether the message was actually delivered live or
+  queued at the foreign org — the "queued at org-b" sender-visible message the feature spec
+  describes is truthfully achievable only for a **same-server** route (§4 of
+  [rendezvous-protocol-v1.md](./rendezvous-protocol-v1.md)); `meridian-admin mailbox dump` at the
+  receiving org is the real, honest proof for the federated case. This is a **widening** of the
+  already-accepted `ROUTE_REPLY_GRACE` false-positive residual immediately below, not a new one.
+- **Quota is a legitimate exception to fire-and-forget.** If enqueueing would exceed the
+  recipient's mailbox quota, `handle_fed_route` returns `Err(FedErr{code: "mailbox_full"})` instead
+  of `Ok(())` — see §4. `ttl_days == 0` at the receiving org (mailbox genuinely disabled) is the one
+  case that still silently drops, matching pre-8.6 behavior exactly: there is nowhere durable to
+  put the message, and (per the architect consult behind 8.3/8.5/8.6) `ttl_days == 0` has no
+  wire-visible signal of its own.
+
 **The fixed-latency-tax / reply-wait this implies, and its measured bound (task 3.20).** Because
 there is no `FedRouteOk`, the dialing side (`route_foreign`,
 `apps/rendezvous/src/federation/outbound.rs`) has no positive signal that a route succeeded — it
@@ -164,6 +188,7 @@ Stable `code` strings used in `FedErr` (`apps/proto/src/fed.rs::fed_error_codes`
 | `rate_limited` | federation-edge rate limits exceeded (keyed per ADR 0017 C5) | [2.6](../tasks/phase-2/2.6-federation-policy-limits.md) |
 | `not_found` | `FetchBundle`'s target is not an account this org is authoritative for | [2.7](../tasks/phase-2/2.7-federated-prekey-fetch.md) |
 | `bad_request` | malformed frame or body | any handler |
+| `mailbox_full` | `Route`'s target is offline and enqueueing would exceed their mailbox quota — a legitimate exception to fire-and-forget-on-success (§2) | [8.6](../tasks/phase-8/8.6-fed-route-mailbox-enqueue.md) |
 
 **`FetchBundle`'s per-account rate-limit axis is keyed on `req.target`, not on an asserted
 `from`.** §0/ADR 0017 C5 says the "origin account" rate-limit axis keys on the asserted `from` —

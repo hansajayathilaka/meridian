@@ -300,6 +300,10 @@ pub struct FederatedPairOpts {
     /// tests only ever reach B through A's federation link and never need a direct client
     /// connection to B at all.
     pub spawn_b_c2s: bool,
+    /// B's mailbox config (task 8.6) — defaults to `Mailbox::default()` (`ttl_days=14`); a test
+    /// exercising the offline-federated-route mailbox path overrides this (e.g. `quota_mb: 0` to
+    /// force an immediate `mailbox_full`).
+    pub b_mailbox: Mailbox,
 }
 
 impl Default for FederatedPairOpts {
@@ -322,6 +326,7 @@ impl Default for FederatedPairOpts {
             b_fed_reachability_per_origin_per_min: 600,
             b_allow_test_tamper: false,
             spawn_b_c2s: true,
+            b_mailbox: Mailbox::default(),
         }
     }
 }
@@ -364,6 +369,7 @@ pub async fn boot_federated_pair(opts: FederatedPairOpts) -> FederatedPair {
     let mut b_config = base_config(&opts.b_domain);
     b_config.federation = b_federation;
     b_config.server.allow_test_tamper = opts.b_allow_test_tamper;
+    b_config.mailbox = opts.b_mailbox;
     let b_store = Arc::new(MemoryStore::new());
     let b_state = AppState::new(b_config, b_store);
     let b_fed_addr = spawn_federation(b_state.clone()).await;

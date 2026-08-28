@@ -176,14 +176,19 @@ pub async fn handle_fed_fetch(
 /// **Fire-and-forget on success** (federation-protocol-v1.md §2): this function's `Ok(())` means
 /// [`serve_link`] sends NO reply frame at all — not even one signalling that the local recipient
 /// was actually connected. `Registry::send_to`'s own return value (`bool`, whether it found a live
-/// connection and enqueued onto it) is never surfaced back across the federation boundary — not
-/// just in the disconnect-race sense: this also silently swallows an outbound-side delivery
-/// failure at B (e.g. a full mpsc channel to a slow client) exactly as it swallows a target that
-/// disconnected between `route_foreign`'s `reachable_foreign` pre-check (architect decision #3)
-/// and this call. Neither path is reported back to the calling peer — `route_foreign`'s pre-check
-/// is what a caller relies on for target liveness, not this call's outcome. Both are the same
-/// accepted residual, not a new error this function invents a code for: see this task's "Out:
-/// offline queuing" scope boundary (a defined error at fed_route time, never a queue).
+/// connection and enqueued onto it) is never surfaced back across the federation boundary — that
+/// covers both a target that disconnected between `route_foreign`'s `reachable_foreign` pre-check
+/// (architect decision #3) and this call, and an outbound-side delivery failure at B itself (e.g. a
+/// full/closed mpsc channel to a slow client). **Before task 8.6, both cases were genuine, silent,
+/// permanent message loss** — `Ok(())` regardless of whether `send_to` actually delivered. **Task
+/// 8.6 closes that gap**: `send_to == false` now falls through to the same TTL/quota-aware mailbox
+/// enqueue task 8.5 built for the local route path (via [`crate::store::mailbox_enqueue_with_quota`]),
+/// so the message becomes durable instead of lost, still without a new reply frame on success
+/// (`route_foreign`'s pre-check is still what a caller relies on for target liveness, not this
+/// call's outcome — no `FedRouteOk`, ever). The one remaining accepted residual is `ttl_days == 0`
+/// at B (mailbox genuinely disabled): that case still silently drops, matching pre-8.6 behavior,
+/// since there's nowhere durable to put the message and no wire-visible signal for "TTL=0" exists
+/// (phase-8 architect consult point 5).
 ///
 /// **Task 3.8 (review findings F8 + N4).** Two fixes, both local to this function:
 ///
@@ -199,11 +204,21 @@ pub async fn handle_fed_fetch(
 /// 2. **N4**: the oversized check below now measures `req.envelope`'s own byte length directly
 ///    instead of re-encoding the whole [`FedFrame`] just to measure it — see that check's own doc
 ///    comment for the approximation this introduces.
+///
+/// Bundles [`handle_fed_route`]'s metrics/store/mailbox-config dependencies into one parameter —
+/// task 8.6 added the latter two for the offline-mailbox-enqueue path, which would otherwise push
+/// the function over clippy's `too_many_arguments` threshold.
+pub struct FedRouteDeps<'a> {
+    pub metrics: &'a Metrics,
+    pub store: &'a dyn Store,
+    pub mailbox: &'a crate::config::Mailbox,
+}
+
 pub async fn handle_fed_route(
     registry: &Registry,
     policy: &FederationPolicy,
     limits: &FederationLimits,
-    metrics: &Metrics,
+    deps: FedRouteDeps<'_>,
     origin_domains: &[String],
     metering_key: &str,
     req: &FedRoute,
@@ -267,9 +282,46 @@ pub async fn handle_fed_route(
     // back across the federation boundary (see doc comment above) — this only affects the local
     // metric, not the wire reply (there is none, on either branch).
     if registry.send_to(&req.to, Message::Binary(bytes)) {
-        metrics.envelope_routed();
+        deps.metrics.envelope_routed();
+        return Ok(());
     }
-    Ok(())
+
+    // Task 8.6: the recipient is offline at B. Before this task, this was a silent, permanent
+    // message loss (the request above always returned `Ok(())` regardless of delivery) — closing
+    // that gap is this task's whole point, as a side effect of building the mailbox. `FedRoute`
+    // stays fire-and-forget on success (phase-8 architect consult point 2: no `FedRouteOk`, ever) —
+    // A's `RouteOk` to its own sender stays the existing optimistic `{delivered:true, queued:false}`
+    // even though B actually queued rather than delivered live; `meridian-admin mailbox dump` at B
+    // is the real, honest proof for the federated case (doc-synced in federation-protocol-v1.md).
+    if deps.mailbox.ttl_days == 0 {
+        // Mailbox genuinely disabled at B (pure-P2P mode) — matches the pre-8.6 behavior exactly:
+        // silently drop. No wire-visible difference (phase-8 consult point 5), so still `Ok(())`.
+        return Ok(());
+    }
+    match crate::store::mailbox_enqueue_with_quota(
+        deps.store,
+        req.to,
+        req.envelope.as_bytes().to_vec(),
+        crate::ws::now_secs(),
+        deps.mailbox.ttl_days,
+        deps.mailbox.quota_mb,
+    )
+    .await
+    {
+        Ok(crate::store::MailboxEnqueueOutcome::Queued(_id)) => Ok(()),
+        // A legitimate exception to fire-and-forget-on-success (federation-protocol-v1.md §2
+        // already says "failure is reported only via `FedErr`") — never silently swallowed into
+        // the `ROUTE_REPLY_GRACE` "no reply ⇒ assume success" inference on A's side, since this is
+        // a genuine, immediate `FedErr` reply, not a timeout.
+        Ok(crate::store::MailboxEnqueueOutcome::QuotaExceeded) => Err(FedErr {
+            code: fed_error_codes::MAILBOX_FULL.to_string(),
+            msg: "recipient's mailbox is full".to_string(),
+        }),
+        Err(_) => Err(FedErr {
+            code: fed_error_codes::BAD_REQUEST.to_string(),
+            msg: "store failed".to_string(),
+        }),
+    }
 }
 
 /// Server B's inbound `fed_reachability` handler (task 2.8): origin admission, then the DEDICATED
@@ -427,7 +479,11 @@ pub async fn serve_link(mut link: FederationLink, state: Arc<AppState>) {
                     &state.registry,
                     &state.federation.policy,
                     &state.federation.limits,
-                    &state.metrics,
+                    FedRouteDeps {
+                        metrics: &state.metrics,
+                        store: state.store.as_ref(),
+                        mailbox: &state.config.mailbox,
+                    },
                     &origin_domains,
                     &metering_key,
                     &req,

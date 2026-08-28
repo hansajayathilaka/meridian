@@ -142,6 +142,46 @@ pub struct MailboxEntry {
     pub size_bytes: u64,
 }
 
+/// `MB` in `config::Mailbox::quota_mb` means MiB (binary) — no design doc pins this down
+/// (`config::Mailbox::quota_mb`'s own doc comment carries a `TODO: confirm` on the default number
+/// itself), so this is a disambiguation, not an invented requirement, consistent with the
+/// codebase's one other documented size precedent (`mrd.file/1`'s 64 KiB chunk size, task 7.5).
+pub const MAILBOX_QUOTA_BYTES_PER_MB: u64 = 1024 * 1024;
+
+/// Outcome of a quota-aware mailbox enqueue attempt (tasks 8.5/8.6's shared logic).
+pub enum MailboxEnqueueOutcome {
+    /// Enqueued; carries the new row's server-assigned id.
+    Queued(u64),
+    /// Enqueueing `blob` would have exceeded `recipient`'s configured quota — nothing was written.
+    QuotaExceeded,
+}
+
+/// Check `recipient`'s current mailbox usage against `quota_mb`, then enqueue `blob` if it fits.
+/// Shared by the local route path (task 8.5, `ws::handle_route`) and the federated route path
+/// (task 8.6, `federation::inbound::handle_fed_route`) so the quota math lives in exactly one
+/// place. Callers are responsible for the `ttl_days == 0` (mailbox disabled) short-circuit — this
+/// function always attempts to enqueue, matching the "quota is the only enqueue-time gate" scope
+/// of both call sites.
+pub async fn mailbox_enqueue_with_quota(
+    store: &dyn Store,
+    recipient: [u8; 32],
+    blob: Vec<u8>,
+    now: u64,
+    ttl_days: u32,
+    quota_mb: u32,
+) -> StoreResult<MailboxEnqueueOutcome> {
+    let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
+    let current_bytes = store.mailbox_size_bytes_for_recipient(&recipient).await?;
+    if current_bytes + blob.len() as u64 > quota_bytes {
+        return Ok(MailboxEnqueueOutcome::QuotaExceeded);
+    }
+    let ttl_secs = ttl_days as u64 * 86_400;
+    let id = store
+        .mailbox_enqueue(recipient, blob, now, now + ttl_secs)
+        .await?;
+    Ok(MailboxEnqueueOutcome::Queued(id))
+}
+
 #[derive(Default)]
 struct Account {
     #[allow(dead_code)]

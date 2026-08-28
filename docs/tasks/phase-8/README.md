@@ -110,7 +110,7 @@ cross-federation acceptance test (8.13) and the phase-exit demo (8.14) come last
 
 **Wave 3 — route-path integration**
 - [x] **8.5** `handle_route` local mailbox enqueue, TTL/quota-aware (depends on 8.1, 8.3) — [file](./8.5-local-route-mailbox-enqueue.md)
-- [ ] **8.6** `handle_fed_route` mailbox enqueue on offline recipient (depends on 8.1, 8.3, 8.5) — [file](./8.6-fed-route-mailbox-enqueue.md)
+- [x] **8.6** `handle_fed_route` mailbox enqueue on offline recipient (depends on 8.1, 8.3, 8.5) — [file](./8.6-fed-route-mailbox-enqueue.md)
 
 **Wave 4 — delivery, ack, and independent storage-only follow-ons**
 - [ ] **8.7** Delivery-on-reconnect push + `MailboxAck` handling, server side (depends on 8.1, 8.2, 8.3, 8.5) — [file](./8.7-mailbox-delivery-reconnect-ack.md)
