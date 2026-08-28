@@ -123,7 +123,7 @@ cross-federation acceptance test (8.13) and the phase-exit demo (8.14) come last
 - [x] **8.10** X3DH-initial-message-via-mailbox coverage (depends on 8.5, 8.7) — [file](./8.10-x3dh-initial-via-mailbox.md)
 
 **Wave 6 — acceptance + exit**
-- [ ] **8.13** Cross-federation acceptance test: Org A → Org B mailbox → reconnect (depends on 8.6, 8.7, 8.9) — [file](./8.13-cross-federation-mailbox-acceptance.md)
+- [x] **8.13** Cross-federation acceptance test: Org A → Org B mailbox → reconnect (depends on 8.6, 8.7, 8.9) — [file](./8.13-cross-federation-mailbox-acceptance.md)
 - [ ] **8.14** Phase exit: full demo script + doc sync (depends on 8.1–8.13) — [file](./8.14-phase-exit-mailbox-demo.md)
 
 ## Exit criteria

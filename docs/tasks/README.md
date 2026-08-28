@@ -573,7 +573,7 @@ wire-protocol questions T07 raises before any task started; full record and brea
 - [x] **8.10** X3DH-initial-message-via-mailbox coverage — [file](./phase-8/8.10-x3dh-initial-via-mailbox.md)
 
 **Wave 6 — acceptance + exit**
-- [ ] **8.13** Cross-federation acceptance test: Org A → Org B mailbox → reconnect — [file](./phase-8/8.13-cross-federation-mailbox-acceptance.md)
+- [x] **8.13** Cross-federation acceptance test: Org A → Org B mailbox → reconnect — [file](./phase-8/8.13-cross-federation-mailbox-acceptance.md)
 - [ ] **8.14** Phase exit: full demo script + doc sync — [file](./phase-8/8.14-phase-exit-mailbox-demo.md)
 
 ## Legend / how to read
