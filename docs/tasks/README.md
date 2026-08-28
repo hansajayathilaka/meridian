@@ -575,6 +575,8 @@ wire-protocol questions T07 raises before any task started; full record and brea
 **Wave 6 — acceptance + exit**
 - [x] **8.13** Cross-federation acceptance test: Org A → Org B mailbox → reconnect — [file](./phase-8/8.13-cross-federation-mailbox-acceptance.md)
 - [x] **8.15** Client surfaces the mailbox-queued outcome (fix-task found during 8.14's live demo prep) — [file](./phase-8/8.15-client-surfaces-mailbox-queued-outcome.md)
+- [x] **8.16** `meridian register` persists its published bundle's prekey secrets (fix-task found during 8.14's live demo) — [file](./phase-8/8.16-cli-register-persists-prekey-secrets.md)
+- [x] **8.17** Mailbox-drained messages arriving before a first-contact request is accepted must not be silently lost (fix-task found during 8.14's live demo) — [file](./phase-8/8.17-mailbox-ack-must-not-swallow-pending-request-messages.md)
 - [ ] **8.14** Phase exit: full demo script + doc sync — [file](./phase-8/8.14-phase-exit-mailbox-demo.md)
 
 ## Legend / how to read

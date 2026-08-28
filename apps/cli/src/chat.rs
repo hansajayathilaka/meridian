@@ -906,7 +906,20 @@ async fn handle_inbound(
             Ok(())
         }
         // Already gated: refused, never merged into the pending request (task 2.10 deliverable).
+        //
+        // (task 8.17) Unlike a genuinely bad envelope (Desync/Crypto/etc., below), this one was
+        // perfectly valid — it just arrived while an earlier first-contact request from the same
+        // sender is still undecided. A mailbox-drained one of these must NOT be acked: `run`'s own
+        // per-iteration `client.ack_pending_mailbox()` call has no idea this delivery was actually
+        // discarded rather than shown to the user, and would otherwise permanently delete the
+        // server's only durable copy of a message the user never saw — the same "acked but never
+        // actually delivered" loss task 8.8's `discard_pending_mailbox_ack` exists to prevent for a
+        // save failure, now also needed for this non-failure, still-not-delivered case. Once the
+        // user resolves the pending request and reconnects, the row is still there to redrain.
         Err(ChatError::RequestPending) => {
+            if let Some(id) = deliver.mailbox_id {
+                client.discard_pending_mailbox_ack(id);
+            }
             if json {
                 println!("{{\"event\":\"rejected\",\"reason\":\"pending message request\"}}");
             }
@@ -1333,6 +1346,54 @@ fn banner(
     } else {
         println!("  (waiting for the first message; you can start typing — it will send once the session opens)");
     }
+}
+
+/// Connect, publish a fresh prekey bundle, and durably persist the matching secret scalars into
+/// this account's sealed session store (`load_state`/`save_state`, below) — the standalone
+/// counterpart to `run`'s own inline connect+publish+`state.vault.set_bundle` sequence (see that
+/// function's "Publish a fresh bundle..." comment, the pattern this mirrors exactly). Used by
+/// `main.rs::cmd_register` (task 8.16 fix): before this existed, `cmd_register` called
+/// `SignalingClient::publish_bundle` directly and only ever read `generated.bundle.otk_count()`
+/// off the result, discarding `generated`'s secret scalars entirely — publishing a bundle whose
+/// matching private one-time-prekey/SPK secrets were never saved anywhere, on disk or in memory.
+/// A peer who X3DH-initiated against that published bundle produced an envelope this account could
+/// **never** decrypt, not even in a later `meridian chat` run against the very same account,
+/// because nothing durable ever recorded which secret scalars the server's published public bundle
+/// corresponded to. Returns the number of one-time prekeys published.
+pub(crate) async fn register_bundle(
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+    account_pub: [u8; 32],
+    server: &str,
+    invite: Option<String>,
+) -> Result<usize, String> {
+    let mut state = load_state(store, handle)?;
+
+    let mut client = SignalingClient::connect(server, store, handle, account_pub, invite, 1)
+        .await
+        .map_err(|e| format!("connecting to {server}: {e}"))?;
+    let generated = client
+        .publish_bundle(store, handle, DEFAULT_OTK_COUNT)
+        .await
+        .map_err(|e| format!("publishing bundle: {e}"))?;
+    let _ = client.close().await;
+
+    let count = generated.bundle.otk_count();
+    let otks: Vec<([u8; 32], [u8; 32])> = generated
+        .bundle
+        .otks
+        .iter()
+        .zip(generated.otk_secrets.iter())
+        .map(|(p, s)| (*p, **s))
+        .collect();
+    state.vault.set_bundle(
+        generated.bundle.spk,
+        *generated.spk_secret,
+        otks,
+        crate::now_unix(),
+    );
+    save_state(&state, store, handle)?;
+    Ok(count)
 }
 
 fn load_state(store: &dyn SecretStore, handle: &KeyHandle) -> Result<ChatState, String> {

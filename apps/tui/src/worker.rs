@@ -3244,6 +3244,17 @@ async fn process_inbound_delivery(
         };
 
         let mut needs_recovery_fetch = None;
+        // (task 8.17) Set when this delivery's own `ChatError::RequestPending` arm (below) fires
+        // for a mailbox-drained envelope: unlike the genuinely-bad-envelope rejections grouped
+        // into the catch-all `Err(e)` arm (Desync, Crypto, a forged sender, …), `RequestPending`
+        // means the envelope was perfectly valid but arrived while an *earlier* first-contact
+        // request from the same sender is still undecided — it is never merged into that pending
+        // request (task 2.10's own deliverable), so it would otherwise be a permanent, silent
+        // loss: acked and deleted from the server's durable mailbox without ever reaching the
+        // user. See the doc comment on `persisted`'s computation below for how this is threaded
+        // into the same ack-withholding mechanism task 8.8 already built for a `save_chat` I/O
+        // failure.
+        let mut defer_mailbox_ack = false;
         // (task 8.8, ADR 0024) A mailbox-drained push (`mailbox_id.is_some()`, task 8.7)
         // carries the `[0u8; 32]` `from` placeholder, never a real routing-layer identity —
         // `open_inbound_from_mailbox` is the entry point that knows to authenticate via
@@ -3360,10 +3371,23 @@ async fn process_inbound_delivery(
                 }
                 (None, None)
             }
-            // Everything else — `RequestPending`, `Crypto` (envelope v2 has no signature to
-            // fail; a decrypt/AEAD failure is what tampering surfaces as now),
-            // `UnsupportedEnvelopeVersion`, `SenderMismatch`, `UnknownPrekey`, `NoSession`, a
-            // codec/store error — dropped, logged, never trusted. Mirrors
+            // (task 8.17) A perfectly valid envelope, just from a sender whose *earlier*
+            // first-contact request this account hasn't decided yet — task 2.10's own
+            // deliverable is that it is never merged into that pending request, so it is
+            // dropped here exactly like the catch-all below. Unlike those genuinely-bad
+            // envelopes, though, a mailbox-drained one of these must not be acked: the user
+            // will resolve the pending request and reconnect, and this row needs to still be
+            // there to redeliver then — see `defer_mailbox_ack`'s own doc comment above.
+            Err(ChatError::RequestPending) => {
+                defer_mailbox_ack = true;
+                (None, None)
+            }
+            // Everything else — `Crypto` (envelope v2 has no signature to fail; a decrypt/AEAD
+            // failure is what tampering surfaces as now), `UnsupportedEnvelopeVersion`,
+            // `SenderMismatch`, `UnknownPrekey`, `NoSession`, a codec/store error — genuinely bad
+            // input, dropped, logged, never trusted, and (unlike `RequestPending` above) never
+            // redeliverable into anything better next time, so acking a mailbox-drained one of
+            // these is correct: retrying it would just reject it again forever. Mirrors
             // `apps/cli/src/chat.rs::handle_inbound`'s own reject-loudly-never-trust catch-all
             // exactly (this section's own module doc).
             Err(e) => {
@@ -3372,19 +3396,24 @@ async fn process_inbound_delivery(
             }
         };
 
-        // (task 8.8) `persisted` reflects whether THIS save actually succeeded — never
-        // whether `open_inbound`/`open_inbound_from_mailbox` itself returned `Ok`. A
-        // mailbox-drained envelope that was rejected (Desync, Crypto, SenderMismatch, …) still
-        // had its (no-op) session state durably saved here, exactly as before this task; only
-        // a `save_chat` I/O failure must withhold the ack, since that specific failure is the
-        // one crash-analogous case where "processing happened but wasn't made durable" is true.
+        // (task 8.8, extended by 8.17) `persisted` now means "safe to ack" rather than purely
+        // "did the file write succeed": a mailbox-drained envelope that was rejected as
+        // genuinely bad (Desync, Crypto, SenderMismatch, …) still had its (no-op) session state
+        // durably saved here, exactly as task 8.8 left it — those stay acked on any successful
+        // save. `defer_mailbox_ack` (task 8.17) withholds it for the one additional case where
+        // the save succeeding doesn't mean this specific envelope was ever actually delivered:
+        // `RequestPending` — see that match arm's own doc comment. Both this and a genuine
+        // `save_chat` I/O failure are the same crash-analogous shape ("processing happened, or
+        // didn't happen at all, but this envelope wasn't made available to the user"), so both
+        // withhold the ack through the identical mechanism.
         let persisted = save_chat(&chat, store, handle)
             .inspect_err(|e| {
                 eprintln!(
                     "meridian tui: could not persist sessions.bin after an inbound envelope: {e}"
                 );
             })
-            .is_ok();
+            .is_ok()
+            && !defer_mailbox_ack;
 
         (event, ack, needs_recovery_fetch, persisted)
     })
@@ -3406,14 +3435,20 @@ async fn process_inbound_delivery(
         let _ = client.route_with_hint(from, hint, receipt_blob).await;
     }
 
-    // (task 8.8, ADR 0024) Flush any mailbox row id `client.next_deliver()` accumulated —
-    // possibly for earlier deliveries too, never only THIS one, since `pending_mailbox_acks`
-    // batches across the whole connection (see `ack_pending_mailbox`'s own doc comment). `persisted`
-    // is `false` only when THIS delivery's processing was never attempted (sessions.bin failed to
-    // load) or was attempted but not durably saved (sessions.bin failed to write) — acking THIS
-    // delivery's own id in either case would delete the mailbox's only durable record of a message
-    // whose local-side handling isn't actually durable yet, exactly the crash-between-ack-and-
-    // processing loss `ack_pending_mailbox`'s own doc comment warns against. A live delivery
+    // (task 8.8, ADR 0024; extended by 8.17) Flush any mailbox row id `client.next_deliver()`
+    // accumulated — possibly for earlier deliveries too, never only THIS one, since
+    // `pending_mailbox_acks` batches across the whole connection (see `ack_pending_mailbox`'s own
+    // doc comment). `persisted` is `false` when THIS delivery's processing was never attempted
+    // (sessions.bin failed to load), was attempted but not durably saved (sessions.bin failed to
+    // write), or (task 8.17) was a perfectly valid envelope that arrived while an earlier
+    // first-contact request from the same sender was still undecided (`ChatError::RequestPending`)
+    // — never merged into that pending request, so this delivery was never actually shown to the
+    // user despite the save succeeding. Acking THIS delivery's own id in any of these cases would
+    // delete the mailbox's only durable record of a message the user never actually received,
+    // exactly the crash-between-ack-and-processing loss `ack_pending_mailbox`'s own doc comment
+    // warns against — the `RequestPending` case just reaches the same "not actually delivered"
+    // outcome by a different, non-crash path (a decision still pending, not a failure). A live
+    // delivery
     // (`mailbox_id: None`) never added anything to flush, so this is a harmless no-op network round
     // trip skipped entirely in that case (`ack_pending_mailbox` itself no-ops on an empty batch) —
     // best-effort, like every other network call in this function: a failed ack here is not fatal,
