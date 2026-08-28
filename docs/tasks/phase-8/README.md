@@ -109,7 +109,7 @@ cross-federation acceptance test (8.13) and the phase-exit demo (8.14) come last
 - [x] **8.4** Conformance vectors for the mailbox wire fields (depends on 8.3) — [file](./8.4-mailbox-conformance-vectors.md)
 
 **Wave 3 — route-path integration**
-- [ ] **8.5** `handle_route` local mailbox enqueue, TTL/quota-aware (depends on 8.1, 8.3) — [file](./8.5-local-route-mailbox-enqueue.md)
+- [x] **8.5** `handle_route` local mailbox enqueue, TTL/quota-aware (depends on 8.1, 8.3) — [file](./8.5-local-route-mailbox-enqueue.md)
 - [ ] **8.6** `handle_fed_route` mailbox enqueue on offline recipient (depends on 8.1, 8.3, 8.5) — [file](./8.6-fed-route-mailbox-enqueue.md)
 
 **Wave 4 — delivery, ack, and independent storage-only follow-ons**

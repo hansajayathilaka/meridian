@@ -137,6 +137,17 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 
 ### Live carry-forwards (not owned by any open task)
+- **Mailbox quota check is a TOCTOU race under concurrent routes to the same recipient** (task 8.5's
+  review): `queue_to_mailbox`'s quota check (`mailbox_size_bytes_for_recipient` then
+  `mailbox_enqueue`) is read-then-write across two unserialized `Store` calls — neither
+  `MemoryStore` nor `SqliteStore` hold a lock spanning both. Two connections routing to the same
+  offline recipient concurrently can both pass the quota check and both insert, overrunning
+  `quota_mb` by a bounded amount (roughly one extra envelope per concurrent racer, not unbounded).
+  Non-blocking for 8.5 (the task didn't scope concurrency control, and the store trait has no
+  compare-and-swap primitive to build one on cheaply), but no open phase-8 task owns fixing it (e.g.
+  a per-recipient async lock, or a single atomic conditional-insert in SQLite). Flag for a future
+  `/plan-phase` if the overrun bound is judged worth closing.
+
 Phase 4 is now closed; its own unowned findings live in
 [phase-4/README.md](./phase-4/README.md#exit-criteria)'s "Findings with no task yet" sections, for
 `/plan-phase` to pick up in a future build phase. These are the standing exceptions that would otherwise
@@ -535,7 +546,7 @@ wire-protocol questions T07 raises before any task started; full record and brea
 - [x] **8.4** Conformance vectors for the mailbox wire fields — [file](./phase-8/8.4-mailbox-conformance-vectors.md)
 
 **Wave 3 — route-path integration**
-- [ ] **8.5** `handle_route` local mailbox enqueue, TTL/quota-aware — [file](./phase-8/8.5-local-route-mailbox-enqueue.md)
+- [x] **8.5** `handle_route` local mailbox enqueue, TTL/quota-aware — [file](./phase-8/8.5-local-route-mailbox-enqueue.md)
 - [ ] **8.6** `handle_fed_route` mailbox enqueue on offline recipient — [file](./phase-8/8.6-fed-route-mailbox-enqueue.md)
 
 **Wave 4 — delivery, ack, and storage-only follow-ons**

@@ -421,6 +421,11 @@ async fn handle_route(
         }
     }
 
+    // Kept in case the recipient turns out to be offline and this falls through to the
+    // mailbox-enqueue path below (T07) — both `deliver_one` and the tamper-hook plan below consume
+    // `body.blob.0` regardless of whether the recipient is actually connected.
+    let blob_for_mailbox = body.blob.0.clone();
+
     // The honest path, and the ONLY path compiled into a default/release build: exactly one
     // `Deliver`, to the requested recipient, carrying the client's bytes unaltered, with `from` set
     // to the key this connection authenticated as. The blob is never *inspected* — it stays opaque.
@@ -472,8 +477,9 @@ async fn handle_route(
             },
         )
         .await;
-    } else {
-        // Offline delivery / mailbox is T07; here an offline recipient is an error.
+    } else if state.config.mailbox.ttl_days == 0 {
+        // TTL=0: the mailbox is genuinely disabled (pure-P2P mode), not just empty — unchanged
+        // pre-T07 behavior, never attempt an enqueue.
         send_err(
             tx,
             frame.id,
@@ -481,6 +487,67 @@ async fn handle_route(
             "recipient offline",
         )
         .await;
+    } else {
+        queue_to_mailbox(state, tx, frame, body.to, blob_for_mailbox).await;
+    }
+}
+
+/// `MB` in `config.mailbox.quota_mb` means MiB (binary), matching this codebase's one other
+/// documented size convention (`mrd.file/1`'s 64 KiB chunk size, task 7.5) — no design doc pins
+/// this down explicitly (`TODO: confirm` already carried on `Mailbox::quota_mb`'s own doc comment,
+/// task 8.1), so this is a reasonable disambiguation, not an invented requirement.
+const MAILBOX_QUOTA_BYTES_PER_MB: u64 = 1024 * 1024;
+
+/// The offline+mailbox-enabled branch of `handle_route` (T07, phase-8 architect consult point 4):
+/// enqueue the recipient's ciphertext into their mailbox for later delivery-on-reconnect (8.7),
+/// unless doing so would exceed their configured quota. Never a `RouteOk` on the quota-exceeded
+/// path — a distinct `mailbox_full` error, per the wire consult 8.3 already shipped.
+async fn queue_to_mailbox(
+    state: &Arc<AppState>,
+    tx: &mpsc::Sender<Message>,
+    frame: &Frame,
+    recipient: [u8; 32],
+    blob: Vec<u8>,
+) {
+    let quota_bytes = state.config.mailbox.quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
+    let current_bytes = match state
+        .store
+        .mailbox_size_bytes_for_recipient(&recipient)
+        .await
+    {
+        Ok(n) => n,
+        Err(_) => return send_err(tx, frame.id, error_codes::BAD_REQUEST, "store failed").await,
+    };
+    if current_bytes + blob.len() as u64 > quota_bytes {
+        return send_err(
+            tx,
+            frame.id,
+            error_codes::MAILBOX_FULL,
+            "recipient's mailbox is full",
+        )
+        .await;
+    }
+
+    let now = now_secs();
+    let ttl_secs = state.config.mailbox.ttl_days as u64 * 86_400;
+    match state
+        .store
+        .mailbox_enqueue(recipient, blob, now, now + ttl_secs)
+        .await
+    {
+        Ok(_id) => {
+            send(
+                tx,
+                Op::RouteOk,
+                frame.id,
+                &RouteOk {
+                    delivered: false,
+                    queued: true,
+                },
+            )
+            .await;
+        }
+        Err(_) => send_err(tx, frame.id, error_codes::BAD_REQUEST, "store failed").await,
     }
 }
 

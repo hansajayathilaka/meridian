@@ -43,7 +43,7 @@ All 32-byte keys and 64-byte signatures are encoded as **CBOR byte strings** (ma
 
 `PrekeyBundle = { v, account_pub: bstr[32], spk: bstr[32], spk_sig: bstr[64], otks: [*bstr[32]], otk_sigs: [*bstr[64]], device_record?: bstr }` — every `*_sig` is `Ed25519(account_pub)` over the corresponding public key. `device_record` is opaque and account-signed (T13). ≤100 one-time prekeys.
 
-**Error codes:** `auth_required`, `auth_failed`, `replay`, `admission_denied`, `not_found`, `not_connected`, `rate_limited`, `bad_bundle`, `bad_request`, `turn_unavailable`, `fed_denied`, `fed_unreachable`, `not_found_at_hint` (the last three are T06/[2.3](../tasks/phase-2/2.3-c2s-federation-extension.md) additions — see §4).
+**Error codes:** `auth_required`, `auth_failed`, `replay`, `admission_denied`, `not_found`, `not_connected`, `rate_limited`, `bad_bundle`, `bad_request`, `turn_unavailable`, `fed_denied`, `fed_unreachable`, `not_found_at_hint` (the last three are T06/[2.3](../tasks/phase-2/2.3-c2s-federation-extension.md) additions — see §4), `mailbox_full` ([T07](../architecture/features/07-offline-mailbox.md)/[8.3](../tasks/phase-8/8.3-wire-proto-mailbox-fields.md) addition — see §4).
 
 ## 2. Handshake & registration
 
@@ -60,7 +60,7 @@ All 32-byte keys and 64-byte signatures are encoded as **CBOR byte strings** (ma
 
 ## 4. Routing
 
-`Route{to, blob}` delivers `blob` verbatim to every live connection for `to` as `Deliver{from, blob}`, and replies `RouteOk{delivered:true}`; an offline recipient is `not_connected` (the ciphertext mailbox is [T07](../architecture/features/07-offline-mailbox.md)). The server **never** decodes `blob` — it is `OpaqueBlob` end to end, enforced by `tools/lint-no-serde-on-blob.sh`.
+`Route{to, blob}` delivers `blob` verbatim to every live connection for `to` as `Deliver{from, blob}`, and replies `RouteOk{delivered:true}`. An offline recipient ([T07](../architecture/features/07-offline-mailbox.md), [8.5](../tasks/phase-8/8.5-local-route-mailbox-enqueue.md)) is one of three outcomes depending on server config: `config.mailbox.ttl_days == 0` (mailbox disabled, pure-P2P mode) stays the pre-T07 `not_connected` error; otherwise the ciphertext is enqueued into the recipient's mailbox for delivery on reconnect ([8.7](../tasks/phase-8/8.7-mailbox-delivery-reconnect-ack.md)) and the reply is `RouteOk{delivered:false, queued:true}`; if enqueueing would exceed the recipient's `config.mailbox.quota_mb`, the reply is `Err{mailbox_full}` instead (never a `RouteOk`). The server **never** decodes `blob` — it is `OpaqueBlob` end to end, enforced by `tools/lint-no-serde-on-blob.sh`.
 
 ### Federation hints (T06)
 
@@ -174,4 +174,8 @@ Storage is a trait ([`store.rs`](../../apps/rendezvous/src/store.rs)). The MVP d
 - TLS is proxy/VIP-terminated in this increment (ws on the bind address); direct rustls termination is a follow-up.
 - Persistence defaults to in-memory; the sqlx/SQLite impl is feature-gated and stores each bundle as one CBOR blob rather than the fully normalized [data-model](../architecture/data-model.md) columns. **Resolved, re-deferred to T07** ([2.3](../tasks/phase-2/2.3-c2s-federation-extension.md)): Feature 06 adds no new persisted state of its own — the federation map, policy and allowlist are config (not DB rows), rate limits are in-memory counters, reachability is live `Registry` state, and the bundle a federated fetch serves is the same blob already stored today. [T07](../architecture/features/07-offline-mailbox.md)'s mailbox is the first feature that needs per-envelope rows, TTL sweeps and quota accounting — the first actual consumer a normalized schema would have. Normalized schema + Postgres remain out of scope until then.
 - Prekey **secret** lifecycle (persistence, rotation) is deferred to T03 (X3DH); T02 publishes real, signed public prekeys. *TODO: confirm in T03.*
-- Offline delivery returns `not_connected`; the ciphertext mailbox is T07.
+- **Resolved (8.5)**: offline delivery now queues into the recipient's ciphertext mailbox
+  (`RouteOk{queued:true}`) whenever `config.mailbox.ttl_days > 0` and the recipient is under quota —
+  see §4. `not_connected` survives only for `ttl_days == 0` (mailbox genuinely disabled). Delivery
+  on reconnect is [8.7](../tasks/phase-8/8.7-mailbox-delivery-reconnect-ack.md); federated routing's
+  own mailbox enqueue is [8.6](../tasks/phase-8/8.6-fed-route-mailbox-enqueue.md).
