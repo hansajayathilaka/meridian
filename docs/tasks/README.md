@@ -570,7 +570,7 @@ wire-protocol questions T07 raises before any task started; full record and brea
 
 **Wave 5**
 - [x] **8.8** Client-side `MailboxAck` send + redelivery-dedup confirmation — [file](./phase-8/8.8-client-mailbox-ack-dedup.md)
-- [ ] **8.10** X3DH-initial-message-via-mailbox coverage — [file](./phase-8/8.10-x3dh-initial-via-mailbox.md)
+- [x] **8.10** X3DH-initial-message-via-mailbox coverage — [file](./phase-8/8.10-x3dh-initial-via-mailbox.md)
 
 **Wave 6 — acceptance + exit**
 - [ ] **8.13** Cross-federation acceptance test: Org A → Org B mailbox → reconnect — [file](./phase-8/8.13-cross-federation-mailbox-acceptance.md)
