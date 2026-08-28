@@ -574,6 +574,7 @@ wire-protocol questions T07 raises before any task started; full record and brea
 
 **Wave 6 — acceptance + exit**
 - [x] **8.13** Cross-federation acceptance test: Org A → Org B mailbox → reconnect — [file](./phase-8/8.13-cross-federation-mailbox-acceptance.md)
+- [x] **8.15** Client surfaces the mailbox-queued outcome (fix-task found during 8.14's live demo prep) — [file](./phase-8/8.15-client-surfaces-mailbox-queued-outcome.md)
 - [ ] **8.14** Phase exit: full demo script + doc sync — [file](./phase-8/8.14-phase-exit-mailbox-demo.md)
 
 ## Legend / how to read

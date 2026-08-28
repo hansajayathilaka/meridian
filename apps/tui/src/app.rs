@@ -600,16 +600,19 @@ pub struct SendMessageRequest {
 
 /// What sending actually produced: the worker-minted `mid` (matches
 /// `crate::store::history::HistoryEntry::mid`'s shape), the worker's wall-clock read at the moment
-/// of sending, and whether the peer was reachable right now — mirrors
-/// `apps/cli/src/chat.rs::send_text`'s own `delivered: bool` (`route_tolerant`'s return value)
-/// exactly. `delivered == false` is the pre-T07 "peer offline" case
-/// ([tui-client.md §7](../../../docs/architecture/tui-client.md#7-what-the-user-sees-when-things-go-wrong)),
-/// never "queued for later delivery" — see `crate::screens::chat::offline_failure_copy`.
+/// of sending, and the routing outcome — mirrors `apps/cli/src/chat.rs::send_text`'s own
+/// `RouteOutcome` (`route_tolerant`'s return value) exactly. `delivered == false` no longer means
+/// "genuinely offline" on its own (task 8.15): `queued == true` is the T07 mailbox case — durably
+/// queued server-side, will arrive on the peer's reconnect, never a retry candidate — while
+/// `delivered == false && queued == false` is the genuine "not delivered, nothing to wait for"
+/// case ([tui-client.md §7](../../../docs/architecture/tui-client.md#7-what-the-user-sees-when-things-go-wrong)).
+/// See `crate::screens::chat::offline_failure_copy`/`queued_notice_copy`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentMessage {
     pub mid: String,
     pub ts: u64,
     pub delivered: bool,
+    pub queued: bool,
 }
 
 /// [`Effect::SendMessage`]'s payload — same request/outcome shape as [`GenerateAccountEffect`].

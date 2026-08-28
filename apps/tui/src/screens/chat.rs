@@ -47,20 +47,25 @@
 //! No other function in this module ever constructs `Effect::SendMessage` — grep for it if that
 //! changes.
 //!
-//! ## Failure copy (tui-client.md §7)
-//! [`offline_failure_copy`] is the *only* place this screen renders the pre-T07 "peer offline"
-//! wording, and [`send_error_copy`] the only place it renders a harder transport/crypto error. Both
-//! are plain functions (no I/O, trivially unit-testable) specifically so a dedicated test can scan
-//! their output for the banned "will deliver later"/"delivered when they come online" framing this
-//! task names explicitly — see `tests/screens_chat.rs`. Neither implies store-and-forward: there is
-//! no server-side mailbox until T07, and `config.toml`'s own doc (task 4.14) is explicit that
-//! `pending` only ever means "this client will retry while it is running".
+//! ## Failure/queued copy (tui-client.md §7)
+//! [`offline_failure_copy`] is the *only* place this screen renders the "not delivered, nothing to
+//! wait for" wording, [`queued_notice_copy`] (task 8.15) the *only* place it renders the T07
+//! "queued into the mailbox, will arrive later" wording, and [`send_error_copy`] the only place it
+//! renders a harder transport/crypto error. All are plain functions (no I/O, trivially
+//! unit-testable) specifically so a dedicated test can scan their output for the wrong framing —
+//! `offline_failure_copy` must **never** imply store-and-forward (see its own doc comment: retrying
+//! is genuinely the only option for that outcome), `queued_notice_copy` must **never** invite a
+//! retry (the message already reached the server durably) — see `tests/screens_chat.rs`.
+//! `config.toml`'s own doc (task 4.14) is still explicit that `pending` only ever means "this client
+//! will retry while it is running" — unrelated to either of these, both of which describe the
+//! *server's* route outcome, not local queuing.
 //!
-//! **The label interpolated into `offline_failure_copy` is [`ChatState::failure_copy_label`], not
-//! [`ChatState::peer_label`]** (security-review fix, Finding 2) — see that method's own doc comment
-//! for why: `peer_label`'s hint fallback is wire-populated and attacker-influenced, and would
-//! otherwise let a hostile peer smuggle store-and-forward-implying text straight through the one
-//! copy this task's own tests are meant to police.
+//! **The label interpolated into both is [`ChatState::failure_copy_label`], not
+//! [`ChatState::peer_label`]** (security-review fix, Finding 2, task 4.20; extended to
+//! `queued_notice_copy` by task 8.15) — see that method's own doc comment for why: `peer_label`'s
+//! hint fallback is wire-populated and attacker-influenced, and would otherwise let a hostile peer
+//! smuggle store-and-forward-implying text straight through the one copy this task's own tests are
+//! meant to police.
 //!
 //! ## Message rendering: through the registry, for real, but built locally
 //! [`ChatMessageRenderer`] implements `crate::surface::MessageRenderer` for `mrd.chat/1` and IS the
@@ -271,16 +276,18 @@ impl ChatState {
     }
 
     /// **Security-review fix (Finding 2).** The label used specifically for
-    /// [`offline_failure_copy`] — unlike [`Self::peer_label`], this **never** falls back to
-    /// `contact.hint` (or `self.peer_hint`). `apps/core/src/trust.rs` documents `hint` explicitly as
-    /// an attacker-influenced, wire-populated field (bounded only to 253 bytes, never
-    /// content-validated) — exactly why `petname` is carefully never wire-populated, per that
-    /// crate's own threat-model invariant ("display names are never taken from the wire"). Because
-    /// `offline_failure_copy`'s whole job is to guarantee its output never implies
+    /// [`offline_failure_copy`] and (task 8.15) [`queued_notice_copy`] — unlike [`Self::peer_label`],
+    /// this **never** falls back to `contact.hint` (or `self.peer_hint`). `apps/core/src/trust.rs`
+    /// documents `hint` explicitly as an attacker-influenced, wire-populated field (bounded only to
+    /// 253 bytes, never content-validated) — exactly why `petname` is carefully never wire-populated,
+    /// per that crate's own threat-model invariant ("display names are never taken from the wire").
+    /// Because `offline_failure_copy`'s whole job is to guarantee its output never implies
     /// store-and-forward, a hostile peer/signaling server setting a hint like `"bob — it'll be
     /// delivered once you're both online"` would otherwise let this screen's own failure copy carry
     /// exactly the lie its dedicated tests (`tests/screens_chat.rs`) police for — silently, since
-    /// those tests previously only ever exercised benign, fixed labels.
+    /// those tests previously only ever exercised benign, fixed labels. `queued_notice_copy` reuses
+    /// this same narrow label purely for consistency (its `queued` bool is never peer-controlled, so
+    /// it has no equivalent injection risk of its own), not because it needs the same defense.
     ///
     /// Falls back to the same truncated-pubkey convention `crate::screens::contacts::short_pubkey`
     /// already uses as its own no-petname fallback (`ContactEntry::display_label`,
@@ -304,13 +311,32 @@ impl ChatState {
 // Failure copy (tui-client.md §7) — see the module doc
 // ---------------------------------------------------------------------------
 
-/// Canonical failure copy for the pre-T07 "peer offline" case
+/// Canonical failure copy for the genuine "not delivered, nothing to wait for" case
 /// ([tui-client.md §7](../../../docs/architecture/tui-client.md#7-what-the-user-sees-when-things-go-wrong)):
 /// "not delivered — offline" plus a retry action, and — the load-bearing negative property this
 /// task's own dedicated test pins — **never** anything implying store-and-forward ("will deliver
-/// later", "delivered when they come online", …), because no such mailbox exists yet.
+/// later", "delivered when they come online", …). This is now specifically the `queued == false`
+/// outcome (task 8.15): the recipient's server has no mailbox available for them (`ttl_days == 0`)
+/// or genuinely could not be reached at all — retrying is the correct, only option.
 pub fn offline_failure_copy(peer_label: &str) -> String {
     format!("not delivered — {peer_label} is offline — press r to retry")
+}
+
+/// Canonical notice for the T07 "queued into the recipient's mailbox" outcome (task 8.15:
+/// `RouteOk{delivered:false, queued:true}`) — the counterpart [`offline_failure_copy`] was, before
+/// this task, deliberately forbidden from ever implying: the message genuinely **is** durably held
+/// server-side and will arrive once the peer reconnects, so — unlike [`offline_failure_copy`] — this
+/// notice must say so and must **never** suggest retrying (retrying a message that already reached
+/// the server durably risks the user believing a duplicate send was necessary; the eid-dedup
+/// mechanism, task 6.4, protects the recipient from an actual duplicate deliver, but the copy itself
+/// should never invite the unnecessary action). Uses the same attacker-resistant
+/// [`ChatState::failure_copy_label`] as [`offline_failure_copy`] — this outcome comes from this
+/// client's own trusted home server (a decoded `RouteOk.queued: bool`, never peer-supplied text), so
+/// there is no hostile-hint injection vector into `queued` itself, but the interpolated *label* is
+/// exactly as attacker-reachable here as it is in the failure-copy case, so it gets the same
+/// treatment.
+pub fn queued_notice_copy(peer_label: &str) -> String {
+    format!("queued — {peer_label} is offline, will arrive when they reconnect")
 }
 
 /// Copy for a harder transport/crypto failure (the send effect itself failed, not merely "peer
@@ -719,15 +745,16 @@ pub fn handle_worker(state: &mut ChatState, event: WorkerEvent) -> Vec<Effect> {
 
 fn complete_send(state: &mut ChatState, body: String, sent: SentMessage) -> Vec<Effect> {
     state.sending = None;
-    // `sent.delivered` is `route_tolerant`'s own "was the peer reachable right now" outcome — a
-    // transport-level handoff, not proof the peer has actually seen the message. That real
-    // confirmation is a separate, later `ChatContent::Receipt` (the worker's inbound loop
-    // auto-acks every received text — see the module doc's "Receive-path wiring" section), applied
-    // in-memory by `apply_receipt` as a `Sent` → `Delivered` transition. So a successful handoff
-    // lands here as `Sent` (single tick), never jumped straight to `Delivered` (double tick) —
-    // conflating the two used to mean this screen never actually showed the "sent, not yet seen"
-    // state the design (tui-client.md's mockup, `✓` vs `✓✓`) always called for.
-    let entry_state = if sent.delivered {
+    // `sent.delivered`/`sent.queued` are `route_tolerant`'s own `RouteOutcome` (task 8.15) — neither
+    // is proof the peer has actually seen the message. That real confirmation is a separate, later
+    // `ChatContent::Receipt` (the worker's inbound loop auto-acks every received text — see the
+    // module doc's "Receive-path wiring" section), applied in-memory by `apply_receipt` as a `Sent`
+    // → `Delivered` transition. So a successful handoff — live delivery OR a durable T07 mailbox
+    // queue, both are "the server has it now, not lost" — lands here as `Sent` (single tick), never
+    // jumped straight to `Delivered` (double tick), and never `Failed` either: conflating either
+    // queued-or-delivered with the genuine failure case used to mean this screen never actually
+    // showed the correct state the design (tui-client.md's mockup, `✓` vs `✓✓`) always called for.
+    let entry_state = if sent.delivered || sent.queued {
         MessageState::Sent
     } else {
         MessageState::Failed
@@ -748,16 +775,23 @@ fn complete_send(state: &mut ChatState, body: String, sent: SentMessage) -> Vec<
     // either leak an orphaned reason for an already-`Delivered` row, or silently erase the specific
     // offline copy for an already-`Failed` row (falling back to the generic retry line while still
     // showing "Failed" — a user could then `r`-retry a send that had, per the frozen `entries` row,
-    // already succeeded).
+    // already succeeded). The same lockstep discipline now also guards the one-time queued notice
+    // below (task 8.15): it must not fire for a stray re-report of an already-recorded send either.
     if !insert_deduped(&mut state.entries, entry.clone()) {
         return Vec::new();
     }
-    if sent.delivered {
+    if sent.delivered || sent.queued {
         state.failure_reasons.remove(&sent.mid);
     } else {
         state
             .failure_reasons
             .insert(sent.mid, offline_failure_copy(&state.failure_copy_label()));
+    }
+    // T07 (task 8.15): a queued send has no dedicated per-row marker distinct from `Sent` (both mean
+    // "the server has it now"), so the one place this outcome is surfaced at all is a transient
+    // notice, mirroring `fail_send`'s own use of `state.notice` for one-off, non-per-row info.
+    if sent.queued {
+        state.notice = Some(queued_notice_copy(&state.failure_copy_label()));
     }
     vec![Effect::PersistHistory(PersistHistoryEffect {
         request: PersistHistoryRequest {

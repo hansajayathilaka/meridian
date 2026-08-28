@@ -27,7 +27,7 @@ use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{
     generate_account, FileSecretStore, KeyHandle, MemorySecretStore, OsSecretStore, SecretStore,
 };
-use meridian_core::signaling::{SignalingClient, DEFAULT_OTK_COUNT};
+use meridian_core::signaling::{RouteOutcome, SignalingClient, DEFAULT_OTK_COUNT};
 use meridian_core::trust::{Contact, PinnedKey, SendGate, TrustState, TrustStore};
 
 use crate::app::{
@@ -2118,7 +2118,7 @@ async fn run_send_message(
         .map_err(|e| format!("sealing message: {e}"))?;
     save_chat(&chat, store, handle)?;
 
-    let delivered = route_tolerant(
+    let outcome = route_tolerant(
         &mut client,
         request.peer_pubkey,
         &request.peer_hint,
@@ -2127,12 +2127,13 @@ async fn run_send_message(
     )
     .await;
     let _ = client.close().await;
-    let delivered = delivered?;
+    let outcome = outcome?;
 
     Ok(SentMessage {
         mid: hex::encode(id),
         ts: now_unix(),
-        delivered,
+        delivered: outcome.delivered,
+        queued: outcome.queued,
     })
 }
 
@@ -2225,26 +2226,29 @@ fn federation_error_line(
     }
 }
 
-/// Route a blob, treating a `not_connected` server reply as "not delivered" rather than a fatal
-/// error — mirrors `apps/cli/src/chat.rs::route_tolerant` exactly: a momentarily-offline peer must
-/// not be reported as a harder failure than it is (offline delivery is the T07 mailbox, out of
-/// scope for this whole phase — see [`SentMessage`]'s own doc comment on what `delivered: false`
-/// must never imply).
+/// Route a blob, treating a `not_connected` server reply as "not delivered, not queued" rather than
+/// a fatal error — mirrors `apps/cli/src/chat.rs::route_tolerant` exactly: a momentarily-offline
+/// peer with no mailbox available must not be reported as a harder failure than it is. Returns the
+/// full [`RouteOutcome`] (task 8.15) — see [`SentMessage`]'s own doc comment for what `delivered`
+/// vs. `queued` now mean.
 async fn route_tolerant(
     client: &mut SignalingClient,
     to: [u8; 32],
     hint: &str,
     blob: Vec<u8>,
     peer_label: &str,
-) -> Result<bool, String> {
+) -> Result<RouteOutcome, String> {
     use meridian_core::proto::error_codes::NOT_CONNECTED;
     use meridian_core::signaling::SignalError;
     match client
-        .route_with_hint(to, sanitize_routing_hint(hint), blob)
+        .route_with_hint_detailed(to, sanitize_routing_hint(hint), blob)
         .await
     {
-        Ok(delivered) => Ok(delivered),
-        Err(SignalError::Server(e)) if e.code == NOT_CONNECTED => Ok(false),
+        Ok(outcome) => Ok(outcome),
+        Err(SignalError::Server(e)) if e.code == NOT_CONNECTED => Ok(RouteOutcome {
+            delivered: false,
+            queued: false,
+        }),
         Err(e) => Err(federation_error_line(&e, peer_label, "routing message to")),
     }
 }

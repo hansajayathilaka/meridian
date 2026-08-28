@@ -124,7 +124,8 @@ cross-federation acceptance test (8.13) and the phase-exit demo (8.14) come last
 
 **Wave 6 — acceptance + exit**
 - [x] **8.13** Cross-federation acceptance test: Org A → Org B mailbox → reconnect (depends on 8.6, 8.7, 8.9) — [file](./8.13-cross-federation-mailbox-acceptance.md)
-- [ ] **8.14** Phase exit: full demo script + doc sync (depends on 8.1–8.13) — [file](./8.14-phase-exit-mailbox-demo.md)
+- [x] **8.15** Client surfaces the mailbox-queued outcome (fix-task found during 8.14's live demo prep; depends on 8.5, 8.6) — [file](./8.15-client-surfaces-mailbox-queued-outcome.md)
+- [ ] **8.14** Phase exit: full demo script + doc sync (depends on 8.1–8.13, 8.15) — [file](./8.14-phase-exit-mailbox-demo.md)
 
 ## Exit criteria
 Phase 8 is done when every task is `[x]`, the tree is green (`cargo build --workspace`, `cargo fmt

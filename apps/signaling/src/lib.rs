@@ -15,7 +15,7 @@ mod client;
 mod error;
 
 pub use bundle::{generate_bundle, verify_bundle, GeneratedBundle};
-pub use client::{install_crypto_provider, SignalingClient};
+pub use client::{install_crypto_provider, RouteOutcome, SignalingClient};
 pub use error::{Result, SignalError};
 
 /// Default one-time-prekey batch size published at registration (feature spec: ≤100).

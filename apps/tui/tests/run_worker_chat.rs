@@ -444,11 +444,15 @@ async fn send_to_an_online_peer_reports_delivered_true() {
     }
 }
 
-/// `delivered == false` is the pre-T07 "peer offline right now" case — `route_tolerant`'s real
-/// `not_connected` outcome, surfaced faithfully, still a `WorkerEvent::Completed` (never a
-/// `WorkerEvent::Failed`): the send itself succeeded, the peer just was not reachable to receive it.
+/// `delivered == false` for an offline peer, still a `WorkerEvent::Completed` (never a
+/// `WorkerEvent::Failed`): the send itself succeeded, the peer just was not reachable to receive it
+/// live. `write_server_config`'s server runs `Config::default()`'s non-zero `mailbox.ttl_days` (task
+/// 8.15: this test's own send genuinely takes the T07 mailbox-enqueue path, not the pre-T07
+/// `not_connected` drop — see `BundleFetchCountingStore`'s own doc comment on its mailbox-method
+/// forwarding, a few lines up in this file), so the real, current outcome here is
+/// `{delivered:false, queued:true}`, asserted below.
 #[tokio::test]
-async fn send_to_an_offline_peer_completes_with_delivered_false() {
+async fn send_to_an_offline_peer_completes_with_delivered_false_and_queued_true() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let _env = EnvGuard::set(tmp.path());
     let (server, _store) = spawn_server();
@@ -465,10 +469,17 @@ async fn send_to_an_offline_peer_completes_with_delivered_false() {
         WorkerEvent::Completed(Effect::SendMessage(SendMessageEffect {
             outcome: Some(sent),
             ..
-        })) => assert!(
-            !sent.delivered,
-            "peer connection was closed before the send"
-        ),
+        })) => {
+            assert!(
+                !sent.delivered,
+                "peer connection was closed before the send"
+            );
+            assert!(
+                sent.queued,
+                "the default (non-zero ttl_days) mailbox must have durably queued this send \
+                 rather than dropping it — got {sent:?}"
+            );
+        }
         other => panic!(
             "an offline peer must still be a Completed outcome (delivered: false), got {other:?}"
         ),

@@ -37,7 +37,7 @@
 use meridian_core::chat::{ChatError, ChatState, SPK_ROTATION_INTERVAL_SECS};
 use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{KeyHandle, SecretStore};
-use meridian_core::signaling::{SignalingClient, DEFAULT_OTK_COUNT};
+use meridian_core::signaling::{RouteOutcome, SignalingClient, DEFAULT_OTK_COUNT};
 use meridian_core::trust::{SendGate, TrustStore};
 use tokio::sync::mpsc;
 
@@ -468,9 +468,15 @@ fn federation_error_line(
     }
 }
 
-/// Route a blob, treating a `not_connected` server reply as "not delivered" rather than a fatal
-/// error: a momentarily-offline peer must not tear down the chat session (offline delivery is the
-/// T07 mailbox). Other transport/server errors still propagate.
+/// Route a blob, treating a `not_connected` server reply as "not delivered, not queued" rather than
+/// a fatal error: a momentarily-offline peer with no mailbox available must not tear down the chat
+/// session. Other transport/server errors still propagate.
+///
+/// Returns the full [`RouteOutcome`] (task 8.15) rather than a collapsed bool: `not_connected`
+/// (`ttl_days == 0` at the recipient's server, or no mailbox story at all) means genuinely
+/// `{delivered:false, queued:false}` — every other outcome, including "queued into the recipient's
+/// offline mailbox" (T07: `{delivered:false, queued:true}`), comes straight off the real `RouteOk`
+/// the server sent.
 ///
 /// `hint` (task 2.15) is the peer's `@domain` routing hint — the same value already threaded into
 /// `fetch_with_retry` — passed on every routed call (not just the initial bundle fetch) so an
@@ -484,15 +490,18 @@ async fn route_tolerant(
     hint: &str,
     blob: Vec<u8>,
     peer_label: &str,
-) -> Result<bool, String> {
+) -> Result<RouteOutcome, String> {
     use meridian_core::proto::error_codes::NOT_CONNECTED;
     use meridian_core::signaling::SignalError;
     match client
-        .route_with_hint(to, Some(hint.to_string()), blob)
+        .route_with_hint_detailed(to, Some(hint.to_string()), blob)
         .await
     {
-        Ok(delivered) => Ok(delivered),
-        Err(SignalError::Server(e)) if e.code == NOT_CONNECTED => Ok(false),
+        Ok(outcome) => Ok(outcome),
+        Err(SignalError::Server(e)) if e.code == NOT_CONNECTED => Ok(RouteOutcome {
+            delivered: false,
+            queued: false,
+        }),
         Err(e) => Err(federation_error_line(&e, peer_label, "routing message to")),
     }
 }
@@ -524,19 +533,57 @@ async fn send_text(
             },
         )
         .map_err(|e| format!("sealing message: {e}"))?;
-    let delivered = route_tolerant(client, *peer_ik, peer_hint, blob, peer_label).await?;
-    if json {
-        println!(
-            "{{\"event\":\"sent\",\"id\":\"{}\",\"delivered\":{}}}",
-            hex::encode(id),
-            delivered
-        );
-    } else if delivered {
-        println!("[you] {text}");
-    } else {
-        println!("[you] {text}  (peer offline — not delivered; mailbox is T07)");
-    }
+    let outcome = route_tolerant(client, *peer_ik, peer_hint, blob, peer_label).await?;
+    println!(
+        "{}",
+        sent_line(text, outcome, peer_label, peer_hint, id, json)
+    );
     Ok(())
+}
+
+/// The one line [`send_text`] prints for a completed send, factored out as a pure function (task
+/// 8.15) so the three-way `delivered` / `queued` / neither mapping is unit-testable without a live
+/// `SignalingClient` — mirrors this file's existing `gate_lines` pattern (see this module's own test
+/// block). `queued` (T07) must never be conflated with the genuine "not delivered, nothing to wait
+/// for" case: the mailbox-queued line echoes the feature spec's own demo script wording
+/// (`docs/architecture/features/07-offline-mailbox.md`: `[mailbox] bob offline — queued at org-b`) —
+/// minus that script's illustrative `(expires in 14d)`, since `RouteOk` carries no TTL for this
+/// client to report — and — the property this function's own dedicated tests pin — never says
+/// "mailbox is T07" (stale now that T07 is done) and never collapses `queued:true` into the plain
+/// "not delivered" line.
+///
+/// **Same-server only, today.** A federated route (task 8.6, phase-8 architect consult point 2)
+/// always replies to *this* sender with the optimistic `RouteOk{delivered:true, queued:false}` on
+/// any successful `route_foreign`, whether the foreign server delivered live or queued to its own
+/// mailbox — `outcome.queued` can only ever be `true` here for a peer on this same server. A
+/// cross-org send that actually queued at the recipient's org therefore still prints the plain
+/// `[you] {text}` line, not this one; `meridian-admin mailbox dump` at the *recipient's* org is the
+/// only honest proof for that case (see task 8.14's own doc-sync note on this exact framing gap).
+fn sent_line(
+    text: &str,
+    outcome: RouteOutcome,
+    peer_label: &str,
+    peer_hint: &str,
+    id: [u8; 16],
+    json: bool,
+) -> String {
+    if json {
+        format!(
+            "{{\"event\":\"sent\",\"id\":\"{}\",\"delivered\":{},\"queued\":{}}}",
+            hex::encode(id),
+            outcome.delivered,
+            outcome.queued
+        )
+    } else if outcome.delivered {
+        format!("[you] {text}")
+    } else if outcome.queued {
+        format!(
+            "[you] {text}  ([mailbox] {peer_label} offline — queued at {peer_hint}, will arrive \
+             on reconnect)"
+        )
+    } else {
+        format!("[you] {text}  (peer offline — not delivered; no mailbox available)")
+    }
 }
 
 /// (task 4.4) Every outbound `mrd.chat/1` **text** send funnels through here — never straight to
@@ -1432,6 +1479,90 @@ mod tests {
                     "kind={kind} json={json} dropped the canonical reason: {lines:?}"
                 );
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // (task 8.15) `sent_line` — the three-way `delivered`/`queued`/neither mapping `send_text`
+    // prints, extracted so it's unit-testable without a live `SignalingClient`. The property these
+    // tests pin: a queued send must say so (never the stale "mailbox is T07" wording, never
+    // collapsed into the same line as a genuine drop), and JSON mode always carries both fields so a
+    // scripted consumer can tell the three outcomes apart itself.
+    // -----------------------------------------------------------------------------------------
+
+    fn outcome(delivered: bool, queued: bool) -> RouteOutcome {
+        RouteOutcome { delivered, queued }
+    }
+
+    #[test]
+    fn delivered_line_is_plain_with_no_offline_qualifier() {
+        let line = sent_line(
+            "hi",
+            outcome(true, false),
+            "bob",
+            "org-b.test",
+            [0u8; 16],
+            false,
+        );
+        assert_eq!(line, "[you] hi");
+    }
+
+    #[test]
+    fn queued_line_names_the_mailbox_and_never_says_mailbox_is_t07() {
+        let line = sent_line(
+            "hi",
+            outcome(false, true),
+            "bob",
+            "org-b.test",
+            [0u8; 16],
+            false,
+        );
+        assert!(
+            line.contains("queued"),
+            "a mailbox-queued send must say so: {line:?}"
+        );
+        assert!(
+            line.contains("org-b.test"),
+            "must name the server the message was queued at: {line:?}"
+        );
+        assert!(
+            !line.to_lowercase().contains("mailbox is t07"),
+            "T07 is done — this wording must never appear again: {line:?}"
+        );
+    }
+
+    #[test]
+    fn genuinely_not_delivered_line_never_claims_queued_or_arriving_later() {
+        let line = sent_line(
+            "hi",
+            outcome(false, false),
+            "bob",
+            "org-b.test",
+            [0u8; 16],
+            false,
+        );
+        assert!(
+            !line.contains("queued") && !line.contains("arrive"),
+            "a genuine drop (no mailbox available) must never imply store-and-forward: {line:?}"
+        );
+    }
+
+    #[test]
+    fn json_mode_always_carries_both_delivered_and_queued_fields() {
+        for (delivered, queued) in [(true, false), (false, true), (false, false)] {
+            let line = sent_line(
+                "hi",
+                outcome(delivered, queued),
+                "bob",
+                "org-b.test",
+                [0u8; 16],
+                true,
+            );
+            assert!(
+                line.contains(&format!("\"delivered\":{delivered}")),
+                "{line:?}"
+            );
+            assert!(line.contains(&format!("\"queued\":{queued}")), "{line:?}");
         }
     }
 

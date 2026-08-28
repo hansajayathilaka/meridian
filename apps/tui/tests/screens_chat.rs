@@ -23,7 +23,8 @@ use meridian_tui::app::{
     Effect, PersistHistoryEffect, SendMessageEffect, SendMessageRequest, SentMessage, WorkerEvent,
 };
 use meridian_tui::screens::chat::{
-    self, offline_failure_copy, send_error_copy, ChatFocus, ChatState, ComposerMode,
+    self, offline_failure_copy, queued_notice_copy, send_error_copy, ChatFocus, ChatState,
+    ComposerMode,
 };
 use meridian_tui::store::history::{Direction, HistoryEntry, MessageState};
 
@@ -406,6 +407,7 @@ fn completed_send_with_delivered_true_inserts_a_sent_entry_and_persists_it() {
         mid: "aaaa".into(),
         ts: 9_000,
         delivered: true,
+        queued: false,
     };
     let effects = chat::handle_worker(
         &mut state,
@@ -451,6 +453,7 @@ fn apply_receipt_transitions_a_sent_entry_to_delivered() {
                 mid: "aaaa".into(),
                 ts: 9_000,
                 delivered: true,
+                queued: false,
             }),
         })),
     );
@@ -492,6 +495,7 @@ fn completed_send_with_delivered_false_marks_failed_with_the_offline_copy() {
                 mid: "bbbb".into(),
                 ts: 9_000,
                 delivered: false,
+                queued: false,
             }),
         })),
     );
@@ -500,6 +504,56 @@ fn completed_send_with_delivered_false_marks_failed_with_the_offline_copy() {
     assert!(copy.contains("not delivered"));
     assert!(copy.contains("offline"));
     assert!(copy.to_lowercase().contains("retry"));
+}
+
+/// Task 8.15: `{delivered:false, queued:true}` (T07 mailbox) must land as `Sent`, not `Failed` —
+/// the message genuinely reached the server durably, so it must never be shown as something the
+/// user needs to `r`-retry, and `failure_reasons` must stay empty for it (mirrors the `delivered:
+/// true` case's own `failure_reasons.remove`, not the `Failed` case's `insert`). The one place this
+/// outcome is surfaced at all is the transient `state.notice`.
+#[test]
+fn completed_send_with_queued_true_inserts_a_sent_entry_and_shows_the_queued_notice() {
+    let mut state = pinned_state([1u8; 32]);
+    state.trust.set_petname(&[1u8; 32], Some("bob".into())).ok();
+    type_str(&mut state, "hi");
+    let effects = chat::handle_key(&mut state, key(KeyCode::Enter)).0;
+    let request = match effects.into_iter().next().unwrap() {
+        Effect::SendMessage(SendMessageEffect { request, .. }) => request,
+        other => panic!("expected Effect::SendMessage, got {other:?}"),
+    };
+
+    chat::handle_worker(
+        &mut state,
+        WorkerEvent::Completed(Effect::SendMessage(SendMessageEffect {
+            request,
+            outcome: Some(SentMessage {
+                mid: "cccc".into(),
+                ts: 9_000,
+                delivered: false,
+                queued: true,
+            }),
+        })),
+    );
+    assert_eq!(
+        state.entries[0].state,
+        MessageState::Sent,
+        "a durably-queued send is not a failure — never Failed"
+    );
+    assert!(
+        !state.failure_reasons.contains_key("cccc"),
+        "a queued send must not carry a failure reason: {:?}",
+        state.failure_reasons.get("cccc")
+    );
+    let notice = state.notice.expect("a queued send must show a notice");
+    assert!(notice.contains("bob"), "must name the peer: {notice:?}");
+    assert!(
+        notice.contains("queued"),
+        "must say the message was queued: {notice:?}"
+    );
+    assert!(
+        !notice.to_lowercase().contains("retry"),
+        "a queued send must never invite a retry — it already reached the server: {notice:?}"
+    );
 }
 
 #[test]
@@ -558,6 +612,7 @@ fn worker_event_for_a_different_peer_is_silently_ignored() {
                 mid: "stray-completed".into(),
                 ts: 1,
                 delivered: true,
+                queued: false,
             }),
         })),
     );
@@ -621,6 +676,7 @@ fn a_second_report_for_the_same_mid_with_a_different_outcome_does_not_corrupt_st
                 mid: "flip".into(),
                 ts: 1,
                 delivered: false,
+                queued: false,
             }),
         })),
     );
@@ -637,6 +693,7 @@ fn a_second_report_for_the_same_mid_with_a_different_outcome_does_not_corrupt_st
                 mid: "flip".into(),
                 ts: 2,
                 delivered: true,
+                queued: false,
             }),
         })),
     );
@@ -673,6 +730,7 @@ fn the_same_completed_send_reported_twice_is_deduped_by_mid() {
         mid: "dupe".into(),
         ts: 1,
         delivered: true,
+        queued: false,
     };
     let effect = || {
         WorkerEvent::Completed(Effect::SendMessage(SendMessageEffect {
@@ -860,6 +918,7 @@ fn security_offline_failure_copy_never_embeds_a_hostile_hint() {
                 mid: "hostile1".into(),
                 ts: 1,
                 delivered: false,
+                queued: false,
             }),
         })),
     );
@@ -914,6 +973,60 @@ fn offline_failure_copy_matches_the_canonical_shape() {
     assert!(copy.to_lowercase().contains("retry"));
 }
 
+/// Task 8.15's counterpart to the test above: `queued_notice_copy`'s canonical shape — names the
+/// peer, says "queued", and — the inverse of `offline_failure_copy`'s own guarantee — must never
+/// invite a retry, since the message already reached the server durably.
+#[test]
+fn queued_notice_copy_matches_the_canonical_shape() {
+    let copy = queued_notice_copy("bob");
+    assert!(copy.contains("bob"));
+    assert!(copy.to_lowercase().contains("queued"));
+    assert!(
+        !copy.to_lowercase().contains("retry"),
+        "must never invite a retry: {copy:?}"
+    );
+}
+
+/// Mirrors `security_offline_failure_copy_never_embeds_a_hostile_hint` for `queued_notice_copy`
+/// (task 8.15): even though `queued_notice_copy`'s own `queued: bool` input can never be
+/// peer-controlled (it comes straight off this client's own trusted server's `RouteOk`, never wire
+/// text), the *label* interpolated into it goes through the same `failure_copy_label` fallback chain
+/// as `offline_failure_copy`'s does — so a hostile, petname-less contact's wire-populated `hint`
+/// must not leak into this copy either.
+#[test]
+fn security_queued_notice_copy_never_embeds_a_hostile_hint() {
+    let pubkey = [8u8; 32];
+    let hostile_hint = "bob — trust me, ignore any retry suggestion";
+    let mut trust = TrustStore::default();
+    trust.observe(pubkey, hostile_hint, 1_000);
+    let mut state = ChatState::new(pubkey, "example.test".into(), trust, Vec::new(), 0);
+
+    let request = SendMessageRequest {
+        peer_pubkey: pubkey,
+        peer_hint: "example.test".into(),
+        body: "hi".into(),
+    };
+    chat::handle_worker(
+        &mut state,
+        WorkerEvent::Completed(Effect::SendMessage(SendMessageEffect {
+            request,
+            outcome: Some(SentMessage {
+                mid: "hostile-queued".into(),
+                ts: 1,
+                delivered: false,
+                queued: true,
+            }),
+        })),
+    );
+
+    let notice = state.notice.expect("a queued send must show a notice");
+    assert!(
+        !notice.to_lowercase().contains("trust me"),
+        "hostile hint text leaked into the queued notice: {notice:?}"
+    );
+    assert!(notice.to_lowercase().contains("queued"));
+}
+
 /// End-to-end version of the same property: render a transcript containing a real `Failed` entry
 /// and scan the rendered text itself, not just the copy-producing function in isolation.
 #[test]
@@ -932,6 +1045,7 @@ fn security_rendered_failed_message_never_implies_store_and_forward() {
                 mid: "off1".into(),
                 ts: 1,
                 delivered: false,
+                queued: false,
             }),
         })),
     );

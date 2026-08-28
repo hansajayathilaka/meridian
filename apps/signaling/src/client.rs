@@ -36,6 +36,21 @@ pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// The full outcome of a [`SignalingClient::route_with_hint_detailed`] call — mirrors
+/// [`meridian_proto::RouteOk`]'s two fields exactly, so a mailbox-aware caller (task 8.15) can tell
+/// "delivered live right now" from "queued into the recipient's offline mailbox, will arrive on
+/// reconnect" (T07) from "genuinely not delivered" (neither field true — e.g. `ttl_days == 0` at the
+/// recipient's server), rather than the collapsed single bool [`SignalingClient::route_with_hint`]
+/// returns for callers that don't need the distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteOutcome {
+    /// Pushed to a live connection right now.
+    pub delivered: bool,
+    /// Durably queued into the recipient's offline mailbox instead (T07) — always `false` when
+    /// `delivered` is `true` (see [`RouteOk`]'s own doc comment: the two are mutually exclusive).
+    pub queued: bool,
+}
+
 /// An authenticated client session to a rendezvous server.
 pub struct SignalingClient {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -335,7 +350,10 @@ impl SignalingClient {
     }
 
     /// Route an opaque, client-signed envelope to an online peer. Returns whether it was delivered
-    /// (offline delivery / mailbox is T07).
+    /// live right now — `false` collapses both "queued into the recipient's offline mailbox, will
+    /// arrive on reconnect" (T07) and "genuinely not delivered" into one bool; use
+    /// [`route_with_hint_detailed`](Self::route_with_hint_detailed) when the caller needs to tell
+    /// those apart.
     pub async fn route(&mut self, to: [u8; 32], blob: Vec<u8>) -> Result<bool> {
         self.route_with_hint(to, None, blob).await
     }
@@ -347,12 +365,33 @@ impl SignalingClient {
     /// "this client never dials `hint` itself" caveat as
     /// [`fetch_bundle`](Self::fetch_bundle)'s identical parameter: only the server this client is
     /// `connect`ed to ever federates a request onward.
+    ///
+    /// Returns just `RouteOk.delivered` — see [`route_with_hint_detailed`](Self::route_with_hint_detailed)
+    /// for a caller that also needs `RouteOk.queued` (T07, task 8.15: `delivered == false` no longer
+    /// implies the envelope was dropped — it may have been durably queued into the recipient's
+    /// mailbox instead).
     pub async fn route_with_hint(
         &mut self,
         to: [u8; 32],
         hint: Option<String>,
         blob: Vec<u8>,
     ) -> Result<bool> {
+        self.route_with_hint_detailed(to, hint, blob)
+            .await
+            .map(|outcome| outcome.delivered)
+    }
+
+    /// Same request as [`route_with_hint`](Self::route_with_hint), but returns the full
+    /// [`RouteOutcome`] instead of collapsing it to one bool — the mailbox-aware callers need to
+    /// distinguish "queued for later delivery" (T07: `{delivered:false, queued:true}`) from
+    /// "genuinely not delivered" (`{delivered:false, queued:false}`, e.g. `ttl_days == 0` at the
+    /// recipient's server) rather than showing the same "offline, not delivered" copy for both.
+    pub async fn route_with_hint_detailed(
+        &mut self,
+        to: [u8; 32],
+        hint: Option<String>,
+        blob: Vec<u8>,
+    ) -> Result<RouteOutcome> {
         let body = RouteBody {
             to,
             to_hint: hint.clone(),
@@ -363,7 +402,10 @@ impl SignalingClient {
             .await
             .map_err(|e| crate::error::classify_federation_error(e, hint.as_deref()))?;
         let ok: RouteOk = reply.decode()?;
-        Ok(ok.delivered)
+        Ok(RouteOutcome {
+            delivered: ok.delivered,
+            queued: ok.queued,
+        })
     }
 
     /// Request an ephemeral TURN credential, distinct per request, for a new P2P session (T05,

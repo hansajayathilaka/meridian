@@ -510,6 +510,7 @@ fn at_rest_audit_finds_no_plaintext_leaks() {
         mid: hex::encode([0x51u8; 16]),
         ts: FIXED_NOW,
         delivered: true,
+        queued: false,
     };
     let effects = worker(
         &mut app,
