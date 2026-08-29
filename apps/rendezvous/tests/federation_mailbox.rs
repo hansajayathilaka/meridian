@@ -102,7 +102,7 @@ async fn federated_enqueue_against_bs_real_live_state_queues_then_drains_reconne
     let queued = pair
         .b_state
         .store
-        .mailbox_list_for_recipient(&bob.pubkey)
+        .mailbox_list_for_recipient(&bob.pubkey, 0)
         .await
         .expect("mailbox_list_for_recipient must succeed");
     assert_eq!(
@@ -154,7 +154,7 @@ async fn federated_enqueue_against_bs_real_live_state_queues_then_drains_reconne
     let after_ack = pair
         .b_state
         .store
-        .mailbox_list_for_recipient(&bob.pubkey)
+        .mailbox_list_for_recipient(&bob.pubkey, 0)
         .await
         .expect("mailbox_list_for_recipient must succeed");
     assert!(
@@ -225,7 +225,7 @@ async fn federated_enqueue_against_bs_real_live_state_over_quota_is_rejected_not
     let rows = pair
         .b_state
         .store
-        .mailbox_list_for_recipient(&bob.pubkey)
+        .mailbox_list_for_recipient(&bob.pubkey, 0)
         .await
         .expect("mailbox_list_for_recipient must succeed");
     assert!(

@@ -75,13 +75,23 @@ pub trait Store: Send + Sync {
         ))
     }
 
-    /// List every row currently held for `recipient_pub`, ordered by `arrived_at` then `id` (the
-    /// tie-break for same-timestamp arrivals, since `id` is assigned sequentially).
+    /// List every row currently held for `recipient_pub` that has NOT yet expired
+    /// (`expires_at > now`), ordered by `arrived_at` then `id` (the tie-break for same-timestamp
+    /// arrivals, since `id` is assigned sequentially).
+    ///
+    /// `now` is caller-injected (unix seconds), the same testability rationale
+    /// [`Store::mailbox_enqueue`]'s own doc comment gives for `arrived_at`/`expires_at` — task 9.3
+    /// (review finding F5). A row whose `expires_at <= now` is excluded here even though it may
+    /// not yet have been physically reclaimed by [`Store::mailbox_purge_expired`]'s periodic pass:
+    /// this is the "not yet observed by callers" half of that gap; `mailbox_purge_expired` stays
+    /// the sole mechanism that actually deletes the row (task 9.3's Scope explicitly leaves
+    /// `mailbox_purge.rs` unchanged).
     async fn mailbox_list_for_recipient(
         &self,
         recipient_pub: &[u8; 32],
+        now: u64,
     ) -> StoreResult<Vec<MailboxEntry>> {
-        let _ = recipient_pub;
+        let _ = (recipient_pub, now);
         Err(StoreError::Backend(
             "mailbox_list_for_recipient is not implemented for this store backend".to_string(),
         ))
@@ -114,10 +124,20 @@ pub trait Store: Send + Sync {
         ))
     }
 
-    /// Sum of `size_bytes` across every row currently held for `recipient_pub` — the quota
-    /// accounting primitive a later task's "mailbox full" check reads.
-    async fn mailbox_size_bytes_for_recipient(&self, recipient_pub: &[u8; 32]) -> StoreResult<u64> {
-        let _ = recipient_pub;
+    /// Sum of `size_bytes` across every row currently held for `recipient_pub` that has NOT yet
+    /// expired (`expires_at > now`) — the quota accounting primitive
+    /// [`mailbox_enqueue_with_quota`]'s "mailbox full" check reads.
+    ///
+    /// `now` is caller-injected, same rationale as [`Store::mailbox_list_for_recipient`]'s own doc
+    /// comment (task 9.3, review finding F5): without this filter, expired-but-not-yet-purged
+    /// bytes would wrongly count toward `quota_mb`, causing spurious `mailbox_full` errors for
+    /// senders until the next purge pass reclaims them.
+    async fn mailbox_size_bytes_for_recipient(
+        &self,
+        recipient_pub: &[u8; 32],
+        now: u64,
+    ) -> StoreResult<u64> {
+        let _ = (recipient_pub, now);
         Err(StoreError::Backend(
             "mailbox_size_bytes_for_recipient is not implemented for this store backend"
                 .to_string(),
@@ -241,7 +261,12 @@ pub async fn mailbox_enqueue_with_quota(
 ) -> StoreResult<MailboxEnqueueOutcome> {
     let _guard = locks.lock_recipient(&recipient).await;
     let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
-    let current_bytes = store.mailbox_size_bytes_for_recipient(&recipient).await?;
+    // Task 9.3: `now` (already caller-injected here, pre-dating this task) is also the "not yet
+    // expired" cutoff for the read below — an expired-but-not-yet-purged row must not count
+    // toward the quota this check enforces.
+    let current_bytes = store
+        .mailbox_size_bytes_for_recipient(&recipient, now)
+        .await?;
     if current_bytes + blob.len() as u64 > quota_bytes {
         return Ok(MailboxEnqueueOutcome::QuotaExceeded);
     }
@@ -349,9 +374,19 @@ impl Store for MemoryStore {
     async fn mailbox_list_for_recipient(
         &self,
         recipient_pub: &[u8; 32],
+        now: u64,
     ) -> StoreResult<Vec<MailboxEntry>> {
         let mailboxes = self.mailboxes.lock().unwrap();
-        let mut entries = mailboxes.get(recipient_pub).cloned().unwrap_or_default();
+        let mut entries: Vec<MailboxEntry> = mailboxes
+            .get(recipient_pub)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| e.expires_at > now)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         entries.sort_by_key(|e| (e.arrived_at, e.id));
         Ok(entries)
     }
@@ -382,11 +417,21 @@ impl Store for MemoryStore {
         Ok(purged)
     }
 
-    async fn mailbox_size_bytes_for_recipient(&self, recipient_pub: &[u8; 32]) -> StoreResult<u64> {
+    async fn mailbox_size_bytes_for_recipient(
+        &self,
+        recipient_pub: &[u8; 32],
+        now: u64,
+    ) -> StoreResult<u64> {
         let mailboxes = self.mailboxes.lock().unwrap();
         Ok(mailboxes
             .get(recipient_pub)
-            .map(|entries| entries.iter().map(|e| e.size_bytes).sum())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| e.expires_at > now)
+                    .map(|e| e.size_bytes)
+                    .sum()
+            })
             .unwrap_or(0))
     }
 }
@@ -416,7 +461,10 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        let entries = store
+            .mailbox_list_for_recipient(&recipient, 0)
+            .await
+            .unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, id_a);
         assert_eq!(entries[0].blob, vec![1, 2, 3]);
@@ -442,7 +490,10 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        let entries = store
+            .mailbox_list_for_recipient(&recipient, 0)
+            .await
+            .unwrap();
         assert_eq!(
             entries.iter().map(|e| e.id).collect::<Vec<_>>(),
             vec![id_a, id_b]
@@ -473,14 +524,18 @@ mod tests {
         assert_eq!(deleted, 0);
         assert_eq!(
             store
-                .mailbox_list_for_recipient(&alice)
+                .mailbox_list_for_recipient(&alice, 0)
                 .await
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
-            store.mailbox_list_for_recipient(&bob).await.unwrap().len(),
+            store
+                .mailbox_list_for_recipient(&bob, 0)
+                .await
+                .unwrap()
+                .len(),
             1
         );
 
@@ -488,13 +543,13 @@ mod tests {
         let deleted = store.mailbox_delete_by_ids(&bob, &[bob_id]).await.unwrap();
         assert_eq!(deleted, 1);
         assert!(store
-            .mailbox_list_for_recipient(&bob)
+            .mailbox_list_for_recipient(&bob, 0)
             .await
             .unwrap()
             .is_empty());
         assert_eq!(
             store
-                .mailbox_list_for_recipient(&alice)
+                .mailbox_list_for_recipient(&alice, 0)
                 .await
                 .unwrap()
                 .len(),
@@ -532,7 +587,14 @@ mod tests {
         let purged = store.mailbox_purge_expired(500).await.unwrap();
         assert_eq!(purged, 1);
 
-        let remaining = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        // Same `now` (500) as the purge pass above: the surviving row's `expires_at` (1_000) is
+        // still in its future either way, so this also exercises `mailbox_list_for_recipient`'s
+        // own `expires_at > now` filter (task 9.3) alongside the physical purge, not just the
+        // purge in isolation.
+        let remaining = store
+            .mailbox_list_for_recipient(&recipient, 500)
+            .await
+            .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, fresh_id);
         assert_ne!(remaining[0].id, expired_id);
@@ -559,22 +621,131 @@ mod tests {
 
         assert_eq!(
             store
-                .mailbox_size_bytes_for_recipient(&alice)
+                .mailbox_size_bytes_for_recipient(&alice, 0)
                 .await
                 .unwrap(),
             150
         );
         assert_eq!(
-            store.mailbox_size_bytes_for_recipient(&bob).await.unwrap(),
+            store
+                .mailbox_size_bytes_for_recipient(&bob, 0)
+                .await
+                .unwrap(),
             7
         );
         // A recipient with no mailbox at all sums to zero, not an error.
         assert_eq!(
             store
-                .mailbox_size_bytes_for_recipient(&[9u8; 32])
+                .mailbox_size_bytes_for_recipient(&[9u8; 32], 0)
                 .await
                 .unwrap(),
             0
+        );
+    }
+
+    // -- task 9.3: `expires_at` read filter (review finding F5) --------------------------------
+    //
+    // Deliverable 3: a drain against a mix of expired-but-not-yet-purged and live rows must return
+    // only the live ones, and quota accounting must ignore expired-unpurged bytes. `mailbox_purge_
+    // expired` is never called in either test below — the row that "should already be gone" is
+    // still physically present, proving the filter (not the purge job) is what excludes it.
+
+    #[tokio::test]
+    async fn mailbox_list_for_recipient_excludes_expired_but_unpurged_rows() {
+        let store = MemoryStore::new();
+        let recipient = [13u8; 32];
+
+        let live_id = store
+            .mailbox_enqueue(recipient, vec![1], 0, 1_000)
+            .await
+            .unwrap();
+        // Past its deadline relative to `now` below, but never purged in this test.
+        let expired_id = store
+            .mailbox_enqueue(recipient, vec![2], 0, 100)
+            .await
+            .unwrap();
+
+        let now = 500; // > expired's expires_at (100), < live's expires_at (1_000)
+        let entries = store
+            .mailbox_list_for_recipient(&recipient, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![live_id],
+            "an expired-but-unpurged row must not be observed by a list/drain call, even though \
+             it is still physically present — expired_id={expired_id} must be absent"
+        );
+
+        // Belt-and-suspenders: the row really is still there, just not surfaced by the filtered
+        // read above — proving this is a read-time filter, not an accidental purge side effect.
+        assert_eq!(
+            store.mailbox_purge_expired(0).await.unwrap(),
+            0,
+            "no purge pass ran in this test — the row's continued physical presence below is not \
+             explained by an unrelated deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_size_bytes_for_recipient_ignores_expired_unpurged_bytes() {
+        let store = MemoryStore::new();
+        let recipient = [14u8; 32];
+
+        store
+            .mailbox_enqueue(recipient, vec![0u8; 40], 0, 1_000) // live
+            .await
+            .unwrap();
+        store
+            .mailbox_enqueue(recipient, vec![0u8; 999_999], 0, 100) // expired, unpurged
+            .await
+            .unwrap();
+
+        let now = 500;
+        assert_eq!(
+            store
+                .mailbox_size_bytes_for_recipient(&recipient, now)
+                .await
+                .unwrap(),
+            40,
+            "the large expired-but-unpurged row must not count toward quota accounting"
+        );
+    }
+
+    /// End-to-end through [`mailbox_enqueue_with_quota`] itself (not just the raw size read above):
+    /// a huge expired-unpurged row must not cause a spurious `mailbox_full` for a new, small
+    /// enqueue that easily fits within `quota_mb` once the expired bytes are correctly excluded.
+    #[tokio::test]
+    async fn mailbox_enqueue_with_quota_ignores_expired_unpurged_bytes_against_the_cap() {
+        let store = MemoryStore::new();
+        let locks = MailboxLocks::default();
+        let recipient = [15u8; 32];
+        let quota_mb: u32 = 1;
+        let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
+
+        // Already exceeds the 1 MiB quota on its own, but expired as of `now` below and never
+        // purged — without the fix, this would wrongly count toward quota and reject the enqueue.
+        store
+            .mailbox_enqueue(recipient, vec![0u8; (quota_bytes + 1) as usize], 0, 100)
+            .await
+            .unwrap();
+
+        let now = 500; // > the pre-filled row's expires_at (100)
+        let outcome = mailbox_enqueue_with_quota(
+            &store,
+            &locks,
+            recipient,
+            vec![0u8; 10],
+            now,
+            14,
+            quota_mb,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, MailboxEnqueueOutcome::Queued(_)),
+            "an expired-but-unpurged row must not count toward quota_mb — this enqueue should \
+             have fit"
         );
     }
 
@@ -629,8 +800,11 @@ mod tests {
         async fn mailbox_list_for_recipient(
             &self,
             recipient_pub: &[u8; 32],
+            now: u64,
         ) -> StoreResult<Vec<MailboxEntry>> {
-            self.inner.mailbox_list_for_recipient(recipient_pub).await
+            self.inner
+                .mailbox_list_for_recipient(recipient_pub, now)
+                .await
         }
         async fn mailbox_delete_by_ids(
             &self,
@@ -645,10 +819,11 @@ mod tests {
         async fn mailbox_size_bytes_for_recipient(
             &self,
             recipient_pub: &[u8; 32],
+            now: u64,
         ) -> StoreResult<u64> {
             let bytes = self
                 .inner
-                .mailbox_size_bytes_for_recipient(recipient_pub)
+                .mailbox_size_bytes_for_recipient(recipient_pub, now)
                 .await?;
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             Ok(bytes)
@@ -712,8 +887,11 @@ mod tests {
         }
         assert_eq!(queued + quota_exceeded, concurrency);
 
+        // `now=0`: matches the `now=0` every racer above passed to `mailbox_enqueue_with_quota`
+        // (so `expires_at = 0 + 14 days`, always `> 0`) — this assertion is about the race's byte
+        // bound, not about task 9.3's expiry filter, so `0` never spuriously excludes a row here.
         let total = store
-            .mailbox_size_bytes_for_recipient(&recipient)
+            .mailbox_size_bytes_for_recipient(&recipient, 0)
             .await
             .unwrap();
         assert!(
@@ -766,7 +944,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .mailbox_size_bytes_for_recipient(&recipient)
+                .mailbox_size_bytes_for_recipient(&recipient, 0)
                 .await
                 .unwrap(),
             quota_bytes
@@ -799,7 +977,7 @@ mod tests {
         // The rejected attempt wrote nothing.
         assert_eq!(
             store
-                .mailbox_size_bytes_for_recipient(&recipient)
+                .mailbox_size_bytes_for_recipient(&recipient, 0)
                 .await
                 .unwrap(),
             quota_bytes

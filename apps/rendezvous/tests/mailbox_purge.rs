@@ -1,8 +1,10 @@
 //! Task 8.9 acceptance: the mailbox TTL-expiry purge job provably purges — physically deletes —
-//! expired rows, not merely excludes them from a query. See
-//! `apps/rendezvous/src/mailbox_purge.rs`'s module doc for why `mailbox_list_for_recipient`'s own
-//! lack of an `expires_at` filter already makes the purge job the sole enforcement point; this
-//! file's SQLite test additionally proves it with a raw, independent row-count query.
+//! expired rows, not merely excludes them from a query. This remains meaningful even after task
+//! 9.3 gave `mailbox_list_for_recipient`/`mailbox_size_bytes_for_recipient` their own
+//! `expires_at > now` read-time filter (review finding F5): that filter only stops expired rows
+//! from being *observed*, it does not reclaim storage — this file's SQLite test additionally
+//! proves genuine physical deletion with a raw, independent row-count query that bypasses the
+//! `Store` trait (and so bypasses task 9.3's filter) entirely.
 
 use std::sync::Arc;
 
@@ -25,11 +27,13 @@ async fn purge_once_removes_a_row_past_its_deadline() {
         .await
         .unwrap();
 
-    // Before the deadline: purging at `now < expires_at` must not touch it.
+    // Before the deadline: purging at `now < expires_at` must not touch it. Uses the same `now`
+    // (500) for the list call's own `expires_at > now` filter (task 9.3) — the row is genuinely
+    // live at this point either way.
     run_purge_once(&state, 500).await.unwrap();
     assert_eq!(
         store
-            .mailbox_list_for_recipient(&recipient)
+            .mailbox_list_for_recipient(&recipient, 500)
             .await
             .unwrap()
             .len(),
@@ -41,7 +45,7 @@ async fn purge_once_removes_a_row_past_its_deadline() {
     run_purge_once(&state, 1_001).await.unwrap();
     assert!(
         store
-            .mailbox_list_for_recipient(&recipient)
+            .mailbox_list_for_recipient(&recipient, 1_001)
             .await
             .unwrap()
             .is_empty(),
@@ -50,10 +54,9 @@ async fn purge_once_removes_a_row_past_its_deadline() {
 }
 
 /// SQLite backend: same clock-injected purge, but proven with a raw, independent `SELECT COUNT(*)`
-/// against the same on-disk database file — physical deletion, not a query-time filter that would
-/// merely hide an undeleted row from `mailbox_list_for_recipient` (which itself never filters on
-/// `expires_at` at all, so this is genuinely testing the purge job's own DELETE, not incidentally
-/// relying on the list query to mask a bug).
+/// against the same on-disk database file — physical deletion, not merely `mailbox_list_for_
+/// recipient`'s own read-time `expires_at > now` filter (task 9.3), so this is genuinely testing
+/// the purge job's own DELETE, not incidentally relying on the list query's filter to mask a bug.
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn purge_once_physically_deletes_the_row_sqlite() {
@@ -98,7 +101,7 @@ async fn purge_once_physically_deletes_the_row_sqlite() {
 
     // Belt-and-suspenders: the store's own list query also reports empty.
     assert!(store
-        .mailbox_list_for_recipient(&recipient)
+        .mailbox_list_for_recipient(&recipient, 1_001)
         .await
         .unwrap()
         .is_empty());

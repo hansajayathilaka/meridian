@@ -199,7 +199,14 @@ async fn serve(
 /// drain, exactly like every other `Store` failure in this module already fails closed to "try
 /// again next time" rather than wedging the connection.
 async fn drain_mailbox(state: &Arc<AppState>, tx: &mpsc::Sender<Message>, account_pub: &[u8; 32]) {
-    let Ok(rows) = state.store.mailbox_list_for_recipient(account_pub).await else {
+    // Task 9.3 (review finding F5): `now_secs()` excludes any row that has expired but not yet
+    // been physically reclaimed by the purge job — a reconnecting recipient must not receive an
+    // envelope that should already be gone.
+    let Ok(rows) = state
+        .store
+        .mailbox_list_for_recipient(account_pub, now_secs())
+        .await
+    else {
         return;
     };
     for row in rows {

@@ -179,9 +179,12 @@ impl Store for BundleFetchCountingStore {
     async fn mailbox_list_for_recipient(
         &self,
         recipient_pub: &[u8; 32],
+        now: u64,
     ) -> Result<Vec<meridian_rendezvous::store::MailboxEntry>, meridian_rendezvous::store::StoreError>
     {
-        self.inner.mailbox_list_for_recipient(recipient_pub).await
+        self.inner
+            .mailbox_list_for_recipient(recipient_pub, now)
+            .await
     }
 
     async fn mailbox_delete_by_ids(
@@ -202,9 +205,10 @@ impl Store for BundleFetchCountingStore {
     async fn mailbox_size_bytes_for_recipient(
         &self,
         recipient_pub: &[u8; 32],
+        now: u64,
     ) -> Result<u64, meridian_rendezvous::store::StoreError> {
         self.inner
-            .mailbox_size_bytes_for_recipient(recipient_pub)
+            .mailbox_size_bytes_for_recipient(recipient_pub, now)
             .await
     }
 }

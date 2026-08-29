@@ -17,7 +17,7 @@ async fn empty_mailbox_dumps_as_explicitly_empty() {
     let store = MemoryStore::new();
     let recipient = [3u8; 32];
 
-    let out = dump_mailbox(&store, recipient).await.unwrap();
+    let out = dump_mailbox(&store, recipient, 0).await.unwrap();
 
     assert!(out.contains("0 envelopes"));
     assert!(out.contains("(empty)"));
@@ -37,7 +37,7 @@ async fn memory_store_dump_reports_sizes_timestamps_and_opaque_markers() {
         .await
         .unwrap();
 
-    let out = dump_mailbox(&store, recipient).await.unwrap();
+    let out = dump_mailbox(&store, recipient, 0).await.unwrap();
 
     assert!(out.contains("2 envelopes"));
     assert!(out.contains("arrived_at=1000"));
@@ -60,7 +60,7 @@ async fn plaintext_never_appears_in_output() {
         .await
         .unwrap();
 
-    let out = dump_mailbox(&store, recipient).await.unwrap();
+    let out = dump_mailbox(&store, recipient, 0).await.unwrap();
 
     assert!(!out.contains("meet at 9pm"));
     assert!(!out.contains("hey"));
@@ -79,8 +79,8 @@ async fn dump_only_sees_the_named_recipients_own_rows() {
         .unwrap();
     store.mailbox_enqueue(bob, vec![4, 5], 0, 1).await.unwrap();
 
-    let alice_out = dump_mailbox(&store, alice).await.unwrap();
-    let bob_out = dump_mailbox(&store, bob).await.unwrap();
+    let alice_out = dump_mailbox(&store, alice, 0).await.unwrap();
+    let bob_out = dump_mailbox(&store, bob, 0).await.unwrap();
 
     assert!(alice_out.contains("1 envelope"));
     assert!(!alice_out.contains("2 envelope"));
@@ -107,7 +107,7 @@ async fn sqlite_store_dump_matches_the_memory_store_shape() {
         .await
         .unwrap();
 
-    let out = dump_mailbox(&store, recipient).await.unwrap();
+    let out = dump_mailbox(&store, recipient, 0).await.unwrap();
 
     assert!(out.contains("1 envelope"));
     assert!(out.contains("arrived_at=100"));

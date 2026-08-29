@@ -2570,7 +2570,7 @@ async fn three_offline_messages_from_a_new_contact_are_never_silently_lost() {
         .expect("seed row 3");
     assert_eq!(
         store
-            .mailbox_list_for_recipient(&us_pub)
+            .mailbox_list_for_recipient(&us_pub, 0)
             .await
             .expect("list before drain")
             .len(),
@@ -2605,7 +2605,7 @@ async fn three_offline_messages_from_a_new_contact_are_never_silently_lost() {
     // The load-bearing assertion task 8.17 exists for: rows 2 and 3 must still be sitting in the
     // mailbox, unacked — not silently deleted despite never having been shown to the user.
     let still_queued = store
-        .mailbox_list_for_recipient(&us_pub)
+        .mailbox_list_for_recipient(&us_pub, 0)
         .await
         .expect("list after first drain");
     assert_eq!(
@@ -2656,7 +2656,7 @@ async fn three_offline_messages_from_a_new_contact_are_never_silently_lost() {
     }
 
     let final_queued = store
-        .mailbox_list_for_recipient(&us_pub)
+        .mailbox_list_for_recipient(&us_pub, 0)
         .await
         .expect("list after second drain");
     assert!(

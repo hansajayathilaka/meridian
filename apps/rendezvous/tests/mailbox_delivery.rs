@@ -149,14 +149,14 @@ async fn mailbox_ack_deletes_only_the_acked_rows_scoped_to_the_acking_account() 
 
     // Bob's own row is gone.
     assert!(store
-        .mailbox_list_for_recipient(&bob.pubkey)
+        .mailbox_list_for_recipient(&bob.pubkey, 0)
         .await
         .unwrap()
         .is_empty());
     // Alice's row survives untouched — acking an id you were never sent, naming another
     // account's row, must be a no-op, never a cross-account deletion.
     let alice_rows = store
-        .mailbox_list_for_recipient(&alice.pubkey)
+        .mailbox_list_for_recipient(&alice.pubkey, 0)
         .await
         .unwrap();
     assert_eq!(alice_rows.len(), 1);
@@ -192,7 +192,7 @@ async fn unacked_rows_survive_and_are_redrained_on_reconnect() {
     // Rows must still be there — never deleted just by being pushed.
     assert_eq!(
         store
-            .mailbox_list_for_recipient(&bob.pubkey)
+            .mailbox_list_for_recipient(&bob.pubkey, 0)
             .await
             .unwrap()
             .len(),

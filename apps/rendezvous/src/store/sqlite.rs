@@ -183,12 +183,18 @@ impl Store for SqliteStore {
     async fn mailbox_list_for_recipient(
         &self,
         recipient_pub: &[u8; 32],
+        now: u64,
     ) -> StoreResult<Vec<MailboxEntry>> {
+        // Task 9.3 (review finding F5): `expires_at > ?2` excludes rows past their deadline that
+        // haven't been physically reclaimed yet by `mailbox_purge_expired`'s periodic pass — same
+        // "not yet expired" semantics as that method's own `expires_at <= now` deletion predicate,
+        // just inverted.
         let rows: Vec<(i64, Vec<u8>, Vec<u8>, i64, i64, i64)> = sqlx::query_as(
             "SELECT id, recipient_pub, blob, arrived_at, expires_at, size_bytes FROM mailbox \
-             WHERE recipient_pub = ?1 ORDER BY arrived_at ASC, id ASC",
+             WHERE recipient_pub = ?1 AND expires_at > ?2 ORDER BY arrived_at ASC, id ASC",
         )
         .bind(recipient_pub.as_slice())
+        .bind(now as i64)
         .fetch_all(&self.pool)
         .await
         .map_err(backend)?;
@@ -229,11 +235,19 @@ impl Store for SqliteStore {
         Ok(result.rows_affected())
     }
 
-    async fn mailbox_size_bytes_for_recipient(&self, recipient_pub: &[u8; 32]) -> StoreResult<u64> {
+    async fn mailbox_size_bytes_for_recipient(
+        &self,
+        recipient_pub: &[u8; 32],
+        now: u64,
+    ) -> StoreResult<u64> {
+        // Same `expires_at > ?2` exclusion as `mailbox_list_for_recipient` above (task 9.3): an
+        // expired-but-unpurged row must not count toward quota accounting.
         let row: (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(size_bytes), 0) FROM mailbox WHERE recipient_pub = ?1",
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM mailbox \
+             WHERE recipient_pub = ?1 AND expires_at > ?2",
         )
         .bind(recipient_pub.as_slice())
+        .bind(now as i64)
         .fetch_one(&self.pool)
         .await
         .map_err(backend)?;
@@ -322,7 +336,10 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        let entries = store
+            .mailbox_list_for_recipient(&recipient, 0)
+            .await
+            .unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, id_a);
         assert_eq!(entries[0].blob, vec![1, 2, 3]);
@@ -348,7 +365,10 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        let entries = store
+            .mailbox_list_for_recipient(&recipient, 0)
+            .await
+            .unwrap();
         assert_eq!(
             entries.iter().map(|e| e.id).collect::<Vec<_>>(),
             vec![id_a, id_b]
@@ -379,14 +399,18 @@ mod tests {
         assert_eq!(deleted, 0);
         assert_eq!(
             store
-                .mailbox_list_for_recipient(&alice)
+                .mailbox_list_for_recipient(&alice, 0)
                 .await
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
-            store.mailbox_list_for_recipient(&bob).await.unwrap().len(),
+            store
+                .mailbox_list_for_recipient(&bob, 0)
+                .await
+                .unwrap()
+                .len(),
             1
         );
 
@@ -394,13 +418,13 @@ mod tests {
         let deleted = store.mailbox_delete_by_ids(&bob, &[bob_id]).await.unwrap();
         assert_eq!(deleted, 1);
         assert!(store
-            .mailbox_list_for_recipient(&bob)
+            .mailbox_list_for_recipient(&bob, 0)
             .await
             .unwrap()
             .is_empty());
         assert_eq!(
             store
-                .mailbox_list_for_recipient(&alice)
+                .mailbox_list_for_recipient(&alice, 0)
                 .await
                 .unwrap()
                 .len(),
@@ -438,7 +462,11 @@ mod tests {
         let purged = store.mailbox_purge_expired(500).await.unwrap();
         assert_eq!(purged, 1);
 
-        let remaining = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        // Same `now` (500) as the purge pass above — see `store.rs`'s identical comment for why.
+        let remaining = store
+            .mailbox_list_for_recipient(&recipient, 500)
+            .await
+            .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, fresh_id);
         assert_ne!(remaining[0].id, expired_id);
@@ -465,22 +493,132 @@ mod tests {
 
         assert_eq!(
             store
-                .mailbox_size_bytes_for_recipient(&alice)
+                .mailbox_size_bytes_for_recipient(&alice, 0)
                 .await
                 .unwrap(),
             150
         );
         assert_eq!(
-            store.mailbox_size_bytes_for_recipient(&bob).await.unwrap(),
+            store
+                .mailbox_size_bytes_for_recipient(&bob, 0)
+                .await
+                .unwrap(),
             7
         );
         // A recipient with no mailbox at all sums to zero, not an error.
         assert_eq!(
             store
-                .mailbox_size_bytes_for_recipient(&[9u8; 32])
+                .mailbox_size_bytes_for_recipient(&[9u8; 32], 0)
                 .await
                 .unwrap(),
             0
+        );
+    }
+
+    // -- task 9.3: `expires_at` read filter (review finding F5) --------------------------------
+    //
+    // Mirrors `store.rs`'s `MemoryStore` version of these tests exactly, proving the filter
+    // behaves identically for the SQLite backend. `mailbox_purge_expired` is never called in
+    // either test below — the row that "should already be gone" is still physically present,
+    // proving the filter (not the purge job) is what excludes it.
+
+    #[tokio::test]
+    async fn mailbox_list_for_recipient_excludes_expired_but_unpurged_rows() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let recipient = [13u8; 32];
+
+        let live_id = store
+            .mailbox_enqueue(recipient, vec![1], 0, 1_000)
+            .await
+            .unwrap();
+        // Past its deadline relative to `now` below, but never purged in this test.
+        let expired_id = store
+            .mailbox_enqueue(recipient, vec![2], 0, 100)
+            .await
+            .unwrap();
+
+        let now = 500; // > expired's expires_at (100), < live's expires_at (1_000)
+        let entries = store
+            .mailbox_list_for_recipient(&recipient, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![live_id],
+            "an expired-but-unpurged row must not be observed by a list/drain call, even though \
+             it is still physically present — expired_id={expired_id} must be absent"
+        );
+
+        // Belt-and-suspenders: the row really is still there, just not surfaced by the filtered
+        // read above — proving this is a read-time filter, not an accidental purge side effect.
+        assert_eq!(
+            store.mailbox_purge_expired(0).await.unwrap(),
+            0,
+            "no purge pass ran in this test — the row's continued physical presence below is not \
+             explained by an unrelated deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_size_bytes_for_recipient_ignores_expired_unpurged_bytes() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let recipient = [14u8; 32];
+
+        store
+            .mailbox_enqueue(recipient, vec![0u8; 40], 0, 1_000) // live
+            .await
+            .unwrap();
+        store
+            .mailbox_enqueue(recipient, vec![0u8; 999_999], 0, 100) // expired, unpurged
+            .await
+            .unwrap();
+
+        let now = 500;
+        assert_eq!(
+            store
+                .mailbox_size_bytes_for_recipient(&recipient, now)
+                .await
+                .unwrap(),
+            40,
+            "the large expired-but-unpurged row must not count toward quota accounting"
+        );
+    }
+
+    /// End-to-end through [`mailbox_enqueue_with_quota`] itself (not just the raw size read
+    /// above): a huge expired-unpurged row must not cause a spurious `mailbox_full` for a new,
+    /// small enqueue that easily fits within `quota_mb` once the expired bytes are correctly
+    /// excluded.
+    #[tokio::test]
+    async fn mailbox_enqueue_with_quota_ignores_expired_unpurged_bytes_against_the_cap() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let locks = MailboxLocks::default();
+        let recipient = [15u8; 32];
+        let quota_mb: u32 = 1;
+        let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
+
+        // Already exceeds the 1 MiB quota on its own, but expired as of `now` below and never
+        // purged — without the fix, this would wrongly count toward quota and reject the enqueue.
+        store
+            .mailbox_enqueue(recipient, vec![0u8; (quota_bytes + 1) as usize], 0, 100)
+            .await
+            .unwrap();
+
+        let now = 500; // > the pre-filled row's expires_at (100)
+        let outcome = mailbox_enqueue_with_quota(
+            &store,
+            &locks,
+            recipient,
+            vec![0u8; 10],
+            now,
+            14,
+            quota_mb,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, MailboxEnqueueOutcome::Queued(_)),
+            "an expired-but-unpurged row must not count toward quota_mb — this enqueue should \
+             have fit"
         );
     }
 
@@ -502,7 +640,10 @@ mod tests {
         } // pool dropped here — simulates process exit.
 
         let store = SqliteStore::connect(&url).await.unwrap();
-        let entries = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        let entries = store
+            .mailbox_list_for_recipient(&recipient, 0)
+            .await
+            .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].blob, vec![42, 43]);
     }
@@ -554,8 +695,10 @@ mod tests {
         }
         assert_eq!(queued + quota_exceeded, concurrency);
 
+        // `now=0`: matches the `now=0` every racer above passed to `mailbox_enqueue_with_quota`
+        // (so `expires_at = 0 + 14 days`, always `> 0`) — see `store.rs`'s identical comment.
         let total = store
-            .mailbox_size_bytes_for_recipient(&recipient)
+            .mailbox_size_bytes_for_recipient(&recipient, 0)
             .await
             .unwrap();
         assert!(
@@ -606,7 +749,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .mailbox_size_bytes_for_recipient(&recipient)
+                .mailbox_size_bytes_for_recipient(&recipient, 0)
                 .await
                 .unwrap(),
             quota_bytes
@@ -639,7 +782,7 @@ mod tests {
         // The rejected attempt wrote nothing.
         assert_eq!(
             store
-                .mailbox_size_bytes_for_recipient(&recipient)
+                .mailbox_size_bytes_for_recipient(&recipient, 0)
                 .await
                 .unwrap(),
             quota_bytes

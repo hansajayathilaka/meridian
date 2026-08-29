@@ -525,7 +525,7 @@ async fn route_to_offline_peer_errors_when_mailbox_disabled() {
 
     assert_eq!(
         store
-            .mailbox_size_bytes_for_recipient(&bob.pubkey)
+            .mailbox_size_bytes_for_recipient(&bob.pubkey, 0)
             .await
             .unwrap(),
         0,
@@ -551,7 +551,10 @@ async fn route_to_offline_peer_with_mailbox_enabled_queues() {
         "queued (not live-delivered) must report delivered=false over the wire"
     );
 
-    let rows = store.mailbox_list_for_recipient(&bob.pubkey).await.unwrap();
+    let rows = store
+        .mailbox_list_for_recipient(&bob.pubkey, 0)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].blob, payload);
 }
@@ -575,7 +578,7 @@ async fn route_to_offline_peer_over_quota_is_rejected() {
 
     assert_eq!(
         store
-            .mailbox_size_bytes_for_recipient(&bob.pubkey)
+            .mailbox_size_bytes_for_recipient(&bob.pubkey, 0)
             .await
             .unwrap(),
         0,

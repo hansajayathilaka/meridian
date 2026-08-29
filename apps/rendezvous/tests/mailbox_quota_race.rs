@@ -161,8 +161,11 @@ mod memory_backend {
         async fn mailbox_list_for_recipient(
             &self,
             recipient_pub: &[u8; 32],
+            now: u64,
         ) -> StoreResult<Vec<MailboxEntry>> {
-            self.inner.mailbox_list_for_recipient(recipient_pub).await
+            self.inner
+                .mailbox_list_for_recipient(recipient_pub, now)
+                .await
         }
         async fn mailbox_delete_by_ids(
             &self,
@@ -177,10 +180,11 @@ mod memory_backend {
         async fn mailbox_size_bytes_for_recipient(
             &self,
             recipient_pub: &[u8; 32],
+            now: u64,
         ) -> StoreResult<u64> {
             let bytes = self
                 .inner
-                .mailbox_size_bytes_for_recipient(recipient_pub)
+                .mailbox_size_bytes_for_recipient(recipient_pub, now)
                 .await?;
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             Ok(bytes)
@@ -209,8 +213,12 @@ mod memory_backend {
 
         let (queued, _mailbox_full) = race_routes_at_one_offline_recipient(&url, bob.pubkey).await;
 
+        // `now=0`: every row here was enqueued through the real route path using the real wall
+        // clock (`ws::now_secs()`) and `base_config`'s multi-day `ttl_days`, so `expires_at` is
+        // always far in the future relative to `0` — this assertion is about the race's byte
+        // bound (task 9.1), not task 9.3's expiry filter, so `0` never spuriously excludes a row.
         let total = store
-            .mailbox_size_bytes_for_recipient(&bob.pubkey)
+            .mailbox_size_bytes_for_recipient(&bob.pubkey, 0)
             .await
             .unwrap();
         assert_bound_holds(total, queued);
@@ -251,8 +259,12 @@ mod sqlite_backend {
 
         let (queued, _mailbox_full) = race_routes_at_one_offline_recipient(&url, bob.pubkey).await;
 
+        // `now=0`: every row here was enqueued through the real route path using the real wall
+        // clock (`ws::now_secs()`) and `base_config`'s multi-day `ttl_days`, so `expires_at` is
+        // always far in the future relative to `0` — this assertion is about the race's byte
+        // bound (task 9.1), not task 9.3's expiry filter, so `0` never spuriously excludes a row.
         let total = store
-            .mailbox_size_bytes_for_recipient(&bob.pubkey)
+            .mailbox_size_bytes_for_recipient(&bob.pubkey, 0)
             .await
             .unwrap();
         assert_bound_holds(total, queued);

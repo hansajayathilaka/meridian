@@ -299,7 +299,7 @@ async fn federated_route_to_offline_recipient_enqueues_and_still_reports_ok() {
          fire-and-forget-on-success — got {result:?}"
     );
 
-    let rows = store.mailbox_list_for_recipient(&bob).await.unwrap();
+    let rows = store.mailbox_list_for_recipient(&bob, 0).await.unwrap();
     assert_eq!(rows.len(), 1, "the envelope must actually be durable now");
     assert_eq!(rows[0].blob, payload);
 }
@@ -349,7 +349,10 @@ async fn federated_route_to_offline_recipient_over_quota_is_rejected() {
     assert_eq!(err.code, fed_error_codes::MAILBOX_FULL);
 
     assert_eq!(
-        store.mailbox_size_bytes_for_recipient(&bob).await.unwrap(),
+        store
+            .mailbox_size_bytes_for_recipient(&bob, 0)
+            .await
+            .unwrap(),
         0,
         "a quota-rejected federated route must not create a row"
     );

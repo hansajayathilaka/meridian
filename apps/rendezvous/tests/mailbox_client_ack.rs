@@ -50,7 +50,7 @@ async fn next_deliver_alone_never_acks() {
 
     assert_eq!(
         store
-            .mailbox_list_for_recipient(&bob.pubkey)
+            .mailbox_list_for_recipient(&bob.pubkey, 0)
             .await
             .unwrap()
             .len(),
@@ -100,7 +100,7 @@ async fn ack_pending_mailbox_flushes_the_whole_accumulated_batch_in_one_call() {
     // Still all present — accumulation alone (three next_deliver calls) sent nothing.
     assert_eq!(
         store
-            .mailbox_list_for_recipient(&bob.pubkey)
+            .mailbox_list_for_recipient(&bob.pubkey, 0)
             .await
             .unwrap()
             .len(),
@@ -112,7 +112,7 @@ async fn ack_pending_mailbox_flushes_the_whole_accumulated_batch_in_one_call() {
 
     assert!(
         store
-            .mailbox_list_for_recipient(&bob.pubkey)
+            .mailbox_list_for_recipient(&bob.pubkey, 0)
             .await
             .unwrap()
             .is_empty(),
@@ -146,7 +146,7 @@ async fn ack_pending_mailbox_only_covers_ids_seen_before_the_flush_call() {
     // A second row queued (and drained) AFTER the first flush must not have been swept up by it.
     bc.ack_pending_mailbox().await.unwrap();
     assert!(store
-        .mailbox_list_for_recipient(&bob.pubkey)
+        .mailbox_list_for_recipient(&bob.pubkey, 0)
         .await
         .unwrap()
         .is_empty());
@@ -163,7 +163,7 @@ async fn ack_pending_mailbox_only_covers_ids_seen_before_the_flush_call() {
     assert_eq!(d2.mailbox_id, Some(id_b));
     bc2.ack_pending_mailbox().await.unwrap();
     assert!(store
-        .mailbox_list_for_recipient(&bob.pubkey)
+        .mailbox_list_for_recipient(&bob.pubkey, 0)
         .await
         .unwrap()
         .is_empty());
@@ -205,7 +205,10 @@ async fn discard_pending_mailbox_ack_withdraws_only_the_named_id() {
     bc.discard_pending_mailbox_ack(ids[1]);
     bc.ack_pending_mailbox().await.unwrap();
 
-    let remaining = store.mailbox_list_for_recipient(&bob.pubkey).await.unwrap();
+    let remaining = store
+        .mailbox_list_for_recipient(&bob.pubkey, 0)
+        .await
+        .unwrap();
     assert_eq!(
         remaining.len(),
         1,
