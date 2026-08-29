@@ -69,7 +69,7 @@ so no ordering constraint; 9.10 (the bundled nit sweep) lands last so its new te
 race-fixed/TTL-filtered code paths from 9.1/9.3.
 
 - [x] **9.1** Serialize mailbox quota check-and-enqueue; cap local route envelope size (F1) — [file](./9.1-mailbox-quota-race-and-local-size-cap.md)
-- [~] **9.2** Quota exact-at-cap boundary test (F6; depends on 9.1) — [file](./9.2-mailbox-quota-boundary-test.md)
+- [x] **9.2** Quota exact-at-cap boundary test (F6; depends on 9.1) — [file](./9.2-mailbox-quota-boundary-test.md)
 - [ ] **9.3** Filter `expires_at` on mailbox reads (F5; soft-depends on 9.1) — [file](./9.3-mailbox-expires-at-read-filter.md)
 - [ ] **9.4** Fix drain/registration race window (F4; soft-depends on 9.1) — [file](./9.4-mailbox-drain-registration-race.md)
 - [ ] **9.5** Chunk `MailboxAck` delete into sub-999-parameter batches (F2) — [file](./9.5-mailbox-ack-chunk-delete.md)
