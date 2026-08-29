@@ -90,7 +90,7 @@ hickory-resolver = { version = "0.26.1", default-features = false, features = ["
 meridian-signaling = { path = "../signaling" }
 meridian-identity = { path = "../identity" }
 meridian-store = { path = "../store" }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "test-util"] }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }

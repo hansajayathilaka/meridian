@@ -590,6 +590,63 @@ mod tests {
         assert_eq!(deleted, 0);
     }
 
+    /// (task 9.10, N5) Double-acking an already-deleted row for the SAME account/recipient — the
+    /// second `MailboxAck` a client's own connection might send for an id it already acked (a
+    /// redelivered/duplicate ack frame, or a reconnect racing an ack the server already applied) —
+    /// must be a silent `Ok(0)`, never an error and never a panic. Distinct from
+    /// [`mailbox_delete_by_ids_removes_only_the_matching_row_for_the_matching_recipient`]'s
+    /// cross-recipient no-op above: this is the SAME recipient acking the SAME id twice in a row.
+    /// Enqueues through [`mailbox_enqueue_with_quota`] (task 9.1's `MailboxLocks`-guarded path) so
+    /// this exercises the real check-then-write path an account's own connection enqueues through,
+    /// not just the raw [`Store::mailbox_enqueue`] primitive.
+    #[tokio::test]
+    async fn mailbox_delete_by_ids_double_ack_of_an_already_deleted_row_is_a_silent_no_op() {
+        let store = MemoryStore::new();
+        let locks = MailboxLocks::default();
+        let recipient = [17u8; 32];
+
+        let outcome =
+            mailbox_enqueue_with_quota(&store, &locks, recipient, vec![7, 7, 7], 0, 14, 50)
+                .await
+                .unwrap();
+        let id = match outcome {
+            MailboxEnqueueOutcome::Queued(id) => id,
+            MailboxEnqueueOutcome::QuotaExceeded => panic!("must fit comfortably under quota"),
+        };
+
+        // FIRST ack: genuinely deletes the row.
+        let deleted_first = store
+            .mailbox_delete_by_ids(&recipient, &[id])
+            .await
+            .unwrap();
+        assert_eq!(
+            deleted_first, 1,
+            "the first ack must actually delete the row"
+        );
+        assert!(store
+            .mailbox_list_for_recipient(&recipient, 0)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // SECOND ack of the SAME id, from the same account: silent no-op, not an error.
+        let deleted_second = store.mailbox_delete_by_ids(&recipient, &[id]).await;
+        assert!(
+            matches!(deleted_second, Ok(0)),
+            "double-acking an already-deleted row must be a silent Ok(0), not an error — got \
+             {deleted_second:?}"
+        );
+        // The no-op re-ack must not disturb this recipient's (now-empty) accounting either.
+        assert_eq!(
+            store
+                .mailbox_size_bytes_for_recipient(&recipient, 0)
+                .await
+                .unwrap(),
+            0,
+            "a no-op re-ack must not affect quota accounting"
+        );
+    }
+
     #[tokio::test]
     async fn mailbox_purge_expired_removes_only_rows_past_their_deadline() {
         let store = MemoryStore::new();
