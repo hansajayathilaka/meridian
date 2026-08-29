@@ -202,12 +202,12 @@ const MAILBOX_LOCK_SHARDS: usize = 256;
 /// shard collision above) — the "keep the lock scope narrow" constraint this task's own notes call
 /// out.
 ///
-/// One instance lives on [`crate::state::AppState`] and is shared by both the local route path
-/// (`ws::queue_to_mailbox`) and the federated route path
-/// (`federation::inbound::handle_fed_route`), so a local and a federated enqueue racing at the same
-/// recipient are serialized against EACH OTHER too, not just against callers on the same path.
-/// Task 9.4 (the mailbox-drain/registration race) is expected to reuse this same primitive, per the
-/// phase's task-sequencing note.
+/// One instance lives on [`crate::state::AppState`] and is shared by the local route path
+/// (`ws::queue_to_mailbox`), the federated route path (`federation::inbound::handle_fed_route`),
+/// AND (task 9.4, review finding F4) `ws::handle_socket`'s own connection-setup sequence, which
+/// holds a recipient's shard across "register, then drain" — see that call site's doc comment for
+/// why. A local enqueue, a federated enqueue, and a reconnecting recipient's own drain, all racing
+/// at the same recipient, are therefore all serialized against EACH OTHER, not just pairwise.
 pub struct MailboxLocks {
     shards: Vec<AsyncMutex<()>>,
 }
@@ -229,7 +229,15 @@ impl MailboxLocks {
 
     /// Acquire the shard guarding `recipient`. Held by the returned guard until dropped — callers
     /// must hold it across both the quota read and the enqueue write.
-    async fn lock_recipient(&self, recipient: &[u8; 32]) -> tokio::sync::MutexGuard<'_, ()> {
+    ///
+    /// `pub(crate)` (not private): task 9.4 reuses this directly from `ws::handle_socket`'s
+    /// connection-setup sequence (register-then-drain, held across the drain) — see that call
+    /// site's own doc comment — rather than only ever being reached indirectly through
+    /// [`mailbox_enqueue_with_quota`].
+    pub(crate) async fn lock_recipient(
+        &self,
+        recipient: &[u8; 32],
+    ) -> tokio::sync::MutexGuard<'_, ()> {
         // First 8 bytes of an already-uniformly-random Ed25519/X25519 pubkey as a shard selector —
         // no need for a real hash function over key material that's already high-entropy.
         let mut buf = [0u8; 8];
@@ -731,17 +739,10 @@ mod tests {
             .unwrap();
 
         let now = 500; // > the pre-filled row's expires_at (100)
-        let outcome = mailbox_enqueue_with_quota(
-            &store,
-            &locks,
-            recipient,
-            vec![0u8; 10],
-            now,
-            14,
-            quota_mb,
-        )
-        .await
-        .unwrap();
+        let outcome =
+            mailbox_enqueue_with_quota(&store, &locks, recipient, vec![0u8; 10], now, 14, quota_mb)
+                .await
+                .unwrap();
         assert!(
             matches!(outcome, MailboxEnqueueOutcome::Queued(_)),
             "an expired-but-unpurged row must not count toward quota_mb — this enqueue should \

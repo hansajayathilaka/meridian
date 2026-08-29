@@ -87,17 +87,44 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<AppState>, peer_ip: IpA
         }
     };
 
-    // 3) Drain any queued mailbox mail (task 8.7), before this connection is registered as
-    // reachable — so a live route arriving concurrently on another connection can never race with
-    // (and interleave ahead of or behind) this drain. "Before any other traffic" per this task's
-    // own Deliverable 3.
-    drain_mailbox(&state, &tx, &account_pub).await;
-
-    // 4) Serve the authenticated session.
+    // 3) Register the connection as reachable FIRST, then drain any queued mailbox mail (task 8.7)
+    // — task 9.4 (review finding F4) swapped this from the original drain-then-register order.
+    // That order left a real window between the drain finishing and `registry.add` running: a
+    // `Route` from a third party landing there found this recipient not-yet-registered, fell
+    // through to `queue_to_mailbox`, and then sat mailboxed until the recipient's NEXT reconnect —
+    // even though the recipient was already live in wall-clock terms by the time that `Route` was
+    // processed, silently contradicting "deliver on reconnect" for a message that in fact arrived
+    // after reconnect completed.
+    //
+    // Registering first closes that structurally: any `handle_route` live-delivery attempt
+    // (`deliver_one`, gated on `state.registry.is_connected`) that runs AFTER `registry.add` below
+    // returns finds this connection reachable and delivers straight to it — it can no longer
+    // observe "not yet registered" and fall through to the mailbox for a recipient that, in fact,
+    // already has a live connection.
     let conn_id = state.next_conn_id();
     state.registry.add(account_pub, conn_id, tx.clone());
     state.metrics.conn_opened();
 
+    // The drain itself is still wrapped in the SAME per-recipient `MailboxLocks` shard task 9.1
+    // introduced for `mailbox_enqueue_with_quota`'s check-then-write (`state.mailbox_locks`, reused
+    // rather than inventing a second lock, per this task's own Scope) — not to catch every
+    // conceivable interleaving (closing `handle_route`'s own unlocked check-then-act fully would
+    // mean touching that path too, out of this task's Scope; see the task file's Risk note), but to
+    // give a definite before/after ordering against a concurrent SAME-recipient mailbox write that
+    // raced ahead of `registry.add` above and had already (correctly, at the time) decided this
+    // recipient was still offline: if that write is already committed by the time this drain
+    // acquires the lock, the drain observes and delivers it as part of THIS connect sequence rather
+    // than stranding it for the next one; if it is still in flight and wins the lock race, this
+    // drain simply waits for it to land first. `MailboxEntry` rows this drain reads are never
+    // re-delivered live by the racing `Route` itself in that case — `deliver_one`'s own
+    // `registry.is_connected` check already ran (and returned false) before that `Route` ever
+    // reached the lock, so there is exactly one delivery path per envelope, never both.
+    {
+        let _drain_guard = state.mailbox_locks.lock_recipient(&account_pub).await;
+        drain_mailbox(&state, &tx, &account_pub).await;
+    }
+
+    // 4) Serve the authenticated session.
     serve(&state, &mut stream, &tx, &account_pub).await;
 
     // 5) Teardown.
@@ -192,9 +219,12 @@ async fn serve(
 }
 
 /// Task 8.7: push every row currently queued for `account_pub`, in `arrived_at`/`id` order, as
-/// `Deliver{from: MAILBOX_DRAIN_FROM_PLACEHOLDER, blob, mailbox_id: Some(id)}` — before this
-/// connection is registered as reachable (see the caller), so nothing else can interleave with the
-/// drain. Best-effort: a store failure here drops the connection to neither a half-drained mailbox
+/// `Deliver{from: MAILBOX_DRAIN_FROM_PLACEHOLDER, blob, mailbox_id: Some(id)}`. Called by
+/// [`handle_socket`] AFTER this connection is registered as reachable (task 9.4 — see that call
+/// site's doc comment for why the order flipped from the original "drain, then register"), under
+/// the recipient's `MailboxLocks` shard so a concurrent same-recipient mailbox write racing this
+/// drain gets a definite before/after ordering against it rather than an arbitrary interleaving.
+/// Best-effort: a store failure here drops the connection to neither a half-drained mailbox
 /// state nor a stuck handshake — it's logged nowhere (no client-id logging) and simply skips the
 /// drain, exactly like every other `Store` failure in this module already fails closed to "try
 /// again next time" rather than wedging the connection.
