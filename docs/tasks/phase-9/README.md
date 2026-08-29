@@ -80,5 +80,13 @@ race-fixed/TTL-filtered code paths from 9.1/9.3.
 - [x] **9.10** Nit sweep: mailbox-drain proptest, `purge_loop` coverage, double-ack no-op test (N3, N4, N5; soft-depends on 9.1, 9.3) — [file](./9.10-phase-9-nit-sweep.md)
 
 ## Exit criteria
-All fix-tasks (9.1–9.10) `[x]`, tree green, docs synced, findings closed per the report's verdict. Then:
-`/pick-next-phase` for the next build phase (T14, unblocked once this review clears).
+All fix-tasks (9.1–9.10) `[x]` — met. Tree green workspace-wide (`cargo build --workspace`,
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`tools/check-docs.sh`, `tools/lint-server-no-core.sh`, all clean). Findings closed per the report's
+verdict: every task's named reviewer(s) signed off PASS with zero blocking findings surviving any
+task's final review round (9.1 and 9.4 each needed one same-task follow-up commit after their first
+review round found a genuine blocking defect, both re-reviewed clean afterward). N2 stays an unowned
+carry-forward for T14's own future task file. Docs synced as part of each task's own commit (no
+separate `/doc-sync` pass needed — no wire/diagram changes beyond 9.8's additive conformance vector).
+Draft PR carrying all commits: [#87](https://github.com/hansajayathilaka/meridian/pull/87). **Phase 9
+is closed.** Next: `/pick-next-phase` for the next build phase — T14 is unblocked.

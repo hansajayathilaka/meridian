@@ -211,7 +211,9 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   carry-forward for T14's own future task file, per the report's own verdict. Tree green
   workspace-wide (`cargo build --workspace`, `cargo fmt --all -- --check`,
   `cargo clippy --workspace --all-targets -- -D warnings`, `tools/check-docs.sh`,
-  `tools/lint-server-no-core.sh`). Full closure summary: [phase-9/README.md](./phase-9/README.md#exit-criteria).
+  `tools/lint-server-no-core.sh`). Draft PR carrying all commits:
+  [#87](https://github.com/hansajayathilaka/meridian/pull/87). Full closure summary:
+  [phase-9/README.md](./phase-9/README.md#exit-criteria).
 - **NEXT:** `/pick-next-phase` — T14 is now unblocked (Phase 9's own verdict was already "green to
   proceed," and its fix-tasks are now closed too). The Phase-1 adversarial frontier remains an
   unowned carry-forward for a future `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08
