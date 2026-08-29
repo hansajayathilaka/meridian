@@ -574,4 +574,75 @@ mod tests {
              (queued={queued} of {concurrency})"
         );
     }
+
+    // -- task 9.2: quota exact-at-cap boundary (review finding F6) --------------------------------
+    //
+    // Mirrors `store.rs`'s `MemoryStore` version of these two tests exactly (same recipient/quota
+    // shape), proving the boundary behaves identically for the SQLite backend.
+
+    #[tokio::test]
+    async fn mailbox_enqueue_with_quota_allows_filling_the_quota_exactly() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let locks = MailboxLocks::default();
+        let recipient = [11u8; 32];
+        let quota_mb: u32 = 1;
+        let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
+
+        // Pre-fill directly (bypassing the quota gate, which isn't under test here) to
+        // `quota_bytes - 10`, so the `mailbox_enqueue_with_quota` call below with a 10-byte blob
+        // lands EXACTLY at the boundary: `current_bytes + blob.len() == quota_bytes`.
+        store
+            .mailbox_enqueue(recipient, vec![0u8; (quota_bytes - 10) as usize], 0, 1_000)
+            .await
+            .unwrap();
+
+        let outcome =
+            mailbox_enqueue_with_quota(&store, &locks, recipient, vec![0u8; 10], 0, 14, quota_mb)
+                .await
+                .unwrap();
+        assert!(
+            matches!(outcome, MailboxEnqueueOutcome::Queued(_)),
+            "filling the quota exactly must be allowed (strict `>` comparison, not `>=`)"
+        );
+        assert_eq!(
+            store
+                .mailbox_size_bytes_for_recipient(&recipient)
+                .await
+                .unwrap(),
+            quota_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_enqueue_with_quota_rejects_one_byte_over_the_quota() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let locks = MailboxLocks::default();
+        let recipient = [12u8; 32];
+        let quota_mb: u32 = 1;
+        let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
+
+        // Pre-fill directly to exactly `quota_bytes`, so the next call's
+        // `current_bytes + blob.len()` is `quota_bytes + 1` — one byte over.
+        store
+            .mailbox_enqueue(recipient, vec![0u8; quota_bytes as usize], 0, 1_000)
+            .await
+            .unwrap();
+
+        let outcome =
+            mailbox_enqueue_with_quota(&store, &locks, recipient, vec![0u8; 1], 0, 14, quota_mb)
+                .await
+                .unwrap();
+        assert!(
+            matches!(outcome, MailboxEnqueueOutcome::QuotaExceeded),
+            "one byte past the quota must be rejected"
+        );
+        // The rejected attempt wrote nothing.
+        assert_eq!(
+            store
+                .mailbox_size_bytes_for_recipient(&recipient)
+                .await
+                .unwrap(),
+            quota_bytes
+        );
+    }
 }
