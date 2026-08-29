@@ -87,7 +87,7 @@ use ratatui::Terminal;
 /// + ttl_secs`). Every test using this connects a REAL inbound loop (`spawn_inbound_loop`), which
 /// triggers the REAL server-side `ws::drain_mailbox` and its `expires_at > now_secs()` filter
 /// (task 9.3, review finding F5) — a small literal like `10_000` (year 1970) would make these rows
-/// look already-expired against the real wall clock and the drain would silently deliver nothing.
+///   look already-expired against the real wall clock and the drain would silently deliver nothing.
 const FAR_FUTURE_EXPIRES_AT: u64 = 9_999_999_999;
 
 // ---------------------------------------------------------------------------
