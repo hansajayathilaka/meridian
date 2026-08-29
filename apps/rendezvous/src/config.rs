@@ -680,7 +680,50 @@ impl Config {
 
     /// Cross-field fail-closed checks that a single field's `Deserialize` impl can't express.
     fn validate(&self) -> Result<(), String> {
-        self.federation.validate()
+        self.federation.validate()?;
+        self.mailbox.validate()
+    }
+}
+
+impl Mailbox {
+    /// Reject configuration combinations that are individually valid per-field but collapse a
+    /// user-visible feature when combined — the [`Federation::validate`] precedent, applied here.
+    ///
+    /// `quota_mb == 0` together with a non-zero `ttl_days` is exactly that: `ttl_days != 0` says
+    /// the mailbox is meant to be active (see [`Mailbox::ttl_days`]'s own doc comment — `0` is the
+    /// sole, explicitly documented "mailbox intentionally disabled" value, checked first on the
+    /// enqueue path in [`crate::ws::handle_route`]'s "TTL=0: pure-P2P mode" branch), while
+    /// `quota_mb == 0` gives every recipient a zero-byte budget — so every offline route to this
+    /// org's recipients hits [`crate::store::mailbox_enqueue_with_quota`]'s quota check and fails
+    /// closed with `mailbox_full` immediately, indistinguishable at runtime from "mailbox
+    /// intentionally near-full" until an operator digs in. Unlike `ttl_days`, `quota_mb` has no
+    /// documented "0 is a deliberate, self-consistent disable" meaning of its own (see
+    /// [`Mailbox::quota_mb`]'s doc comment) — a bare `quota_mb == 0` is never a real operator
+    /// intent on its own, only ever a typo, so it is rejected here whenever `ttl_days` says the
+    /// mailbox should otherwise be doing real work.
+    ///
+    /// Deliberately NOT symmetric: `ttl_days == 0` combined with a non-zero `quota_mb` is left
+    /// unflagged. `ttl_days == 0` is `Mailbox`'s own documented, self-sufficient "pure-P2P mode"
+    /// disable switch — `queue_to_mailbox`'s caller never even attempts an enqueue once it's set,
+    /// so `quota_mb`'s value is simply unused in that state, not contradicted by it (e.g. an
+    /// operator who flips `ttl_days` to `0` to opt into pure-P2P mode without also touching the
+    /// unrelated, now-irrelevant `quota_mb` default is not a mistake worth rejecting). That is
+    /// unlike the checked direction above, where `quota_mb == 0` actively breaks a mailbox that
+    /// `ttl_days` says should be working.
+    fn validate(&self) -> Result<(), String> {
+        if self.quota_mb == 0 && self.ttl_days != 0 {
+            return Err(format!(
+                "mailbox.quota_mb = 0 combined with mailbox.ttl_days = {} is almost certainly a \
+                 typo, not an intentional config: ttl_days != 0 means the mailbox is meant to be \
+                 active, but quota_mb = 0 gives every recipient a zero-byte quota, so every \
+                 offline route to this org's recipients will fail immediately with mailbox_full. \
+                 To intentionally disable the mailbox entirely, set mailbox.ttl_days = 0 (pure-P2P \
+                 mode) instead; to keep the mailbox active, set mailbox.quota_mb to a non-zero \
+                 per-recipient byte budget.",
+                self.ttl_days
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1511,6 +1554,85 @@ mod tests {
         let err = Config::load(Some(file.path().to_str().unwrap()))
             .expect_err("a non-integer ttl_days must be rejected, not silently ignored");
         assert!(!err.to_string().is_empty());
+    }
+
+    // -- task 9.9: mailbox quota/ttl config validation (review finding N1) ---------------------
+
+    #[test]
+    fn mailbox_zero_quota_with_nonzero_ttl_is_rejected_fail_closed() {
+        // The precise footgun this task exists to close: `quota_mb = 0` with `ttl_days != 0`
+        // silently makes every offline route to this org's recipients fail immediately with
+        // `mailbox_full`, indistinguishable from "mailbox intentionally near-full" until an
+        // operator digs in. Must be a hard `Err` at config-load time, like `Federation`'s
+        // analogous footguns, not a silent load.
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[mailbox]\nquota_mb = 0\nttl_days = 14\n");
+
+        let err = Config::load(Some(file.path().to_str().unwrap())).expect_err(
+            "quota_mb = 0 combined with a non-zero ttl_days must be rejected, not silently loaded",
+        );
+        assert!(err.to_string().contains("quota_mb"));
+        assert!(err.to_string().contains("ttl_days"));
+    }
+
+    #[test]
+    fn mailbox_zero_quota_with_zero_ttl_is_accepted() {
+        // `ttl_days = 0` is its own, self-sufficient "mailbox disabled" switch (pure-P2P mode) —
+        // `quota_mb`'s value, including `0`, is simply unused in that state, so this combination
+        // is not the footgun the check above exists to catch.
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[mailbox]\nquota_mb = 0\nttl_days = 0\n");
+
+        let config = Config::load(Some(file.path().to_str().unwrap()))
+            .expect("quota_mb = 0 with ttl_days = 0 (mailbox fully disabled) must be accepted");
+        assert_eq!(config.mailbox.quota_mb, 0);
+        assert_eq!(config.mailbox.ttl_days, 0);
+    }
+
+    #[test]
+    fn mailbox_ttl_zero_with_nonzero_quota_is_accepted() {
+        // Deliberately NOT symmetric with the rejected combination above: `ttl_days = 0` disables
+        // the mailbox entirely regardless of `quota_mb`'s value, so an operator who opts into
+        // pure-P2P mode without also zeroing the now-irrelevant `quota_mb` default has made no
+        // mistake worth rejecting.
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[mailbox]\nttl_days = 0\nquota_mb = 50\n");
+
+        let config = Config::load(Some(file.path().to_str().unwrap()))
+            .expect("ttl_days = 0 with a non-zero quota_mb must be accepted");
+        assert_eq!(config.mailbox.ttl_days, 0);
+        assert_eq!(config.mailbox.quota_mb, 50);
+    }
+
+    #[test]
+    fn mailbox_sane_default_config_passes_validation() {
+        // A completely untouched `[mailbox]` section (the shipped defaults: ttl_days = 14,
+        // quota_mb = 50) must still load cleanly — this task adds a new load-time check, not a
+        // new default.
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("");
+
+        let config = Config::load(Some(file.path().to_str().unwrap()))
+            .expect("default mailbox config must pass validation");
+        assert_eq!(config.mailbox.ttl_days, 14);
+        assert_eq!(config.mailbox.quota_mb, 50);
+    }
+
+    #[test]
+    fn mailbox_zero_quota_env_override_with_nonzero_ttl_is_rejected_fail_closed() {
+        // Mirrors `federation_handshake_timeout_zero_is_rejected_fail_closed`'s env-override
+        // coverage: the check must fire regardless of whether the offending value came from the
+        // file or an env var.
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[("MERIDIAN_RENDEZVOUS_MAILBOX__QUOTA_MB", "0")],
+        );
+        let file = write_toml("");
+
+        let err = Config::load(Some(file.path().to_str().unwrap())).expect_err(
+            "an env-overridden quota_mb = 0 with the default non-zero ttl_days must be rejected",
+        );
+        assert!(err.to_string().contains("quota_mb"));
     }
 
     #[test]
