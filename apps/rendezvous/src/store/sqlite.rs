@@ -604,17 +604,10 @@ mod tests {
             .unwrap();
 
         let now = 500; // > the pre-filled row's expires_at (100)
-        let outcome = mailbox_enqueue_with_quota(
-            &store,
-            &locks,
-            recipient,
-            vec![0u8; 10],
-            now,
-            14,
-            quota_mb,
-        )
-        .await
-        .unwrap();
+        let outcome =
+            mailbox_enqueue_with_quota(&store, &locks, recipient, vec![0u8; 10], now, 14, quota_mb)
+                .await
+                .unwrap();
         assert!(
             matches!(outcome, MailboxEnqueueOutcome::Queued(_)),
             "an expired-but-unpurged row must not count toward quota_mb — this enqueue should \
