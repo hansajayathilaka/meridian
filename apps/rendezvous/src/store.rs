@@ -102,6 +102,12 @@ pub trait Store: Send + Sync {
     /// deletion — the caller's own `recipient_pub` is never trusted to be verified upstream by id
     /// alone (8.7's `MailboxAck` handler depends on this being safe to call with
     /// attacker-influenced ids). Returns the count of rows actually deleted.
+    ///
+    /// A backend that issues one bound SQL statement per `ids` batch (namely `SqliteStore`, task
+    /// 9.5) MUST chunk internally so no single statement's bound-parameter count can approach
+    /// SQLite's conservative compile-time default `SQLITE_MAX_VARIABLE_NUMBER = 999` — this method
+    /// accepts arbitrarily large `ids` slices from callers (`ws.rs`'s `MAILBOX_ACK_MAX_IDS` cap
+    /// bounds it to 4096) and must not error out on a large-but-capped batch.
     async fn mailbox_delete_by_ids(
         &self,
         recipient_pub: &[u8; 32],

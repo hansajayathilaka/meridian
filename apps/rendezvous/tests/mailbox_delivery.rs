@@ -212,3 +212,77 @@ async fn unacked_rows_survive_and_are_redrained_on_reconnect() {
     assert_eq!(m1.mailbox_id, Some(id_a));
     assert_eq!(m2.mailbox_id, Some(id_b));
 }
+
+/// Task 9.5: `ws::MAILBOX_ACK_MAX_IDS` (private to that module, duplicated here — the task's Scope
+/// explicitly forbids changing its value, so this literal must track it) silently truncates an
+/// oversized `MailboxAck.ids` to its first `MAILBOX_ACK_MAX_IDS` entries before deleting, with no
+/// client-visible signal that truncation happened (`MailboxAckOk{}` is sent regardless). This test
+/// proves that documented "fails safe" behavior at the exact boundary: an ack listing one real,
+/// currently-queued row id BEFORE the boundary (survives being included, i.e. gets deleted) and one
+/// real, currently-queued row id AFTER the boundary (excluded by truncation, must survive) —
+/// asserting `MailboxAckOk{}` still comes back with no error, the before-boundary row is gone, and
+/// the after-boundary row is untouched, ready to be redrained on the next reconnect.
+#[tokio::test]
+async fn mailbox_ack_past_the_max_ids_cap_silently_truncates_and_still_ok_the_survivor_redrains() {
+    const MAILBOX_ACK_MAX_IDS: usize = 4096;
+
+    let (store, state) = spawn_store();
+    let url = spawn_c2s(state).await;
+    let bob = new_acct("localhost");
+
+    let id_before_boundary = store
+        .mailbox_enqueue(bob.pubkey, vec![1], 0, FAR_FUTURE_EXPIRES_AT)
+        .await
+        .unwrap();
+    let id_after_boundary = store
+        .mailbox_enqueue(bob.pubkey, vec![2], 1, FAR_FUTURE_EXPIRES_AT)
+        .await
+        .unwrap();
+
+    let mut ws = raw_connect(&bob, &url).await;
+    // The connection handler always drains post-AuthOk — both queued rows arrive first.
+    for _ in 0..2 {
+        let drained = recv_frame(&mut ws).await;
+        assert_eq!(drained.op, Op::Deliver);
+    }
+
+    // Build a batch of MAILBOX_ACK_MAX_IDS + 1 ids: `id_before_boundary` at index 0 (survives
+    // truncation, i.e. IS in the accepted prefix and gets deleted), MAILBOX_ACK_MAX_IDS - 1
+    // never-queued filler ids filling out the rest of the accepted prefix, then
+    // `id_after_boundary` as the very last entry — one past the cap, so it must be dropped by
+    // truncation and never reach the delete.
+    let mut ids = Vec::with_capacity(MAILBOX_ACK_MAX_IDS + 1);
+    ids.push(id_before_boundary);
+    // Filler ids far outside the range MemoryStore's sequential id assignment could ever produce
+    // in this test, so none of them can accidentally collide with a real row.
+    ids.extend((0..MAILBOX_ACK_MAX_IDS as u64 - 1).map(|i| 9_000_000 + i));
+    ids.push(id_after_boundary);
+    assert_eq!(ids.len(), MAILBOX_ACK_MAX_IDS + 1);
+
+    let ack = MailboxAck { ids };
+    let ack_frame = Frame::new(Op::MailboxAck, 2, &ack).unwrap();
+    send_frame(&mut ws, &ack_frame).await;
+    let reply = recv_frame(&mut ws).await;
+    assert_eq!(
+        reply.op,
+        Op::MailboxAckOk,
+        "a truncated batch must still be acked with no error signal"
+    );
+    let _: MailboxAckOk = reply.decode().unwrap();
+
+    // The before-boundary row (inside the accepted prefix) was deleted.
+    let remaining = store
+        .mailbox_list_for_recipient(&bob.pubkey, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        remaining.len(),
+        1,
+        "exactly the after-boundary row must survive — got: {remaining:?}"
+    );
+    assert_eq!(
+        remaining[0].id, id_after_boundary,
+        "the id past MAILBOX_ACK_MAX_IDS must survive the silently-truncated ack, ready to be \
+         redrained on the next reconnect"
+    );
+}

@@ -267,10 +267,13 @@ async fn drain_mailbox(state: &Arc<AppState>, tx: &mpsc::Sender<Message>, accoun
     }
 }
 
-/// The maximum number of ids accepted in one `MailboxAck` — caps the SQL `IN (...)` clause
-/// `mailbox_delete_by_ids` builds so a very large, attacker-controlled `ids` list can't approach
-/// SQLite's `SQLITE_MAX_VARIABLE_NUMBER` (carried forward from task 8.2's review). **Not actually
-/// bounded by `config.mailbox.quota_mb` today** (task 8.7's review, should-fix, non-blocking):
+/// The maximum number of ids accepted in one `MailboxAck` — bounds how much work (and how many
+/// chunked `DELETE` statements, task 9.5) one ack can make the store do, and keeps a very large,
+/// attacker-controlled `ids` list from growing without limit (carried forward from task 8.2's
+/// review). The SQLite backend's `mailbox_delete_by_ids` chunks its `IN (...)` deletes into
+/// sub-999-bound-parameter batches internally (task 9.5) regardless of how many ids it is called
+/// with, so this cap is a request-size/work bound, not what keeps the delete itself safe. **Not
+/// actually bounded by `config.mailbox.quota_mb` today** (task 8.7's review, should-fix, non-blocking):
 /// quota is byte-based only, `Op::Route` has no per-message rate limit, and no per-recipient row
 /// count cap exists anywhere in 8.1/8.2/8.5/8.6 — a connected account can legitimately enqueue far
 /// more than this many tiny envelopes against one victim recipient while staying under the byte

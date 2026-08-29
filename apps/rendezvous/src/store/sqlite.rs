@@ -18,6 +18,14 @@ fn backend<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
+/// The maximum number of ids `mailbox_delete_by_ids` binds into a single `DELETE ... IN (...)`
+/// statement's parameter list (task 9.5). One additional bound parameter (`recipient_pub`) is
+/// always reserved alongside a batch's ids, so the total bound-parameter count per statement is
+/// this value plus 1 — chosen to stay safely under SQLite's conservative compile-time default
+/// `SQLITE_MAX_VARIABLE_NUMBER = 999` regardless of how the SQLite the server links against was
+/// built.
+const MAILBOX_DELETE_MAX_IDS_PER_BATCH: usize = 900;
+
 /// A persistent store backed by SQLite. `url` is a sqlx SQLite URL, e.g. `sqlite://rdv.db` or
 /// `sqlite::memory:`.
 pub struct SqliteStore {
@@ -213,17 +221,32 @@ impl Store for SqliteStore {
         // no-op, never an error and never a cross-recipient deletion (8.7's `MailboxAck` handler
         // depends on this being safe to call with client-supplied ids — same contract as the
         // in-memory backend, task 8.1).
-        let mut qb: QueryBuilder<Sqlite> =
-            QueryBuilder::new("DELETE FROM mailbox WHERE recipient_pub = ");
-        qb.push_bind(recipient_pub.as_slice());
-        qb.push(" AND id IN (");
-        let mut separated = qb.separated(", ");
-        for id in ids {
-            separated.push_bind(*id as i64);
+        //
+        // Task 9.5: chunk into batches of at most `MAILBOX_DELETE_MAX_IDS_PER_BATCH` ids per
+        // statement. Each statement binds one parameter for `recipient_pub` plus one per id in
+        // the `IN (...)` list, so a single unchunked call for `ws.rs`'s full
+        // `MAILBOX_ACK_MAX_IDS` (4096) batch would bind 4097 parameters — comfortably past
+        // SQLite's conservative compile-time default `SQLITE_MAX_VARIABLE_NUMBER = 999` (older
+        // builds; newer builds default higher, but this crate must not assume that), which would
+        // turn the delete itself into a hard error and defeat the cap's whole purpose. Chunking
+        // keeps every statement's parameter count (1 recipient bind + up to
+        // `MAILBOX_DELETE_MAX_IDS_PER_BATCH` id binds) safely under 999 regardless of build
+        // configuration.
+        let mut deleted = 0u64;
+        for chunk in ids.chunks(MAILBOX_DELETE_MAX_IDS_PER_BATCH) {
+            let mut qb: QueryBuilder<Sqlite> =
+                QueryBuilder::new("DELETE FROM mailbox WHERE recipient_pub = ");
+            qb.push_bind(recipient_pub.as_slice());
+            qb.push(" AND id IN (");
+            let mut separated = qb.separated(", ");
+            for id in chunk {
+                separated.push_bind(*id as i64);
+            }
+            separated.push_unseparated(")");
+            let result = qb.build().execute(&self.pool).await.map_err(backend)?;
+            deleted += result.rows_affected();
         }
-        separated.push_unseparated(")");
-        let result = qb.build().execute(&self.pool).await.map_err(backend)?;
-        Ok(result.rows_affected())
+        Ok(deleted)
     }
 
     async fn mailbox_purge_expired(&self, now: u64) -> StoreResult<u64> {
@@ -443,6 +466,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(deleted, 0);
+    }
+
+    /// Task 9.5: a single `mailbox_delete_by_ids` call with a batch as large as `ws.rs`'s
+    /// `MAILBOX_ACK_MAX_IDS` (4096) must succeed against real SQLite in one call, not error out —
+    /// this is the direct proof that internal chunking (`MAILBOX_DELETE_MAX_IDS_PER_BATCH`) keeps
+    /// every one of the multiple `DELETE` statements it issues under SQLite's bound-parameter
+    /// limit, covering the exact 4097-bound-parameter shape (4096 ids + 1 recipient bind) that a
+    /// full, unchunked `MailboxAck` batch would otherwise produce.
+    #[tokio::test]
+    async fn mailbox_delete_by_ids_handles_a_full_mailbox_ack_max_ids_batch_in_one_call() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let recipient = [5u8; 32];
+
+        const MAILBOX_ACK_MAX_IDS: u64 = 4096;
+        let mut ids = Vec::with_capacity(MAILBOX_ACK_MAX_IDS as usize);
+        for i in 0..MAILBOX_ACK_MAX_IDS {
+            let id = store
+                .mailbox_enqueue(recipient, vec![i as u8], i, i + 1_000)
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        assert_eq!(ids.len(), MAILBOX_ACK_MAX_IDS as usize);
+
+        let deleted = store.mailbox_delete_by_ids(&recipient, &ids).await.unwrap();
+        assert_eq!(deleted, MAILBOX_ACK_MAX_IDS);
+        assert!(store
+            .mailbox_list_for_recipient(&recipient, 0)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
