@@ -650,7 +650,7 @@ agent; landing order and dependencies: [phase-9/README.md](./phase-9/README.md#t
 - [x] **9.4** Fix drain/registration race window (F4; soft-depends on 9.1) — [file](./phase-9/9.4-mailbox-drain-registration-race.md)
 - [x] **9.5** Chunk `MailboxAck` delete into sub-999-parameter batches (F2) — [file](./phase-9/9.5-mailbox-ack-chunk-delete.md)
 - [x] **9.6** Document/validate client trust in `Deliver.mailbox_id` (F3) — [file](./phase-9/9.6-mailbox-id-client-trust-boundary.md)
-- [~] **9.7** Federated-path `ttl_days == 0` test (F7) — [file](./phase-9/9.7-federated-ttl-zero-test.md)
+- [x] **9.7** Federated-path `ttl_days == 0` test (F7) — [file](./phase-9/9.7-federated-ttl-zero-test.md)
 - [ ] **9.8** Lock `MailboxAck{ids:[]}` conformance vector (F8) — [file](./phase-9/9.8-mailbox-ack-empty-conformance-vector.md)
 - [ ] **9.9** Add `Mailbox::validate` config check (N1) — [file](./phase-9/9.9-mailbox-config-validate.md)
 - [ ] **9.10** Nit sweep: mailbox-drain proptest, `purge_loop` coverage, double-ack no-op test (N3, N4, N5; soft-depends on 9.1, 9.3) — [file](./phase-9/9.10-phase-9-nit-sweep.md)
