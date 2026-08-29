@@ -40,7 +40,13 @@ FAIL=0
 # 2.4+) — same reasoning as Deliver/RouteBody already on this list: they carry
 # OpaqueBlob/opaque routing fields (FedRoute.envelope) or plain routing metadata
 # (target/to/from/domain/requesting_server/connected/code/msg), never decoded content.
-ALLOWLIST='^(Auth|AuthOk|Publish|PublishOk|Fetch|Bundle|RouteBody|RouteOk|Deliver|TurnReq|TurnGrant|ErrBody|Challenge|FedHello|FedFetchBundle|FedBundle|FedRoute|FedReachability|FedReachable|FedErr)$'
+#
+# MailboxAck|MailboxAckOk (task 8.3, allowlisted here in task 8.7 when apps/rendezvous first
+# actually decodes MailboxAck): mailbox-drain ack control-plane types, apps/proto/src/msg.rs.
+# `MailboxAck.ids` is a `Vec<u64>` of the mailbox's own server-assigned row ids, never the opaque
+# `eid` inside a blob (task 7.6); `MailboxAckOk` is an empty body. Neither carries or decodes
+# envelope content.
+ALLOWLIST='^(Auth|AuthOk|Publish|PublishOk|Fetch|Bundle|RouteBody|RouteOk|Deliver|TurnReq|TurnGrant|ErrBody|Challenge|FedHello|FedFetchBundle|FedBundle|FedRoute|FedReachability|FedReachable|FedErr|MailboxAck|MailboxAckOk)$'
 
 # Multi-line-aware scan for `let NAME: TYPE = ....decode()` across every *.rs file under the given
 # roots, emitting `file:line:leaf_type_name` — one per match, with TYPE already resolved to its
@@ -173,7 +179,7 @@ RS
   fi
   rm -rf "$ml_dir"
   echo "-- selftest: expect PASS on the real tree (no false positives on legitimate decodes) --"
-  if ! lint_paths apps/proto apps/rendezvous; then
+  if ! lint_paths apps/proto apps/rendezvous apps/admin; then
     echo "SELFTEST FAILED: lint has false positives on the clean tree."
     exit 1
   fi
@@ -181,7 +187,7 @@ RS
   exit 0
 fi
 
-if lint_paths apps/proto apps/rendezvous; then
+if lint_paths apps/proto apps/rendezvous apps/admin; then
   FAIL=0
 else
   FAIL=$?

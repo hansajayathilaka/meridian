@@ -329,7 +329,8 @@ Good terminal UX is mostly good failure UX. Each of these has a defined presenta
 | Condition | Presentation |
 |---|---|
 | Rendezvous unreachable | Status bar `● reconnecting (3/5)`, backoff from config, composer stays usable, sends queue locally with a visible `pending` state |
-| Peer offline (pre-T07) | Message marked `failed` with "not delivered — <petname> is offline" and a retry action. **Never** "will deliver later" |
+| Peer offline, no mailbox available (`ttl_days == 0`, or unreachable) | Message marked `failed` with "not delivered — <petname> is offline" and a retry action. **Never** "will deliver later" |
+| Peer offline, queued into their mailbox (T07, task 8.15) | Message marked `sent` (single tick — same as a live handoff, since the server durably has it either way) plus a one-time notice "queued — <petname> is offline, will arrive when they reconnect". **Never** a retry action — the message already reached the server |
 | Federation `closed` / stale hint | The client error taxonomy from task 2.9, rendered as a one-line explanation plus what the user can do |
 | Bundle verification failure | Hard error, no fallback, wording from verification-ux.md; the contact is not added |
 | Ratchet desync | The fresh-X3DH auto-recovery decision (task 1.18) with its user-visible notice — not silent |

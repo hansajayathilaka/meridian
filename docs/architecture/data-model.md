@@ -33,6 +33,9 @@ mailbox(           -- ADR-7. A7 learns: count, sizes, timestamps. Nothing else.
                    -- "no s2s dedup" already stands) — the server never needs to read eid at all.
   recipient_pub, blob BLOB /*opaque — no-serde lint*/,
   arrived_at, expires_at, size_bytes)
+  -- INDEX(recipient_pub): list-for-recipient (and the delete/size paths, both scoped by
+  -- recipient_pub) are the hot path; added in the SQLite migration (task 8.2), named here per
+  -- Definition of Task §6 sync-docs-on-schema-change.
   -- purge job on expires_at; delete on ack (by id); quota trigger per recipient
   -- TTL=0 config ⇒ inserts disabled entirely (pure-P2P mode)
 
@@ -56,7 +59,7 @@ C4 — not a certificate/key fingerprint, hence not named `ca_pin`). No per-part
 version of that field (parsed, never consulted) by making it a fail-closed config-load error —
 federation admission is server-wide only, via `federation.policy` ([task 2.6](../tasks/phase-2/2.6-federation-policy-limits.md), `open | allowlist | closed`), never a per-partner dimension.
 
-Deliberately absent: contact lists, message metadata beyond the mailbox row, display names, sender columns on mailbox rows (sender is inside the sealed envelope). Backup/restore stance (§10): losing this DB costs *reachability* (clients republish bundles on reconnect), never confidentiality or identity.
+Deliberately absent: contact lists, message metadata beyond the mailbox row, display names, sender columns on mailbox rows (`MessageEnvelope::sender_pub` is outer plaintext authenticated via the ratchet's AAD, not ciphertext — but it lives inside `blob`, which the server never decodes; a mailbox-drained `Deliver.from` is a fixed placeholder, never a persisted sender identity — [ADR 0024](../adr/0024-mailbox-drain-from-attestation.md)). Backup/restore stance (§10): losing this DB costs *reachability* (clients republish bundles on reconnect), never confidentiality or identity.
 
 ## 2. Client local store (encrypted via SecretStore key)
 

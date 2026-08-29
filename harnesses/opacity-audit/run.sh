@@ -25,3 +25,13 @@ cargo test -q -p meridian-cli --bin meridian opacity::tests::federated_opacity_a
 cargo test -q -p meridian-cli --bin meridian opacity::tests::federated_opacity_scan_is_sensitive_to_a_fed_only_leak -- --exact
 echo "[opacity-audit] OK: zero plaintext leaks in EITHER the local c2s transcript or the federated"
 echo "  s2s FedRoute transcript — grep -c plaintext == 0 at both servers."
+
+# 8.12: opacity/at-rest audit for MAILBOX ROWS (T07's offline ciphertext mailbox, task 8.2). This
+# is the first raw-DB-page scanner in this codebase (the two audits above scan wire transcripts,
+# not on-disk bytes) — see apps/cli/src/opacity.rs's `run_mailbox_at_rest_audit` doc comment for
+# why. Requires the meridian-rendezvous `sqlite` dev-dependency feature (apps/cli/Cargo.toml).
+echo "[opacity-audit] no-plaintext-at-rest audit, mailbox rows (task 8.12)…"
+cargo test -q -p meridian-cli --bin meridian opacity::tests::mailbox_at_rest_audit_passes -- --exact
+cargo test -q -p meridian-cli --bin meridian opacity::tests::mailbox_at_rest_audit_catches_a_planted_plaintext_regression -- --exact
+echo "[opacity-audit] OK: zero plaintext leaks in the raw on-disk mailbox .db bytes, AND the scan"
+echo "  is proven non-vacuous (it catches a planted-plaintext regression)."

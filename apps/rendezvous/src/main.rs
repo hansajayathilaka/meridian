@@ -75,6 +75,14 @@ async fn main() {
         });
     }
 
+    // Task 8.9: the mailbox TTL-expiry purge job. Never fatal on failure (a purge-pass error just
+    // means the next tick tries again) — same non-fatal posture as the federation accept loop
+    // above, which is this crate's existing precedent for a long-running background task.
+    let purge_state = state.clone();
+    tokio::spawn(async move {
+        meridian_rendezvous::mailbox_purge::purge_loop(purge_state).await;
+    });
+
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .unwrap_or_else(|e| panic!("bind {bind}: {e}"));

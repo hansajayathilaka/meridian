@@ -73,3 +73,11 @@ urls = [                         # the candidate ladder, preference order
 ]
 ttl_secs = 120                   # credential lifetime (short); reuse bounded by coturn user-quota
                                   # env: MERIDIAN_RENDEZVOUS_TURN__TTL_SECS
+
+[mailbox]                        # offline ciphertext mailbox (T07, ADR 0007)
+ttl_days = 14                    # 0 disables the mailbox entirely (pure-P2P mode)
+                                  # env: MERIDIAN_RENDEZVOUS_MAILBOX__TTL_DAYS
+quota_mb = 50                    # per-recipient quota, in MiB -- TODO: confirm (no design-doc default)
+                                  # env: MERIDIAN_RENDEZVOUS_MAILBOX__QUOTA_MB
+purge_interval_secs = 3600       # how often the expired-row purge job sweeps (task 8.9)
+                                  # env: MERIDIAN_RENDEZVOUS_MAILBOX__PURGE_INTERVAL_SECS

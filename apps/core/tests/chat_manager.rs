@@ -126,7 +126,7 @@ impl Party {
     fn recv_raw(&mut self, from: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, ChatError> {
         let ik = self.ik();
         self.state
-            .open_bytes(&self.store, self.account.handle(), &ik, from, blob)
+            .open_bytes(&self.store, self.account.handle(), &ik, from, blob, false)
     }
 }
 

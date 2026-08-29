@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use meridian_identity::{generate_account, KeyHandle, MemorySecretStore};
 use meridian_rendezvous::config::{
-    Config, DiscoveryMode, Federation, FederationPolicyMode, Limits, Server, Turn,
+    Config, DiscoveryMode, Federation, FederationPolicyMode, Limits, Mailbox, Server, Turn,
 };
 use meridian_rendezvous::federation::inbound::{bind_federation, run_federation};
 use meridian_rendezvous::federation::link::build_client_tls_config;
@@ -185,6 +185,7 @@ pub fn config_with_federation(domain: &str, federation: Federation) -> Config {
         limits: Limits::default(),
         turn: Turn::default(),
         federation,
+        mailbox: Mailbox::default(),
     }
 }
 
@@ -299,6 +300,10 @@ pub struct FederatedPairOpts {
     /// tests only ever reach B through A's federation link and never need a direct client
     /// connection to B at all.
     pub spawn_b_c2s: bool,
+    /// B's mailbox config (task 8.6) — defaults to `Mailbox::default()` (`ttl_days=14`); a test
+    /// exercising the offline-federated-route mailbox path overrides this (e.g. `quota_mb: 0` to
+    /// force an immediate `mailbox_full`).
+    pub b_mailbox: Mailbox,
 }
 
 impl Default for FederatedPairOpts {
@@ -321,6 +326,7 @@ impl Default for FederatedPairOpts {
             b_fed_reachability_per_origin_per_min: 600,
             b_allow_test_tamper: false,
             spawn_b_c2s: true,
+            b_mailbox: Mailbox::default(),
         }
     }
 }
@@ -363,6 +369,7 @@ pub async fn boot_federated_pair(opts: FederatedPairOpts) -> FederatedPair {
     let mut b_config = base_config(&opts.b_domain);
     b_config.federation = b_federation;
     b_config.server.allow_test_tamper = opts.b_allow_test_tamper;
+    b_config.mailbox = opts.b_mailbox;
     let b_store = Arc::new(MemoryStore::new());
     let b_state = AppState::new(b_config, b_store);
     let b_fed_addr = spawn_federation(b_state.clone()).await;

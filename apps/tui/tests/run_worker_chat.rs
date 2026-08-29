@@ -156,6 +156,57 @@ impl Store for BundleFetchCountingStore {
     async fn total_otks(&self) -> Result<u64, meridian_rendezvous::store::StoreError> {
         self.inner.total_otks().await
     }
+
+    // (task 8.8) Forwarded to `self.inner`, exactly like every other method above — without
+    // these, the trait's own default impls (`StoreError::Backend("... not implemented")`, added
+    // task 8.1) apply instead, and `handle_route`'s offline-recipient path (task 8.5) genuinely
+    // calls `mailbox_enqueue_with_quota` against `Config::default()`'s non-zero `ttl_days` in
+    // `spawn_server` below — a route to an offline peer would hard-fail with `bad_request "store
+    // failed"` rather than exercising the real mailbox-queuing behavior this test's own peer-
+    // offline scenario is supposed to go through.
+    async fn mailbox_enqueue(
+        &self,
+        recipient_pub: [u8; 32],
+        blob: Vec<u8>,
+        arrived_at: u64,
+        expires_at: u64,
+    ) -> Result<u64, meridian_rendezvous::store::StoreError> {
+        self.inner
+            .mailbox_enqueue(recipient_pub, blob, arrived_at, expires_at)
+            .await
+    }
+
+    async fn mailbox_list_for_recipient(
+        &self,
+        recipient_pub: &[u8; 32],
+    ) -> Result<Vec<meridian_rendezvous::store::MailboxEntry>, meridian_rendezvous::store::StoreError>
+    {
+        self.inner.mailbox_list_for_recipient(recipient_pub).await
+    }
+
+    async fn mailbox_delete_by_ids(
+        &self,
+        recipient_pub: &[u8; 32],
+        ids: &[u64],
+    ) -> Result<u64, meridian_rendezvous::store::StoreError> {
+        self.inner.mailbox_delete_by_ids(recipient_pub, ids).await
+    }
+
+    async fn mailbox_purge_expired(
+        &self,
+        now: u64,
+    ) -> Result<u64, meridian_rendezvous::store::StoreError> {
+        self.inner.mailbox_purge_expired(now).await
+    }
+
+    async fn mailbox_size_bytes_for_recipient(
+        &self,
+        recipient_pub: &[u8; 32],
+    ) -> Result<u64, meridian_rendezvous::store::StoreError> {
+        self.inner
+            .mailbox_size_bytes_for_recipient(recipient_pub)
+            .await
+    }
 }
 
 /// Starts the real rendezvous server on a background OS thread with its own runtime, bound to an
@@ -393,11 +444,15 @@ async fn send_to_an_online_peer_reports_delivered_true() {
     }
 }
 
-/// `delivered == false` is the pre-T07 "peer offline right now" case — `route_tolerant`'s real
-/// `not_connected` outcome, surfaced faithfully, still a `WorkerEvent::Completed` (never a
-/// `WorkerEvent::Failed`): the send itself succeeded, the peer just was not reachable to receive it.
+/// `delivered == false` for an offline peer, still a `WorkerEvent::Completed` (never a
+/// `WorkerEvent::Failed`): the send itself succeeded, the peer just was not reachable to receive it
+/// live. `write_server_config`'s server runs `Config::default()`'s non-zero `mailbox.ttl_days` (task
+/// 8.15: this test's own send genuinely takes the T07 mailbox-enqueue path, not the pre-T07
+/// `not_connected` drop — see `BundleFetchCountingStore`'s own doc comment on its mailbox-method
+/// forwarding, a few lines up in this file), so the real, current outcome here is
+/// `{delivered:false, queued:true}`, asserted below.
 #[tokio::test]
-async fn send_to_an_offline_peer_completes_with_delivered_false() {
+async fn send_to_an_offline_peer_completes_with_delivered_false_and_queued_true() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let _env = EnvGuard::set(tmp.path());
     let (server, _store) = spawn_server();
@@ -414,10 +469,17 @@ async fn send_to_an_offline_peer_completes_with_delivered_false() {
         WorkerEvent::Completed(Effect::SendMessage(SendMessageEffect {
             outcome: Some(sent),
             ..
-        })) => assert!(
-            !sent.delivered,
-            "peer connection was closed before the send"
-        ),
+        })) => {
+            assert!(
+                !sent.delivered,
+                "peer connection was closed before the send"
+            );
+            assert!(
+                sent.queued,
+                "the default (non-zero ttl_days) mailbox must have durably queued this send \
+                 rather than dropping it — got {sent:?}"
+            );
+        }
         other => panic!(
             "an offline peer must still be a Completed outcome (delivered: false), got {other:?}"
         ),

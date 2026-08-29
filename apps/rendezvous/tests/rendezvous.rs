@@ -8,7 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use meridian_identity::{generate_account, sign, KeyHandle, MemorySecretStore};
 use meridian_proto::{error_codes, Auth, Challenge, ErrBody, Frame, Op};
 use meridian_rendezvous::config::Admission;
-use meridian_rendezvous::{serve, AppState, Config, MemoryStore};
+use meridian_rendezvous::{serve, AppState, Config, MemoryStore, Store};
 use meridian_signaling::{SignalError, SignalingClient, DEFAULT_OTK_COUNT};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
@@ -24,6 +24,19 @@ async fn spawn(config: Config) -> String {
         let _ = serve(state, listener).await;
     });
     format!("ws://{addr}")
+}
+
+/// Same as [`spawn`], but also hands back the concrete `MemoryStore` so a test can inspect mailbox
+/// rows directly (task 8.5) rather than only observing wire-visible outcomes.
+async fn spawn_with_store(config: Config) -> (String, Arc<MemoryStore>) {
+    let store = Arc::new(MemoryStore::new());
+    let state = AppState::new(config, store.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve(state, listener).await;
+    });
+    (format!("ws://{addr}"), store)
 }
 
 fn config_open() -> Config {
@@ -493,9 +506,13 @@ async fn routes_opaque_envelope_between_connected_peers() {
     assert_eq!(msg.blob.as_bytes(), payload.as_slice());
 }
 
+/// `ttl_days == 0` means the mailbox is genuinely disabled (pure-P2P mode, task 8.5) — an offline
+/// route stays the pre-T07 `not_connected` error, and never creates a mailbox row.
 #[tokio::test]
-async fn route_to_offline_peer_errors() {
-    let url = spawn(config_open()).await;
+async fn route_to_offline_peer_errors_when_mailbox_disabled() {
+    let mut config = config_open();
+    config.mailbox.ttl_days = 0;
+    let (url, store) = spawn_with_store(config).await;
     let alice = new_acct("localhost");
     let bob = new_acct("localhost"); // never connects
 
@@ -505,6 +522,65 @@ async fn route_to_offline_peer_errors() {
         SignalError::Server(ErrBody { code, .. }) => assert_eq!(code, error_codes::NOT_CONNECTED),
         other => panic!("expected not_connected, got {other:?}"),
     }
+
+    assert_eq!(
+        store
+            .mailbox_size_bytes_for_recipient(&bob.pubkey)
+            .await
+            .unwrap(),
+        0,
+        "ttl_days=0 must never create a mailbox row"
+    );
+}
+
+/// A route to an offline recipient with the mailbox enabled (`ttl_days > 0`, task 8.5's default
+/// path) queues instead of failing: `RouteOk{delivered:false, queued:true}`, and a row shows up in
+/// the recipient's mailbox.
+#[tokio::test]
+async fn route_to_offline_peer_with_mailbox_enabled_queues() {
+    let config = config_open(); // default Mailbox: ttl_days=14, quota_mb=50
+    let (url, store) = spawn_with_store(config).await;
+    let alice = new_acct("localhost");
+    let bob = new_acct("localhost"); // never connects
+
+    let mut ac = alice.connect(&url).await.unwrap();
+    let payload = vec![0xAB, 0xCD, 0xEF];
+    let delivered = ac.route(bob.pubkey, payload.clone()).await.unwrap();
+    assert!(
+        !delivered,
+        "queued (not live-delivered) must report delivered=false over the wire"
+    );
+
+    let rows = store.mailbox_list_for_recipient(&bob.pubkey).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].blob, payload);
+}
+
+/// An offline route that would push the recipient's mailbox over `quota_mb` is rejected with
+/// `mailbox_full`, never `RouteOk`, and creates no new row.
+#[tokio::test]
+async fn route_to_offline_peer_over_quota_is_rejected() {
+    let mut config = config_open();
+    config.mailbox.quota_mb = 0; // any non-empty enqueue immediately exceeds a zero quota
+    let (url, store) = spawn_with_store(config).await;
+    let alice = new_acct("localhost");
+    let bob = new_acct("localhost"); // never connects
+
+    let mut ac = alice.connect(&url).await.unwrap();
+    let err = ac.route(bob.pubkey, vec![1, 2, 3]).await.unwrap_err();
+    match err {
+        SignalError::Server(ErrBody { code, .. }) => assert_eq!(code, error_codes::MAILBOX_FULL),
+        other => panic!("expected mailbox_full, got {other:?}"),
+    }
+
+    assert_eq!(
+        store
+            .mailbox_size_bytes_for_recipient(&bob.pubkey)
+            .await
+            .unwrap(),
+        0,
+        "a quota-rejected route must not create a row"
+    );
 }
 
 // -- admission ---------------------------------------------------------------

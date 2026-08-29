@@ -110,10 +110,21 @@ pub struct RouteBody {
 }
 
 /// Server → client: outcome of a route. `delivered = false` means the recipient was not connected
-/// (the mailbox that would hold it offline is T07, out of scope here).
+/// live. Three outcomes (T07 mailbox, phase-8 architect consult): delivered live →
+/// `{delivered:true}` (`queued` omitted); queued to the recipient's mailbox (offline, `ttl_days >
+/// 0`, under quota) → `{delivered:false, queued:true}`; offline with no mailbox available
+/// (`ttl_days == 0`, or over quota) → an `Err` (`not_connected` / `mailbox_full`), never a
+/// `RouteOk` at all.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteOk {
     pub delivered: bool,
+    /// `true` only when this route was accepted into the recipient's offline mailbox rather than
+    /// delivered live (T07). Additive field: `#[serde(default, skip_serializing_if = "is_false")]`
+    /// so a `{delivered:true}` reply (or any `false` value) omits the key entirely, keeping
+    /// existing `RouteOk{delivered:true}` traffic byte-identical to before this field existed —
+    /// see `apps/proto/tests/roundtrip.rs`'s explicit backward-compatibility test.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub queued: bool,
 }
 
 /// Server → recipient: a routed envelope pushed to a connected client. `from` is the sender key
@@ -130,10 +141,56 @@ pub struct RouteOk {
 /// ([ADR 0016](../../../docs/adr/0016-envelope-deniability.md) residual R4, scope-corrected).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deliver {
+    /// The routing server's own assertion of who sent this — a live connection's authenticated
+    /// `account_pub` for a same-server route, a federated `FedRoute.from` for a cross-org one.
+    /// Server testimony only (ADR 0016 residual R4), never the cryptographic trust boundary (the
+    /// ratchet AEAD over `envelope.sender_pub`, embedded in `blob` itself, is).
+    ///
+    /// **When `mailbox_id.is_some()` (a mailbox-drained push, task 8.7), this is
+    /// [`MAILBOX_DRAIN_FROM_PLACEHOLDER`] — never a real, persisted sender identity.** The
+    /// original sender's connection may have closed days earlier; the server has no live
+    /// assertion left to make, and persisting one at enqueue time would be a durable, queryable
+    /// server-side contact graph — forbidden outright (`docs/security/anonymity-and-retention.md`'s
+    /// must-never list, item 2; `docs/adr/0024-mailbox-drain-from-attestation.md`).
+    /// Client-side reception of a mailbox-drained `Deliver` must derive the real sender from
+    /// `envelope.sender_pub` alone (already recoverable from `blob` without the server's help),
+    /// never by comparing this field against it.
     #[serde(with = "crate::bytes::b32")]
     pub from: [u8; 32],
     pub blob: OpaqueBlob,
+    /// Present only when this push drains a row from the recipient's offline mailbox (T07) —
+    /// absent for a live route's push. Carries the mailbox's own server-assigned row `id` (never
+    /// the opaque `eid` inside `blob`, which the server cannot read — data-model.md's mailbox
+    /// table, task 7.6); the client echoes it back in a later [`MailboxAck`] to have the row
+    /// deleted. Additive field: `#[serde(default, skip_serializing_if = "Option::is_none")]` keeps
+    /// an existing live-route `Deliver{from, blob}` byte-identical to before this field existed —
+    /// see `apps/proto/tests/roundtrip.rs`'s explicit backward-compatibility test.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mailbox_id: Option<u64>,
 }
+
+/// `Deliver.from`'s value on every mailbox-drained push (`mailbox_id.is_some()`) — a fixed sentinel
+/// meaning "no server assertion available," never a real account key. `[0u8; 32]` cannot collide
+/// with any ADR-0001 self-certifying account key (real key material), unlike e.g. the recipient's
+/// own key, which could look like a genuine self-send. See [`Deliver`]'s own doc comment and
+/// `docs/adr/0024-mailbox-drain-from-attestation.md` for the full reasoning.
+pub const MAILBOX_DRAIN_FROM_PLACEHOLDER: [u8; 32] = [0u8; 32];
+
+/// Client → server: acknowledge receipt of one or more mailbox-drain [`Deliver`] pushes so the
+/// server can delete the corresponding rows (T07). `ids` are the mailbox's own server-assigned row
+/// `id`s echoed back from [`Deliver::mailbox_id`] — **never** the opaque `eid` inside the envelope
+/// blob, which the server cannot read (data-model.md's mailbox table note, task 7.6). The server
+/// deletes only rows that both match one of `ids` and belong to the authenticated connection's own
+/// `account_pub` — an id naming another account's row is silently ignored, never an error (no
+/// existence oracle).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailboxAck {
+    pub ids: Vec<u64>,
+}
+
+/// Server → client: the [`MailboxAck`] was processed (matching rows deleted, if any).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailboxAckOk {}
 
 /// Client → server: request ephemeral TURN credentials for a new session (T05, wire-protocol §2,
 /// system-design §5.4). The body is intentionally empty — the server mints a fresh, time-limited,
@@ -204,6 +261,12 @@ pub mod error_codes {
     /// (the stale-hint case, ADR 0001 consequences — a UX/reachability outcome, never a security
     /// warning) ([2.7](../../../docs/tasks/phase-2/2.7-federated-prekey-fetch.md) emits this).
     pub const NOT_FOUND_AT_HINT: &str = "not_found_at_hint";
+    /// `RouteBody` named a recipient who is offline and whose mailbox is already at its
+    /// size/count quota — the sender gets a synchronous error instead of the envelope being
+    /// silently dropped or accepted past the cap (T07, phase-8 architect consult point 4).
+    /// Distinct from `not_connected`: that means "no mailbox available at all" (`ttl_days == 0`),
+    /// this means "a mailbox exists but is full."
+    pub const MAILBOX_FULL: &str = "mailbox_full";
 }
 
 fn is_false(b: &bool) -> bool {

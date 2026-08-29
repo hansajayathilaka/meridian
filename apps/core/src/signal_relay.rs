@@ -148,6 +148,7 @@ mod tests {
         let deliver = meridian_proto::Deliver {
             from: [7u8; 32],
             blob: meridian_proto::OpaqueBlob::new(vec![1, 2, 3]),
+            mailbox_id: None,
         };
         let (from, blob) = map_deliver_result(Ok(deliver)).unwrap();
         assert_eq!(from, [7u8; 32]);

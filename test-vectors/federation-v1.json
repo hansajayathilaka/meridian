@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "T06 federation (s2s) wire-encoding conformance vectors — deterministic CBOR (fixed byte patterns, no RNG/wall-clock). Regenerate with `cargo run -p xtask -- vectors`. Spec: docs/api/federation-protocol-v1.md, apps/proto/src/fed.rs.",
+  "note": "T06 federation (s2s) wire-encoding conformance vectors — deterministic CBOR (fixed byte patterns, no RNG/wall-clock). Regenerate with `cargo run -p xtask -- vectors`. Spec: docs/api/federation-protocol-v1.md, apps/proto/src/fed.rs. Extended in task 8.4 with an `err-mailbox-full` case (task 8.3's fed_error_codes::MAILBOX_FULL) alongside the existing `err` (NOT_FOUND) case.",
   "vectors": [
     {
       "name": "hello",
@@ -70,6 +70,16 @@
         "msg": "unknown target"
       },
       "frame_hex": "a3626f70634572726269640264626f64795823a264636f6465696e6f745f666f756e64636d73676e756e6b6e6f776e20746172676574"
+    },
+    {
+      "name": "err-mailbox-full",
+      "op": "Err",
+      "id": 2,
+      "fields": {
+        "code": "mailbox_full",
+        "msg": "recipient mailbox is full"
+      },
+      "frame_hex": "a3626f70634572726269640264626f64795832a264636f64656c6d61696c626f785f66756c6c636d73677819726563697069656e74206d61696c626f782069732066756c6c"
     }
   ]
 }

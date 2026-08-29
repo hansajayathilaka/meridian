@@ -67,7 +67,7 @@ use meridian_core::identity::{
 };
 use meridian_core::signaling::SignalingClient;
 use meridian_core::trust::{TrustState, TrustStore};
-use meridian_rendezvous::{serve, AppState, Config, MemoryStore};
+use meridian_rendezvous::{serve, AppState, Config, MemoryStore, Store};
 
 use meridian_tui::app::{
     AcceptRequestEffect, AcceptRequestRequest, App, AppEvent, Effect, InboundEvent, Screen,
@@ -148,6 +148,32 @@ fn spawn_server() -> String {
     });
     let addr = rx.recv().unwrap();
     format!("ws://{addr}")
+}
+
+/// Like [`spawn_server`], but also returns the [`MemoryStore`] behind it — for a test that needs
+/// to seed a mailbox row directly (task 8.8's `mailbox_drained_delivery_from_an_existing_session_*`
+/// below), mirroring `apps/rendezvous/tests/mailbox_delivery.rs`'s own direct-seed technique
+/// rather than orchestrating a real offline-detection race.
+fn spawn_server_with_store() -> (String, std::sync::Arc<MemoryStore>) {
+    let store = std::sync::Arc::new(MemoryStore::new());
+    let store_for_server = store.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let config = Config::default();
+            let state = AppState::new(config, store_for_server);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tx.send(addr).unwrap();
+            let _ = serve(state, listener).await;
+        });
+    });
+    let addr = rx.recv().unwrap();
+    (format!("ws://{addr}"), store)
 }
 
 // ---------------------------------------------------------------------------
@@ -715,6 +741,179 @@ async fn inbound_text_message_while_chat_open_appends_live_and_persists() {
     assert_eq!(saved[0].body, "hi, it's me");
     assert_eq!(saved[1].mid, entry.mid);
     assert_eq!(saved[1].body, entry.body);
+}
+
+/// Task 8.8, review finding 1 (blocking, now fixed) — the exact real-caller-path regression the
+/// review flagged as untested: a mailbox-drained `Deliver` (task 8.7) from an ALREADY-ESTABLISHED
+/// session must file its `InboundEvent::Message` under the real sender, never the server's
+/// `[0u8; 32]` mailbox-drain placeholder. Before the fix, `process_inbound_delivery` used
+/// `deliver.from` (the placeholder, for a mailbox-drained push) directly as the event's
+/// `peer_pubkey` — silently misfiling the message into a shared placeholder pseudo-contact instead
+/// of the real conversation, and (in `apps/cli`'s equivalent code path) crashing the whole process
+/// via an unguarded `seal_outbound` `NoSession` error.
+///
+/// "Us" never connects to the real server until the very end, so this test never has to
+/// orchestrate a real disconnect/reconnect race to get "us" genuinely offline when the peer's
+/// second message arrives: an established responder session is built entirely locally first (the
+/// same `open_inbound`/`accept_request` calls the live/accept flow would make, just run
+/// synchronously against no live inbound loop yet) and sealed into `sessions.bin`, then the
+/// peer's follow-up message is seeded directly into the mailbox — mirroring
+/// `apps/rendezvous/tests/mailbox_delivery.rs`'s own direct-seed technique — before "us" ever
+/// connects for the first time and (task 8.7) drains it immediately post-`AuthOk`.
+#[tokio::test]
+async fn mailbox_drained_delivery_from_an_existing_session_files_under_the_real_sender_not_the_placeholder(
+) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let (server, store) = spawn_server_with_store();
+    let (handle, us_pub) = setup_us_account();
+
+    // "Us" publishes a bundle (so the peer can X3DH-initiate) and keeps the matching prekey
+    // secrets in a local `CoreChatState` — same as `publish_own_bundle`, except this function
+    // holds onto that `CoreChatState` so it can also fold a locally-established peer session into
+    // the SAME `sessions.bin` below, before the real inbound loop ever connects.
+    let os = OsSecretStore::new(SERVICE);
+    let mut us_chat = CoreChatState::default();
+    {
+        let mut client = SignalingClient::connect(&server, &os, &handle, us_pub, None, 1)
+            .await
+            .expect("us connect to publish");
+        let generated = client
+            .publish_bundle(&os, &handle, 8)
+            .await
+            .expect("us publish_bundle");
+        let _ = client.close().await;
+        let otks: Vec<([u8; 32], [u8; 32])> = generated
+            .bundle
+            .otks
+            .iter()
+            .zip(generated.otk_secrets.iter())
+            .map(|(p, s)| (*p, **s))
+            .collect();
+        us_chat.vault.set_bundle(
+            generated.bundle.spk,
+            *generated.spk_secret,
+            otks,
+            1_760_000_000,
+        );
+    }
+
+    // Peer: fetch us's bundle, X3DH-initiate, seal a first message — exactly
+    // `peer_send_first_contact`'s own shape, but "us" is not connected to receive it live.
+    let (peer_store, peer_account) = generate_peer();
+    let peer_pub = *peer_account.public_key().as_bytes();
+    let mut peer_chat = CoreChatState::default();
+    let mut peer_client = SignalingClient::connect(
+        &server,
+        &peer_store,
+        peer_account.handle(),
+        peer_pub,
+        None,
+        1,
+    )
+    .await
+    .expect("peer connect");
+    let bundle = peer_client
+        .fetch_bundle(us_pub, None, false)
+        .await
+        .expect("peer fetch us bundle");
+    peer_chat
+        .start_initiator_session(
+            &peer_store,
+            peer_account.handle(),
+            &peer_pub,
+            &us_pub,
+            &bundle.spk,
+            bundle.otks.first().copied(),
+        )
+        .expect("peer start_initiator_session");
+    let mut first_id = [0u8; 16];
+    getrandom::fill(&mut first_id).expect("random id");
+    let first_blob = peer_chat
+        .seal_outbound(
+            &peer_store,
+            peer_account.handle(),
+            &peer_pub,
+            &us_pub,
+            &ChatContent::Text {
+                id: first_id,
+                body: "hi, it's me".into(),
+            },
+        )
+        .expect("peer seal first");
+
+    // "Us", entirely locally (no network, no live inbound loop yet): open the first-contact
+    // envelope and accept it — genuinely establishing the responder session, exactly as the real
+    // live/accept flow would, with no connection-teardown timing to get right.
+    let first_content = us_chat.open_inbound(&os, &handle, &us_pub, &peer_pub, &first_blob);
+    assert!(
+        matches!(
+            first_content,
+            Err(meridian_core::chat::ChatError::MessageRequest)
+        ),
+        "the first contact must land as a pending request: {first_content:?}"
+    );
+    us_chat
+        .accept_request(&peer_pub)
+        .expect("accept the first-contact request");
+    assert!(us_chat.has_session(&peer_pub));
+
+    // Persist the now-established session to `sessions.bin` — same technique `publish_own_bundle`
+    // uses for the bundle-only case, extended to include the established peer session.
+    let sealed = us_chat
+        .seal_at_rest(&os, &handle)
+        .expect("seal sessions.bin");
+    let path = meridian_core::account::sessions_path().expect("sessions_path");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create sessions.bin parent dir");
+    }
+    std::fs::write(&path, sealed).expect("write sessions.bin");
+
+    // Peer sends a SECOND message on the now-established session — but instead of routing it
+    // live, seed it directly into the mailbox: "us" is genuinely offline server-side (it has never
+    // connected to receive anything), so this is exactly what `handle_route`'s own offline-enqueue
+    // path would produce, just without needing to race a real disconnect.
+    let mut second_id = [0u8; 16];
+    getrandom::fill(&mut second_id).expect("random id");
+    let second_blob = peer_chat
+        .seal_outbound(
+            &peer_store,
+            peer_account.handle(),
+            &peer_pub,
+            &us_pub,
+            &ChatContent::Text {
+                id: second_id,
+                body: "second message, delivered via mailbox drain".into(),
+            },
+        )
+        .expect("peer seal second");
+    store
+        .mailbox_enqueue(us_pub, second_blob, 0, 10_000)
+        .await
+        .expect("seed mailbox row");
+    let _ = peer_client.close().await;
+
+    // NOW connect "us"'s real inbound loop for the first time — task 8.7's own drain fires
+    // immediately post-`AuthOk`, before any other traffic, going through the exact real
+    // `process_inbound_delivery` code path task 8.8 fixed.
+    let mut rx = spawn_inbound_loop(handle.clone(), us_pub, &server);
+    let event = recv_inbound(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("the mailbox-drained follow-up message must arrive");
+    let (event_peer, entry) = match event {
+        InboundEvent::Message { peer_pubkey, entry } => (peer_pubkey, entry),
+        other => panic!("expected InboundEvent::Message, got {other:?}"),
+    };
+    assert_eq!(
+        event_peer, peer_pub,
+        "a mailbox-drained message from an EXISTING session must file under the real sender \
+         (task 8.8 review finding 1), not the mailbox-drain placeholder or any other value"
+    );
+    assert_ne!(
+        event_peer, [0u8; 32],
+        "must never file a mailbox-drained message under the all-zero placeholder"
+    );
+    assert_eq!(entry.body, "second message, delivered via mailbox drain");
 }
 
 /// Deliverable (b)'s own dedup requirement: an inbound message racing a *already-applied* outbound
@@ -1954,4 +2153,514 @@ async fn repeated_desync_against_an_ordinary_pinned_contact_reaches_recovery_and
         ChatContent::Text { body, .. } => assert_eq!(body, "still alive after the burst"),
         other => panic!("expected the recovered Text message, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Task 8.10: X3DH-initial-message-via-mailbox coverage — wire-protocol.md's transport-
+// independence invariant ("the same Envelope bytes are valid whether carried over WSS routing,
+// the mailbox, s2s federation, or a data channel") exercised for the mailbox case, which no
+// earlier task's tests cover. Deliverable's Tests section named `apps/rendezvous/tests/` or
+// `apps/core/tests/`, whichever already hosted X3DH/mailbox-adjacent integration coverage — in
+// practice neither crate has both a real `SignalingClient`/`ChatState` (needs `meridian-core`,
+// which `apps/rendezvous` deliberately never depends on — the server-no-core invariant) AND a
+// spinnable real `meridian-rendezvous` server (`apps/core`'s dev-dependencies have neither
+// `meridian-signaling` server-fixture tooling nor `meridian-rendezvous` itself) at once. This
+// file already has both (task 8.8 added `spawn_server_with_store` here for exactly this reason),
+// and already established the "seed the mailbox directly, then let a real `run_inbound_loop`
+// drain it" technique this task reuses — so these two tests land here instead, matching the
+// task's own file (Outcome note recorded in the task's Status section, mirroring 8.12's
+// precedent for a Tests-section suggestion that didn't fit the real crate layout).
+// ---------------------------------------------------------------------------
+
+/// Deliverable 1's primary case: Alice (the peer) X3DH-initiates against Bob's ("us"'s) bundle
+/// while Bob is genuinely offline — the opening, `Prekey`-bearing envelope queues to the mailbox
+/// (never routed live) — and only decrypts + establishes the session once Bob's real inbound loop
+/// connects for the first time and (task 8.7) drains it immediately post-`AuthOk`. Task 2.10's
+/// gate means a genuine first contact never auto-delivers, mailbox-drained or not, so the
+/// assertion is on `InboundEvent::MessageRequest`, exactly like this file's own
+/// `message_request_surfaces_via_ctrl_r_when_requests_screen_is_not_open` for the LIVE case —
+/// the whole point of this test is that the mailbox-drained path reaches the identical outcome.
+#[tokio::test]
+async fn x3dh_opening_message_delivered_via_mailbox_establishes_the_session_and_gates_as_a_request()
+{
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let (server, store) = spawn_server_with_store();
+    let (handle, us_pub) = setup_us_account();
+    publish_own_bundle(&server, &handle, us_pub).await;
+
+    // Peer: fetch us's bundle, X3DH-initiate, seal the opening message — a real `Prekey`-bearing
+    // envelope, byte-for-byte what a live route would have carried.
+    let (peer_store, peer_account) = generate_peer();
+    let peer_pub = *peer_account.public_key().as_bytes();
+    let mut peer_client = SignalingClient::connect(
+        &server,
+        &peer_store,
+        peer_account.handle(),
+        peer_pub,
+        None,
+        1,
+    )
+    .await
+    .expect("peer connect");
+    let bundle = peer_client
+        .fetch_bundle(us_pub, None, false)
+        .await
+        .expect("peer fetch us bundle");
+    let mut peer_chat = CoreChatState::default();
+    peer_chat
+        .start_initiator_session(
+            &peer_store,
+            peer_account.handle(),
+            &peer_pub,
+            &us_pub,
+            &bundle.spk,
+            bundle.otks.first().copied(),
+        )
+        .expect("peer start_initiator_session");
+    let mut id = [0u8; 16];
+    getrandom::fill(&mut id).expect("random id");
+    let opening_blob = peer_chat
+        .seal_outbound(
+            &peer_store,
+            peer_account.handle(),
+            &peer_pub,
+            &us_pub,
+            &ChatContent::Text {
+                id,
+                body: "hi, initiating while you're offline".into(),
+            },
+        )
+        .expect("peer seal opening message");
+    assert!(
+        MessageEnvelope::from_blob(&opening_blob)
+            .expect("decode envelope")
+            .prekey
+            .is_some(),
+        "sanity: the opening message must genuinely carry the X3DH prekey preamble"
+    );
+
+    // Seed it directly into the mailbox — "us" is genuinely offline (never connected at all).
+    store
+        .mailbox_enqueue(us_pub, opening_blob, 0, 10_000)
+        .await
+        .expect("seed mailbox row");
+    let _ = peer_client.close().await;
+
+    // "Us" connects for the first time — task 8.7's drain fires immediately post-`AuthOk`.
+    let mut rx = spawn_inbound_loop(handle.clone(), us_pub, &server);
+    let event = recv_inbound(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("the mailbox-drained opening message must arrive");
+    let entry = match event {
+        InboundEvent::MessageRequest(entry) => entry,
+        other => panic!("expected InboundEvent::MessageRequest, got {other:?}"),
+    };
+    assert_eq!(
+        entry.sender_ik, peer_pub,
+        "the pending request must be keyed by the real sender, not the mailbox-drain placeholder"
+    );
+    assert!(!entry.safety_number.is_empty());
+
+    // Accept it — the session must now be genuinely established, exactly as the live first-
+    // contact flow leaves it (`establish_accepted_conversation`'s own assertion shape).
+    let outcome = dispatch_effect(Effect::AcceptRequest(AcceptRequestEffect {
+        request: AcceptRequestRequest {
+            sender_ik: peer_pub,
+        },
+        outcome: None,
+    }))
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            meridian_tui::app::WorkerEvent::Completed(Effect::AcceptRequest(_))
+        ),
+        "accept must succeed: {outcome:?}"
+    );
+
+    // And the session is genuinely live afterwards: a further, ordinary steady-state message from
+    // the peer — this time routed LIVE, proving the mailbox-established session is byte-for-byte
+    // as usable as a live-established one (the transport-independence invariant this task exists
+    // to prove) — decrypts normally.
+    let mut peer_client2 = SignalingClient::connect(
+        &server,
+        &peer_store,
+        peer_account.handle(),
+        peer_pub,
+        None,
+        1,
+    )
+    .await
+    .expect("peer reconnect");
+    peer_send_text(
+        &peer_store,
+        &peer_account,
+        us_pub,
+        &mut peer_chat,
+        &mut peer_client2,
+        "confirmed: the mailbox-established session works live too",
+    )
+    .await;
+    let event = recv_inbound(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("the live follow-up message must arrive");
+    match event {
+        InboundEvent::Message { peer_pubkey, entry } => {
+            assert_eq!(peer_pubkey, peer_pub);
+            assert_eq!(
+                entry.body,
+                "confirmed: the mailbox-established session works live too"
+            );
+        }
+        other => panic!("expected InboundEvent::Message, got {other:?}"),
+    }
+}
+
+/// Deliverable 1's second case: out-of-order mailbox delivery still decrypts, via the Double
+/// Ratchet's skipped-message-key mechanism (T03) — proving that mechanism is exercised identically
+/// through `open_inbound_from_mailbox` as through the live `open_inbound` path it was originally
+/// proven against. The real server-side drain always delivers `arrived_at`/`id`-ordered (task
+/// 8.7) — genuine wire-level reordering is not something the mailbox itself introduces — so the
+/// out-of-order case this task's acceptance criterion names is reproduced at the `ChatState`
+/// level directly (mirroring `apps/core/tests/preamble_mutation.rs`'s and `eid_dedup.rs`'s own
+/// established technique for isolating a `ChatState` property from transport plumbing): two
+/// envelopes are sealed on an already-established session, and the LATER one is opened via
+/// `open_inbound_from_mailbox` first — forcing the ratchet to derive and retain a skipped message
+/// key for the earlier envelope's counter — and only then is the earlier one opened, also via
+/// `open_inbound_from_mailbox`, and must still decrypt correctly using that retained skipped key.
+///
+/// **Both envelopes still carry the X3DH prekey preamble, not just the opening one — security
+/// review caught this and it is worth recording precisely.** `Session::needs_prekey()` only turns
+/// `false` once `Session::confirmed` flips, which happens only inside `Session::decrypt` on the
+/// *initiator* side (peer's `peer_chat` here) — i.e. only after the peer has itself received and
+/// decrypted a reply. This test never seals anything back to the peer (`us_chat.accept_request` is
+/// pure local bookkeeping, no network, no reply), so `peer_chat`'s session is never confirmed and
+/// both `blob_a`/`blob_b` reattach the same prekey preamble, same as an ordinary unconfirmed-
+/// initiator resend. This does NOT reach `open_bytes`'s fresh-provisional-session fallback
+/// (`apps/core/src/chat.rs`, the branch a genuine first-contact prekey message takes): that branch
+/// only fires when `!self.sessions.contains_key(&envelope.sender_pub)`, which is false here (the
+/// session from the opening exchange is already installed) — so both opens go straight to the
+/// existing session's ordinary `Session::decrypt`, and since neither message triggers a DH ratchet
+/// turn (that only happens once the peer itself decrypts a reply), the header still decrypts under
+/// the *same* header key regardless of order — genuinely exercising the skipped-key store
+/// (`Ratchet::skip_message_keys`/`try_skipped`), not the prekey/freshness-gate machinery.
+#[tokio::test]
+async fn out_of_order_mailbox_drained_delivery_decrypts_via_skipped_message_keys() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let os = OsSecretStore::new(SERVICE);
+    let (handle, us_pub) = setup_us_account();
+
+    let mut us_chat = CoreChatState::default();
+    let (peer_store, peer_account) = generate_peer();
+    let peer_pub = *peer_account.public_key().as_bytes();
+    let mut peer_chat = CoreChatState::default();
+
+    // Establish a real session entirely locally (no network needed for this ChatState-level
+    // proof): a locally-generated bundle (same primitive `SignalingClient::publish_bundle` uses
+    // server-side, just invoked directly with no connection), peer X3DH-initiates against it,
+    // "us" opens and accepts the opening message.
+    let generated = meridian_core::signaling::generate_bundle(&os, &handle, us_pub, 4)
+        .expect("generate_bundle");
+    let otks: Vec<([u8; 32], [u8; 32])> = generated
+        .bundle
+        .otks
+        .iter()
+        .zip(generated.otk_secrets.iter())
+        .map(|(p, s)| (*p, **s))
+        .collect();
+    us_chat.vault.set_bundle(
+        generated.bundle.spk,
+        *generated.spk_secret,
+        otks,
+        1_760_000_000,
+    );
+    peer_chat
+        .start_initiator_session(
+            &peer_store,
+            peer_account.handle(),
+            &peer_pub,
+            &us_pub,
+            &generated.bundle.spk,
+            generated.bundle.otks.first().copied(),
+        )
+        .expect("peer start_initiator_session");
+    let mut open_id = [0u8; 16];
+    getrandom::fill(&mut open_id).expect("random id");
+    let opening_blob = peer_chat
+        .seal_outbound(
+            &peer_store,
+            peer_account.handle(),
+            &peer_pub,
+            &us_pub,
+            &ChatContent::Text {
+                id: open_id,
+                body: "opening".into(),
+            },
+        )
+        .expect("peer seal opening");
+    let opened = us_chat.open_inbound(&os, &handle, &us_pub, &peer_pub, &opening_blob);
+    assert!(matches!(
+        opened,
+        Err(meridian_core::chat::ChatError::MessageRequest)
+    ));
+    us_chat
+        .accept_request(&peer_pub)
+        .expect("accept opening request");
+
+    // Peer seals two further, steady-state envelopes on the confirmed session.
+    let mut id_a = [0u8; 16];
+    getrandom::fill(&mut id_a).expect("random id");
+    let blob_a = peer_chat
+        .seal_outbound(
+            &peer_store,
+            peer_account.handle(),
+            &peer_pub,
+            &us_pub,
+            &ChatContent::Text {
+                id: id_a,
+                body: "first of the pair".into(),
+            },
+        )
+        .expect("peer seal a");
+    let mut id_b = [0u8; 16];
+    getrandom::fill(&mut id_b).expect("random id");
+    let blob_b = peer_chat
+        .seal_outbound(
+            &peer_store,
+            peer_account.handle(),
+            &peer_pub,
+            &us_pub,
+            &ChatContent::Text {
+                id: id_b,
+                body: "second of the pair".into(),
+            },
+        )
+        .expect("peer seal b");
+
+    // Open the LATER envelope FIRST, via the mailbox-drain entry point — this must leave a
+    // skipped message key behind for the earlier envelope's ratchet counter.
+    let later_first = us_chat
+        .open_inbound_from_mailbox(
+            &os,
+            &handle,
+            &us_pub,
+            &meridian_core::proto::MAILBOX_DRAIN_FROM_PLACEHOLDER,
+            &blob_b,
+        )
+        .expect("the later envelope must decrypt even though the earlier one hasn't arrived yet");
+    assert_eq!(
+        later_first,
+        ChatContent::Text {
+            id: id_b,
+            body: "second of the pair".into(),
+        }
+    );
+
+    // Now open the EARLIER envelope, also via the mailbox-drain entry point — proving the
+    // skipped-key mechanism (and the mailbox-drain sender-authentication path) compose correctly:
+    // this must still decrypt, using the key retained above, not fail as stale/replayed.
+    let earlier_second = us_chat
+        .open_inbound_from_mailbox(
+            &os,
+            &handle,
+            &us_pub,
+            &meridian_core::proto::MAILBOX_DRAIN_FROM_PLACEHOLDER,
+            &blob_a,
+        )
+        .expect(
+            "the earlier, out-of-order envelope must still decrypt via its retained skipped \
+             message key",
+        );
+    assert_eq!(
+        earlier_second,
+        ChatContent::Text {
+            id: id_a,
+            body: "first of the pair".into(),
+        }
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 8.17: a mailbox-drained message arriving before an earlier first-contact request from the
+// same sender is accepted must not be silently lost.
+// ---------------------------------------------------------------------------
+
+/// Reproduces the feature spec's own headline demo scenario end to end, through the real
+/// `run_inbound_loop`: three offline messages from a brand-new contact queue at "us"'s mailbox;
+/// on first reconnect, only the opening (`Prekey`-bearing) one is decryptable at all — it triggers
+/// `ChatError::MessageRequest` (task 2.10's gate) — while the second and third, drained in the
+/// SAME connection before the user answers, hit `ChatError::RequestPending`. Before task 8.17,
+/// `process_inbound_delivery`'s per-delivery `persisted` gate had no special case for
+/// `RequestPending`, so those two rows were unconditionally acked and permanently deleted despite
+/// never having reached the user — this test's own load-bearing assertion is that they survive,
+/// unacked, and correctly redeliver once the user accepts and reconnects.
+#[tokio::test]
+async fn three_offline_messages_from_a_new_contact_are_never_silently_lost() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env = EnvGuard::set(tmp.path());
+    let (server, store) = spawn_server_with_store();
+    let (handle, us_pub) = setup_us_account();
+    publish_own_bundle(&server, &handle, us_pub).await;
+
+    // Peer: X3DH-initiate against us's bundle, then seal three messages on the SAME session (the
+    // ratchet advances across all three, exactly as three real live sends would) — never routed
+    // live, seeded directly into the mailbox, simulating "us" genuinely offline throughout.
+    let (peer_store, peer_account) = generate_peer();
+    let peer_pub = *peer_account.public_key().as_bytes();
+    let mut peer_client = SignalingClient::connect(
+        &server,
+        &peer_store,
+        peer_account.handle(),
+        peer_pub,
+        None,
+        1,
+    )
+    .await
+    .expect("peer connect");
+    let bundle = peer_client
+        .fetch_bundle(us_pub, None, false)
+        .await
+        .expect("peer fetch us bundle");
+    let mut peer_chat = CoreChatState::default();
+    peer_chat
+        .start_initiator_session(
+            &peer_store,
+            peer_account.handle(),
+            &peer_pub,
+            &us_pub,
+            &bundle.spk,
+            bundle.otks.first().copied(),
+        )
+        .expect("peer start_initiator_session");
+    let _ = peer_client.close().await;
+
+    let mut seal = |body: &str| {
+        let mut id = [0u8; 16];
+        getrandom::fill(&mut id).expect("random id");
+        peer_chat
+            .seal_outbound(
+                &peer_store,
+                peer_account.handle(),
+                &peer_pub,
+                &us_pub,
+                &ChatContent::Text {
+                    id,
+                    body: body.to_string(),
+                },
+            )
+            .expect("peer seal message")
+    };
+    let blob1 = seal("msg 1");
+    let blob2 = seal("msg 2");
+    let blob3 = seal("msg 3");
+
+    store
+        .mailbox_enqueue(us_pub, blob1, 0, 10_000)
+        .await
+        .expect("seed row 1");
+    store
+        .mailbox_enqueue(us_pub, blob2, 0, 10_000)
+        .await
+        .expect("seed row 2");
+    store
+        .mailbox_enqueue(us_pub, blob3, 0, 10_000)
+        .await
+        .expect("seed row 3");
+    assert_eq!(
+        store
+            .mailbox_list_for_recipient(&us_pub)
+            .await
+            .expect("list before drain")
+            .len(),
+        3
+    );
+
+    // "Us" connects for the first time — task 8.7's drain fires immediately post-`AuthOk`. Only
+    // message 1 ever reaches the event stream as a `MessageRequest`; 2 and 3, hitting
+    // `RequestPending`, are silently dropped from the *event* stream by design (task 2.10) — the
+    // property under test is whether they also silently vanish from the *mailbox*, which they
+    // must not.
+    let mut rx = spawn_inbound_loop(handle.clone(), us_pub, &server);
+    let event = recv_inbound(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("the opening message must arrive as a MessageRequest");
+    let entry = match event {
+        InboundEvent::MessageRequest(entry) => entry,
+        other => panic!("expected InboundEvent::MessageRequest, got {other:?}"),
+    };
+    assert_eq!(entry.sender_ik, peer_pub);
+
+    // No further inbound event for this connection — 2 and 3 are processed (drained, rejected,
+    // and — the fix — left unacked) entirely within the worker, never surfaced to the app.
+    assert!(
+        recv_inbound(&mut rx, Duration::from_secs(2))
+            .await
+            .is_none(),
+        "messages 2 and 3 must not surface as any kind of InboundEvent while the request is \
+         still pending"
+    );
+
+    // The load-bearing assertion task 8.17 exists for: rows 2 and 3 must still be sitting in the
+    // mailbox, unacked — not silently deleted despite never having been shown to the user.
+    let still_queued = store
+        .mailbox_list_for_recipient(&us_pub)
+        .await
+        .expect("list after first drain");
+    assert_eq!(
+        still_queued.len(),
+        2,
+        "messages 2 and 3 must survive, unacked, since they arrived before the request was \
+         accepted — not silently lost: {still_queued:?}"
+    );
+
+    // Accept the request — the session is now genuinely established.
+    let outcome = dispatch_effect(Effect::AcceptRequest(AcceptRequestEffect {
+        request: AcceptRequestRequest {
+            sender_ik: peer_pub,
+        },
+        outcome: None,
+    }))
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            meridian_tui::app::WorkerEvent::Completed(Effect::AcceptRequest(_))
+        ),
+        "accept must succeed: {outcome:?}"
+    );
+
+    // "Us" reconnects again — both preserved rows must now redeliver, correctly ordered, and the
+    // mailbox must end up empty.
+    let mut rx2 = spawn_inbound_loop(handle, us_pub, &server);
+    let event2 = recv_inbound(&mut rx2, Duration::from_secs(10))
+        .await
+        .expect("message 2 must redeliver on the next reconnect");
+    match event2 {
+        InboundEvent::Message { peer_pubkey, entry } => {
+            assert_eq!(peer_pubkey, peer_pub);
+            assert_eq!(entry.body, "msg 2");
+        }
+        other => panic!("expected InboundEvent::Message for msg 2, got {other:?}"),
+    }
+    let event3 = recv_inbound(&mut rx2, Duration::from_secs(10))
+        .await
+        .expect("message 3 must redeliver right after message 2");
+    match event3 {
+        InboundEvent::Message { peer_pubkey, entry } => {
+            assert_eq!(peer_pubkey, peer_pub);
+            assert_eq!(entry.body, "msg 3");
+        }
+        other => panic!("expected InboundEvent::Message for msg 3, got {other:?}"),
+    }
+
+    let final_queued = store
+        .mailbox_list_for_recipient(&us_pub)
+        .await
+        .expect("list after second drain");
+    assert!(
+        final_queued.is_empty(),
+        "all three messages must be acked+deleted once genuinely delivered: {final_queued:?}"
+    );
 }

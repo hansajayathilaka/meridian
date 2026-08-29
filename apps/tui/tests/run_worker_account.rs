@@ -154,6 +154,56 @@ impl Store for CountingStore {
     async fn total_otks(&self) -> Result<u64, meridian_rendezvous::store::StoreError> {
         self.inner.total_otks().await
     }
+
+    // (task 8.8) Forwarded to `self.inner`, exactly like every other method above — without
+    // these, the trait's own default impls (`StoreError::Backend("... not implemented")`, added
+    // task 8.1) apply instead. See `run_worker_chat.rs::BundleFetchCountingStore`'s identical
+    // forwarding (and its doc comment) for the concrete failure this closes: a route to an
+    // offline recipient (task 8.5) calls these against `Config::default()`'s non-zero
+    // `ttl_days` and would hard-fail with `bad_request "store failed"` without them.
+    async fn mailbox_enqueue(
+        &self,
+        recipient_pub: [u8; 32],
+        blob: Vec<u8>,
+        arrived_at: u64,
+        expires_at: u64,
+    ) -> Result<u64, meridian_rendezvous::store::StoreError> {
+        self.inner
+            .mailbox_enqueue(recipient_pub, blob, arrived_at, expires_at)
+            .await
+    }
+
+    async fn mailbox_list_for_recipient(
+        &self,
+        recipient_pub: &[u8; 32],
+    ) -> Result<Vec<meridian_rendezvous::store::MailboxEntry>, meridian_rendezvous::store::StoreError>
+    {
+        self.inner.mailbox_list_for_recipient(recipient_pub).await
+    }
+
+    async fn mailbox_delete_by_ids(
+        &self,
+        recipient_pub: &[u8; 32],
+        ids: &[u64],
+    ) -> Result<u64, meridian_rendezvous::store::StoreError> {
+        self.inner.mailbox_delete_by_ids(recipient_pub, ids).await
+    }
+
+    async fn mailbox_purge_expired(
+        &self,
+        now: u64,
+    ) -> Result<u64, meridian_rendezvous::store::StoreError> {
+        self.inner.mailbox_purge_expired(now).await
+    }
+
+    async fn mailbox_size_bytes_for_recipient(
+        &self,
+        recipient_pub: &[u8; 32],
+    ) -> Result<u64, meridian_rendezvous::store::StoreError> {
+        self.inner
+            .mailbox_size_bytes_for_recipient(recipient_pub)
+            .await
+    }
 }
 
 /// Starts the real rendezvous server on a background OS thread with its own runtime (so it keeps

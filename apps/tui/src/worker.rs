@@ -27,7 +27,7 @@ use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{
     generate_account, FileSecretStore, KeyHandle, MemorySecretStore, OsSecretStore, SecretStore,
 };
-use meridian_core::signaling::{SignalingClient, DEFAULT_OTK_COUNT};
+use meridian_core::signaling::{RouteOutcome, SignalingClient, DEFAULT_OTK_COUNT};
 use meridian_core::trust::{Contact, PinnedKey, SendGate, TrustState, TrustStore};
 
 use crate::app::{
@@ -2118,7 +2118,7 @@ async fn run_send_message(
         .map_err(|e| format!("sealing message: {e}"))?;
     save_chat(&chat, store, handle)?;
 
-    let delivered = route_tolerant(
+    let outcome = route_tolerant(
         &mut client,
         request.peer_pubkey,
         &request.peer_hint,
@@ -2127,12 +2127,13 @@ async fn run_send_message(
     )
     .await;
     let _ = client.close().await;
-    let delivered = delivered?;
+    let outcome = outcome?;
 
     Ok(SentMessage {
         mid: hex::encode(id),
         ts: now_unix(),
-        delivered,
+        delivered: outcome.delivered,
+        queued: outcome.queued,
     })
 }
 
@@ -2225,26 +2226,29 @@ fn federation_error_line(
     }
 }
 
-/// Route a blob, treating a `not_connected` server reply as "not delivered" rather than a fatal
-/// error — mirrors `apps/cli/src/chat.rs::route_tolerant` exactly: a momentarily-offline peer must
-/// not be reported as a harder failure than it is (offline delivery is the T07 mailbox, out of
-/// scope for this whole phase — see [`SentMessage`]'s own doc comment on what `delivered: false`
-/// must never imply).
+/// Route a blob, treating a `not_connected` server reply as "not delivered, not queued" rather than
+/// a fatal error — mirrors `apps/cli/src/chat.rs::route_tolerant` exactly: a momentarily-offline
+/// peer with no mailbox available must not be reported as a harder failure than it is. Returns the
+/// full [`RouteOutcome`] (task 8.15) — see [`SentMessage`]'s own doc comment for what `delivered`
+/// vs. `queued` now mean.
 async fn route_tolerant(
     client: &mut SignalingClient,
     to: [u8; 32],
     hint: &str,
     blob: Vec<u8>,
     peer_label: &str,
-) -> Result<bool, String> {
+) -> Result<RouteOutcome, String> {
     use meridian_core::proto::error_codes::NOT_CONNECTED;
     use meridian_core::signaling::SignalError;
     match client
-        .route_with_hint(to, sanitize_routing_hint(hint), blob)
+        .route_with_hint_detailed(to, sanitize_routing_hint(hint), blob)
         .await
     {
-        Ok(delivered) => Ok(delivered),
-        Err(SignalError::Server(e)) if e.code == NOT_CONNECTED => Ok(false),
+        Ok(outcome) => Ok(outcome),
+        Err(SignalError::Server(e)) if e.code == NOT_CONNECTED => Ok(RouteOutcome {
+            delivered: false,
+            queued: false,
+        }),
         Err(e) => Err(federation_error_line(&e, peer_label, "routing message to")),
     }
 }
@@ -3172,6 +3176,11 @@ async fn process_inbound_delivery(
     // `attempt_worker_recovery`'s own call site at the bottom of this function.
     let recovery_store = store.clone();
     let recovery_handle = handle.clone();
+    // (task 8.8, review finding 2) `deliver` moves into the blocking closure below; this delivery's
+    // own `mailbox_id` is captured now (cheap — `Option<u64>` is `Copy`) so the async tail can
+    // still act on it after the closure returns `persisted`. See the `client.discard_pending_mailbox_ack`
+    // call at this function's tail for why.
+    let this_mailbox_id = deliver.mailbox_id;
 
     type Ack = ([u8; 32], Option<String>, Vec<u8>);
     // The third element is `Some(peer_ik)` exactly when this delivery's own `ChatError::Desync`
@@ -3179,150 +3188,240 @@ async fn process_inbound_delivery(
     // read `SendGate::Ok` for `peer_ik` — i.e. the network half (`attempt_worker_recovery`, which
     // this synchronous closure cannot itself perform) should now fetch a fresh bundle and hand it
     // to `meridian_core::desync::attempt_recovery`.
-    let (event, ack, needs_recovery_fetch): (Option<InboundEvent>, Option<Ack>, Option<[u8; 32]>) =
-        tokio::task::spawn_blocking(move || {
-            let store: &dyn SecretStore = store.as_ref();
-            let handle = &handle;
+    let (event, ack, needs_recovery_fetch, persisted): (
+        Option<InboundEvent>,
+        Option<Ack>,
+        Option<[u8; 32]>,
+        bool,
+    ) = tokio::task::spawn_blocking(move || {
+        let store: &dyn SecretStore = store.as_ref();
+        let handle = &handle;
 
-            // A `sessions.bin` that fails to load (corrupt, wrong key) is a hard local problem,
-            // not something this envelope caused — drop this one delivery rather than crash the
-            // loop; the next successful delivery gets exactly the same chance. Mirrors every
-            // other handler's fail-closed `load_chat`/`load_trust` contract in this module.
-            let mut chat = match load_chat(store, handle) {
-                Ok(chat) => chat,
-                Err(e) => {
-                    eprintln!(
-                        "meridian tui: could not load sessions.bin for an inbound envelope: {e}"
-                    );
-                    return (None, None, None);
-                }
-            };
-            chat.expire_previous_generation(now_unix());
+        // A `sessions.bin` that fails to load (corrupt, wrong key) is a hard local problem,
+        // not something this envelope caused — drop this one delivery rather than crash the
+        // loop; the next successful delivery gets exactly the same chance. Mirrors every
+        // other handler's fail-closed `load_chat`/`load_trust` contract in this module.
+        //
+        // (task 8.8) `persisted` (the 4th tuple element) stays `false` on this early return —
+        // this envelope's processing was never even attempted, let alone durably saved, so a
+        // mailbox-drained delivery's id must NOT be acked below: see the doc comment on the
+        // `client.ack_pending_mailbox()` call at this function's async tail for why acking here
+        // would reproduce exactly the crash-between-ack-and-processing loss this task exists
+        // to avoid.
+        let mut chat = match load_chat(store, handle) {
+            Ok(chat) => chat,
+            Err(e) => {
+                eprintln!("meridian tui: could not load sessions.bin for an inbound envelope: {e}");
+                return (None, None, None, false);
+            }
+        };
+        chat.expire_previous_generation(now_unix());
 
-            let mut needs_recovery_fetch = None;
-            let (event, ack) = match chat.open_inbound(
+        // (task 8.8, review finding 1 — blocking) `deliver.from` is the wire value ChatState's
+        // own sender check consumes, but it is NOT the real peer identity for a mailbox-drained
+        // push: it is always `MAILBOX_DRAIN_FROM_PLACEHOLDER`. Everything downstream of the
+        // `open_inbound*` call in this function — the display/history event's `peer_pubkey`, the
+        // pending-request lookup, the auto-ack's routing target, and the desync-recovery gating —
+        // needs the REAL sender, or a mailbox-drained message from an existing contact silently
+        // files under a shared all-zero pseudo-contact instead of that contact's real
+        // conversation (and every distinct mailbox-drained sender collapses into that same
+        // bucket). `effective_from` is that real identity: for a mailbox-drained delivery, it's
+        // `envelope.sender_pub`, read via the same cheap, non-cryptographic parse
+        // `open_bytes`/`open_inbound_gated` already perform on their own copy of `blob` — safe to
+        // read before authentication succeeds for exactly the reason `open_inbound_gated`'s own
+        // early decode is safe (see that method's doc comment): it can only affect map lookups
+        // and event labeling here, never a state mutation, since nothing commits before
+        // `open_inbound_from_mailbox`'s own successful AEAD decrypt. A blob too malformed to
+        // parse falls back to `deliver.from` — harmless, since `open_inbound_from_mailbox` will
+        // independently fail to decode it too, and no arm below that uses `effective_from` is
+        // reached on a decode failure.
+        let effective_from = if deliver.mailbox_id.is_some() {
+            meridian_core::envelope::MessageEnvelope::from_blob(deliver.blob.as_bytes())
+                .map(|env| env.sender_pub)
+                .unwrap_or(deliver.from)
+        } else {
+            deliver.from
+        };
+
+        let mut needs_recovery_fetch = None;
+        // (task 8.17) Set when this delivery's own `ChatError::RequestPending` arm (below) fires
+        // for a mailbox-drained envelope: unlike the genuinely-bad-envelope rejections grouped
+        // into the catch-all `Err(e)` arm (Desync, Crypto, a forged sender, …), `RequestPending`
+        // means the envelope was perfectly valid but arrived while an *earlier* first-contact
+        // request from the same sender is still undecided — it is never merged into that pending
+        // request (task 2.10's own deliverable), so it would otherwise be a permanent, silent
+        // loss: acked and deleted from the server's durable mailbox without ever reaching the
+        // user. See the doc comment on `persisted`'s computation below for how this is threaded
+        // into the same ack-withholding mechanism task 8.8 already built for a `save_chat` I/O
+        // failure.
+        let mut defer_mailbox_ack = false;
+        // (task 8.8, ADR 0024) A mailbox-drained push (`mailbox_id.is_some()`, task 8.7)
+        // carries the `[0u8; 32]` `from` placeholder, never a real routing-layer identity —
+        // `open_inbound_from_mailbox` is the entry point that knows to authenticate via
+        // `envelope.sender_pub` alone instead of comparing against it. Every live/
+        // federated-live delivery (`mailbox_id: None`) keeps going through the ordinary
+        // `open_inbound`, unchanged. Note this call still passes the literal `deliver.from` (the
+        // placeholder, on a mailbox-drained push) — not `effective_from` — since that parameter
+        // is the wire value the sender-mismatch check itself reasons about (and ignores, on this
+        // path); `effective_from` is for every OTHER use of "the peer's identity" below.
+        let open_result = if deliver.mailbox_id.is_some() {
+            chat.open_inbound_from_mailbox(
                 store,
                 handle,
                 &account_pub,
                 &deliver.from,
                 deliver.blob.as_bytes(),
-            ) {
-                Ok(ChatContent::Text { id, body }) => {
-                    // Auto-ack (never gated by `SendGate` — see this section's own module doc).
-                    // Best-effort: a failed seal must not stop the message itself from being
-                    // delivered to the user — never treated as fatal to this whole delivery.
-                    let ack = chat
-                        .seal_outbound(
-                            store,
-                            handle,
-                            &account_pub,
-                            &deliver.from,
-                            &ChatContent::Receipt { ack: id },
-                        )
-                        .ok()
-                        .map(|receipt_blob| {
-                            // Runs the looked-up hint through the same [`sanitize_routing_hint`]
-                            // every other routing-hint call site uses — see that function's own
-                            // doc comment for why an empty-but-present hint must never be
-                            // forwarded verbatim.
-                            let hint = load_trust(store, handle)
-                                .ok()
-                                .and_then(|t| t.contact(&deliver.from).map(|c| c.hint.clone()))
-                                .and_then(|h| sanitize_routing_hint(&h));
-                            (deliver.from, hint, receipt_blob)
-                        });
-                    let event = Some(InboundEvent::Message {
-                        peer_pubkey: deliver.from,
-                        entry: HistoryEntry {
-                            v: crate::store::history::CURRENT_VERSION,
-                            mid: hex::encode(id),
-                            dir: HistDirection::In,
-                            ts: now_unix(),
-                            stream: "mrd.chat/1".to_string(),
-                            body,
-                            state: MessageState::Received,
-                        },
+            )
+        } else {
+            chat.open_inbound(
+                store,
+                handle,
+                &account_pub,
+                &deliver.from,
+                deliver.blob.as_bytes(),
+            )
+        };
+        let (event, ack) = match open_result {
+            Ok(ChatContent::Text { id, body }) => {
+                // Auto-ack (never gated by `SendGate` — see this section's own module doc).
+                // Best-effort: a failed seal must not stop the message itself from being
+                // delivered to the user — never treated as fatal to this whole delivery.
+                let ack = chat
+                    .seal_outbound(
+                        store,
+                        handle,
+                        &account_pub,
+                        &effective_from,
+                        &ChatContent::Receipt { ack: id },
+                    )
+                    .ok()
+                    .map(|receipt_blob| {
+                        // Runs the looked-up hint through the same [`sanitize_routing_hint`]
+                        // every other routing-hint call site uses — see that function's own
+                        // doc comment for why an empty-but-present hint must never be
+                        // forwarded verbatim.
+                        let hint = load_trust(store, handle)
+                            .ok()
+                            .and_then(|t| t.contact(&effective_from).map(|c| c.hint.clone()))
+                            .and_then(|h| sanitize_routing_hint(&h));
+                        (effective_from, hint, receipt_blob)
                     });
-                    (event, ack)
-                }
-                Ok(ChatContent::Receipt { ack }) => (
-                    Some(InboundEvent::Receipt {
-                        peer_pubkey: deliver.from,
-                        ack: hex::encode(ack),
-                    }),
-                    None,
-                ),
-                // First contact (task 2.10, §3.5) — gated, never auto-delivered. `open_inbound`
-                // already installed the pending request into `chat` itself; read it back to build
-                // the display copy.
-                Err(ChatError::MessageRequest) => (
-                    chat.pending_request(&deliver.from).map(|req| {
-                        InboundEvent::MessageRequest(crate::screens::requests::RequestEntry::from(
-                            req,
-                        ))
-                    }),
-                    None,
-                ),
-                // (task 5.5, review finding F5) A ratchet desync — still dropped exactly like any
-                // other rejection (never delivered, never trusted), but repeated occurrences from
-                // the same peer may now trigger the same guarded receiver-side recovery
-                // `apps/cli/src/chat.rs::maybe_attempt_recovery` already applies: consult
-                // `ChatState::recovery_recommended` first (cheap, I/O-free — never fires before the
-                // repeated-`Desync` threshold), then `TrustStore::can_send` *before* any network
-                // I/O — a peer already `Warn`/`Blocked` from an unresolved key change must not get
-                // an automatic re-handshake layered on top, and must not even cost a wasted fetch
-                // round trip to discover that. `note_recovery_attempted` is called on the early-
-                // refusal path too (mirroring `maybe_attempt_recovery`'s own doc), so a gated
-                // peer's counter is rate-limited the same way a successfully-recovered peer's is.
-                // Only `SendGate::Ok` sets `needs_recovery_fetch`, handing the actual network fetch
-                // + `meridian_core::desync::attempt_recovery` call off to `attempt_worker_recovery`
-                // below (this closure is synchronous and performs no network I/O of its own).
-                Err(ChatError::Desync) => {
-                    eprintln!("meridian tui: dropped an inbound envelope: ratchet desync");
-                    if chat.recovery_recommended(&deliver.from) {
-                        match load_trust(store, handle) {
-                            Ok(trust) => match trust.can_send(&deliver.from) {
-                                SendGate::Ok => needs_recovery_fetch = Some(deliver.from),
-                                gate => {
-                                    chat.note_recovery_attempted(&deliver.from);
-                                    eprintln!(
-                                        "meridian tui: desync recovery paused for a peer: {gate:?}"
-                                    );
-                                }
-                            },
-                            Err(e) => eprintln!(
-                                "meridian tui: could not load trust.bin to gate desync \
+                let event = Some(InboundEvent::Message {
+                    peer_pubkey: effective_from,
+                    entry: HistoryEntry {
+                        v: crate::store::history::CURRENT_VERSION,
+                        mid: hex::encode(id),
+                        dir: HistDirection::In,
+                        ts: now_unix(),
+                        stream: "mrd.chat/1".to_string(),
+                        body,
+                        state: MessageState::Received,
+                    },
+                });
+                (event, ack)
+            }
+            Ok(ChatContent::Receipt { ack }) => (
+                Some(InboundEvent::Receipt {
+                    peer_pubkey: effective_from,
+                    ack: hex::encode(ack),
+                }),
+                None,
+            ),
+            // First contact (task 2.10, §3.5) — gated, never auto-delivered. `open_inbound`
+            // already installed the pending request into `chat` itself; read it back to build
+            // the display copy.
+            Err(ChatError::MessageRequest) => (
+                chat.pending_request(&effective_from).map(|req| {
+                    InboundEvent::MessageRequest(crate::screens::requests::RequestEntry::from(req))
+                }),
+                None,
+            ),
+            // (task 5.5, review finding F5) A ratchet desync — still dropped exactly like any
+            // other rejection (never delivered, never trusted), but repeated occurrences from
+            // the same peer may now trigger the same guarded receiver-side recovery
+            // `apps/cli/src/chat.rs::maybe_attempt_recovery` already applies: consult
+            // `ChatState::recovery_recommended` first (cheap, I/O-free — never fires before the
+            // repeated-`Desync` threshold), then `TrustStore::can_send` *before* any network
+            // I/O — a peer already `Warn`/`Blocked` from an unresolved key change must not get
+            // an automatic re-handshake layered on top, and must not even cost a wasted fetch
+            // round trip to discover that. `note_recovery_attempted` is called on the early-
+            // refusal path too (mirroring `maybe_attempt_recovery`'s own doc), so a gated
+            // peer's counter is rate-limited the same way a successfully-recovered peer's is.
+            // Only `SendGate::Ok` sets `needs_recovery_fetch`, handing the actual network fetch
+            // + `meridian_core::desync::attempt_recovery` call off to `attempt_worker_recovery`
+            // below (this closure is synchronous and performs no network I/O of its own).
+            Err(ChatError::Desync) => {
+                eprintln!("meridian tui: dropped an inbound envelope: ratchet desync");
+                if chat.recovery_recommended(&effective_from) {
+                    match load_trust(store, handle) {
+                        Ok(trust) => match trust.can_send(&effective_from) {
+                            SendGate::Ok => needs_recovery_fetch = Some(effective_from),
+                            gate => {
+                                chat.note_recovery_attempted(&effective_from);
+                                eprintln!(
+                                    "meridian tui: desync recovery paused for a peer: {gate:?}"
+                                );
+                            }
+                        },
+                        Err(e) => eprintln!(
+                            "meridian tui: could not load trust.bin to gate desync \
                                  recovery: {e}"
-                            ),
-                        }
+                        ),
                     }
-                    (None, None)
                 }
-                // Everything else — `RequestPending`, `Crypto` (envelope v2 has no signature to
-                // fail; a decrypt/AEAD failure is what tampering surfaces as now),
-                // `UnsupportedEnvelopeVersion`, `SenderMismatch`, `UnknownPrekey`, `NoSession`, a
-                // codec/store error — dropped, logged, never trusted. Mirrors
-                // `apps/cli/src/chat.rs::handle_inbound`'s own reject-loudly-never-trust catch-all
-                // exactly (this section's own module doc).
-                Err(e) => {
-                    eprintln!("meridian tui: dropped an inbound envelope: {e}");
-                    (None, None)
-                }
-            };
+                (None, None)
+            }
+            // (task 8.17) A perfectly valid envelope, just from a sender whose *earlier*
+            // first-contact request this account hasn't decided yet — task 2.10's own
+            // deliverable is that it is never merged into that pending request, so it is
+            // dropped here exactly like the catch-all below. Unlike those genuinely-bad
+            // envelopes, though, a mailbox-drained one of these must not be acked: the user
+            // will resolve the pending request and reconnect, and this row needs to still be
+            // there to redeliver then — see `defer_mailbox_ack`'s own doc comment above.
+            Err(ChatError::RequestPending) => {
+                defer_mailbox_ack = true;
+                (None, None)
+            }
+            // Everything else — `Crypto` (envelope v2 has no signature to fail; a decrypt/AEAD
+            // failure is what tampering surfaces as now), `UnsupportedEnvelopeVersion`,
+            // `SenderMismatch`, `UnknownPrekey`, `NoSession`, a codec/store error — genuinely bad
+            // input, dropped, logged, never trusted, and (unlike `RequestPending` above) never
+            // redeliverable into anything better next time, so acking a mailbox-drained one of
+            // these is correct: retrying it would just reject it again forever. Mirrors
+            // `apps/cli/src/chat.rs::handle_inbound`'s own reject-loudly-never-trust catch-all
+            // exactly (this section's own module doc).
+            Err(e) => {
+                eprintln!("meridian tui: dropped an inbound envelope: {e}");
+                (None, None)
+            }
+        };
 
-            if let Err(e) = save_chat(&chat, store, handle) {
+        // (task 8.8, extended by 8.17) `persisted` now means "safe to ack" rather than purely
+        // "did the file write succeed": a mailbox-drained envelope that was rejected as
+        // genuinely bad (Desync, Crypto, SenderMismatch, …) still had its (no-op) session state
+        // durably saved here, exactly as task 8.8 left it — those stay acked on any successful
+        // save. `defer_mailbox_ack` (task 8.17) withholds it for the one additional case where
+        // the save succeeding doesn't mean this specific envelope was ever actually delivered:
+        // `RequestPending` — see that match arm's own doc comment. Both this and a genuine
+        // `save_chat` I/O failure are the same crash-analogous shape ("processing happened, or
+        // didn't happen at all, but this envelope wasn't made available to the user"), so both
+        // withhold the ack through the identical mechanism.
+        let persisted = save_chat(&chat, store, handle)
+            .inspect_err(|e| {
                 eprintln!(
                     "meridian tui: could not persist sessions.bin after an inbound envelope: {e}"
                 );
-            }
+            })
+            .is_ok()
+            && !defer_mailbox_ack;
 
-            (event, ack, needs_recovery_fetch)
-        })
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("meridian tui: inbound-delivery blocking task panicked: {e}");
-            (None, None, None)
-        });
+        (event, ack, needs_recovery_fetch, persisted)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        eprintln!("meridian tui: inbound-delivery blocking task panicked: {e}");
+        (None, None, None, false)
+    });
 
     // (task 5.5 deadlock fix — review finding, blocking) Dropped here, explicitly, the instant the
     // blocking closure's own atomic load-mutate-save sequence has completed — never held across the
@@ -3334,6 +3433,35 @@ async fn process_inbound_delivery(
 
     if let Some((from, hint, receipt_blob)) = ack {
         let _ = client.route_with_hint(from, hint, receipt_blob).await;
+    }
+
+    // (task 8.8, ADR 0024; extended by 8.17) Flush any mailbox row id `client.next_deliver()`
+    // accumulated — possibly for earlier deliveries too, never only THIS one, since
+    // `pending_mailbox_acks` batches across the whole connection (see `ack_pending_mailbox`'s own
+    // doc comment). `persisted` is `false` when THIS delivery's processing was never attempted
+    // (sessions.bin failed to load), was attempted but not durably saved (sessions.bin failed to
+    // write), or (task 8.17) was a perfectly valid envelope that arrived while an earlier
+    // first-contact request from the same sender was still undecided (`ChatError::RequestPending`)
+    // — never merged into that pending request, so this delivery was never actually shown to the
+    // user despite the save succeeding. Acking THIS delivery's own id in any of these cases would
+    // delete the mailbox's only durable record of a message the user never actually received,
+    // exactly the crash-between-ack-and-processing loss `ack_pending_mailbox`'s own doc comment
+    // warns against — the `RequestPending` case just reaches the same "not actually delivered"
+    // outcome by a different, non-crash path (a decision still pending, not a failure). A live
+    // delivery
+    // (`mailbox_id: None`) never added anything to flush, so this is a harmless no-op network round
+    // trip skipped entirely in that case (`ack_pending_mailbox` itself no-ops on an empty batch) —
+    // best-effort, like every other network call in this function: a failed ack here is not fatal,
+    // the row simply gets redrained (and re-processed, harmlessly, per `eid` dedup) on reconnect.
+    if persisted {
+        let _ = client.ack_pending_mailbox().await;
+    } else if let Some(id) = this_mailbox_id {
+        // (task 8.8, review finding 2 — should-fix) `persisted == false`: THIS delivery's own id
+        // must not ride along in a LATER delivery's successful flush. `next_deliver()` already
+        // unconditionally queued it (accumulation happens before processing is even attempted), so
+        // withdraw it explicitly rather than leaving it in `pending_mailbox_acks` for some
+        // unrelated future `ack_pending_mailbox()` call to sweep up.
+        client.discard_pending_mailbox_ack(id);
     }
 
     if let Some(peer_ik) = needs_recovery_fetch {

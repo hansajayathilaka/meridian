@@ -8,8 +8,9 @@ use std::sync::Arc;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use meridian_proto::{
-    error_codes, Auth, AuthOk, Bundle, Challenge, Deliver, ErrBody, Fetch, Frame, Op, Publish,
-    PublishOk, RouteBody, RouteOk, TurnReq,
+    error_codes, Auth, AuthOk, Bundle, Challenge, Deliver, ErrBody, Fetch, Frame, MailboxAck,
+    MailboxAckOk, Op, Publish, PublishOk, RouteBody, RouteOk, TurnReq,
+    MAILBOX_DRAIN_FROM_PLACEHOLDER,
 };
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -22,7 +23,7 @@ use crate::federation::outbound::{
 };
 use crate::state::AppState;
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -86,14 +87,20 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<AppState>, peer_ip: IpA
         }
     };
 
-    // 3) Serve the authenticated session.
+    // 3) Drain any queued mailbox mail (task 8.7), before this connection is registered as
+    // reachable — so a live route arriving concurrently on another connection can never race with
+    // (and interleave ahead of or behind) this drain. "Before any other traffic" per this task's
+    // own Deliverable 3.
+    drain_mailbox(&state, &tx, &account_pub).await;
+
+    // 4) Serve the authenticated session.
     let conn_id = state.next_conn_id();
     state.registry.add(account_pub, conn_id, tx.clone());
     state.metrics.conn_opened();
 
     serve(&state, &mut stream, &tx, &account_pub).await;
 
-    // 4) Teardown.
+    // 5) Teardown.
     state.registry.remove(&account_pub, conn_id);
     state.metrics.conn_closed();
     drop(tx);
@@ -178,9 +185,85 @@ async fn serve(
             Op::Fetch => handle_fetch(state, tx, account_pub, &frame).await,
             Op::Route => handle_route(state, tx, account_pub, &frame).await,
             Op::TurnReq => handle_turn(state, tx, account_pub, &frame).await,
+            Op::MailboxAck => handle_mailbox_ack(state, tx, account_pub, &frame).await,
             _ => send_err(tx, frame.id, error_codes::BAD_REQUEST, "unexpected op").await,
         }
     }
+}
+
+/// Task 8.7: push every row currently queued for `account_pub`, in `arrived_at`/`id` order, as
+/// `Deliver{from: MAILBOX_DRAIN_FROM_PLACEHOLDER, blob, mailbox_id: Some(id)}` — before this
+/// connection is registered as reachable (see the caller), so nothing else can interleave with the
+/// drain. Best-effort: a store failure here drops the connection to neither a half-drained mailbox
+/// state nor a stuck handshake — it's logged nowhere (no client-id logging) and simply skips the
+/// drain, exactly like every other `Store` failure in this module already fails closed to "try
+/// again next time" rather than wedging the connection.
+async fn drain_mailbox(state: &Arc<AppState>, tx: &mpsc::Sender<Message>, account_pub: &[u8; 32]) {
+    let Ok(rows) = state.store.mailbox_list_for_recipient(account_pub).await else {
+        return;
+    };
+    for row in rows {
+        send(
+            tx,
+            Op::Deliver,
+            0,
+            &Deliver {
+                from: MAILBOX_DRAIN_FROM_PLACEHOLDER,
+                blob: meridian_proto::OpaqueBlob::new(row.blob),
+                mailbox_id: Some(row.id),
+            },
+        )
+        .await;
+    }
+}
+
+/// The maximum number of ids accepted in one `MailboxAck` — caps the SQL `IN (...)` clause
+/// `mailbox_delete_by_ids` builds so a very large, attacker-controlled `ids` list can't approach
+/// SQLite's `SQLITE_MAX_VARIABLE_NUMBER` (carried forward from task 8.2's review). **Not actually
+/// bounded by `config.mailbox.quota_mb` today** (task 8.7's review, should-fix, non-blocking):
+/// quota is byte-based only, `Op::Route` has no per-message rate limit, and no per-recipient row
+/// count cap exists anywhere in 8.1/8.2/8.5/8.6 — a connected account can legitimately enqueue far
+/// more than this many tiny envelopes against one victim recipient while staying under the byte
+/// quota. When a batch exceeds this cap, the excess ids are silently dropped and `MailboxAckOk{}`
+/// is still sent, with no signal to the client that part of its ack didn't take effect. This
+/// fails safe (an unacked row simply persists and gets redrained on the next reconnect — `eid`
+/// dedup at the client, task 6.4, prevents any duplicate-processing harm from that), so it is not
+/// blocking, but is a real, reachable correctness surprise, not a merely theoretical one — see
+/// `docs/tasks/README.md`'s Live carry-forwards for the tracked fix (report actual-deleted-count,
+/// or add a row-count cap alongside the byte quota).
+const MAILBOX_ACK_MAX_IDS: usize = 4096;
+
+/// Task 8.7: `MailboxAck{ids}` → delete exactly those rows, scoped to the authenticated
+/// connection's own `account_pub` — never trusting `ids` alone. The safety property this relies on
+/// is 8.1's `mailbox_delete_by_ids` contract: an id naming another account's row is a silent no-op,
+/// never an error and never a cross-account deletion, so a connected account acking ids it was
+/// never sent (the attack shape, not just a same-account partial ack) simply deletes nothing beyond
+/// its own rows. Always replies `MailboxAckOk{}`, even for an empty or all-foreign id set — acking
+/// is not a query, so there is nothing to distinguish an existence oracle out of here.
+async fn handle_mailbox_ack(
+    state: &Arc<AppState>,
+    tx: &mpsc::Sender<Message>,
+    account_pub: &[u8; 32],
+    frame: &Frame,
+) {
+    let ack: MailboxAck = match frame.decode() {
+        Ok(a) => a,
+        Err(_) => return send_err(tx, frame.id, error_codes::BAD_REQUEST, "malformed").await,
+    };
+    let ids = if ack.ids.len() > MAILBOX_ACK_MAX_IDS {
+        &ack.ids[..MAILBOX_ACK_MAX_IDS]
+    } else {
+        &ack.ids[..]
+    };
+    if state
+        .store
+        .mailbox_delete_by_ids(account_pub, ids)
+        .await
+        .is_err()
+    {
+        return send_err(tx, frame.id, error_codes::BAD_REQUEST, "store failed").await;
+    }
+    send(tx, Op::MailboxAckOk, frame.id, &MailboxAckOk {}).await;
 }
 
 async fn handle_publish(
@@ -421,6 +504,11 @@ async fn handle_route(
         }
     }
 
+    // Kept in case the recipient turns out to be offline and this falls through to the
+    // mailbox-enqueue path below (T07) — both `deliver_one` and the tamper-hook plan below consume
+    // `body.blob.0` regardless of whether the recipient is actually connected.
+    let blob_for_mailbox = body.blob.0.clone();
+
     // The honest path, and the ONLY path compiled into a default/release build: exactly one
     // `Deliver`, to the requested recipient, carrying the client's bytes unaltered, with `from` set
     // to the key this connection authenticated as. The blob is never *inspected* — it stays opaque.
@@ -462,9 +550,19 @@ async fn handle_route(
     };
 
     if delivered {
-        send(tx, Op::RouteOk, frame.id, &RouteOk { delivered: true }).await;
-    } else {
-        // Offline delivery / mailbox is T07; here an offline recipient is an error.
+        send(
+            tx,
+            Op::RouteOk,
+            frame.id,
+            &RouteOk {
+                delivered: true,
+                queued: false,
+            },
+        )
+        .await;
+    } else if state.config.mailbox.ttl_days == 0 {
+        // TTL=0: the mailbox is genuinely disabled (pure-P2P mode), not just empty — unchanged
+        // pre-T07 behavior, never attempt an enqueue.
         send_err(
             tx,
             frame.id,
@@ -472,6 +570,56 @@ async fn handle_route(
             "recipient offline",
         )
         .await;
+    } else {
+        queue_to_mailbox(state, tx, frame, body.to, blob_for_mailbox).await;
+    }
+}
+
+/// The offline+mailbox-enabled branch of `handle_route` (T07, phase-8 architect consult point 4):
+/// enqueue the recipient's ciphertext into their mailbox for later delivery-on-reconnect (8.7),
+/// unless doing so would exceed their configured quota. Never a `RouteOk` on the quota-exceeded
+/// path — a distinct `mailbox_full` error, per the wire consult 8.3 already shipped. Quota math
+/// itself lives in [`crate::store::mailbox_enqueue_with_quota`], shared with the federated route
+/// path (task 8.6, `federation::inbound::handle_fed_route`).
+async fn queue_to_mailbox(
+    state: &Arc<AppState>,
+    tx: &mpsc::Sender<Message>,
+    frame: &Frame,
+    recipient: [u8; 32],
+    blob: Vec<u8>,
+) {
+    let outcome = crate::store::mailbox_enqueue_with_quota(
+        state.store.as_ref(),
+        recipient,
+        blob,
+        now_secs(),
+        state.config.mailbox.ttl_days,
+        state.config.mailbox.quota_mb,
+    )
+    .await;
+    match outcome {
+        Ok(crate::store::MailboxEnqueueOutcome::Queued(_id)) => {
+            send(
+                tx,
+                Op::RouteOk,
+                frame.id,
+                &RouteOk {
+                    delivered: false,
+                    queued: true,
+                },
+            )
+            .await;
+        }
+        Ok(crate::store::MailboxEnqueueOutcome::QuotaExceeded) => {
+            send_err(
+                tx,
+                frame.id,
+                error_codes::MAILBOX_FULL,
+                "recipient's mailbox is full",
+            )
+            .await;
+        }
+        Err(_) => send_err(tx, frame.id, error_codes::BAD_REQUEST, "store failed").await,
     }
 }
 
@@ -492,7 +640,16 @@ async fn handle_federated_route(
 ) {
     match route_foreign(state, hint, to, from, blob).await {
         Ok(()) => {
-            send(tx, Op::RouteOk, frame.id, &RouteOk { delivered: true }).await;
+            send(
+                tx,
+                Op::RouteOk,
+                frame.id,
+                &RouteOk {
+                    delivered: true,
+                    queued: false,
+                },
+            )
+            .await;
         }
         Err(e) => {
             let (code, msg) = federated_route_error_reply(hint, &e);
@@ -561,6 +718,12 @@ fn federated_route_error_reply(hint: &str, e: &RouteForeignError) -> (&'static s
                 error_codes::FED_DENIED
             } else if fed_err.code == fed_error_codes::RATE_LIMITED {
                 error_codes::RATE_LIMITED
+            } else if fed_err.code == fed_error_codes::MAILBOX_FULL {
+                // Task 8.6: B's own mailbox quota is exhausted for this recipient — a genuine,
+                // distinct outcome from "unreachable," not squashed into the generic connectivity
+                // fallback below. `Route`'s local (same-server, task 8.5) and federated paths now
+                // surface the identical client-visible code for the identical condition.
+                error_codes::MAILBOX_FULL
             } else {
                 // `bad_request` from the peer, or any future/unknown fed error code: no existing
                 // local code fits precisely, so fail closed to the generic connectivity/protocol
@@ -597,6 +760,9 @@ fn deliver_one(
     let deliver = Deliver {
         from,
         blob: meridian_proto::OpaqueBlob::new(blob),
+        // A live route push, never a mailbox drain (T07's mailbox-drain push is 8.7's job) —
+        // `mailbox_id` stays absent here.
+        mailbox_id: None,
     };
     let bytes = Frame::new(Op::Deliver, 0, &deliver).ok()?.to_bytes().ok()?;
     if state.registry.send_to(to, Message::Binary(bytes)) {
@@ -674,5 +840,35 @@ fn admission_label(state: &Arc<AppState>) -> &'static str {
     match state.config.server.admission {
         crate::config::Admission::Open => "open",
         crate::config::Admission::Invite => "invite",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use meridian_proto::FedErr;
+
+    /// Task 8.6: proves the `federated_route_error_reply`/`fed_error_codes::MAILBOX_FULL` mapping
+    /// directly, since the real A-to-B wire path can't deterministically reach it (the same
+    /// pre-check-vs-delivery race `federation_route.rs`'s task-8.6 tests document) — this is the
+    /// unit-level half of "A gets `Err{mailbox_full}` end-to-end": the store/enqueue half is
+    /// covered there (`federated_route_to_offline_recipient_over_quota_is_rejected`), and this
+    /// covers the pure mapping `RouteForeignError::Fed(FedErr{mailbox_full}) -> error_codes::MAILBOX_FULL`
+    /// that turns B's genuine `FedErr` into the client-visible code A's own sender actually sees.
+    #[test]
+    fn federated_route_error_reply_maps_fed_mailbox_full_to_local_mailbox_full() {
+        let fed_err = FedErr {
+            code: meridian_proto::fed_error_codes::MAILBOX_FULL.to_string(),
+            msg: "recipient's mailbox is full".to_string(),
+        };
+        let (code, _msg) =
+            federated_route_error_reply("org-b.test", &RouteForeignError::Fed(fed_err));
+        assert_eq!(
+            code,
+            error_codes::MAILBOX_FULL,
+            "a genuine FedErr{{mailbox_full}} from B must surface as the identical client-visible \
+             code the local (same-server) route path already produces for the same condition \
+             (task 8.5) — never squashed into the generic fed_unreachable fallback"
+        );
     }
 }

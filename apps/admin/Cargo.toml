@@ -1,0 +1,30 @@
+[package]
+name = "meridian-admin"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Task 8.11: `meridian-admin mailbox dump <pubkey>` — the T07 feature spec's "honesty demo" made
+# runnable. This is deliberately NOT a general admin CLI: `mailbox dump` is its only subcommand
+# (see src/main.rs's module doc). It reads the SAME on-disk store a real `meridian-rendezvous`
+# server would (via that crate's `Config`/`Store`/`default_store`), read-only, directly on disk —
+# it is not a network client. The `sqlite` feature on the `meridian-rendezvous` dependency below is
+# required for that: an in-memory store would be useless for inspecting a real deployment's data.
+
+[lib]
+name = "meridian_admin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "meridian-admin"
+path = "src/main.rs"
+
+[dependencies]
+meridian-rendezvous = { path = "../rendezvous", features = ["sqlite"] }
+clap = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -104,7 +104,16 @@ impl Party {
     fn recv_raw(&mut self, from: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, ChatError> {
         let ik = self.ik();
         self.state
-            .open_bytes(&self.store, self.account.handle(), &ik, from, blob)
+            .open_bytes(&self.store, self.account.handle(), &ik, from, blob, false)
+    }
+
+    /// (task 8.8) Like [`Self::recv_raw`], but simulating a **mailbox-drained** redelivery (ADR
+    /// 0024): `mailbox_drained: true` skips the `sender_pub != from` check, matching the real
+    /// `open_inbound_from_mailbox` path a reconnect-triggered redrain goes through.
+    fn recv_raw_mailbox(&mut self, from: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, ChatError> {
+        let ik = self.ik();
+        self.state
+            .open_bytes(&self.store, self.account.handle(), &ik, from, blob, true)
     }
 
     fn recv_content(&mut self, from: &[u8; 32], blob: &[u8]) -> Result<ChatContent, ChatError> {
@@ -248,6 +257,58 @@ fn redelivered_envelope_is_dropped_before_any_decrypt_attempt() {
             id: [4u8; 16],
             body: "still fine".into()
         }
+    );
+}
+
+// -- 1b. eid dedup survives a reconnect-triggered mailbox-drain redelivery (task 8.8) -----------
+
+/// (task 8.8 Deliverable 2, ADR 0024) The mailbox-drain counterpart of
+/// [`redelivered_envelope_is_dropped_before_any_decrypt_attempt`] above: a message queued to the
+/// mailbox and pushed on reconnect carries the `[0u8; 32]` `from` placeholder
+/// (`meridian_proto::MAILBOX_DRAIN_FROM_PLACEHOLDER`), not the real sender. `eid` dedup is keyed
+/// purely off `envelope.eid` — never `from` — so a redelivered mailbox-drained envelope (the
+/// server re-drains an unacked row on a second reconnect, task 8.7's own
+/// `unacked_rows_survive_and_are_redrained_on_reconnect` behavior) must still be recognized and
+/// dropped, exactly like a live redelivery, with the sender check simply skipped rather than bypassed
+/// via a hole in the dedup logic.
+#[test]
+fn mailbox_drained_redelivery_is_still_caught_by_eid_dedup() {
+    let mut alice = Party::new("eid.mailbox-redeliver.a");
+    let mut bob = Party::new("eid.mailbox-redeliver.b");
+    let bob_ik = bob.ik();
+    let (bob_spk, bob_otks) = bob.publish(2);
+
+    alice.start(&bob_ik, &bob_spk, Some(bob_otks[0]));
+    let opening = alice.seal(&bob_ik, 1, "hello via mailbox");
+
+    const PLACEHOLDER: [u8; 32] = [0u8; 32];
+
+    // First arrival: drained from the mailbox, `from` is the placeholder, not `alice_ik`.
+    let first = bob
+        .recv_raw_mailbox(&PLACEHOLDER, &opening)
+        .expect("a mailbox-drained opening envelope must decrypt via sender_pub alone");
+    assert_eq!(
+        ChatContent::decode(&first).unwrap(),
+        ChatContent::Text {
+            id: [1u8; 16],
+            body: "hello via mailbox".into(),
+        }
+    );
+
+    let before = state_bytes(&bob.state);
+
+    // THE REDELIVERY: the server re-drains the same unacked row on a second reconnect (8.7) —
+    // same envelope bytes, same placeholder `from`.
+    let duplicate = bob.recv_raw_mailbox(&PLACEHOLDER, &opening);
+    assert!(
+        matches!(duplicate, Err(ChatError::DuplicateEnvelope)),
+        "a redelivered mailbox-drained envelope must be ChatError::DuplicateEnvelope, not \
+         reprocessed — got: {duplicate:?}"
+    );
+    assert_eq!(
+        before,
+        state_bytes(&bob.state),
+        "a rejected mailbox-drained duplicate must leave the chat state untouched"
     );
 }
 

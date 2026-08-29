@@ -15,7 +15,7 @@ use meridian_core::identity::{
     self, generate_account, parse_id, pubkey_from_seed, sign, verify, FileSecretStore, KeyHandle,
     MemorySecretStore, OsSecretStore, PublicKey, SecretStore, Signature,
 };
-use meridian_core::signaling::{SignalError, SignalingClient, DEFAULT_OTK_COUNT};
+use meridian_core::signaling::{SignalError, SignalingClient};
 
 mod account;
 mod chat;
@@ -581,19 +581,10 @@ fn cmd_register(server: &str, invite: Option<String>) -> Result<ExitCode, String
     let store = load_store(&descriptor)?;
     let handle = KeyHandle::from_label(&descriptor.label);
 
-    let published = block_on(runtime()?, async {
-        let mut client =
-            SignalingClient::connect(server, store.as_ref(), &handle, account_pub, invite, 1)
-                .await
-                .map_err(|e| e.to_string())?;
-        let generated = client
-            .publish_bundle(store.as_ref(), &handle, DEFAULT_OTK_COUNT)
-            .await
-            .map_err(|e| e.to_string())?;
-        let count = generated.bundle.otk_count();
-        let _ = client.close().await;
-        Ok::<usize, String>(count)
-    })?;
+    let published = block_on(
+        runtime()?,
+        chat::register_bundle(store.as_ref(), &handle, account_pub, server, invite),
+    )?;
 
     println!(
         "registered {} — published bundle with {published} one-time prekeys",

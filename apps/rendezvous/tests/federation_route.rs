@@ -32,15 +32,15 @@ use async_trait::async_trait;
 use meridian_proto::{
     error_codes, fed_error_codes, FedErr, FedFrame, FedOp, FedReachable, FedRoute, OpaqueBlob,
 };
-use meridian_rendezvous::config::{DiscoveryMode, Federation, FederationPolicyMode};
-use meridian_rendezvous::federation::inbound::handle_fed_route;
+use meridian_rendezvous::config::{DiscoveryMode, Federation, FederationPolicyMode, Mailbox};
+use meridian_rendezvous::federation::inbound::{handle_fed_route, FedRouteDeps};
 use meridian_rendezvous::federation::outbound::ROUTE_REPLY_GRACE;
 use meridian_rendezvous::federation::FederationTimeouts;
 use meridian_rendezvous::federation::{dial, Discovery, DiscoveryError, Endpoint};
 use meridian_rendezvous::federation::{FederationLimits, FederationListener, FederationPolicy};
 use meridian_rendezvous::metrics::Metrics;
 use meridian_rendezvous::state::Registry;
-use meridian_rendezvous::{AppState, MemoryStore};
+use meridian_rendezvous::{AppState, MemoryStore, Store};
 use meridian_signaling::SignalError;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -215,11 +215,17 @@ async fn bs_defense_in_depth_oversized_check_rejects_directly() {
         envelope: OpaqueBlob::new(vec![0x41u8; 2 * 1024 * 1024]),
     };
     let metrics = Metrics::new();
+    let store = MemoryStore::new();
+    let mailbox = Mailbox::default();
     let err = handle_fed_route(
         &registry,
         &policy,
         &limits,
-        &metrics,
+        FedRouteDeps {
+            metrics: &metrics,
+            store: &store,
+            mailbox: &mailbox,
+        },
         &["org-a.test".to_string()],
         "org-a.test",
         &req,
@@ -230,6 +236,117 @@ async fn bs_defense_in_depth_oversized_check_rejects_directly() {
     // The oversized recipient must never have reached the registry (defense-in-depth means the
     // check runs BEFORE delivery, not merely in addition to it).
     assert!(!registry.is_connected(&req.to));
+}
+
+// -- task 8.6: federated mailbox enqueue on an offline recipient -----------------------------------
+//
+// Genuinely exercising this branch through the real A-to-B wire path (`route_with_hint`) is not
+// possible deterministically: `route_foreign`'s own `reachable_foreign` pre-check (architect
+// decision #3) already gates the *entire* target-liveness axis ahead of ever sending the actual
+// `FedRoute` — a recipient that never connected to B is `not_connected` at A before B's
+// `handle_fed_route` runs at all, and a recipient that stays connected through both the pre-check
+// and the delivery attempt is simply "delivered," never reaching the offline branch either. The
+// only way to reach this branch for real is the narrow pre-check/delivery disconnect race this
+// task's own doc comment describes — not something a fast, non-flaky test can construct. So, same
+// reasoning and the same directness as `bs_defense_in_depth_oversized_check_rejects_directly`
+// above: call `handle_fed_route` directly with a hand-built `FedRoute` naming a recipient that was
+// never registered in `Registry` at all.
+
+/// Offline + `ttl_days > 0` + under quota: `handle_fed_route` enqueues into B's own store and
+/// returns `Ok(())` — the pre-8.6 return value is unchanged, but it's no longer a lie: before this
+/// task `Ok(())` meant "silently dropped," now it means "durably queued." `Ok(())` is what makes
+/// `handle_federated_route` (`ws.rs`) reply `RouteOk{delivered:true, queued:false}` to A's own
+/// sender unconditionally (that mapping itself is pre-existing and untouched by this task — proven
+/// live, with delivery instead of queuing, by `federated_route_delivers_byte_identical_envelope`
+/// above) — this is the accepted, documented optimistic-success residual (phase-8 architect
+/// consult point 2): A's sender never learns whether B delivered live or queued.
+#[tokio::test]
+async fn federated_route_to_offline_recipient_enqueues_and_still_reports_ok() {
+    let registry = Registry::default();
+    let policy = FederationPolicy::Open;
+    let limits = FederationLimits::new(300, 600, 30, 300);
+    let store = MemoryStore::new();
+    let mailbox = Mailbox::default(); // ttl_days=14, quota_mb=50 — plenty of room
+    let bob = [0x33u8; 32];
+    let payload = b"queued while bob was offline".to_vec();
+    let req = FedRoute {
+        to: bob,
+        from: [0x22u8; 32],
+        envelope: OpaqueBlob::new(payload.clone()),
+    };
+
+    let result = handle_fed_route(
+        &registry,
+        &policy,
+        &limits,
+        FedRouteDeps {
+            metrics: &Metrics::new(),
+            store: &store,
+            mailbox: &mailbox,
+        },
+        &["org-a.test".to_string()],
+        "org-a.test",
+        &req,
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "offline + mailbox enabled + under quota must still report Ok(()), matching \
+         fire-and-forget-on-success — got {result:?}"
+    );
+
+    let rows = store.mailbox_list_for_recipient(&bob).await.unwrap();
+    assert_eq!(rows.len(), 1, "the envelope must actually be durable now");
+    assert_eq!(rows[0].blob, payload);
+}
+
+/// Offline + would exceed `quota_mb`: `handle_fed_route` returns `Err(FedErr{code:mailbox_full})`
+/// — a legitimate, deliberate exception to fire-and-forget-on-success (federation-protocol-v1.md
+/// §2 already says failure is reported only via `FedErr`), never a silent drop and never a
+/// `RouteOk`-shaped anything (there is no `FedRouteOk`). `ws::federated_route_error_reply` then
+/// maps `fed_error_codes::MAILBOX_FULL` through to the identical `error_codes::MAILBOX_FULL` the
+/// local (same-server) route path already produces (task 8.5) — same client-visible code for the
+/// same condition, regardless of which side of a federation boundary it happened on.
+#[tokio::test]
+async fn federated_route_to_offline_recipient_over_quota_is_rejected() {
+    let registry = Registry::default();
+    let policy = FederationPolicy::Open;
+    let limits = FederationLimits::new(300, 600, 30, 300);
+    let store = MemoryStore::new();
+    let mailbox = Mailbox {
+        ttl_days: 14,
+        quota_mb: 0, // any non-empty enqueue immediately exceeds a zero quota
+        ..Mailbox::default()
+    };
+    let bob = [0x44u8; 32];
+    let req = FedRoute {
+        to: bob,
+        from: [0x22u8; 32],
+        envelope: OpaqueBlob::new(b"this will not fit".to_vec()),
+    };
+
+    let err = handle_fed_route(
+        &registry,
+        &policy,
+        &limits,
+        FedRouteDeps {
+            metrics: &Metrics::new(),
+            store: &store,
+            mailbox: &mailbox,
+        },
+        &["org-a.test".to_string()],
+        "org-a.test",
+        &req,
+    )
+    .await
+    .expect_err("over-quota enqueue must be a genuine FedErr, never Ok(())");
+    assert_eq!(err.code, fed_error_codes::MAILBOX_FULL);
+
+    assert_eq!(
+        store.mailbox_size_bytes_for_recipient(&bob).await.unwrap(),
+        0,
+        "a quota-rejected federated route must not create a row"
+    );
 }
 
 // -- closed policy at B ----------------------------------------------------------------------------

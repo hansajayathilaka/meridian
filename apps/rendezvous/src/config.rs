@@ -16,6 +16,7 @@ pub struct Config {
     pub limits: Limits,
     pub turn: Turn,
     pub federation: Federation,
+    pub mailbox: Mailbox,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -93,6 +94,48 @@ pub struct Limits {
     pub fetch_per_account_per_min: u32,
     pub route_per_account_per_min: u32,
     pub turn_per_account_per_min: u32,
+}
+
+/// Offline ciphertext mailbox config (task 8.1, ADR 0007, data-model.md's `mailbox` table). This
+/// struct only stores the values — it is a pure storage-seam config surface with no route-path
+/// wiring or enforcement yet (that's 8.5/8.6/8.9's job). Follows the same figment/fail-closed
+/// pattern as [`Turn`]/[`Federation`] in this file: every field has a sensible built-in default,
+/// and a malformed value (wrong type on an env var or in TOML) is a hard `Err` at load time, never
+/// a silent fallback.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(default)]
+pub struct Mailbox {
+    /// Time-to-live for one mailbox row, in days (ADR 0007's default: 14). `0` is representable —
+    /// data-model.md documents it as "pure-P2P mode" (mailbox inserts disabled entirely) — but
+    /// this task only stores the value; actually disabling the store on `ttl_days == 0` is a later
+    /// task's job (8.5/8.6), not enforced here.
+    pub ttl_days: u32,
+    /// Per-recipient mailbox quota, in megabytes (data-model.md's per-recipient quota trigger;
+    /// enforcement — surfacing a sender-visible "mailbox full" error — is a later task's job).
+    pub quota_mb: u32,
+    /// How often the background purge job (task 8.9) sweeps `Store::mailbox_purge_expired`, in
+    /// seconds. `TODO: confirm`: no concrete cadence appears in the design docs (the feature spec
+    /// only says expired rows must be "provably purged," not on what schedule) — hourly is picked
+    /// as a conservative, unsurprising default for a TTL measured in days, matching this struct's
+    /// own "propose conservatively, mark TODO: confirm" posture for `quota_mb`.
+    pub purge_interval_secs: u64,
+}
+
+impl Default for Mailbox {
+    fn default() -> Self {
+        Self {
+            ttl_days: 14,
+            // `TODO: confirm`: no default quota number appears in the design docs (ADR 0007,
+            // data-model.md, and features/07-offline-mailbox.md all specify "size caps"/"quota"
+            // only in the abstract, with no concrete figure). Picked here, conservatively, as a
+            // starting point for a brand-new storage surface with real disk-cost consequences —
+            // same "propose conservatively, mark TODO: confirm, let an operator raise it" posture
+            // as this file's other under-specified numeric defaults (e.g. `Federation`'s handshake
+            // timeouts). Not wired into any enforcement yet; this task only stores the value.
+            quota_mb: 50,
+            purge_interval_secs: 3600,
+        }
+    }
 }
 
 /// TURN credential-minting surface (§9.2 "TURN secret + bandwidth caps"). An empty `secret`
@@ -1382,6 +1425,92 @@ mod tests {
         let err = Config::load(Some(file.path().to_str().unwrap()))
             .expect_err("a 0ms idle-read deadline must be rejected, not silently loaded");
         assert!(err.to_string().contains("serve_idle_timeout_ms"));
+    }
+
+    // -- task 8.1: mailbox config section ------------------------------------------------------
+
+    #[test]
+    fn mailbox_defaults_to_fourteen_day_ttl() {
+        let m = Mailbox::default();
+        assert_eq!(m.ttl_days, 14);
+
+        let config = Config::from_toml_str("").unwrap();
+        assert_eq!(config.mailbox.ttl_days, 14);
+    }
+
+    #[test]
+    fn mailbox_ttl_days_zero_round_trips_through_config_parsing() {
+        // `ttl_days = 0` must be representable end to end (file, and env override) — this task
+        // only stores the value; actually disabling the store on it is a later task's job.
+        // `Config::load` merges process env regardless of whether this test itself sets any, so it
+        // still needs `ENV_LOCK` to avoid racing a concurrent test's `EnvGuard` (task 8.9 found
+        // this test lacked it, exposed only once enough other mailbox tests added env churn).
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let file = write_toml("[mailbox]\nttl_days = 0\n");
+
+        let config = Config::load(Some(file.path().to_str().unwrap()))
+            .expect("ttl_days = 0 must be a valid config value, not rejected");
+        assert_eq!(config.mailbox.ttl_days, 0);
+    }
+
+    #[test]
+    fn mailbox_env_overrides_apply() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[
+                ("MERIDIAN_RENDEZVOUS_MAILBOX__TTL_DAYS", "0"),
+                ("MERIDIAN_RENDEZVOUS_MAILBOX__QUOTA_MB", "10"),
+            ],
+        );
+        let file = write_toml("");
+
+        let config = Config::load(Some(file.path().to_str().unwrap())).unwrap();
+
+        assert_eq!(config.mailbox.ttl_days, 0);
+        assert_eq!(config.mailbox.quota_mb, 10);
+    }
+
+    #[test]
+    fn example_toml_parses_and_documents_every_mailbox_field() {
+        // Regression test for a real doc-sync gap found while adding `purge_interval_secs` (task
+        // 8.9): `[mailbox]` was never added to `rendezvous.example.toml` when task 8.1 introduced
+        // the section, so `ttl_days`/`quota_mb` had gone three tasks undocumented there. This
+        // loads the actual example file `Config::load` uses, so a future field addition that
+        // forgets to update the example fails a test, not just a docs review.
+        let _guard = EnvGuard::set(ENV_LOCK.lock().unwrap(), &[]);
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let example = format!("{manifest_dir}/rendezvous.example.toml");
+        let config = Config::load(Some(&example)).expect("example TOML must parse");
+        assert_eq!(config.mailbox.ttl_days, 14);
+        assert_eq!(config.mailbox.quota_mb, 50);
+        assert_eq!(config.mailbox.purge_interval_secs, 3600);
+    }
+
+    #[test]
+    fn mailbox_purge_interval_defaults_to_hourly_and_overrides_apply() {
+        let m = Mailbox::default();
+        assert_eq!(m.purge_interval_secs, 3600);
+
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[("MERIDIAN_RENDEZVOUS_MAILBOX__PURGE_INTERVAL_SECS", "60")],
+        );
+        let file = write_toml("");
+        let config = Config::load(Some(file.path().to_str().unwrap())).unwrap();
+        assert_eq!(config.mailbox.purge_interval_secs, 60);
+    }
+
+    #[test]
+    fn mailbox_env_overrides_reject_bad_int_fail_closed() {
+        let _guard = EnvGuard::set(
+            ENV_LOCK.lock().unwrap(),
+            &[("MERIDIAN_RENDEZVOUS_MAILBOX__TTL_DAYS", "not-a-number")],
+        );
+        let file = write_toml("");
+
+        let err = Config::load(Some(file.path().to_str().unwrap()))
+            .expect_err("a non-integer ttl_days must be rejected, not silently ignored");
+        assert!(!err.to_string().is_empty());
     }
 
     #[test]

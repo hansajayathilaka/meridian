@@ -47,6 +47,15 @@ deps row above lists only the numbered features it still needs (03, 06), and 07/
 future `/pick-next-phase` like any other feature whose dependencies are done (see feature 17's note
 above for the same "dependencies done ⇒ pickable" convention).
 
+**[07 — Offline Ciphertext Mailbox is done](../tasks/phase-8/README.md).** [Phase 8](../tasks/phase-8/README.md)
+shipped the TTL-bounded, size-capped ciphertext mailbox (ADR 0007) end to end: local and federated
+route-path enqueue on an offline recipient, delivery-on-reconnect with client-side ack and
+redelivery-dedup, TTL expiry purge, `meridian-admin mailbox dump` (the A7 opacity/honesty demo),
+X3DH-initial-message-via-mailbox coverage, and a cross-federation acceptance test — closed at the
+phase's own exit gate, [task 8.14](../tasks/phase-8/8.14-phase-exit-mailbox-demo.md). 14's deps row
+above (06, 07) is now fully satisfied — it, like 07 before it, is pickable by a future
+`/pick-next-phase`.
+
 ## Phasing (from the design)
 
 The canonical **design** phase narrative (Phase 0–4) lives in

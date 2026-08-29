@@ -37,7 +37,7 @@
 use meridian_core::chat::{ChatError, ChatState, SPK_ROTATION_INTERVAL_SECS};
 use meridian_core::envelope::ChatContent;
 use meridian_core::identity::{KeyHandle, SecretStore};
-use meridian_core::signaling::{SignalingClient, DEFAULT_OTK_COUNT};
+use meridian_core::signaling::{RouteOutcome, SignalingClient, DEFAULT_OTK_COUNT};
 use meridian_core::trust::{SendGate, TrustStore};
 use tokio::sync::mpsc;
 
@@ -366,6 +366,17 @@ pub async fn run(args: ChatArgs<'_>) -> Result<(), String> {
         }
         save_state(&state, store, handle)?;
         save_trust(&trust, store, handle)?;
+        // (task 8.8, ADR 0024) Flush any mailbox row id `client.next_deliver()` accumulated this
+        // iteration — never before `save_state` above has durably persisted whatever this
+        // delivery's `handle_inbound` call mutated. `?` on `save_state`/`save_trust` above already
+        // ends this loop before reaching here on a write failure, so an ack is only ever sent once
+        // processing genuinely made it to disk — matches
+        // `apps/tui/src/worker.rs::process_inbound_delivery`'s identical `persisted`-gated
+        // reasoning. A no-op (no network I/O) on every iteration that wasn't a `next_deliver`
+        // branch, or that delivered a live (non-mailbox) envelope — best-effort like every other
+        // network call in this loop (`route_tolerant`'s own pattern): a failed ack just means the
+        // row gets redrained (and harmlessly re-processed, per `eid` dedup) on the next reconnect.
+        let _ = client.ack_pending_mailbox().await;
     }
 
     save_state(&state, store, handle)?;
@@ -457,9 +468,15 @@ fn federation_error_line(
     }
 }
 
-/// Route a blob, treating a `not_connected` server reply as "not delivered" rather than a fatal
-/// error: a momentarily-offline peer must not tear down the chat session (offline delivery is the
-/// T07 mailbox). Other transport/server errors still propagate.
+/// Route a blob, treating a `not_connected` server reply as "not delivered, not queued" rather than
+/// a fatal error: a momentarily-offline peer with no mailbox available must not tear down the chat
+/// session. Other transport/server errors still propagate.
+///
+/// Returns the full [`RouteOutcome`] (task 8.15) rather than a collapsed bool: `not_connected`
+/// (`ttl_days == 0` at the recipient's server, or no mailbox story at all) means genuinely
+/// `{delivered:false, queued:false}` — every other outcome, including "queued into the recipient's
+/// offline mailbox" (T07: `{delivered:false, queued:true}`), comes straight off the real `RouteOk`
+/// the server sent.
 ///
 /// `hint` (task 2.15) is the peer's `@domain` routing hint — the same value already threaded into
 /// `fetch_with_retry` — passed on every routed call (not just the initial bundle fetch) so an
@@ -473,15 +490,18 @@ async fn route_tolerant(
     hint: &str,
     blob: Vec<u8>,
     peer_label: &str,
-) -> Result<bool, String> {
+) -> Result<RouteOutcome, String> {
     use meridian_core::proto::error_codes::NOT_CONNECTED;
     use meridian_core::signaling::SignalError;
     match client
-        .route_with_hint(to, Some(hint.to_string()), blob)
+        .route_with_hint_detailed(to, Some(hint.to_string()), blob)
         .await
     {
-        Ok(delivered) => Ok(delivered),
-        Err(SignalError::Server(e)) if e.code == NOT_CONNECTED => Ok(false),
+        Ok(outcome) => Ok(outcome),
+        Err(SignalError::Server(e)) if e.code == NOT_CONNECTED => Ok(RouteOutcome {
+            delivered: false,
+            queued: false,
+        }),
         Err(e) => Err(federation_error_line(&e, peer_label, "routing message to")),
     }
 }
@@ -513,19 +533,57 @@ async fn send_text(
             },
         )
         .map_err(|e| format!("sealing message: {e}"))?;
-    let delivered = route_tolerant(client, *peer_ik, peer_hint, blob, peer_label).await?;
-    if json {
-        println!(
-            "{{\"event\":\"sent\",\"id\":\"{}\",\"delivered\":{}}}",
-            hex::encode(id),
-            delivered
-        );
-    } else if delivered {
-        println!("[you] {text}");
-    } else {
-        println!("[you] {text}  (peer offline — not delivered; mailbox is T07)");
-    }
+    let outcome = route_tolerant(client, *peer_ik, peer_hint, blob, peer_label).await?;
+    println!(
+        "{}",
+        sent_line(text, outcome, peer_label, peer_hint, id, json)
+    );
     Ok(())
+}
+
+/// The one line [`send_text`] prints for a completed send, factored out as a pure function (task
+/// 8.15) so the three-way `delivered` / `queued` / neither mapping is unit-testable without a live
+/// `SignalingClient` — mirrors this file's existing `gate_lines` pattern (see this module's own test
+/// block). `queued` (T07) must never be conflated with the genuine "not delivered, nothing to wait
+/// for" case: the mailbox-queued line echoes the feature spec's own demo script wording
+/// (`docs/architecture/features/07-offline-mailbox.md`: `[mailbox] bob offline — queued at org-b`) —
+/// minus that script's illustrative `(expires in 14d)`, since `RouteOk` carries no TTL for this
+/// client to report — and — the property this function's own dedicated tests pin — never says
+/// "mailbox is T07" (stale now that T07 is done) and never collapses `queued:true` into the plain
+/// "not delivered" line.
+///
+/// **Same-server only, today.** A federated route (task 8.6, phase-8 architect consult point 2)
+/// always replies to *this* sender with the optimistic `RouteOk{delivered:true, queued:false}` on
+/// any successful `route_foreign`, whether the foreign server delivered live or queued to its own
+/// mailbox — `outcome.queued` can only ever be `true` here for a peer on this same server. A
+/// cross-org send that actually queued at the recipient's org therefore still prints the plain
+/// `[you] {text}` line, not this one; `meridian-admin mailbox dump` at the *recipient's* org is the
+/// only honest proof for that case (see task 8.14's own doc-sync note on this exact framing gap).
+fn sent_line(
+    text: &str,
+    outcome: RouteOutcome,
+    peer_label: &str,
+    peer_hint: &str,
+    id: [u8; 16],
+    json: bool,
+) -> String {
+    if json {
+        format!(
+            "{{\"event\":\"sent\",\"id\":\"{}\",\"delivered\":{},\"queued\":{}}}",
+            hex::encode(id),
+            outcome.delivered,
+            outcome.queued
+        )
+    } else if outcome.delivered {
+        format!("[you] {text}")
+    } else if outcome.queued {
+        format!(
+            "[you] {text}  ([mailbox] {peer_label} offline — queued at {peer_hint}, will arrive \
+             on reconnect)"
+        )
+    } else {
+        format!("[you] {text}  (peer offline — not delivered; no mailbox available)")
+    }
 }
 
 /// (task 4.4) Every outbound `mrd.chat/1` **text** send funnels through here — never straight to
@@ -752,13 +810,58 @@ async fn handle_inbound(
     // retirement.
     state.expire_previous_generation(crate::now_unix());
 
-    match state.open_inbound(
-        store,
-        handle,
-        account_pub,
-        &deliver.from,
-        deliver.blob.as_bytes(),
-    ) {
+    // (task 8.8, review finding 1 — blocking) `deliver.from` is the wire value ChatState's own
+    // sender check consumes, but it is NOT the real peer identity for a mailbox-drained push: it
+    // is always `MAILBOX_DRAIN_FROM_PLACEHOLDER`. Everything below that treats "the sender" as an
+    // identity — the message-request lookup, `deliver_content`'s display/routing target, and
+    // `maybe_attempt_recovery`'s peer gating — needs the REAL sender, or (as verified: this used
+    // to panic on `pending_request(&deliver.from).expect(...)` for a mailbox-drained first
+    // contact, and crash the whole process via `seal_outbound`'s unguarded `?` on `NoSession` for
+    // a mailbox-drained continuation message from an existing session) this misbehaves outright.
+    // `effective_from` is the real identity: for a mailbox-drained delivery, `envelope.sender_pub`,
+    // read via the same cheap, non-cryptographic parse `open_bytes`/`open_inbound_gated` already
+    // perform on their own copy of `blob` — safe to read before authentication succeeds for
+    // exactly the reason `open_inbound_gated`'s own early decode is safe (see that method's doc
+    // comment): it can only affect map lookups and routing here, never a state mutation, since
+    // nothing commits before `open_inbound_from_mailbox`'s own successful AEAD decrypt. A blob too
+    // malformed to parse falls back to `deliver.from` — harmless, since `open_inbound_from_mailbox`
+    // will independently fail to decode it too, landing in the catch-all `Err(e)` arm below, which
+    // never uses `effective_from`.
+    let effective_from = if deliver.mailbox_id.is_some() {
+        meridian_core::envelope::MessageEnvelope::from_blob(deliver.blob.as_bytes())
+            .map(|env| env.sender_pub)
+            .unwrap_or(deliver.from)
+    } else {
+        deliver.from
+    };
+
+    // (task 8.8, ADR 0024) A mailbox-drained push (`mailbox_id.is_some()`, task 8.7) carries the
+    // `[0u8; 32]` `from` placeholder, never a real routing-layer identity —
+    // `open_inbound_from_mailbox` authenticates via `envelope.sender_pub` alone instead of
+    // comparing against it. Every live/federated-live delivery (`mailbox_id: None`) keeps going
+    // through the ordinary `open_inbound`, unchanged. This call still passes the literal
+    // `deliver.from` (the placeholder, on a mailbox-drained push) — not `effective_from` — since
+    // that parameter is the wire value the sender-mismatch check itself reasons about (and
+    // ignores, on this path); `effective_from` is for every OTHER use of "the peer's identity"
+    // below.
+    let open_result = if deliver.mailbox_id.is_some() {
+        state.open_inbound_from_mailbox(
+            store,
+            handle,
+            account_pub,
+            &deliver.from,
+            deliver.blob.as_bytes(),
+        )
+    } else {
+        state.open_inbound(
+            store,
+            handle,
+            account_pub,
+            &deliver.from,
+            deliver.blob.as_bytes(),
+        )
+    };
+    match open_result {
         Ok(content) => {
             deliver_content(
                 client,
@@ -767,7 +870,7 @@ async fn handle_inbound(
                 store,
                 handle,
                 account_pub,
-                &deliver.from,
+                &effective_from,
                 peer_hint,
                 peer_label,
                 json,
@@ -784,7 +887,7 @@ async fn handle_inbound(
         // "message request from mrd1:<alice>… — accept? y".
         Err(ChatError::MessageRequest) => {
             let req = state
-                .pending_request(&deliver.from)
+                .pending_request(&effective_from)
                 .expect("open_inbound just inserted this request");
             if json {
                 println!(
@@ -803,7 +906,20 @@ async fn handle_inbound(
             Ok(())
         }
         // Already gated: refused, never merged into the pending request (task 2.10 deliverable).
+        //
+        // (task 8.17) Unlike a genuinely bad envelope (Desync/Crypto/etc., below), this one was
+        // perfectly valid — it just arrived while an earlier first-contact request from the same
+        // sender is still undecided. A mailbox-drained one of these must NOT be acked: `run`'s own
+        // per-iteration `client.ack_pending_mailbox()` call has no idea this delivery was actually
+        // discarded rather than shown to the user, and would otherwise permanently delete the
+        // server's only durable copy of a message the user never saw — the same "acked but never
+        // actually delivered" loss task 8.8's `discard_pending_mailbox_ack` exists to prevent for a
+        // save failure, now also needed for this non-failure, still-not-delivered case. Once the
+        // user resolves the pending request and reconnects, the row is still there to redrain.
         Err(ChatError::RequestPending) => {
+            if let Some(id) = deliver.mailbox_id {
+                client.discard_pending_mailbox_ack(id);
+            }
             if json {
                 println!("{{\"event\":\"rejected\",\"reason\":\"pending message request\"}}");
             }
@@ -825,7 +941,7 @@ async fn handle_inbound(
                 store,
                 handle,
                 account_pub,
-                &deliver.from,
+                &effective_from,
                 peer_hint,
                 peer_label,
                 json,
@@ -1232,6 +1348,54 @@ fn banner(
     }
 }
 
+/// Connect, publish a fresh prekey bundle, and durably persist the matching secret scalars into
+/// this account's sealed session store (`load_state`/`save_state`, below) — the standalone
+/// counterpart to `run`'s own inline connect+publish+`state.vault.set_bundle` sequence (see that
+/// function's "Publish a fresh bundle..." comment, the pattern this mirrors exactly). Used by
+/// `main.rs::cmd_register` (task 8.16 fix): before this existed, `cmd_register` called
+/// `SignalingClient::publish_bundle` directly and only ever read `generated.bundle.otk_count()`
+/// off the result, discarding `generated`'s secret scalars entirely — publishing a bundle whose
+/// matching private one-time-prekey/SPK secrets were never saved anywhere, on disk or in memory.
+/// A peer who X3DH-initiated against that published bundle produced an envelope this account could
+/// **never** decrypt, not even in a later `meridian chat` run against the very same account,
+/// because nothing durable ever recorded which secret scalars the server's published public bundle
+/// corresponded to. Returns the number of one-time prekeys published.
+pub(crate) async fn register_bundle(
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+    account_pub: [u8; 32],
+    server: &str,
+    invite: Option<String>,
+) -> Result<usize, String> {
+    let mut state = load_state(store, handle)?;
+
+    let mut client = SignalingClient::connect(server, store, handle, account_pub, invite, 1)
+        .await
+        .map_err(|e| format!("connecting to {server}: {e}"))?;
+    let generated = client
+        .publish_bundle(store, handle, DEFAULT_OTK_COUNT)
+        .await
+        .map_err(|e| format!("publishing bundle: {e}"))?;
+    let _ = client.close().await;
+
+    let count = generated.bundle.otk_count();
+    let otks: Vec<([u8; 32], [u8; 32])> = generated
+        .bundle
+        .otks
+        .iter()
+        .zip(generated.otk_secrets.iter())
+        .map(|(p, s)| (*p, **s))
+        .collect();
+    state.vault.set_bundle(
+        generated.bundle.spk,
+        *generated.spk_secret,
+        otks,
+        crate::now_unix(),
+    );
+    save_state(&state, store, handle)?;
+    Ok(count)
+}
+
 fn load_state(store: &dyn SecretStore, handle: &KeyHandle) -> Result<ChatState, String> {
     let path = account::sessions_path()?;
     match std::fs::read(&path) {
@@ -1376,6 +1540,90 @@ mod tests {
                     "kind={kind} json={json} dropped the canonical reason: {lines:?}"
                 );
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // (task 8.15) `sent_line` — the three-way `delivered`/`queued`/neither mapping `send_text`
+    // prints, extracted so it's unit-testable without a live `SignalingClient`. The property these
+    // tests pin: a queued send must say so (never the stale "mailbox is T07" wording, never
+    // collapsed into the same line as a genuine drop), and JSON mode always carries both fields so a
+    // scripted consumer can tell the three outcomes apart itself.
+    // -----------------------------------------------------------------------------------------
+
+    fn outcome(delivered: bool, queued: bool) -> RouteOutcome {
+        RouteOutcome { delivered, queued }
+    }
+
+    #[test]
+    fn delivered_line_is_plain_with_no_offline_qualifier() {
+        let line = sent_line(
+            "hi",
+            outcome(true, false),
+            "bob",
+            "org-b.test",
+            [0u8; 16],
+            false,
+        );
+        assert_eq!(line, "[you] hi");
+    }
+
+    #[test]
+    fn queued_line_names_the_mailbox_and_never_says_mailbox_is_t07() {
+        let line = sent_line(
+            "hi",
+            outcome(false, true),
+            "bob",
+            "org-b.test",
+            [0u8; 16],
+            false,
+        );
+        assert!(
+            line.contains("queued"),
+            "a mailbox-queued send must say so: {line:?}"
+        );
+        assert!(
+            line.contains("org-b.test"),
+            "must name the server the message was queued at: {line:?}"
+        );
+        assert!(
+            !line.to_lowercase().contains("mailbox is t07"),
+            "T07 is done — this wording must never appear again: {line:?}"
+        );
+    }
+
+    #[test]
+    fn genuinely_not_delivered_line_never_claims_queued_or_arriving_later() {
+        let line = sent_line(
+            "hi",
+            outcome(false, false),
+            "bob",
+            "org-b.test",
+            [0u8; 16],
+            false,
+        );
+        assert!(
+            !line.contains("queued") && !line.contains("arrive"),
+            "a genuine drop (no mailbox available) must never imply store-and-forward: {line:?}"
+        );
+    }
+
+    #[test]
+    fn json_mode_always_carries_both_delivered_and_queued_fields() {
+        for (delivered, queued) in [(true, false), (false, true), (false, false)] {
+            let line = sent_line(
+                "hi",
+                outcome(delivered, queued),
+                "bob",
+                "org-b.test",
+                [0u8; 16],
+                true,
+            );
+            assert!(
+                line.contains(&format!("\"delivered\":{delivered}")),
+                "{line:?}"
+            );
+            assert!(line.contains(&format!("\"queued\":{queued}")), "{line:?}");
         }
     }
 
