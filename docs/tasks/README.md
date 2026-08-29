@@ -632,7 +632,7 @@ mailbox-drain `Deliver.from` sentinel) was already ratified as ADR 0024 during t
 **Verdict: green to proceed — T14 is not blocked.** 10 fix-tasks (9.1–9.10) planned by the **planner**
 agent; landing order and dependencies: [phase-9/README.md](./phase-9/README.md#tasks-todo).
 
-- [ ] **9.1** Serialize mailbox quota check-and-enqueue; cap local route envelope size (F1) — [file](./phase-9/9.1-mailbox-quota-race-and-local-size-cap.md)
+- [~] **9.1** Serialize mailbox quota check-and-enqueue; cap local route envelope size (F1) — [file](./phase-9/9.1-mailbox-quota-race-and-local-size-cap.md)
 - [ ] **9.2** Quota exact-at-cap boundary test (F6; depends on 9.1) — [file](./phase-9/9.2-mailbox-quota-boundary-test.md)
 - [ ] **9.3** Filter `expires_at` on mailbox reads (F5; soft-depends on 9.1) — [file](./phase-9/9.3-mailbox-expires-at-read-filter.md)
 - [ ] **9.4** Fix drain/registration race window (F4; soft-depends on 9.1) — [file](./phase-9/9.4-mailbox-drain-registration-race.md)
