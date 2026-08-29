@@ -252,8 +252,18 @@ pub fn generate_c2s() -> Result<(), String> {
         serde_json::json!({ "ids": mailbox_ack.ids }),
     )?);
 
-    // MailboxAck — empty id list (task 9.8, review finding F8). Reachable whenever
-    // `discard_pending_mailbox_ack` empties the accumulator before a flush — proven for
+    // MailboxAck — empty id list (task 9.8, review finding F8). NOT currently emitted by this
+    // repo's own reference client — `SignalingClient::ack_pending_mailbox`
+    // (`apps/signaling/src/client.rs`) early-returns with no network I/O when
+    // `pending_mailbox_acks` is empty, so `discard_pending_mailbox_ack` draining the accumulator
+    // to zero produces no frame at all, not an empty one (a prior version of this comment claimed
+    // otherwise; corrected after architect review). This vector is still warranted: the wire spec
+    // (`docs/api/wire-protocol.md`) places no non-emptiness constraint on `MailboxAck.ids`, the
+    // server's `handle_mailbox_ack` explicitly documents replying `MailboxAckOk{}` "even for an
+    // empty or all-foreign id set" (`apps/rendezvous/src/ws.rs`), and a future `ids` field gaining
+    // a `#[serde(skip_serializing_if = "Vec::is_empty")]` attribute (mirroring the existing pattern
+    // on `RouteOk.queued`/`Deliver.mailbox_id`) would silently change this shape from `{ids: []}`
+    // (`0x80`) to an omitted key (`0xa0`) with nothing but this vector to catch it. Proven for
     // `meridian-proto`'s own encode/decode symmetry by
     // `apps/proto/tests/roundtrip.rs::mailbox_ack_and_ack_ok_roundtrip`, but until now not
     // byte-locked across implementations. Locks the empty-array CBOR shape (`0x80`) distinct
