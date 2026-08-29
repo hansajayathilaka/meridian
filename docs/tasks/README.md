@@ -214,10 +214,18 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   `tools/lint-server-no-core.sh`). Draft PR carrying all commits:
   [#87](https://github.com/hansajayathilaka/meridian/pull/87). Full closure summary:
   [phase-9/README.md](./phase-9/README.md#exit-criteria).
-- **NEXT:** `/pick-next-phase` — T14 is now unblocked (Phase 9's own verdict was already "green to
-  proceed," and its fix-tasks are now closed too). The Phase-1 adversarial frontier remains an
-  unowned carry-forward for a future `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08
-  residuals are Phase-4-scoped follow-ups and stay listed below for a future phase.
+- **NOW:** **Phase 10 (File Transfer Stream) opened — scope is T09 alone.** The unblocked set at this
+  point is actually {T09, T10, T14} — T14 was the tracker's repeatedly-stated next pick, but T09 and T10
+  both outrank it on the roadmap's own priority tiers (T09/T10 = P2, T14 = P3), and applying the same
+  "sole gate on downstream features" test Phase 2 used to pick T06 over T08/T09 shows **T09 is the sole
+  gate on T11/T16** (and transitively T12/T13/T15 — all of Track D is stalled on it), while **T14 gates
+  nothing downstream**. T09 was deliberately kept out of Phase 2 for review-surface reasons only, never
+  deprioritized. Not bundled with T10 or T14 — no code-path overlap, unlike Phase 4's forced T08+T17
+  bundle. Full dependency-check rationale: [phase-10/README.md](./phase-10/README.md). T10 and T14 both
+  remain valid, unblocked choices for a later build phase.
+- **NEXT:** `/plan-phase` — break T09 into tasks. The Phase-1 adversarial frontier remains an unowned
+  carry-forward for a future `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08 residuals
+  are Phase-4-scoped follow-ups and stay listed below for a future phase.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -689,6 +697,15 @@ agent; landing order and dependencies: [phase-9/README.md](./phase-9/README.md#t
 - [x] **9.8** Lock `MailboxAck{ids:[]}` conformance vector (F8) — [file](./phase-9/9.8-mailbox-ack-empty-conformance-vector.md)
 - [x] **9.9** Add `Mailbox::validate` config check (N1) — [file](./phase-9/9.9-mailbox-config-validate.md)
 - [x] **9.10** Nit sweep: mailbox-drain proptest, `purge_loop` coverage, double-ack no-op test (N3, N4, N5; soft-depends on 9.1, 9.3) — [file](./phase-9/9.10-phase-9-nit-sweep.md)
+
+### Phase 10 — File Transfer Stream · **planning** · [details](./phase-10/README.md)
+Build phase. **[T09 — File Transfer Stream](../architecture/features/09-file-transfer.md)** alone:
+`mrd.file/1` as a pure stream-type extension (manifest-on-ctrl, 64 KiB AEAD-chunked, backpressure,
+resume-via-bitmap, incremental subtree verification, TUI inline preview/progress). Dep T04 done since
+Phase 0. Chosen over T10/T14 (both also technically unblocked) on priority tier (P2 vs T14's P3) and the
+critical-path test — T09 is the sole gate on T11/T16 and transitively T12/T13/T15, T14 gates nothing.
+Full rationale: [phase-10/README.md](./phase-10/README.md). Task breakdown not yet done — `/plan-phase`
+next.
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
