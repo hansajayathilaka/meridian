@@ -476,8 +476,18 @@ impl SignalingClient {
     /// it never reveals anything about mailbox contents either way (no confidentiality break — the
     /// row, like every mailbox row, is ciphertext-only). Adding client-side drain-batch validation
     /// to close this residual would require a wire protocol change for a bound already this narrow;
-    /// not undertaken here. See `docs/architecture/features/07-offline-mailbox.md` for the written
-    /// record of this decision and its bound.
+    /// not undertaken here.
+    ///
+    /// One distinction from `Deliver.from` worth naming: that field's forgery is cryptographically
+    /// inert (it feeds only a local equality check ADR 0024 already waives, never a stored-state
+    /// mutation), while an acked `mailbox_id` DOES drive a real server-side `DELETE` once flushed —
+    /// so unlike `Deliver.from`, this trust decision has a live side effect. It stays within the
+    /// bound above regardless: the worst case is message loss on this account's own mailbox, which
+    /// grants a malicious server no capability beyond what it already has by simply not delivering
+    /// the message at all (`docs/security/threat-model.md`'s accepted A2: a malicious/compromised
+    /// server can drop or delay messages, but never silently weaken a session or read plaintext).
+    /// See `docs/architecture/features/07-offline-mailbox.md` for the written record of this
+    /// decision and its bound.
     fn record_mailbox_ack(pending: &mut Vec<u64>, deliver: &Deliver) {
         if let Some(id) = deliver.mailbox_id {
             pending.push(id);

@@ -63,6 +63,14 @@ for `Deliver.from`, applied to this distinct, weaker field:
   re-vectoring, to close a bound that is already this narrow. Not undertaken; revisit only with a
   fresh forcing function, mirroring ADR 0024's own framing for why it didn't widen `Deliver.from` to
   an `Option` for a functionally-equivalent reason.
+- **Not equally inert to `Deliver.from`:** that field's forgery only feeds a local equality check
+  ADR 0024 already waives — it never touches stored state. An acked `mailbox_id` DOES drive a real
+  server-side `DELETE` once flushed, so this trust decision has a live side effect `Deliver.from`'s
+  never had. The bound above still holds regardless: the worst case (message loss on this account's
+  own mailbox) grants a malicious server no capability beyond what it already has by simply not
+  delivering the message at all — the threat model's already-accepted A2 capability
+  ([threat-model.md](../../security/threat-model.md)): a malicious/compromised server can drop or
+  delay messages, but never silently weaken a session or read plaintext.
 
 Covered by a unit test in `apps/signaling/src/client.rs` (`mailbox_id_on_a_live_looking_deliver_is_still_accumulated`)
 that constructs a live-looking `Deliver` (no ADR-0024 sentinel, a real-looking `from`) carrying a
