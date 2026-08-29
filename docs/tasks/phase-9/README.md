@@ -3,7 +3,7 @@
 
 # Phase 9 — Review of Phase 8
 
-**Kind:** review · **Status:** in progress — sweep running · **Reviews phase(s):** Phase 8 (Offline
+**Kind:** review · **Status:** sweep complete, verdict recorded · **Reviews phase(s):** Phase 8 (Offline
 Ciphertext Mailbox, tasks 8.1–8.17)
 
 ## Goal
@@ -48,11 +48,18 @@ reviews (not new findings, but re-examined for severity/ownership in this pass) 
 - `MailboxAck`'s 4096-id cap is reachable, not merely theoretical (8.7's review).
 - Mailbox quota check is a TOCTOU race under concurrent routes to the same recipient (8.5's review).
 
-Findings, on-the-fly decisions, and coverage gaps: [review-report.md](./review-report.md).
+Findings, on-the-fly decisions, and coverage gaps: [review-report.md](./review-report.md). **14
+findings — 0 blocking, 9 should-fix, 5 nits.** No on-the-fly decision needs `/adr` ratification — the
+one genuine on-the-fly decision Phase 8 produced (the mailbox-drain `Deliver.from` sentinel question)
+was already correctly escalated and ratified as ADR 0024 during the phase itself. Verdict: **green to
+proceed** — T14 is not blocked; F1 (the mailbox quota TOCTOU race, reassessed by security-reviewer as
+a more seriously exploitable storage-exhaustion DoS than the original carry-forward note suggested) is
+the phase's top-priority should-fix.
 
 ## Tasks (todo)
 <!-- Filled by /plan-review-phase. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
-(populated by `/plan-review-phase`)
+(populated by `/plan-review-phase` from [review-report.md](./review-report.md)'s 9 should-fix + 5 nit
+findings)
 
 ## Exit criteria
 All fix-tasks `[x]`, tree green, docs synced, findings closed per the report's verdict. Then:

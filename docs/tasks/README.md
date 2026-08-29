@@ -142,36 +142,58 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   (`cargo build --workspace`, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D
   warnings`, full test suite — 1125 tests across 112 binaries, zero failures). Full closure summary:
   [phase-8/README.md](./phase-8/README.md#exit-criteria).
-- **NEXT:** `/start-review-phase` — sweep Phase 8 for bugs/gaps/loopholes before T14 becomes pickable.
-  The Phase-1 adversarial frontier remains an unowned carry-forward for a future `/plan-phase` if
-  capacity allows; the six Phase-4-named TUI/T08 residuals are Phase-4-scoped follow-ups and stay
-  listed below for a future phase.
+- **NOW:** **Phase 9 (review of Phase 8) opened — sweep complete, verdict recorded.**
+  [Report](./phase-9/review-report.md): 14 findings — **0 blocking**, 9 should-fix (F1–F8, N3–N5 folded
+  as fix-tasks 9.1–9.10), 5 nits (N1, N2 not converted — see below). Diff range `f871859` (Phase 7
+  close) `..` `fa634bc` (current `main`); confirmed via `git log --merges` that only PR #83
+  (`pick-next-phase`, README-only) and PR #84 (all of 8.1–8.17) landed in this window — no untracked
+  out-of-band PRs. All four reviewers confirmed the mailbox's core invariants (TTL-bounded,
+  ciphertext-only, deletion-on-ack, ADR 0007/0024 conformance, clean dependency graph, wire-contract
+  discipline) hold in the shipped code, verified against source rather than task-file claims — full
+  crate suite green throughout (1027 tests, zero failures, zero clippy/fmt/lint drift). The headline
+  finding: **F1**, the mailbox quota check-then-write race already on record as a carry-forward from
+  tasks 8.5/8.7, was re-examined in more depth than the original note and found more seriously
+  exploitable than "roughly one extra envelope per concurrent racer" — the local route path has no
+  per-envelope size cap (unlike the federated path's 1 MiB `MAX_FRAME_LEN`) and no per-account
+  connection-concurrency limit exists, so a single free-to-create account can overrun `quota_mb` by
+  concurrency × envelope size via a burst of near-maximal `Route` frames. F2–F8 are narrower,
+  independent correctness/coverage gaps (an untested `MailboxAck` truncation path with a latent SQLite
+  bound-parameter risk; unverified client trust of server-supplied `Deliver.mailbox_id` for acks,
+  bounded by existing per-recipient delete-scoping; a drain/connection-registration race window that
+  can delay a message to the recipient's *next* reconnect; stale-row leakage into drain/quota reads
+  before the next purge sweep; and three boundary-case test gaps — quota exact-at-cap, federated
+  `ttl_days == 0`, and an unlocked empty-`ids` conformance vector shape, the last a direct echo of
+  Phase 7's own F7 finding). Zero on-the-fly decisions need `/adr` ratification — the one genuine
+  on-the-fly decision Phase 8 produced (the mailbox-drain `Deliver.from` sentinel question) was already
+  correctly escalated and ratified as **ADR 0024** during the phase itself, confirmed by independent
+  architect re-derivation from source. **Verdict: green to proceed — T14 is not blocked**, F1 is simply
+  this review phase's top-priority should-fix. Full report:
+  [phase-9/review-report.md](./phase-9/review-report.md).
+- **NEXT:** `/plan-review-phase` — turn phase-9's 9 should-fix + eligible nit findings into numbered
+  fix-tasks. N1 (no `Mailbox::validate` config check) and N3–N5 (three narrow test-coverage nits) are
+  small enough to fold into a fix-task each; N2 (the unregistered-metrics reminder for T14) is not a
+  fix-task — it stays a carry-forward for T14's own task file. The Phase-1 adversarial frontier remains
+  an unowned carry-forward for a future `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08
+  residuals are Phase-4-scoped follow-ups and stay listed below for a future phase.
 
 
 ### Live carry-forwards (not owned by any open task)
-- **`MailboxAck`'s 4096-id cap is reachable, not merely theoretical** (task 8.7's review): quota
-  (`config.mailbox.quota_mb`) bounds bytes only, `Op::Route` has no per-message rate limit, and no
-  per-recipient row-count cap exists anywhere in 8.1/8.2/8.5/8.6 — a connected account can
-  legitimately enqueue far more than 4096 tiny envelopes against one victim recipient while
-  staying under the byte quota. `handle_mailbox_ack` (`apps/rendezvous/src/ws.rs`) silently
-  truncates an oversized ack batch to the first 4096 ids and still replies `MailboxAckOk{}`, with
-  no signal to the client that part of its ack didn't take effect. Fails safe (the undeleted rows
-  persist and get redrained on the next reconnect; `eid` dedup, task 6.4, prevents any
-  duplicate-processing harm), so non-blocking, but a real correctness surprise. No open task owns
-  the fix — candidates: have the ack reply report the actual-deleted count (8.8, which builds the
-  client-side ack loop that would consume it), or add a per-recipient row-count cap alongside the
-  byte quota (8.9, which already owns quota/purge tuning). Flag for a future `/plan-phase` if not
-  picked up by either.
-- **Mailbox quota check is a TOCTOU race under concurrent routes to the same recipient** (task 8.5's
-  review): `queue_to_mailbox`'s quota check (`mailbox_size_bytes_for_recipient` then
-  `mailbox_enqueue`) is read-then-write across two unserialized `Store` calls — neither
-  `MemoryStore` nor `SqliteStore` hold a lock spanning both. Two connections routing to the same
-  offline recipient concurrently can both pass the quota check and both insert, overrunning
-  `quota_mb` by a bounded amount (roughly one extra envelope per concurrent racer, not unbounded).
-  Non-blocking for 8.5 (the task didn't scope concurrency control, and the store trait has no
-  compare-and-swap primitive to build one on cheaply), but no open phase-8 task owns fixing it (e.g.
-  a per-recipient async lock, or a single atomic conditional-insert in SQLite). Flag for a future
-  `/plan-phase` if the overrun bound is judged worth closing.
+- **RESOLVED into Phase 9's review — `MailboxAck`'s 4096-id cap is reachable, not merely theoretical**
+  (originally task 8.7's review). Phase 9's sweep re-examined this and confirmed it non-blocking (no
+  cross-account harm — `mailbox_delete_by_ids` scopes by `(recipient_pub, id)`, no existence oracle —
+  but genuinely untested, plus a latent SQLite bound-parameter risk on older builds compiled with the
+  `SQLITE_MAX_VARIABLE_NUMBER = 999` default). Recorded as **F2** in
+  [phase-9/review-report.md](./phase-9/review-report.md), pending fix-task **9.2** once
+  `/plan-review-phase` runs. No longer flag separately here — track via Phase 9's fix-tasks instead.
+- **RESOLVED into Phase 9's review — Mailbox quota check is a TOCTOU race under concurrent routes to
+  the same recipient** (originally task 8.5's review). Phase 9's sweep re-examined this in more depth
+  and found it a more seriously exploitable storage-exhaustion DoS than "roughly one extra envelope per
+  concurrent racer": the local route path has no per-envelope size cap (unlike the federated path's
+  1 MiB `MAX_FRAME_LEN`) and no per-account connection-concurrency limit exists, so a single
+  free-to-create account can overrun `quota_mb` by concurrency × envelope size via a burst of
+  near-maximal `Route` frames from multiple connections. Recorded as **F1** (the review's top-priority
+  should-fix) in [phase-9/review-report.md](./phase-9/review-report.md), pending fix-task **9.1**. No
+  longer flag separately here — track via Phase 9's fix-tasks instead.
 
 Phase 4 is now closed; its own unowned findings live in
 [phase-4/README.md](./phase-4/README.md#exit-criteria)'s "Findings with no task yet" sections, for
@@ -590,6 +612,17 @@ wire-protocol questions T07 raises before any task started; full record and brea
 - [x] **8.16** `meridian register` persists its published bundle's prekey secrets (fix-task found during 8.14's live demo) — [file](./phase-8/8.16-cli-register-persists-prekey-secrets.md)
 - [x] **8.17** Mailbox-drained messages arriving before a first-contact request is accepted must not be silently lost (fix-task found during 8.14's live demo) — [file](./phase-8/8.17-mailbox-ack-must-not-swallow-pending-request-messages.md)
 - [x] **8.14** Phase exit: full demo script + doc sync — [file](./phase-8/8.14-phase-exit-mailbox-demo.md)
+
+### Phase 9 — Review of Phase 8 · **in progress — report done, fix-tasks not yet planned** · [details](./phase-9/README.md)
+Review phase. Sweeps everything built since the Phase-7 review: Phase 8 — Offline Ciphertext Mailbox
+(tasks 8.1–8.17). No untracked out-of-band PRs landed in this window (confirmed: only PR #83
+`pick-next-phase` and PR #84, all of 8.1–8.17, merged between the two review points).
+[Report](./phase-9/review-report.md): 14 findings — **0 blocking**, 9 should-fix (F1–F8 plus N3–N5
+folded in as fix-tasks), 5 nits (N1 folds in, N2 stays an unowned carry-forward for T14). Zero
+on-the-fly decisions need `/adr` ratification — Phase 8's one genuine on-the-fly decision (the
+mailbox-drain `Deliver.from` sentinel) was already ratified as ADR 0024 during the phase itself.
+**Verdict: green to proceed — T14 is not blocked.** Fix-tasks not yet broken out — next command is
+`/plan-review-phase`.
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
