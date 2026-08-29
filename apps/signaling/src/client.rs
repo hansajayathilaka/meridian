@@ -450,10 +450,38 @@ impl SignalingClient {
                 }
             }
         };
-        if let Some(id) = deliver.mailbox_id {
-            self.pending_mailbox_acks.push(id);
-        }
+        Self::record_mailbox_ack(&mut self.pending_mailbox_acks, &deliver);
         Ok(deliver)
+    }
+
+    /// (Task 9.6, phase-9 review finding F3.) Accumulate `deliver.mailbox_id`, if present, into
+    /// `pending`, with **no attempt to verify it corresponds to an actual mailbox drain** — this
+    /// client has no wire-level signal that distinguishes "a genuinely queued row this push just
+    /// drained" from "an ordinary live delivery the server happened to tag with a `mailbox_id`
+    /// anyway" (there is no drain-batch marker in the protocol, and adding one would be a
+    /// `meridian-proto` wire change, not a fix to this call site).
+    ///
+    /// **This is an accepted, bounded trust boundary — the same class of question
+    /// `docs/adr/0024-mailbox-drain-from-attestation.md` already reasoned through for
+    /// `Deliver.from`, applied here to the sibling `mailbox_id` field.** Unlike `Deliver.from`
+    /// (whose real trust anchor is `envelope.sender_pub` plus the ratchet AEAD, ADR 0024's whole
+    /// point), `mailbox_id` has no cryptographic backstop of its own — the client simply trusts
+    /// whatever the server sends, then echoes it back in a later `MailboxAck`. The blast radius of
+    /// that trust is bounded server-side, not client-side: `Store::mailbox_delete_by_ids`
+    /// (`apps/rendezvous/src/store.rs`, `ws.rs`'s `MailboxAck` handler) deletes only rows matching
+    /// *both* an acked id *and* the authenticated connection's own `account_pub` — a buggy or
+    /// malicious server can at worst trick this client into acking (and thereby losing) one of its
+    /// **own** genuine queued mailbox rows early. It can never name another account's row (no
+    /// cross-account capability — the scoping is structural, not a check that can be forgotten) and
+    /// it never reveals anything about mailbox contents either way (no confidentiality break — the
+    /// row, like every mailbox row, is ciphertext-only). Adding client-side drain-batch validation
+    /// to close this residual would require a wire protocol change for a bound already this narrow;
+    /// not undertaken here. See `docs/architecture/features/07-offline-mailbox.md` for the written
+    /// record of this decision and its bound.
+    fn record_mailbox_ack(pending: &mut Vec<u64>, deliver: &Deliver) {
+        if let Some(id) = deliver.mailbox_id {
+            pending.push(id);
+        }
     }
 
     /// (task 8.8, ADR 0024) Flush a `MailboxAck` covering every mailbox row id accumulated by
@@ -574,7 +602,8 @@ impl SignalingClient {
 
 #[cfg(test)]
 mod tests {
-    use super::install_crypto_provider;
+    use super::{install_crypto_provider, SignalingClient};
+    use meridian_proto::{Deliver, OpaqueBlob};
 
     /// T3.13/F13: deleting `install_crypto_provider`'s body (or its call site in
     /// [`super::SignalingClient::connect`]) must turn this test red — every `wss://` connection
@@ -589,6 +618,51 @@ mod tests {
         assert!(
             rustls::crypto::CryptoProvider::get_default().is_some(),
             "install_crypto_provider() must leave a default rustls CryptoProvider installed"
+        );
+    }
+
+    /// Task 9.6 (phase-9 review finding F3), mirrors ADR 0024's reasoning shape for the sibling
+    /// `Deliver.from` field. This client has no wire-level way to tell "a genuine mailbox drain"
+    /// apart from "an ordinary live delivery the server happened to tag with a `mailbox_id`" — a
+    /// `Deliver` carrying `from` that is neither the recipient's own key nor the ADR-0024
+    /// `MAILBOX_DRAIN_FROM_PLACEHOLDER` sentinel looks exactly like a live push, yet still gets its
+    /// `mailbox_id` accumulated for a future `MailboxAck` here. That is the accepted, bounded trust
+    /// boundary this task documents (see `record_mailbox_ack`'s own doc comment and
+    /// `docs/architecture/features/07-offline-mailbox.md`): worst case, the server tricks this
+    /// client into acking one of its own genuine queued rows early — never another account's row,
+    /// never a confidentiality break. This test proves the *documented* behavior (accumulate
+    /// regardless of provenance), not an absence of validation — if a future change adds drain-batch
+    /// validation instead, this test must be rewritten (not merely relaxed) to assert rejection.
+    #[test]
+    fn mailbox_id_on_a_live_looking_deliver_is_still_accumulated() {
+        let live_looking_deliver = Deliver {
+            // Neither the ADR-0024 mailbox-drain sentinel nor otherwise distinguishable from a
+            // real, live-routed `Deliver` — an ordinary connection's own `account_pub` assertion.
+            from: [7u8; 32],
+            blob: OpaqueBlob(vec![1, 2, 3]),
+            mailbox_id: Some(42),
+        };
+        let mut pending = Vec::new();
+        SignalingClient::record_mailbox_ack(&mut pending, &live_looking_deliver);
+        assert_eq!(
+            pending,
+            vec![42],
+            "mailbox_id from ANY Deliver (drained or live-looking) accumulates unconditionally — \
+             the accepted trust boundary task 9.6 documents, not a bug"
+        );
+
+        // A `Deliver` with no `mailbox_id` at all (the ordinary live-route shape) must never add
+        // anything, regardless of `from`.
+        let ordinary_live_deliver = Deliver {
+            from: [9u8; 32],
+            blob: OpaqueBlob(vec![4, 5, 6]),
+            mailbox_id: None,
+        };
+        SignalingClient::record_mailbox_ack(&mut pending, &ordinary_live_deliver);
+        assert_eq!(
+            pending,
+            vec![42],
+            "a Deliver without mailbox_id must never be accumulated"
         );
     }
 }
