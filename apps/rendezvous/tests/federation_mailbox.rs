@@ -233,3 +233,81 @@ async fn federated_enqueue_against_bs_real_live_state_over_quota_is_rejected_not
         "a rejected over-quota enqueue must not leave a partial row behind: {rows:?}"
     );
 }
+
+/// Task 9.7 (review finding F7): the federated path's mirror of the local path's
+/// `route_to_offline_peer_errors_when_mailbox_disabled` (`tests/rendezvous.rs`) — "TTL=0 disables the
+/// store entirely" is a named acceptance criterion in the feature spec, and until this test the
+/// federation boundary's own `ttl_days == 0` short-circuit (`handle_fed_route`,
+/// `apps/rendezvous/src/federation/inbound.rs`) had no test proving it actually fires, rather than
+/// silently falling through to `mailbox_enqueue_with_quota` anyway.
+///
+/// **Deliberately NOT asserting a client-visible error, unlike the local test it mirrors** — that is
+/// a real, documented divergence between the two paths, not an oversight: the local path can and does
+/// surface `not_connected` on the same still-open c2s connection that sent the route (`ws.rs`'s own
+/// `mailbox.ttl_days == 0` branch). The federated path has no such option — `FedRoute` is
+/// fire-and-forget on success by protocol (federation-protocol-v1.md §2, phase-8 architect consult
+/// point 2: no `FedRouteOk`, ever) and there is no wire-visible signal for "TTL=0 at B" at all
+/// (consult point 5) — so `handle_fed_route`'s own doc comment documents this exact branch as
+/// matching "the pre-8.6 behavior exactly: silently drop," returning `Ok(())`, never a `FedErr`. This
+/// test proves that documented shape precisely — `Ok(())`, not an error — while proving the actual
+/// acceptance criterion: genuinely NO mailbox row left behind at B, i.e. the short-circuit really did
+/// fire (at line ~302, ahead of the `mailbox_enqueue_with_quota` call) rather than silently
+/// enqueueing anyway.
+#[tokio::test]
+async fn federated_enqueue_against_bs_real_live_state_ttl_zero_drops_without_enqueueing() {
+    use meridian_rendezvous::config::Mailbox;
+
+    let pair = boot_federated_pair(FederatedPairOpts {
+        b_policy: FederationPolicyMode::Open,
+        b_mailbox: Mailbox {
+            ttl_days: 0, // mailbox genuinely disabled at B — pure-P2P mode
+            ..Mailbox::default()
+        },
+        ..Default::default()
+    })
+    .await;
+
+    let alice = new_acct("org-a.test");
+    // Bob is genuinely offline: never connects to B at all before the federated route arrives.
+    let bob = new_acct("org-b.test");
+
+    let req = FedRoute {
+        to: bob.pubkey,
+        from: alice.pubkey,
+        envelope: OpaqueBlob::new(b"must be dropped, never queued, with ttl_days=0 at B".to_vec()),
+    };
+
+    let result = handle_fed_route(
+        &pair.b_state.registry,
+        &pair.b_state.federation.policy,
+        &pair.b_state.federation.limits,
+        FedRouteDeps {
+            metrics: &pair.b_state.metrics,
+            store: pair.b_state.store.as_ref(),
+            mailbox: &pair.b_state.config.mailbox,
+            mailbox_locks: &pair.b_state.mailbox_locks,
+        },
+        &["org-a.test".to_string()],
+        "org-a.test",
+        &req,
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "ttl_days=0 at B is a documented silent drop (fire-and-forget on success), never a \
+         client-visible `FedErr` — got {result:?}"
+    );
+
+    let rows = pair
+        .b_state
+        .store
+        .mailbox_list_for_recipient(&bob.pubkey, 0)
+        .await
+        .expect("mailbox_list_for_recipient must succeed");
+    assert!(
+        rows.is_empty(),
+        "ttl_days=0 must never create a mailbox row at B — the short-circuit must fire before \
+         `mailbox_enqueue_with_quota` is ever called: {rows:?}"
+    );
+}
