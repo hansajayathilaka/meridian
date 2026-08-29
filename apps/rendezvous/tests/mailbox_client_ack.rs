@@ -19,6 +19,15 @@ fn spawn_store() -> (Arc<MemoryStore>, Arc<AppState>) {
     (store, state)
 }
 
+/// A realistic absolute future unix timestamp for directly-seeded rows' `expires_at` in this file
+/// — NOT a small offset from `arrived_at` (real production enqueue always computes
+/// `expires_at = now_secs() + ttl_secs`, an absolute timestamp). Every test below connects a REAL
+/// client, which triggers the REAL `ws::drain_mailbox` and its `expires_at > now_secs()` filter
+/// (task 9.3, review finding F5) — a small literal like `10_000` (year 1970) would make these rows
+/// look already-expired against the real wall clock and the drain would silently deliver nothing,
+/// hanging `next_deliver()`.
+const FAR_FUTURE_EXPIRES_AT: u64 = 9_999_999_999;
+
 /// Deliverable 1/4: `next_deliver()` alone never sends anything over the wire — only
 /// `ack_pending_mailbox()` does. Proven by draining N mailbox-tagged rows via `next_deliver()`
 /// only, then reconnecting: if `next_deliver` had secretly acked on receipt, the rows would be
@@ -31,11 +40,11 @@ async fn next_deliver_alone_never_acks() {
     let bob = new_acct("localhost");
 
     let id_a = store
-        .mailbox_enqueue(bob.pubkey, vec![1], 0, 10_000)
+        .mailbox_enqueue(bob.pubkey, vec![1], 0, FAR_FUTURE_EXPIRES_AT)
         .await
         .unwrap();
     let id_b = store
-        .mailbox_enqueue(bob.pubkey, vec![2], 1, 10_000)
+        .mailbox_enqueue(bob.pubkey, vec![2], 1, FAR_FUTURE_EXPIRES_AT)
         .await
         .unwrap();
 
@@ -85,7 +94,7 @@ async fn ack_pending_mailbox_flushes_the_whole_accumulated_batch_in_one_call() {
     {
         ids.push(
             store
-                .mailbox_enqueue(bob.pubkey, payload, i as u64, 10_000)
+                .mailbox_enqueue(bob.pubkey, payload, i as u64, FAR_FUTURE_EXPIRES_AT)
                 .await
                 .unwrap(),
         );
@@ -135,7 +144,7 @@ async fn ack_pending_mailbox_only_covers_ids_seen_before_the_flush_call() {
     let bob = new_acct("localhost");
 
     let id_a = store
-        .mailbox_enqueue(bob.pubkey, vec![1], 0, 10_000)
+        .mailbox_enqueue(bob.pubkey, vec![1], 0, FAR_FUTURE_EXPIRES_AT)
         .await
         .unwrap();
 
@@ -152,7 +161,7 @@ async fn ack_pending_mailbox_only_covers_ids_seen_before_the_flush_call() {
         .is_empty());
 
     let id_b = store
-        .mailbox_enqueue(bob.pubkey, vec![2], 1, 10_000)
+        .mailbox_enqueue(bob.pubkey, vec![2], 1, FAR_FUTURE_EXPIRES_AT)
         .await
         .unwrap();
     // A live connection can't self-deliver a fresh mailbox row without reconnecting (drain only
@@ -189,7 +198,7 @@ async fn discard_pending_mailbox_ack_withdraws_only_the_named_id() {
     {
         ids.push(
             store
-                .mailbox_enqueue(bob.pubkey, payload, i as u64, 10_000)
+                .mailbox_enqueue(bob.pubkey, payload, i as u64, FAR_FUTURE_EXPIRES_AT)
                 .await
                 .unwrap(),
         );

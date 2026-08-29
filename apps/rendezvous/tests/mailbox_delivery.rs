@@ -69,6 +69,12 @@ fn spawn_store() -> (Arc<MemoryStore>, Arc<AppState>) {
     (store, state)
 }
 
+/// A realistic absolute future unix timestamp for directly-seeded rows' `expires_at` in this file
+/// — see `mailbox_client_ack.rs`'s identical constant/doc comment for why: every test below
+/// connects a REAL client, which triggers the REAL `ws::drain_mailbox` and its
+/// `expires_at > now_secs()` filter (task 9.3, review finding F5).
+const FAR_FUTURE_EXPIRES_AT: u64 = 9_999_999_999;
+
 /// Deliverable 3, case 1: a client with N queued rows receives exactly N `Deliver` frames with
 /// `mailbox_id` set, in `arrived_at`/`id` order, before any other traffic — proven by having a
 /// live message arrive strictly after the N mailbox-drained ones.
@@ -83,7 +89,7 @@ async fn mailbox_drain_delivers_queued_rows_in_order_before_other_traffic() {
     let mut ids = Vec::new();
     for (i, p) in payloads.iter().enumerate() {
         let id = store
-            .mailbox_enqueue(bob.pubkey, p.clone(), 100 + i as u64, 10_000)
+            .mailbox_enqueue(bob.pubkey, p.clone(), 100 + i as u64, FAR_FUTURE_EXPIRES_AT)
             .await
             .unwrap();
         ids.push(id);
@@ -123,11 +129,11 @@ async fn mailbox_ack_deletes_only_the_acked_rows_scoped_to_the_acking_account() 
     let alice = new_acct("localhost");
 
     let bob_id = store
-        .mailbox_enqueue(bob.pubkey, vec![1], 0, 10_000)
+        .mailbox_enqueue(bob.pubkey, vec![1], 0, FAR_FUTURE_EXPIRES_AT)
         .await
         .unwrap();
     let alice_id = store
-        .mailbox_enqueue(alice.pubkey, vec![2], 0, 10_000)
+        .mailbox_enqueue(alice.pubkey, vec![2], 0, FAR_FUTURE_EXPIRES_AT)
         .await
         .unwrap();
 
@@ -172,11 +178,11 @@ async fn unacked_rows_survive_and_are_redrained_on_reconnect() {
     let bob = new_acct("localhost");
 
     let id_a = store
-        .mailbox_enqueue(bob.pubkey, vec![1], 0, 10_000)
+        .mailbox_enqueue(bob.pubkey, vec![1], 0, FAR_FUTURE_EXPIRES_AT)
         .await
         .unwrap();
     let id_b = store
-        .mailbox_enqueue(bob.pubkey, vec![2], 1, 10_000)
+        .mailbox_enqueue(bob.pubkey, vec![2], 1, FAR_FUTURE_EXPIRES_AT)
         .await
         .unwrap();
 
