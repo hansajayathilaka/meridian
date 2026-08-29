@@ -87,7 +87,7 @@ fn three_offline_messages_to_a_new_contact_are_never_silently_lost() {
         "all three sends must complete: stdout={alice_out:?} stderr={alice_err:?}"
     );
 
-    let queued = tokio_test_block_on(store.mailbox_list_for_recipient(&bob_ik)).unwrap();
+    let queued = tokio_test_block_on(store.mailbox_list_for_recipient(&bob_ik, 0)).unwrap();
     assert_eq!(
         queued.len(),
         3,
@@ -118,7 +118,7 @@ fn three_offline_messages_to_a_new_contact_are_never_silently_lost() {
 
     // The load-bearing assertion this task exists for: rows 2 and 3 must still be sitting in the
     // mailbox, un-acked — not silently deleted despite never having been shown to bob.
-    let still_queued = tokio_test_block_on(store.mailbox_list_for_recipient(&bob_ik)).unwrap();
+    let still_queued = tokio_test_block_on(store.mailbox_list_for_recipient(&bob_ik, 0)).unwrap();
     assert_eq!(
         still_queued.len(),
         2,
@@ -146,7 +146,7 @@ fn three_offline_messages_to_a_new_contact_are_never_silently_lost() {
         "must arrive in original order: {bob_out2:?}"
     );
 
-    let final_queued = tokio_test_block_on(store.mailbox_list_for_recipient(&bob_ik)).unwrap();
+    let final_queued = tokio_test_block_on(store.mailbox_list_for_recipient(&bob_ik, 0)).unwrap();
     assert!(
         final_queued.is_empty(),
         "all three messages must be acked+deleted once genuinely delivered: {final_queued:?}"

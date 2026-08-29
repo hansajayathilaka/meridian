@@ -4,9 +4,13 @@
 //! (a query-time filter would satisfy a weaker, wrong reading while leaving stale ciphertext on
 //! disk indefinitely, an ADR 0007 violation: the TTL promise is about server-side data lifetime).
 //!
-//! `Store::mailbox_list_for_recipient`'s own `SELECT`/lookup never filters on `expires_at` at
-//! all (`store.rs`/`store/sqlite.rs`) — this purge job is the *only* place expiry is enforced, by
-//! construction, not merely by convention.
+//! This purge job is the *only* place expiry is physically enforced — the sole mechanism that
+//! reclaims storage. Since task 9.3 (review finding F5), `Store::mailbox_list_for_recipient` and
+//! `Store::mailbox_size_bytes_for_recipient` (`store.rs`/`store/sqlite.rs`) additionally filter to
+//! `expires_at > now` at query time, so a reconnecting recipient or quota check never *observes*
+//! an expired-but-not-yet-purged row — but that read-time filter is a bounded-staleness
+//! observation guard, not a substitute for this job: rows it hasn't yet reached still sit on disk
+//! until this purge physically deletes them.
 
 use std::sync::Arc;
 use std::time::Duration;

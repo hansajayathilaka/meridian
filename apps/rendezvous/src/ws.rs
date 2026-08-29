@@ -87,17 +87,48 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<AppState>, peer_ip: IpA
         }
     };
 
-    // 3) Drain any queued mailbox mail (task 8.7), before this connection is registered as
-    // reachable — so a live route arriving concurrently on another connection can never race with
-    // (and interleave ahead of or behind) this drain. "Before any other traffic" per this task's
-    // own Deliverable 3.
-    drain_mailbox(&state, &tx, &account_pub).await;
-
-    // 4) Serve the authenticated session.
+    // 3) Register the connection as reachable FIRST, then drain any queued mailbox mail (task 8.7)
+    // — task 9.4 (review finding F4) swapped this from the original drain-then-register order.
+    // That order left a real window between the drain finishing and `registry.add` running: a
+    // `Route` from a third party landing there found this recipient not-yet-registered, fell
+    // through to `queue_to_mailbox`, and then sat mailboxed until the recipient's NEXT reconnect —
+    // even though the recipient was already live in wall-clock terms by the time that `Route` was
+    // processed, silently contradicting "deliver on reconnect" for a message that in fact arrived
+    // after reconnect completed.
+    //
+    // Registering first closes that structurally: any `handle_route` live-delivery attempt
+    // (`deliver_one`, gated on `state.registry.is_connected`) that runs AFTER `registry.add` below
+    // returns finds this connection reachable and delivers straight to it — it can no longer
+    // observe "not yet registered" and fall through to the mailbox for a recipient that, in fact,
+    // already has a live connection.
     let conn_id = state.next_conn_id();
     state.registry.add(account_pub, conn_id, tx.clone());
     state.metrics.conn_opened();
 
+    // `drain_mailbox` below reads the mailbox under the SAME per-recipient `MailboxLocks` shard
+    // task 9.1 introduced for `mailbox_enqueue_with_quota`'s check-then-write (`state.mailbox_locks`,
+    // reused rather than inventing a second lock, per this task's own Scope) — not to catch every
+    // conceivable interleaving (closing `handle_route`'s own unlocked check-then-act fully would
+    // mean touching that path too, out of this task's Scope; see the task file's Risk note), but to
+    // give a definite before/after ordering against a concurrent SAME-recipient mailbox write that
+    // raced ahead of `registry.add` above and had already (correctly, at the time) decided this
+    // recipient was still offline: if that write is already committed by the time this drain
+    // acquires the lock, the drain observes and delivers it as part of THIS connect sequence rather
+    // than stranding it for the next one; if it is still in flight and wins the lock race, this
+    // drain simply waits for it to land first. `MailboxEntry` rows this drain reads are never
+    // re-delivered live by the racing `Route` itself in that case — `deliver_one`'s own
+    // `registry.is_connected` check already ran (and returned false) before that `Route` ever
+    // reached the lock, so there is exactly one delivery path per envelope, never both.
+    //
+    // The lock is held ONLY across the `mailbox_list_for_recipient` read inside `drain_mailbox`
+    // (see its own doc comment) — never across the per-row `send`s that follow. A prior version of
+    // this fix held the lock across the whole drain including those sends, which let one slow or
+    // adversarial reader (auth, then simply stop draining the socket) stall the lock indefinitely
+    // and block every other local/federated sender routing to this recipient, or to any other
+    // recipient sharing this shard, on `mailbox_enqueue_with_quota` (review re-check of this task).
+    drain_mailbox(&state, &tx, &account_pub).await;
+
+    // 4) Serve the authenticated session.
     serve(&state, &mut stream, &tx, &account_pub).await;
 
     // 5) Teardown.
@@ -192,15 +223,34 @@ async fn serve(
 }
 
 /// Task 8.7: push every row currently queued for `account_pub`, in `arrived_at`/`id` order, as
-/// `Deliver{from: MAILBOX_DRAIN_FROM_PLACEHOLDER, blob, mailbox_id: Some(id)}` — before this
-/// connection is registered as reachable (see the caller), so nothing else can interleave with the
-/// drain. Best-effort: a store failure here drops the connection to neither a half-drained mailbox
-/// state nor a stuck handshake — it's logged nowhere (no client-id logging) and simply skips the
-/// drain, exactly like every other `Store` failure in this module already fails closed to "try
-/// again next time" rather than wedging the connection.
+/// `Deliver{from: MAILBOX_DRAIN_FROM_PLACEHOLDER, blob, mailbox_id: Some(id)}`. Called by
+/// [`handle_socket`] AFTER this connection is registered as reachable (task 9.4 — see that call
+/// site's doc comment for why the order flipped from the original "drain, then register").
+///
+/// The recipient's `MailboxLocks` shard (task 9.1, reused here per task 9.4) is held ONLY across
+/// the `mailbox_list_for_recipient` read below — released before any row is sent to the client —
+/// so a concurrent same-recipient mailbox write racing this drain gets a definite before/after
+/// ordering against the READ (see the call site's doc comment for the full race analysis), without
+/// blocking that write, or any other sender's `mailbox_enqueue_with_quota` call sharing this
+/// shard, on this connection's own read pace over the network. Best-effort: a store failure here
+/// drops the connection to neither a half-drained mailbox state nor a stuck handshake — it's
+/// logged nowhere (no client-id logging) and simply skips the drain, exactly like every other
+/// `Store` failure in this module already fails closed to "try again next time" rather than
+/// wedging the connection.
 async fn drain_mailbox(state: &Arc<AppState>, tx: &mpsc::Sender<Message>, account_pub: &[u8; 32]) {
-    let Ok(rows) = state.store.mailbox_list_for_recipient(account_pub).await else {
-        return;
+    let rows = {
+        let _drain_guard = state.mailbox_locks.lock_recipient(account_pub).await;
+        // Task 9.3 (review finding F5): `now_secs()` excludes any row that has expired but not yet
+        // been physically reclaimed by the purge job — a reconnecting recipient must not receive
+        // an envelope that should already be gone.
+        match state
+            .store
+            .mailbox_list_for_recipient(account_pub, now_secs())
+            .await
+        {
+            Ok(rows) => rows,
+            Err(_) => return,
+        }
     };
     for row in rows {
         send(
@@ -217,10 +267,13 @@ async fn drain_mailbox(state: &Arc<AppState>, tx: &mpsc::Sender<Message>, accoun
     }
 }
 
-/// The maximum number of ids accepted in one `MailboxAck` — caps the SQL `IN (...)` clause
-/// `mailbox_delete_by_ids` builds so a very large, attacker-controlled `ids` list can't approach
-/// SQLite's `SQLITE_MAX_VARIABLE_NUMBER` (carried forward from task 8.2's review). **Not actually
-/// bounded by `config.mailbox.quota_mb` today** (task 8.7's review, should-fix, non-blocking):
+/// The maximum number of ids accepted in one `MailboxAck` — bounds how much work (and how many
+/// chunked `DELETE` statements, task 9.5) one ack can make the store do, and keeps a very large,
+/// attacker-controlled `ids` list from growing without limit (carried forward from task 8.2's
+/// review). The SQLite backend's `mailbox_delete_by_ids` chunks its `IN (...)` deletes into
+/// sub-999-bound-parameter batches internally (task 9.5) regardless of how many ids it is called
+/// with, so this cap is a request-size/work bound, not what keeps the delete itself safe. **Not
+/// actually bounded by `config.mailbox.quota_mb` today** (task 8.7's review, should-fix, non-blocking):
 /// quota is byte-based only, `Op::Route` has no per-message rate limit, and no per-recipient row
 /// count cap exists anywhere in 8.1/8.2/8.5/8.6 — a connected account can legitimately enqueue far
 /// more than this many tiny envelopes against one victim recipient while staying under the byte
@@ -504,6 +557,27 @@ async fn handle_route(
         }
     }
 
+    // Task 9.1 (review finding F1): local-route defense-in-depth size cap, matching the federated
+    // path's existing `MAX_FRAME_LEN` check (`federation::inbound::handle_fed_route`'s "architect
+    // decision #1" oversized-body check), which the local path lacked entirely before this task —
+    // an oversized envelope routed locally could previously reach `deliver_one`/the mailbox enqueue
+    // unchecked. Same error shape/code as the federated rejection: `error_codes::BAD_REQUEST`
+    // (`"bad_request"` on the wire, identical string to `fed_error_codes::BAD_REQUEST`) with the
+    // same message. This point is reached only for a LOCAL route (the federated branch above always
+    // returns first) — the federated path already gets its own equivalent cap from
+    // `route_foreign`'s pre-dial check plus B's own defense-in-depth check, unchanged by this task.
+    // Measured on `body.blob.0`'s raw length, the same quantity the federated check measures on
+    // `req.envelope`.
+    if body.blob.0.len() > crate::federation::link::MAX_FRAME_LEN {
+        return send_err(
+            tx,
+            frame.id,
+            error_codes::BAD_REQUEST,
+            "envelope too large to route",
+        )
+        .await;
+    }
+
     // Kept in case the recipient turns out to be offline and this falls through to the
     // mailbox-enqueue path below (T07) — both `deliver_one` and the tamper-hook plan below consume
     // `body.blob.0` regardless of whether the recipient is actually connected.
@@ -590,6 +664,7 @@ async fn queue_to_mailbox(
 ) {
     let outcome = crate::store::mailbox_enqueue_with_quota(
         state.store.as_ref(),
+        &state.mailbox_locks,
         recipient,
         blob,
         now_secs(),

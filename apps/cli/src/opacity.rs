@@ -505,7 +505,7 @@ async fn run_mailbox_at_rest_audit() -> Result<AuditReport, String> {
             .await
             .map_err(|e| format!("mailbox_enqueue: {e}"))?;
         let mut entries = store
-            .mailbox_list_for_recipient(&bob_ik)
+            .mailbox_list_for_recipient(&bob_ik, now)
             .await
             .map_err(|e| format!("mailbox_list_for_recipient: {e}"))?;
         entries.retain(|e| e.id == id1 || e.id == id2);

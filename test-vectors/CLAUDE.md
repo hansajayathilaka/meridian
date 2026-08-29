@@ -22,6 +22,8 @@ across all five targets (CLI/WASM/desktop/mobile). This is the "test" memory of 
   `Deliver.mailbox_id`, `MailboxAck`/`MailboxAckOk`, `error_codes::MAILBOX_FULL`) — the pre-8.3
   vectors stay byte-identical (locked by
   `apps/proto/tests/conformance.rs::pre_8_3_vectors_are_byte_identical_after_8_4_regeneration`).
+  Extended in task 9.8 (review finding F8) with `mailbox-ack-empty` (`MailboxAck{ids:[]}`, the
+  `0x80` CBOR empty-array shape), alongside the pre-existing non-empty `mailbox-ack` vector.
 
 `apps/crypto/tests/conformance.rs` re-derives the crypto-derivation vectors (x3dh/ratchet/envelope/
 safety-numbers) from the crate's real code and asserts byte equality — a vector that only "the

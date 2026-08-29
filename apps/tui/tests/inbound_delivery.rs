@@ -81,6 +81,15 @@ use meridian_tui::worker::{dispatch, run_inbound_loop, OnboardingSession};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
+/// A realistic absolute future unix timestamp for rows this file seeds directly into the mailbox
+/// via `Store::mailbox_enqueue` (rather than through a real offline route) — NOT a small offset
+/// from `arrived_at` (real production enqueue always computes an absolute `expires_at = now_secs()
+/// + ttl_secs`). Every test using this connects a REAL inbound loop (`spawn_inbound_loop`), which
+/// triggers the REAL server-side `ws::drain_mailbox` and its `expires_at > now_secs()` filter
+/// (task 9.3, review finding F5) — a small literal like `10_000` (year 1970) would make these rows
+///   look already-expired against the real wall clock and the drain would silently deliver nothing.
+const FAR_FUTURE_EXPIRES_AT: u64 = 9_999_999_999;
+
 // ---------------------------------------------------------------------------
 // `$MERIDIAN_HOME` + mock-keystore environment guard — mirrors
 // `tests/run_worker_chat.rs`'s own `EnvGuard` exactly.
@@ -888,7 +897,7 @@ async fn mailbox_drained_delivery_from_an_existing_session_files_under_the_real_
         )
         .expect("peer seal second");
     store
-        .mailbox_enqueue(us_pub, second_blob, 0, 10_000)
+        .mailbox_enqueue(us_pub, second_blob, 0, FAR_FUTURE_EXPIRES_AT)
         .await
         .expect("seed mailbox row");
     let _ = peer_client.close().await;
@@ -2242,7 +2251,7 @@ async fn x3dh_opening_message_delivered_via_mailbox_establishes_the_session_and_
 
     // Seed it directly into the mailbox — "us" is genuinely offline (never connected at all).
     store
-        .mailbox_enqueue(us_pub, opening_blob, 0, 10_000)
+        .mailbox_enqueue(us_pub, opening_blob, 0, FAR_FUTURE_EXPIRES_AT)
         .await
         .expect("seed mailbox row");
     let _ = peer_client.close().await;
@@ -2557,20 +2566,20 @@ async fn three_offline_messages_from_a_new_contact_are_never_silently_lost() {
     let blob3 = seal("msg 3");
 
     store
-        .mailbox_enqueue(us_pub, blob1, 0, 10_000)
+        .mailbox_enqueue(us_pub, blob1, 0, FAR_FUTURE_EXPIRES_AT)
         .await
         .expect("seed row 1");
     store
-        .mailbox_enqueue(us_pub, blob2, 0, 10_000)
+        .mailbox_enqueue(us_pub, blob2, 0, FAR_FUTURE_EXPIRES_AT)
         .await
         .expect("seed row 2");
     store
-        .mailbox_enqueue(us_pub, blob3, 0, 10_000)
+        .mailbox_enqueue(us_pub, blob3, 0, FAR_FUTURE_EXPIRES_AT)
         .await
         .expect("seed row 3");
     assert_eq!(
         store
-            .mailbox_list_for_recipient(&us_pub)
+            .mailbox_list_for_recipient(&us_pub, 0)
             .await
             .expect("list before drain")
             .len(),
@@ -2605,7 +2614,7 @@ async fn three_offline_messages_from_a_new_contact_are_never_silently_lost() {
     // The load-bearing assertion task 8.17 exists for: rows 2 and 3 must still be sitting in the
     // mailbox, unacked — not silently deleted despite never having been shown to the user.
     let still_queued = store
-        .mailbox_list_for_recipient(&us_pub)
+        .mailbox_list_for_recipient(&us_pub, 0)
         .await
         .expect("list after first drain");
     assert_eq!(
@@ -2656,7 +2665,7 @@ async fn three_offline_messages_from_a_new_contact_are_never_silently_lost() {
     }
 
     let final_queued = store
-        .mailbox_list_for_recipient(&us_pub)
+        .mailbox_list_for_recipient(&us_pub, 0)
         .await
         .expect("list after second drain");
     assert!(

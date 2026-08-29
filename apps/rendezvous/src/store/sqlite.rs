@@ -18,6 +18,14 @@ fn backend<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
+/// The maximum number of ids `mailbox_delete_by_ids` binds into a single `DELETE ... IN (...)`
+/// statement's parameter list (task 9.5). One additional bound parameter (`recipient_pub`) is
+/// always reserved alongside a batch's ids, so the total bound-parameter count per statement is
+/// this value plus 1 — chosen to stay safely under SQLite's conservative compile-time default
+/// `SQLITE_MAX_VARIABLE_NUMBER = 999` regardless of how the SQLite the server links against was
+/// built.
+const MAILBOX_DELETE_MAX_IDS_PER_BATCH: usize = 900;
+
 /// A persistent store backed by SQLite. `url` is a sqlx SQLite URL, e.g. `sqlite://rdv.db` or
 /// `sqlite::memory:`.
 pub struct SqliteStore {
@@ -183,12 +191,18 @@ impl Store for SqliteStore {
     async fn mailbox_list_for_recipient(
         &self,
         recipient_pub: &[u8; 32],
+        now: u64,
     ) -> StoreResult<Vec<MailboxEntry>> {
+        // Task 9.3 (review finding F5): `expires_at > ?2` excludes rows past their deadline that
+        // haven't been physically reclaimed yet by `mailbox_purge_expired`'s periodic pass — same
+        // "not yet expired" semantics as that method's own `expires_at <= now` deletion predicate,
+        // just inverted.
         let rows: Vec<(i64, Vec<u8>, Vec<u8>, i64, i64, i64)> = sqlx::query_as(
             "SELECT id, recipient_pub, blob, arrived_at, expires_at, size_bytes FROM mailbox \
-             WHERE recipient_pub = ?1 ORDER BY arrived_at ASC, id ASC",
+             WHERE recipient_pub = ?1 AND expires_at > ?2 ORDER BY arrived_at ASC, id ASC",
         )
         .bind(recipient_pub.as_slice())
+        .bind(now as i64)
         .fetch_all(&self.pool)
         .await
         .map_err(backend)?;
@@ -207,17 +221,32 @@ impl Store for SqliteStore {
         // no-op, never an error and never a cross-recipient deletion (8.7's `MailboxAck` handler
         // depends on this being safe to call with client-supplied ids — same contract as the
         // in-memory backend, task 8.1).
-        let mut qb: QueryBuilder<Sqlite> =
-            QueryBuilder::new("DELETE FROM mailbox WHERE recipient_pub = ");
-        qb.push_bind(recipient_pub.as_slice());
-        qb.push(" AND id IN (");
-        let mut separated = qb.separated(", ");
-        for id in ids {
-            separated.push_bind(*id as i64);
+        //
+        // Task 9.5: chunk into batches of at most `MAILBOX_DELETE_MAX_IDS_PER_BATCH` ids per
+        // statement. Each statement binds one parameter for `recipient_pub` plus one per id in
+        // the `IN (...)` list, so a single unchunked call for `ws.rs`'s full
+        // `MAILBOX_ACK_MAX_IDS` (4096) batch would bind 4097 parameters — comfortably past
+        // SQLite's conservative compile-time default `SQLITE_MAX_VARIABLE_NUMBER = 999` (older
+        // builds; newer builds default higher, but this crate must not assume that), which would
+        // turn the delete itself into a hard error and defeat the cap's whole purpose. Chunking
+        // keeps every statement's parameter count (1 recipient bind + up to
+        // `MAILBOX_DELETE_MAX_IDS_PER_BATCH` id binds) safely under 999 regardless of build
+        // configuration.
+        let mut deleted = 0u64;
+        for chunk in ids.chunks(MAILBOX_DELETE_MAX_IDS_PER_BATCH) {
+            let mut qb: QueryBuilder<Sqlite> =
+                QueryBuilder::new("DELETE FROM mailbox WHERE recipient_pub = ");
+            qb.push_bind(recipient_pub.as_slice());
+            qb.push(" AND id IN (");
+            let mut separated = qb.separated(", ");
+            for id in chunk {
+                separated.push_bind(*id as i64);
+            }
+            separated.push_unseparated(")");
+            let result = qb.build().execute(&self.pool).await.map_err(backend)?;
+            deleted += result.rows_affected();
         }
-        separated.push_unseparated(")");
-        let result = qb.build().execute(&self.pool).await.map_err(backend)?;
-        Ok(result.rows_affected())
+        Ok(deleted)
     }
 
     async fn mailbox_purge_expired(&self, now: u64) -> StoreResult<u64> {
@@ -229,11 +258,19 @@ impl Store for SqliteStore {
         Ok(result.rows_affected())
     }
 
-    async fn mailbox_size_bytes_for_recipient(&self, recipient_pub: &[u8; 32]) -> StoreResult<u64> {
+    async fn mailbox_size_bytes_for_recipient(
+        &self,
+        recipient_pub: &[u8; 32],
+        now: u64,
+    ) -> StoreResult<u64> {
+        // Same `expires_at > ?2` exclusion as `mailbox_list_for_recipient` above (task 9.3): an
+        // expired-but-unpurged row must not count toward quota accounting.
         let row: (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(size_bytes), 0) FROM mailbox WHERE recipient_pub = ?1",
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM mailbox \
+             WHERE recipient_pub = ?1 AND expires_at > ?2",
         )
         .bind(recipient_pub.as_slice())
+        .bind(now as i64)
         .fetch_one(&self.pool)
         .await
         .map_err(backend)?;
@@ -261,7 +298,12 @@ fn row_to_entry(row: (i64, Vec<u8>, Vec<u8>, i64, i64, i64)) -> StoreResult<Mail
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::store::{
+        mailbox_enqueue_with_quota, MailboxEnqueueOutcome, MailboxLocks, MAILBOX_QUOTA_BYTES_PER_MB,
+    };
     use meridian_proto::BUNDLE_VERSION;
 
     fn bundle(key: [u8; 32], otks: usize) -> PrekeyBundle {
@@ -317,7 +359,10 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        let entries = store
+            .mailbox_list_for_recipient(&recipient, 0)
+            .await
+            .unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, id_a);
         assert_eq!(entries[0].blob, vec![1, 2, 3]);
@@ -343,7 +388,10 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        let entries = store
+            .mailbox_list_for_recipient(&recipient, 0)
+            .await
+            .unwrap();
         assert_eq!(
             entries.iter().map(|e| e.id).collect::<Vec<_>>(),
             vec![id_a, id_b]
@@ -374,14 +422,18 @@ mod tests {
         assert_eq!(deleted, 0);
         assert_eq!(
             store
-                .mailbox_list_for_recipient(&alice)
+                .mailbox_list_for_recipient(&alice, 0)
                 .await
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
-            store.mailbox_list_for_recipient(&bob).await.unwrap().len(),
+            store
+                .mailbox_list_for_recipient(&bob, 0)
+                .await
+                .unwrap()
+                .len(),
             1
         );
 
@@ -389,13 +441,13 @@ mod tests {
         let deleted = store.mailbox_delete_by_ids(&bob, &[bob_id]).await.unwrap();
         assert_eq!(deleted, 1);
         assert!(store
-            .mailbox_list_for_recipient(&bob)
+            .mailbox_list_for_recipient(&bob, 0)
             .await
             .unwrap()
             .is_empty());
         assert_eq!(
             store
-                .mailbox_list_for_recipient(&alice)
+                .mailbox_list_for_recipient(&alice, 0)
                 .await
                 .unwrap()
                 .len(),
@@ -416,6 +468,37 @@ mod tests {
         assert_eq!(deleted, 0);
     }
 
+    /// Task 9.5: a single `mailbox_delete_by_ids` call with a batch as large as `ws.rs`'s
+    /// `MAILBOX_ACK_MAX_IDS` (4096) must succeed against real SQLite in one call, not error out —
+    /// this is the direct proof that internal chunking (`MAILBOX_DELETE_MAX_IDS_PER_BATCH`) keeps
+    /// every one of the multiple `DELETE` statements it issues under SQLite's bound-parameter
+    /// limit, covering the exact 4097-bound-parameter shape (4096 ids + 1 recipient bind) that a
+    /// full, unchunked `MailboxAck` batch would otherwise produce.
+    #[tokio::test]
+    async fn mailbox_delete_by_ids_handles_a_full_mailbox_ack_max_ids_batch_in_one_call() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let recipient = [5u8; 32];
+
+        const MAILBOX_ACK_MAX_IDS: u64 = 4096;
+        let mut ids = Vec::with_capacity(MAILBOX_ACK_MAX_IDS as usize);
+        for i in 0..MAILBOX_ACK_MAX_IDS {
+            let id = store
+                .mailbox_enqueue(recipient, vec![i as u8], i, i + 1_000)
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        assert_eq!(ids.len(), MAILBOX_ACK_MAX_IDS as usize);
+
+        let deleted = store.mailbox_delete_by_ids(&recipient, &ids).await.unwrap();
+        assert_eq!(deleted, MAILBOX_ACK_MAX_IDS);
+        assert!(store
+            .mailbox_list_for_recipient(&recipient, 0)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn mailbox_purge_expired_removes_only_rows_past_their_deadline() {
         let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
@@ -433,7 +516,11 @@ mod tests {
         let purged = store.mailbox_purge_expired(500).await.unwrap();
         assert_eq!(purged, 1);
 
-        let remaining = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        // Same `now` (500) as the purge pass above — see `store.rs`'s identical comment for why.
+        let remaining = store
+            .mailbox_list_for_recipient(&recipient, 500)
+            .await
+            .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, fresh_id);
         assert_ne!(remaining[0].id, expired_id);
@@ -460,22 +547,125 @@ mod tests {
 
         assert_eq!(
             store
-                .mailbox_size_bytes_for_recipient(&alice)
+                .mailbox_size_bytes_for_recipient(&alice, 0)
                 .await
                 .unwrap(),
             150
         );
         assert_eq!(
-            store.mailbox_size_bytes_for_recipient(&bob).await.unwrap(),
+            store
+                .mailbox_size_bytes_for_recipient(&bob, 0)
+                .await
+                .unwrap(),
             7
         );
         // A recipient with no mailbox at all sums to zero, not an error.
         assert_eq!(
             store
-                .mailbox_size_bytes_for_recipient(&[9u8; 32])
+                .mailbox_size_bytes_for_recipient(&[9u8; 32], 0)
                 .await
                 .unwrap(),
             0
+        );
+    }
+
+    // -- task 9.3: `expires_at` read filter (review finding F5) --------------------------------
+    //
+    // Mirrors `store.rs`'s `MemoryStore` version of these tests exactly, proving the filter
+    // behaves identically for the SQLite backend. `mailbox_purge_expired` is never called in
+    // either test below — the row that "should already be gone" is still physically present,
+    // proving the filter (not the purge job) is what excludes it.
+
+    #[tokio::test]
+    async fn mailbox_list_for_recipient_excludes_expired_but_unpurged_rows() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let recipient = [13u8; 32];
+
+        let live_id = store
+            .mailbox_enqueue(recipient, vec![1], 0, 1_000)
+            .await
+            .unwrap();
+        // Past its deadline relative to `now` below, but never purged in this test.
+        let expired_id = store
+            .mailbox_enqueue(recipient, vec![2], 0, 100)
+            .await
+            .unwrap();
+
+        let now = 500; // > expired's expires_at (100), < live's expires_at (1_000)
+        let entries = store
+            .mailbox_list_for_recipient(&recipient, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![live_id],
+            "an expired-but-unpurged row must not be observed by a list/drain call, even though \
+             it is still physically present — expired_id={expired_id} must be absent"
+        );
+
+        // Belt-and-suspenders: the row really is still there, just not surfaced by the filtered
+        // read above — proving this is a read-time filter, not an accidental purge side effect.
+        assert_eq!(
+            store.mailbox_purge_expired(0).await.unwrap(),
+            0,
+            "no purge pass ran in this test — the row's continued physical presence below is not \
+             explained by an unrelated deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_size_bytes_for_recipient_ignores_expired_unpurged_bytes() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let recipient = [14u8; 32];
+
+        store
+            .mailbox_enqueue(recipient, vec![0u8; 40], 0, 1_000) // live
+            .await
+            .unwrap();
+        store
+            .mailbox_enqueue(recipient, vec![0u8; 999_999], 0, 100) // expired, unpurged
+            .await
+            .unwrap();
+
+        let now = 500;
+        assert_eq!(
+            store
+                .mailbox_size_bytes_for_recipient(&recipient, now)
+                .await
+                .unwrap(),
+            40,
+            "the large expired-but-unpurged row must not count toward quota accounting"
+        );
+    }
+
+    /// End-to-end through [`mailbox_enqueue_with_quota`] itself (not just the raw size read
+    /// above): a huge expired-unpurged row must not cause a spurious `mailbox_full` for a new,
+    /// small enqueue that easily fits within `quota_mb` once the expired bytes are correctly
+    /// excluded.
+    #[tokio::test]
+    async fn mailbox_enqueue_with_quota_ignores_expired_unpurged_bytes_against_the_cap() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let locks = MailboxLocks::default();
+        let recipient = [15u8; 32];
+        let quota_mb: u32 = 1;
+        let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
+
+        // Already exceeds the 1 MiB quota on its own, but expired as of `now` below and never
+        // purged — without the fix, this would wrongly count toward quota and reject the enqueue.
+        store
+            .mailbox_enqueue(recipient, vec![0u8; (quota_bytes + 1) as usize], 0, 100)
+            .await
+            .unwrap();
+
+        let now = 500; // > the pre-filled row's expires_at (100)
+        let outcome =
+            mailbox_enqueue_with_quota(&store, &locks, recipient, vec![0u8; 10], now, 14, quota_mb)
+                .await
+                .unwrap();
+        assert!(
+            matches!(outcome, MailboxEnqueueOutcome::Queued(_)),
+            "an expired-but-unpurged row must not count toward quota_mb — this enqueue should \
+             have fit"
         );
     }
 
@@ -497,8 +687,152 @@ mod tests {
         } // pool dropped here — simulates process exit.
 
         let store = SqliteStore::connect(&url).await.unwrap();
-        let entries = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        let entries = store
+            .mailbox_list_for_recipient(&recipient, 0)
+            .await
+            .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].blob, vec![42, 43]);
+    }
+
+    // -- task 9.1: mailbox quota check-then-write race (review finding F1) -----------------------
+    //
+    // Mirrors `store.rs`'s `MemoryStore` version of this test exactly (same recipient/quota/
+    // envelope-size/concurrency shape), proving [`MailboxLocks`] closes the race identically for
+    // the SQLite backend — pooled connections sharing one `sqlite::memory:` cache, same as a real
+    // multi-connection deployment would see.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn mailbox_enqueue_with_quota_races_at_one_recipient_never_overrun_by_more_than_one_envelope(
+    ) {
+        let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+        let locks = Arc::new(MailboxLocks::default());
+        let recipient = [42u8; 32];
+        let quota_mb: u32 = 1; // 1 MiB — fits exactly one near-maximal envelope, never two.
+        let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
+        let envelope_size: usize = 1_000_000;
+        let concurrency = 24;
+
+        let mut handles = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let store = store.clone();
+            let locks = locks.clone();
+            handles.push(tokio::spawn(async move {
+                mailbox_enqueue_with_quota(
+                    store.as_ref(),
+                    locks.as_ref(),
+                    recipient,
+                    vec![0u8; envelope_size],
+                    0,
+                    14,
+                    quota_mb,
+                )
+                .await
+                .unwrap()
+            }));
+        }
+
+        let mut queued = 0usize;
+        let mut quota_exceeded = 0usize;
+        for h in handles {
+            match h.await.unwrap() {
+                MailboxEnqueueOutcome::Queued(_) => queued += 1,
+                MailboxEnqueueOutcome::QuotaExceeded => quota_exceeded += 1,
+            }
+        }
+        assert_eq!(queued + quota_exceeded, concurrency);
+
+        // `now=0`: matches the `now=0` every racer above passed to `mailbox_enqueue_with_quota`
+        // (so `expires_at = 0 + 14 days`, always `> 0`) — see `store.rs`'s identical comment.
+        let total = store
+            .mailbox_size_bytes_for_recipient(&recipient, 0)
+            .await
+            .unwrap();
+        assert!(
+            total <= quota_bytes + envelope_size as u64,
+            "concurrent same-recipient enqueues overran quota_mb by more than one envelope's \
+             worth: total={total} quota_bytes={quota_bytes} envelope_size={envelope_size} \
+             queued={queued}"
+        );
+        assert!(
+            queued >= 1,
+            "at least one racer should have fit before the quota filled"
+        );
+        assert!(
+            queued < concurrency,
+            "quota must actually have been enforced — not every racer can have queued \
+             (queued={queued} of {concurrency})"
+        );
+    }
+
+    // -- task 9.2: quota exact-at-cap boundary (review finding F6) --------------------------------
+    //
+    // Mirrors `store.rs`'s `MemoryStore` version of these two tests exactly (same recipient/quota
+    // shape), proving the boundary behaves identically for the SQLite backend.
+
+    #[tokio::test]
+    async fn mailbox_enqueue_with_quota_allows_filling_the_quota_exactly() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let locks = MailboxLocks::default();
+        let recipient = [11u8; 32];
+        let quota_mb: u32 = 1;
+        let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
+
+        // Pre-fill directly (bypassing the quota gate, which isn't under test here) to
+        // `quota_bytes - 10`, so the `mailbox_enqueue_with_quota` call below with a 10-byte blob
+        // lands EXACTLY at the boundary: `current_bytes + blob.len() == quota_bytes`.
+        store
+            .mailbox_enqueue(recipient, vec![0u8; (quota_bytes - 10) as usize], 0, 1_000)
+            .await
+            .unwrap();
+
+        let outcome =
+            mailbox_enqueue_with_quota(&store, &locks, recipient, vec![0u8; 10], 0, 14, quota_mb)
+                .await
+                .unwrap();
+        assert!(
+            matches!(outcome, MailboxEnqueueOutcome::Queued(_)),
+            "filling the quota exactly must be allowed (strict `>` comparison, not `>=`)"
+        );
+        assert_eq!(
+            store
+                .mailbox_size_bytes_for_recipient(&recipient, 0)
+                .await
+                .unwrap(),
+            quota_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_enqueue_with_quota_rejects_one_byte_over_the_quota() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let locks = MailboxLocks::default();
+        let recipient = [12u8; 32];
+        let quota_mb: u32 = 1;
+        let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
+
+        // Pre-fill directly to exactly `quota_bytes`, so the next call's
+        // `current_bytes + blob.len()` is `quota_bytes + 1` — one byte over.
+        store
+            .mailbox_enqueue(recipient, vec![0u8; quota_bytes as usize], 0, 1_000)
+            .await
+            .unwrap();
+
+        let outcome =
+            mailbox_enqueue_with_quota(&store, &locks, recipient, vec![0u8; 1], 0, 14, quota_mb)
+                .await
+                .unwrap();
+        assert!(
+            matches!(outcome, MailboxEnqueueOutcome::QuotaExceeded),
+            "one byte past the quota must be rejected"
+        );
+        // The rejected attempt wrote nothing.
+        assert_eq!(
+            store
+                .mailbox_size_bytes_for_recipient(&recipient, 0)
+                .await
+                .unwrap(),
+            quota_bytes
+        );
     }
 }

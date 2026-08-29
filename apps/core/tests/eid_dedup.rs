@@ -544,3 +544,91 @@ proptest! {
         }
     }
 }
+
+// -- 5. property coverage of the MAILBOX-DRAIN path, including mixed live/mailbox arrival order
+//       (task 9.10, N3) --------------------------------------------------------------------------
+//
+// Cell 4 above (task 7.4) only ever calls `recv_raw` — the live path, `mailbox_drained: false`.
+// This block generalizes cell 1b's fixed mailbox-redelivery scenario
+// (`mailbox_drained_redelivery_is_still_caught_by_eid_dedup`) the same way task 7.4 generalized
+// cell 1: across randomized, proptest-generated delivery sequences, and additionally lets EACH
+// delivery in a sequence independently choose to arrive via the live path or the mailbox-drain
+// path — covering the mixed-arrival-order case the task calls out by name (e.g. a message
+// delivered once live, then redelivered via a later mailbox drain after a session hiccup, or the
+// reverse: first drained from the mailbox, then redelivered live by a confused relay). Per ADR
+// 0024, `mailbox_drained: true` skips only the `sender_pub != from` check — `eid` dedup itself is
+// keyed purely off `envelope.eid`, with no path-specific carve-out — so this proptest's two
+// invariants are IDENTICAL to cell 4's, regardless of which path (or which MIX of paths) a given
+// index's occurrences arrive over:
+//
+//   1. Every FIRST occurrence of an index, on EITHER path, must succeed; every REPEAT occurrence,
+//      on EITHER path (including a path switch from the first occurrence), must be
+//      `Err(ChatError::DuplicateEnvelope)`.
+//   2. `seen_eids_len` never exceeds `MAX_SEEN_EIDS` and, since `n` never approaches the cap,
+//      tracks the number of distinct successfully-delivered indices exactly — same as cell 4.
+//
+// This is new coverage, not a restatement of cell 4: the ADR 0024 sender-check bypass is exactly
+// the surface a hypothetical dedup bug tied to the (now-skipped) `sender_pub != from` check, or to
+// `from` itself leaking into the dedup key, would show up on — and cell 4 alone provides no
+// evidence either way, since it never calls `recv_raw_mailbox`.
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(12))]
+
+    /// For every `(n, delivery_order)` pair — `n` distinct fresh envelopes and a random sequence of
+    /// `(index, via_mailbox)` pairs (repeats allowed, any order, either path per occurrence) —
+    /// dedup and the `seen_eids_len` bound hold exactly as cell 4 proves for the live-only path.
+    #[test]
+    fn eid_dedup_holds_under_random_interleavings_mixed_live_and_mailbox(
+        (n, delivery_order) in (2usize..=6).prop_flat_map(|n| {
+            (
+                Just(n),
+                proptest::collection::vec((0..n, proptest::bool::ANY), 6..=24),
+            )
+        })
+    ) {
+        let (alice, mut bob, _bob_ik, envelopes) = confirmed_session_with_envelopes(n);
+        // `recv_raw_mailbox`'s `from` is never checked against `envelope.sender_pub` (that's the
+        // whole point of `mailbox_drained: true`), so any fixed placeholder works here — using the
+        // real mailbox wire placeholder keeps this cell faithful to the actual
+        // `open_inbound_from_mailbox` call shape (see `Party::recv_raw_mailbox`'s own doc comment).
+        const PLACEHOLDER: [u8; 32] = [0u8; 32];
+
+        let mut delivered: HashSet<usize> = HashSet::new();
+
+        for (idx, via_mailbox) in delivery_order {
+            let outcome = if via_mailbox {
+                bob.recv_raw_mailbox(&PLACEHOLDER, &envelopes[idx])
+            } else {
+                bob.recv_raw(&alice.ik(), &envelopes[idx])
+            };
+
+            if delivered.insert(idx) {
+                prop_assert!(
+                    outcome.is_ok(),
+                    "a not-yet-delivered envelope (index {idx}, via_mailbox={via_mailbox}) must \
+                     succeed, got {outcome:?}"
+                );
+            } else {
+                prop_assert!(
+                    matches!(outcome, Err(ChatError::DuplicateEnvelope)),
+                    "a redelivery of already-delivered index {idx} (via_mailbox={via_mailbox}, \
+                     possibly on the OTHER path than its first delivery) must be \
+                     Err(ChatError::DuplicateEnvelope), got {outcome:?}"
+                );
+            }
+
+            let len = seen_eids_len(&bob.state);
+            prop_assert!(
+                len <= MAX_SEEN_EIDS,
+                "seen_eids_len ({len}) must never exceed MAX_SEEN_EIDS ({MAX_SEEN_EIDS})"
+            );
+            prop_assert_eq!(
+                len,
+                1 + delivered.len(),
+                "below the cap, seen_eids_len must equal exactly one entry per distinct \
+                 successful decrypt, regardless of which path(s) delivered it"
+            );
+        }
+    }
+}

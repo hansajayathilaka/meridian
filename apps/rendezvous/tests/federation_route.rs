@@ -40,7 +40,7 @@ use meridian_rendezvous::federation::{dial, Discovery, DiscoveryError, Endpoint}
 use meridian_rendezvous::federation::{FederationLimits, FederationListener, FederationPolicy};
 use meridian_rendezvous::metrics::Metrics;
 use meridian_rendezvous::state::Registry;
-use meridian_rendezvous::{AppState, MemoryStore, Store};
+use meridian_rendezvous::{AppState, MailboxLocks, MemoryStore, Store};
 use meridian_signaling::SignalError;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -217,6 +217,7 @@ async fn bs_defense_in_depth_oversized_check_rejects_directly() {
     let metrics = Metrics::new();
     let store = MemoryStore::new();
     let mailbox = Mailbox::default();
+    let mailbox_locks = MailboxLocks::default();
     let err = handle_fed_route(
         &registry,
         &policy,
@@ -225,6 +226,7 @@ async fn bs_defense_in_depth_oversized_check_rejects_directly() {
             metrics: &metrics,
             store: &store,
             mailbox: &mailbox,
+            mailbox_locks: &mailbox_locks,
         },
         &["org-a.test".to_string()],
         "org-a.test",
@@ -267,6 +269,7 @@ async fn federated_route_to_offline_recipient_enqueues_and_still_reports_ok() {
     let limits = FederationLimits::new(300, 600, 30, 300);
     let store = MemoryStore::new();
     let mailbox = Mailbox::default(); // ttl_days=14, quota_mb=50 — plenty of room
+    let mailbox_locks = MailboxLocks::default();
     let bob = [0x33u8; 32];
     let payload = b"queued while bob was offline".to_vec();
     let req = FedRoute {
@@ -283,6 +286,7 @@ async fn federated_route_to_offline_recipient_enqueues_and_still_reports_ok() {
             metrics: &Metrics::new(),
             store: &store,
             mailbox: &mailbox,
+            mailbox_locks: &mailbox_locks,
         },
         &["org-a.test".to_string()],
         "org-a.test",
@@ -295,7 +299,7 @@ async fn federated_route_to_offline_recipient_enqueues_and_still_reports_ok() {
          fire-and-forget-on-success — got {result:?}"
     );
 
-    let rows = store.mailbox_list_for_recipient(&bob).await.unwrap();
+    let rows = store.mailbox_list_for_recipient(&bob, 0).await.unwrap();
     assert_eq!(rows.len(), 1, "the envelope must actually be durable now");
     assert_eq!(rows[0].blob, payload);
 }
@@ -318,6 +322,7 @@ async fn federated_route_to_offline_recipient_over_quota_is_rejected() {
         quota_mb: 0, // any non-empty enqueue immediately exceeds a zero quota
         ..Mailbox::default()
     };
+    let mailbox_locks = MailboxLocks::default();
     let bob = [0x44u8; 32];
     let req = FedRoute {
         to: bob,
@@ -333,6 +338,7 @@ async fn federated_route_to_offline_recipient_over_quota_is_rejected() {
             metrics: &Metrics::new(),
             store: &store,
             mailbox: &mailbox,
+            mailbox_locks: &mailbox_locks,
         },
         &["org-a.test".to_string()],
         "org-a.test",
@@ -343,7 +349,10 @@ async fn federated_route_to_offline_recipient_over_quota_is_rejected() {
     assert_eq!(err.code, fed_error_codes::MAILBOX_FULL);
 
     assert_eq!(
-        store.mailbox_size_bytes_for_recipient(&bob).await.unwrap(),
+        store
+            .mailbox_size_bytes_for_recipient(&bob, 0)
+            .await
+            .unwrap(),
         0,
         "a quota-rejected federated route must not create a row"
     );

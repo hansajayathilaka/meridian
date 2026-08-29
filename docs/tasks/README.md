@@ -180,12 +180,59 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   exercise the final race-fixed/TTL-filtered code paths from 9.1/9.3. N2 (the unregistered-metrics
   reminder) was **not** converted — stays an unowned carry-forward for T14's own future task file, per
   the report's own verdict. Full breakdown: [phase-9/README.md](./phase-9/README.md#tasks-todo).
-- **NEXT:** `/next-task` — work Phase 9's fix-tasks, 9.1 first. The Phase-1 adversarial frontier remains
-  an unowned carry-forward for a future `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08
+- **NOW:** **Phase 9 (review of Phase 8) is closed — 10/10 fix-tasks done** (9.1–9.10), one
+  `/next-task all` batch run, one commit per task (plus small same-task follow-up commits where a
+  review round found something to fix), reviewed throughout by each task's named lens(es). **9.1**
+  (F1, the phase's top-priority DoS fix) serialized the mailbox quota check-and-enqueue via a new
+  256-shard `MailboxLocks` primitive and capped local-route envelope size; its first review round
+  found a genuine blocking defect (the lock held across network sends, letting a slow/adversarial
+  reader stall it indefinitely) fixed in a same-task follow-up commit, re-reviewed clean. **9.2**
+  added the quota exact-at-cap boundary tests. **9.3** filtered `expires_at` on mailbox reads (F5)
+  and, in its own follow-up commit, fixed several pre-existing tests that had been silently relying
+  on an already-expired placeholder timestamp. **9.4** (F4) fixed the drain/registration race by
+  reusing 9.1's lock, reusing the same lock-scope-narrowing lesson 9.1's own review had just
+  surfaced. **9.5** (F2) chunked `MailboxAck` deletes under SQLite's conservative parameter limit.
+  **9.6** (F3) ratified `Deliver.mailbox_id`'s client trust boundary (mirroring ADR 0024's
+  reasoning for the sibling `Deliver.from` field) rather than adding wire-level validation. **9.7**
+  (F7) added the federated-path `ttl_days == 0` test, correcting the task file's own shorthand
+  after tracing the actual fire-and-forget contract to Phase 8's architect consult. **9.8** (F8)
+  locked the `MailboxAck{ids:[]}` conformance vector, and its review corrected a factually wrong
+  reachability claim in the vector's own comment. **9.9** (N1) added `Mailbox::validate`,
+  deliberately asymmetric with `Federation::validate`'s pattern for a verified reason. **9.10**
+  bundled three independent test-coverage nits (N3–N5): an `eid`-dedup proptest extended to the
+  mailbox-drain path, `purge_loop` scheduling coverage, and a double-ack no-op test — closing the
+  phase. Every task's named reviewer(s) signed off PASS with zero blocking findings surviving any
+  task's final review round; every should-fix that came up was either closed in the same commit or
+  explicitly recorded as a documented, non-blocking residual rather than silently dropped (9.1's
+  wire-test determinism gap and untested local/federated cross-serialization claim; 9.4's
+  `handle_route` check-then-act residual, now a tracked carry-forward below; 9.5's cross-chunk
+  non-atomicity and this sandbox's SQLite not enforcing the parameter limit the fix defends against;
+  9.9's related-but-out-of-scope `purge_interval_secs == 0` footgun). N2 stays an unowned
+  carry-forward for T14's own future task file, per the report's own verdict. Tree green
+  workspace-wide (`cargo build --workspace`, `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, `tools/check-docs.sh`,
+  `tools/lint-server-no-core.sh`). Draft PR carrying all commits:
+  [#87](https://github.com/hansajayathilaka/meridian/pull/87). Full closure summary:
+  [phase-9/README.md](./phase-9/README.md#exit-criteria).
+- **NEXT:** `/pick-next-phase` — T14 is now unblocked (Phase 9's own verdict was already "green to
+  proceed," and its fix-tasks are now closed too). The Phase-1 adversarial frontier remains an
+  unowned carry-forward for a future `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08
   residuals are Phase-4-scoped follow-ups and stay listed below for a future phase.
 
 
 ### Live carry-forwards (not owned by any open task)
+- **`handle_route`'s connectivity-check-then-mailbox-write is still two unlocked steps** (found by
+  task 9.4's own review, re-checking its fix for F4). 9.4 closed the specific race it targeted (a
+  `Route` landing between `drain_mailbox` finishing and `registry.add` running), but `handle_route`
+  itself (`apps/rendezvous/src/ws.rs`) checks `state.registry.is_connected`/delivers, or falls
+  through to `queue_to_mailbox`, without holding the recipient's `MailboxLocks` shard across both
+  steps — deliberately out of 9.4's declared "connection-setup sequence only" scope (see that task's
+  own doc comment in `ws.rs::handle_socket`). A narrower version of F4 remains possible in principle:
+  a message can still land in a recipient's mailbox after that recipient's own reconnect-drain has
+  already run, if `handle_route`'s check and write straddle the drain narrowly enough. No open task
+  owns closing this; pick up via a future `/plan-phase` if it proves more than theoretical (e.g. under
+  a live adversarial harness), which would mean threading `MailboxLocks` through `handle_route`'s own
+  check-then-act, not just connection-setup.
 - **RESOLVED into Phase 9's review — `MailboxAck`'s 4096-id cap is reachable, not merely theoretical**
   (originally task 8.7's review). Phase 9's sweep re-examined this and confirmed it non-blocking (no
   cross-account harm — `mailbox_delete_by_ids` scopes by `(recipient_pub, id)`, no existence oracle —
@@ -632,16 +679,16 @@ mailbox-drain `Deliver.from` sentinel) was already ratified as ADR 0024 during t
 **Verdict: green to proceed — T14 is not blocked.** 10 fix-tasks (9.1–9.10) planned by the **planner**
 agent; landing order and dependencies: [phase-9/README.md](./phase-9/README.md#tasks-todo).
 
-- [ ] **9.1** Serialize mailbox quota check-and-enqueue; cap local route envelope size (F1) — [file](./phase-9/9.1-mailbox-quota-race-and-local-size-cap.md)
-- [ ] **9.2** Quota exact-at-cap boundary test (F6; depends on 9.1) — [file](./phase-9/9.2-mailbox-quota-boundary-test.md)
-- [ ] **9.3** Filter `expires_at` on mailbox reads (F5; soft-depends on 9.1) — [file](./phase-9/9.3-mailbox-expires-at-read-filter.md)
-- [ ] **9.4** Fix drain/registration race window (F4; soft-depends on 9.1) — [file](./phase-9/9.4-mailbox-drain-registration-race.md)
-- [ ] **9.5** Chunk `MailboxAck` delete into sub-999-parameter batches (F2) — [file](./phase-9/9.5-mailbox-ack-chunk-delete.md)
-- [ ] **9.6** Document/validate client trust in `Deliver.mailbox_id` (F3) — [file](./phase-9/9.6-mailbox-id-client-trust-boundary.md)
-- [ ] **9.7** Federated-path `ttl_days == 0` test (F7) — [file](./phase-9/9.7-federated-ttl-zero-test.md)
-- [ ] **9.8** Lock `MailboxAck{ids:[]}` conformance vector (F8) — [file](./phase-9/9.8-mailbox-ack-empty-conformance-vector.md)
-- [ ] **9.9** Add `Mailbox::validate` config check (N1) — [file](./phase-9/9.9-mailbox-config-validate.md)
-- [ ] **9.10** Nit sweep: mailbox-drain proptest, `purge_loop` coverage, double-ack no-op test (N3, N4, N5; soft-depends on 9.1, 9.3) — [file](./phase-9/9.10-phase-9-nit-sweep.md)
+- [x] **9.1** Serialize mailbox quota check-and-enqueue; cap local route envelope size (F1) — [file](./phase-9/9.1-mailbox-quota-race-and-local-size-cap.md)
+- [x] **9.2** Quota exact-at-cap boundary test (F6; depends on 9.1) — [file](./phase-9/9.2-mailbox-quota-boundary-test.md)
+- [x] **9.3** Filter `expires_at` on mailbox reads (F5; soft-depends on 9.1) — [file](./phase-9/9.3-mailbox-expires-at-read-filter.md)
+- [x] **9.4** Fix drain/registration race window (F4; soft-depends on 9.1) — [file](./phase-9/9.4-mailbox-drain-registration-race.md)
+- [x] **9.5** Chunk `MailboxAck` delete into sub-999-parameter batches (F2) — [file](./phase-9/9.5-mailbox-ack-chunk-delete.md)
+- [x] **9.6** Document/validate client trust in `Deliver.mailbox_id` (F3) — [file](./phase-9/9.6-mailbox-id-client-trust-boundary.md)
+- [x] **9.7** Federated-path `ttl_days == 0` test (F7) — [file](./phase-9/9.7-federated-ttl-zero-test.md)
+- [x] **9.8** Lock `MailboxAck{ids:[]}` conformance vector (F8) — [file](./phase-9/9.8-mailbox-ack-empty-conformance-vector.md)
+- [x] **9.9** Add `Mailbox::validate` config check (N1) — [file](./phase-9/9.9-mailbox-config-validate.md)
+- [~] **9.10** Nit sweep: mailbox-drain proptest, `purge_loop` coverage, double-ack no-op test (N3, N4, N5; soft-depends on 9.1, 9.3) — [file](./phase-9/9.10-phase-9-nit-sweep.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.

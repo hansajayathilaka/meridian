@@ -89,7 +89,7 @@ async fn main() {
                 }
             };
             let store = default_store(&config).await;
-            match meridian_admin::dump_mailbox(store.as_ref(), recipient).await {
+            match meridian_admin::dump_mailbox(store.as_ref(), recipient, now_unix()).await {
                 Ok(out) => print!("{out}"),
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -124,6 +124,18 @@ fn require_existing_database(config: &meridian_rendezvous::Config) -> Result<(),
         ));
     }
     Ok(())
+}
+
+/// Wall-clock unix seconds — the `now` [`meridian_admin::dump_mailbox`] filters
+/// expired-but-not-yet-purged rows against (task 9.3). This binary has no injected/mocked clock
+/// (it's a one-shot inspection tool, not a long-running server with a test harness), so a direct
+/// `SystemTime::now()` read is appropriate here, unlike the store-layer methods it calls into,
+/// which keep `now` caller-injected for testability.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Parse a raw account public key argument: 64 hex chars / 32 bytes. Errors cleanly (never

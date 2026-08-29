@@ -21,8 +21,19 @@ use meridian_rendezvous::Store;
 /// place this crate calls into [`Store`] at all — [`Store::mailbox_list_for_recipient`], nothing
 /// else (no ack/delete, no enqueue: this tool is read-only by construction, matching the task
 /// file's "read-only access — no new store methods" scope).
-pub async fn dump_mailbox(store: &dyn Store, recipient: [u8; 32]) -> Result<String, StoreError> {
-    let entries = store.mailbox_list_for_recipient(&recipient).await?;
+///
+/// `now` (unix seconds) is caller-injected, same rationale as the `Store` trait's own
+/// `mailbox_enqueue`/`mailbox_list_for_recipient` doc comments — task 9.3 (review finding F5)
+/// added the `expires_at > now` filter to `mailbox_list_for_recipient` itself, so an
+/// expired-but-not-yet-purged row is no longer shown here either: this dump reflects what a
+/// reconnecting recipient would actually receive, not stale rows still awaiting the next purge
+/// pass.
+pub async fn dump_mailbox(
+    store: &dyn Store,
+    recipient: [u8; 32],
+    now: u64,
+) -> Result<String, StoreError> {
+    let entries = store.mailbox_list_for_recipient(&recipient, now).await?;
     Ok(format_dump(&recipient, &entries))
 }
 

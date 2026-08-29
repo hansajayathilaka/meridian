@@ -13,6 +13,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use meridian_proto::PrekeyBundle;
+use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -74,13 +75,23 @@ pub trait Store: Send + Sync {
         ))
     }
 
-    /// List every row currently held for `recipient_pub`, ordered by `arrived_at` then `id` (the
-    /// tie-break for same-timestamp arrivals, since `id` is assigned sequentially).
+    /// List every row currently held for `recipient_pub` that has NOT yet expired
+    /// (`expires_at > now`), ordered by `arrived_at` then `id` (the tie-break for same-timestamp
+    /// arrivals, since `id` is assigned sequentially).
+    ///
+    /// `now` is caller-injected (unix seconds), the same testability rationale
+    /// [`Store::mailbox_enqueue`]'s own doc comment gives for `arrived_at`/`expires_at` — task 9.3
+    /// (review finding F5). A row whose `expires_at <= now` is excluded here even though it may
+    /// not yet have been physically reclaimed by [`Store::mailbox_purge_expired`]'s periodic pass:
+    /// this is the "not yet observed by callers" half of that gap; `mailbox_purge_expired` stays
+    /// the sole mechanism that actually deletes the row (task 9.3's Scope explicitly leaves
+    /// `mailbox_purge.rs` unchanged).
     async fn mailbox_list_for_recipient(
         &self,
         recipient_pub: &[u8; 32],
+        now: u64,
     ) -> StoreResult<Vec<MailboxEntry>> {
-        let _ = recipient_pub;
+        let _ = (recipient_pub, now);
         Err(StoreError::Backend(
             "mailbox_list_for_recipient is not implemented for this store backend".to_string(),
         ))
@@ -91,6 +102,12 @@ pub trait Store: Send + Sync {
     /// deletion — the caller's own `recipient_pub` is never trusted to be verified upstream by id
     /// alone (8.7's `MailboxAck` handler depends on this being safe to call with
     /// attacker-influenced ids). Returns the count of rows actually deleted.
+    ///
+    /// A backend that issues one bound SQL statement per `ids` batch (namely `SqliteStore`, task
+    /// 9.5) MUST chunk internally so no single statement's bound-parameter count can approach
+    /// SQLite's conservative compile-time default `SQLITE_MAX_VARIABLE_NUMBER = 999` — this method
+    /// accepts arbitrarily large `ids` slices from callers (`ws.rs`'s `MAILBOX_ACK_MAX_IDS` cap
+    /// bounds it to 4096) and must not error out on a large-but-capped batch.
     async fn mailbox_delete_by_ids(
         &self,
         recipient_pub: &[u8; 32],
@@ -113,10 +130,20 @@ pub trait Store: Send + Sync {
         ))
     }
 
-    /// Sum of `size_bytes` across every row currently held for `recipient_pub` — the quota
-    /// accounting primitive a later task's "mailbox full" check reads.
-    async fn mailbox_size_bytes_for_recipient(&self, recipient_pub: &[u8; 32]) -> StoreResult<u64> {
-        let _ = recipient_pub;
+    /// Sum of `size_bytes` across every row currently held for `recipient_pub` that has NOT yet
+    /// expired (`expires_at > now`) — the quota accounting primitive
+    /// [`mailbox_enqueue_with_quota`]'s "mailbox full" check reads.
+    ///
+    /// `now` is caller-injected, same rationale as [`Store::mailbox_list_for_recipient`]'s own doc
+    /// comment (task 9.3, review finding F5): without this filter, expired-but-not-yet-purged
+    /// bytes would wrongly count toward `quota_mb`, causing spurious `mailbox_full` errors for
+    /// senders until the next purge pass reclaims them.
+    async fn mailbox_size_bytes_for_recipient(
+        &self,
+        recipient_pub: &[u8; 32],
+        now: u64,
+    ) -> StoreResult<u64> {
+        let _ = (recipient_pub, now);
         Err(StoreError::Backend(
             "mailbox_size_bytes_for_recipient is not implemented for this store backend"
                 .to_string(),
@@ -156,22 +183,110 @@ pub enum MailboxEnqueueOutcome {
     QuotaExceeded,
 }
 
+/// Number of shards [`MailboxLocks`] stripes its per-recipient locking across. Fixed-size (not a
+/// `HashMap<[u8; 32], _>` entry per recipient that would grow unboundedly with every distinct
+/// recipient a server ever sees — no cleanup bookkeeping needed), and large enough that two
+/// *different* recipients landing in the same shard (and so incidentally serializing against each
+/// other, which is the one accepted imprecision of striping) is rare in practice.
+const MAILBOX_LOCK_SHARDS: usize = 256;
+
+/// Per-recipient serialization for [`mailbox_enqueue_with_quota`]'s check-then-write (task 9.1,
+/// review finding F1). The read (`Store::mailbox_size_bytes_for_recipient`) and write
+/// (`Store::mailbox_enqueue`) are two separate `Store` calls with no shared transaction — without
+/// an external lock, N concurrent callers targeting the SAME offline recipient can all read the
+/// same stale `current_bytes`, each independently decide "this still fits," and all enqueue,
+/// overrunning `quota_mb` by up to N x envelope size instead of the intended "at most one envelope
+/// over" bound.
+///
+/// A fixed-size striped lock (hash `recipient` into one of [`MAILBOX_LOCK_SHARDS`]
+/// `tokio::sync::Mutex`es) rather than a compare-and-swap primitive added to the [`Store`] trait
+/// itself: it serializes calls for the SAME recipient identically regardless of which `Store`
+/// backend is in use (`MemoryStore` or `SqliteStore`) since the lock lives entirely in this crate,
+/// outside the trait — no new obligation on either backend impl, and no per-backend atomic-SQL
+/// special-casing to keep behaviorally identical to `MemoryStore`. Held only across one bounded
+/// `Store` call — [`mailbox_enqueue_with_quota`]'s check-then-write, or (task 9.4) `ws::drain_mailbox`'s
+/// `mailbox_list_for_recipient` read — never across unrelated recipients' calls (bar the rare shard
+/// collision above) and, just as importantly, never across a `send` to a client socket or any other
+/// I/O the server doesn't control the pace of: an earlier version of the 9.4 fix held this lock
+/// across `drain_mailbox`'s per-row sends too, which let one slow or adversarial reader stall the
+/// lock indefinitely and block every other sender targeting this shard. This is the "keep the lock
+/// scope narrow" constraint both tasks' own notes call out.
+///
+/// One instance lives on [`crate::state::AppState`] and is shared by the local route path
+/// (`ws::queue_to_mailbox`), the federated route path (`federation::inbound::handle_fed_route`),
+/// AND (task 9.4, review finding F4) `ws::drain_mailbox`'s own mailbox read, run right after this
+/// connection is registered as reachable — see that function's doc comment for why. A local
+/// enqueue, a federated enqueue, and a reconnecting recipient's own drain read, all racing at the
+/// same recipient, are therefore all serialized against EACH OTHER at the point they touch the
+/// `Store`, not just pairwise.
+pub struct MailboxLocks {
+    shards: Vec<AsyncMutex<()>>,
+}
+
+impl Default for MailboxLocks {
+    fn default() -> Self {
+        Self {
+            shards: (0..MAILBOX_LOCK_SHARDS)
+                .map(|_| AsyncMutex::new(()))
+                .collect(),
+        }
+    }
+}
+
+impl MailboxLocks {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Acquire the shard guarding `recipient`. Held by the returned guard until dropped — callers
+    /// must hold it across the bounded `Store` call(s) they're serializing (e.g. both the quota
+    /// read and the enqueue write, for [`mailbox_enqueue_with_quota`]) and MUST release it before
+    /// any unbounded I/O such as a send to a client socket.
+    ///
+    /// `pub(crate)` (not private): task 9.4 reuses this directly from `ws::drain_mailbox` (held only
+    /// across its `mailbox_list_for_recipient` read — see that function's own doc comment) rather
+    /// than only ever being reached indirectly through [`mailbox_enqueue_with_quota`].
+    pub(crate) async fn lock_recipient(
+        &self,
+        recipient: &[u8; 32],
+    ) -> tokio::sync::MutexGuard<'_, ()> {
+        // First 8 bytes of an already-uniformly-random Ed25519/X25519 pubkey as a shard selector —
+        // no need for a real hash function over key material that's already high-entropy.
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&recipient[..8]);
+        let shard = (u64::from_le_bytes(buf) as usize) % self.shards.len();
+        self.shards[shard].lock().await
+    }
+}
+
 /// Check `recipient`'s current mailbox usage against `quota_mb`, then enqueue `blob` if it fits.
 /// Shared by the local route path (task 8.5, `ws::handle_route`) and the federated route path
 /// (task 8.6, `federation::inbound::handle_fed_route`) so the quota math lives in exactly one
 /// place. Callers are responsible for the `ttl_days == 0` (mailbox disabled) short-circuit — this
 /// function always attempts to enqueue, matching the "quota is the only enqueue-time gate" scope
 /// of both call sites.
+///
+/// **Task 9.1 (review finding F1):** `locks` serializes this whole check-then-write against every
+/// OTHER concurrent call (from either route path) naming the same `recipient` — see
+/// [`MailboxLocks`]'s own doc comment for why a striped async lock, not a `Store`-trait
+/// compare-and-swap primitive, closes the race identically for both backends.
 pub async fn mailbox_enqueue_with_quota(
     store: &dyn Store,
+    locks: &MailboxLocks,
     recipient: [u8; 32],
     blob: Vec<u8>,
     now: u64,
     ttl_days: u32,
     quota_mb: u32,
 ) -> StoreResult<MailboxEnqueueOutcome> {
+    let _guard = locks.lock_recipient(&recipient).await;
     let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
-    let current_bytes = store.mailbox_size_bytes_for_recipient(&recipient).await?;
+    // Task 9.3: `now` (already caller-injected here, pre-dating this task) is also the "not yet
+    // expired" cutoff for the read below — an expired-but-not-yet-purged row must not count
+    // toward the quota this check enforces.
+    let current_bytes = store
+        .mailbox_size_bytes_for_recipient(&recipient, now)
+        .await?;
     if current_bytes + blob.len() as u64 > quota_bytes {
         return Ok(MailboxEnqueueOutcome::QuotaExceeded);
     }
@@ -279,9 +394,19 @@ impl Store for MemoryStore {
     async fn mailbox_list_for_recipient(
         &self,
         recipient_pub: &[u8; 32],
+        now: u64,
     ) -> StoreResult<Vec<MailboxEntry>> {
         let mailboxes = self.mailboxes.lock().unwrap();
-        let mut entries = mailboxes.get(recipient_pub).cloned().unwrap_or_default();
+        let mut entries: Vec<MailboxEntry> = mailboxes
+            .get(recipient_pub)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| e.expires_at > now)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         entries.sort_by_key(|e| (e.arrived_at, e.id));
         Ok(entries)
     }
@@ -312,11 +437,21 @@ impl Store for MemoryStore {
         Ok(purged)
     }
 
-    async fn mailbox_size_bytes_for_recipient(&self, recipient_pub: &[u8; 32]) -> StoreResult<u64> {
+    async fn mailbox_size_bytes_for_recipient(
+        &self,
+        recipient_pub: &[u8; 32],
+        now: u64,
+    ) -> StoreResult<u64> {
         let mailboxes = self.mailboxes.lock().unwrap();
         Ok(mailboxes
             .get(recipient_pub)
-            .map(|entries| entries.iter().map(|e| e.size_bytes).sum())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| e.expires_at > now)
+                    .map(|e| e.size_bytes)
+                    .sum()
+            })
             .unwrap_or(0))
     }
 }
@@ -328,6 +463,8 @@ pub use sqlite::SqliteStore;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[tokio::test]
@@ -344,7 +481,10 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        let entries = store
+            .mailbox_list_for_recipient(&recipient, 0)
+            .await
+            .unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, id_a);
         assert_eq!(entries[0].blob, vec![1, 2, 3]);
@@ -370,7 +510,10 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        let entries = store
+            .mailbox_list_for_recipient(&recipient, 0)
+            .await
+            .unwrap();
         assert_eq!(
             entries.iter().map(|e| e.id).collect::<Vec<_>>(),
             vec![id_a, id_b]
@@ -401,14 +544,18 @@ mod tests {
         assert_eq!(deleted, 0);
         assert_eq!(
             store
-                .mailbox_list_for_recipient(&alice)
+                .mailbox_list_for_recipient(&alice, 0)
                 .await
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
-            store.mailbox_list_for_recipient(&bob).await.unwrap().len(),
+            store
+                .mailbox_list_for_recipient(&bob, 0)
+                .await
+                .unwrap()
+                .len(),
             1
         );
 
@@ -416,13 +563,13 @@ mod tests {
         let deleted = store.mailbox_delete_by_ids(&bob, &[bob_id]).await.unwrap();
         assert_eq!(deleted, 1);
         assert!(store
-            .mailbox_list_for_recipient(&bob)
+            .mailbox_list_for_recipient(&bob, 0)
             .await
             .unwrap()
             .is_empty());
         assert_eq!(
             store
-                .mailbox_list_for_recipient(&alice)
+                .mailbox_list_for_recipient(&alice, 0)
                 .await
                 .unwrap()
                 .len(),
@@ -443,6 +590,63 @@ mod tests {
         assert_eq!(deleted, 0);
     }
 
+    /// (task 9.10, N5) Double-acking an already-deleted row for the SAME account/recipient — the
+    /// second `MailboxAck` a client's own connection might send for an id it already acked (a
+    /// redelivered/duplicate ack frame, or a reconnect racing an ack the server already applied) —
+    /// must be a silent `Ok(0)`, never an error and never a panic. Distinct from
+    /// [`mailbox_delete_by_ids_removes_only_the_matching_row_for_the_matching_recipient`]'s
+    /// cross-recipient no-op above: this is the SAME recipient acking the SAME id twice in a row.
+    /// Enqueues through [`mailbox_enqueue_with_quota`] (task 9.1's `MailboxLocks`-guarded path) so
+    /// this exercises the real check-then-write path an account's own connection enqueues through,
+    /// not just the raw [`Store::mailbox_enqueue`] primitive.
+    #[tokio::test]
+    async fn mailbox_delete_by_ids_double_ack_of_an_already_deleted_row_is_a_silent_no_op() {
+        let store = MemoryStore::new();
+        let locks = MailboxLocks::default();
+        let recipient = [17u8; 32];
+
+        let outcome =
+            mailbox_enqueue_with_quota(&store, &locks, recipient, vec![7, 7, 7], 0, 14, 50)
+                .await
+                .unwrap();
+        let id = match outcome {
+            MailboxEnqueueOutcome::Queued(id) => id,
+            MailboxEnqueueOutcome::QuotaExceeded => panic!("must fit comfortably under quota"),
+        };
+
+        // FIRST ack: genuinely deletes the row.
+        let deleted_first = store
+            .mailbox_delete_by_ids(&recipient, &[id])
+            .await
+            .unwrap();
+        assert_eq!(
+            deleted_first, 1,
+            "the first ack must actually delete the row"
+        );
+        assert!(store
+            .mailbox_list_for_recipient(&recipient, 0)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // SECOND ack of the SAME id, from the same account: silent no-op, not an error.
+        let deleted_second = store.mailbox_delete_by_ids(&recipient, &[id]).await;
+        assert!(
+            matches!(deleted_second, Ok(0)),
+            "double-acking an already-deleted row must be a silent Ok(0), not an error — got \
+             {deleted_second:?}"
+        );
+        // The no-op re-ack must not disturb this recipient's (now-empty) accounting either.
+        assert_eq!(
+            store
+                .mailbox_size_bytes_for_recipient(&recipient, 0)
+                .await
+                .unwrap(),
+            0,
+            "a no-op re-ack must not affect quota accounting"
+        );
+    }
+
     #[tokio::test]
     async fn mailbox_purge_expired_removes_only_rows_past_their_deadline() {
         let store = MemoryStore::new();
@@ -460,7 +664,14 @@ mod tests {
         let purged = store.mailbox_purge_expired(500).await.unwrap();
         assert_eq!(purged, 1);
 
-        let remaining = store.mailbox_list_for_recipient(&recipient).await.unwrap();
+        // Same `now` (500) as the purge pass above: the surviving row's `expires_at` (1_000) is
+        // still in its future either way, so this also exercises `mailbox_list_for_recipient`'s
+        // own `expires_at > now` filter (task 9.3) alongside the physical purge, not just the
+        // purge in isolation.
+        let remaining = store
+            .mailbox_list_for_recipient(&recipient, 500)
+            .await
+            .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, fresh_id);
         assert_ne!(remaining[0].id, expired_id);
@@ -487,22 +698,359 @@ mod tests {
 
         assert_eq!(
             store
-                .mailbox_size_bytes_for_recipient(&alice)
+                .mailbox_size_bytes_for_recipient(&alice, 0)
                 .await
                 .unwrap(),
             150
         );
         assert_eq!(
-            store.mailbox_size_bytes_for_recipient(&bob).await.unwrap(),
+            store
+                .mailbox_size_bytes_for_recipient(&bob, 0)
+                .await
+                .unwrap(),
             7
         );
         // A recipient with no mailbox at all sums to zero, not an error.
         assert_eq!(
             store
-                .mailbox_size_bytes_for_recipient(&[9u8; 32])
+                .mailbox_size_bytes_for_recipient(&[9u8; 32], 0)
                 .await
                 .unwrap(),
             0
+        );
+    }
+
+    // -- task 9.3: `expires_at` read filter (review finding F5) --------------------------------
+    //
+    // Deliverable 3: a drain against a mix of expired-but-not-yet-purged and live rows must return
+    // only the live ones, and quota accounting must ignore expired-unpurged bytes. `mailbox_purge_
+    // expired` is never called in either test below — the row that "should already be gone" is
+    // still physically present, proving the filter (not the purge job) is what excludes it.
+
+    #[tokio::test]
+    async fn mailbox_list_for_recipient_excludes_expired_but_unpurged_rows() {
+        let store = MemoryStore::new();
+        let recipient = [13u8; 32];
+
+        let live_id = store
+            .mailbox_enqueue(recipient, vec![1], 0, 1_000)
+            .await
+            .unwrap();
+        // Past its deadline relative to `now` below, but never purged in this test.
+        let expired_id = store
+            .mailbox_enqueue(recipient, vec![2], 0, 100)
+            .await
+            .unwrap();
+
+        let now = 500; // > expired's expires_at (100), < live's expires_at (1_000)
+        let entries = store
+            .mailbox_list_for_recipient(&recipient, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![live_id],
+            "an expired-but-unpurged row must not be observed by a list/drain call, even though \
+             it is still physically present — expired_id={expired_id} must be absent"
+        );
+
+        // Belt-and-suspenders: the row really is still there, just not surfaced by the filtered
+        // read above — proving this is a read-time filter, not an accidental purge side effect.
+        assert_eq!(
+            store.mailbox_purge_expired(0).await.unwrap(),
+            0,
+            "no purge pass ran in this test — the row's continued physical presence below is not \
+             explained by an unrelated deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_size_bytes_for_recipient_ignores_expired_unpurged_bytes() {
+        let store = MemoryStore::new();
+        let recipient = [14u8; 32];
+
+        store
+            .mailbox_enqueue(recipient, vec![0u8; 40], 0, 1_000) // live
+            .await
+            .unwrap();
+        store
+            .mailbox_enqueue(recipient, vec![0u8; 999_999], 0, 100) // expired, unpurged
+            .await
+            .unwrap();
+
+        let now = 500;
+        assert_eq!(
+            store
+                .mailbox_size_bytes_for_recipient(&recipient, now)
+                .await
+                .unwrap(),
+            40,
+            "the large expired-but-unpurged row must not count toward quota accounting"
+        );
+    }
+
+    /// End-to-end through [`mailbox_enqueue_with_quota`] itself (not just the raw size read above):
+    /// a huge expired-unpurged row must not cause a spurious `mailbox_full` for a new, small
+    /// enqueue that easily fits within `quota_mb` once the expired bytes are correctly excluded.
+    #[tokio::test]
+    async fn mailbox_enqueue_with_quota_ignores_expired_unpurged_bytes_against_the_cap() {
+        let store = MemoryStore::new();
+        let locks = MailboxLocks::default();
+        let recipient = [15u8; 32];
+        let quota_mb: u32 = 1;
+        let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
+
+        // Already exceeds the 1 MiB quota on its own, but expired as of `now` below and never
+        // purged — without the fix, this would wrongly count toward quota and reject the enqueue.
+        store
+            .mailbox_enqueue(recipient, vec![0u8; (quota_bytes + 1) as usize], 0, 100)
+            .await
+            .unwrap();
+
+        let now = 500; // > the pre-filled row's expires_at (100)
+        let outcome =
+            mailbox_enqueue_with_quota(&store, &locks, recipient, vec![0u8; 10], now, 14, quota_mb)
+                .await
+                .unwrap();
+        assert!(
+            matches!(outcome, MailboxEnqueueOutcome::Queued(_)),
+            "an expired-but-unpurged row must not count toward quota_mb — this enqueue should \
+             have fit"
+        );
+    }
+
+    // -- task 9.1: mailbox quota check-then-write race (review finding F1) -----------------------
+
+    /// A `Store` wrapper that inserts a short artificial delay inside
+    /// `mailbox_size_bytes_for_recipient`, AFTER the read completes but before it returns.
+    /// `MemoryStore`'s own operations never actually suspend (a `std::sync::Mutex` lock/read/
+    /// unlock, with no real I/O) — so [`mailbox_enqueue_with_quota`]'s read-then-write race window
+    /// against a raw `MemoryStore` is only ever as wide as two OS threads happening to execute that
+    /// tiny synchronous section at literally the same instant, which real scheduling rarely lines
+    /// up even under a `Barrier`-synchronized burst. Widening the window here makes a genuine race
+    /// (the SAME one a slower backend, or a busier server, would hit far more easily) deterministic
+    /// to observe in a fast unit test — it does not change what is being tested: the locking in
+    /// [`mailbox_enqueue_with_quota`] itself, exercised for real, unmodified, against this backend.
+    struct DelayedStore {
+        inner: MemoryStore,
+    }
+
+    #[async_trait]
+    impl Store for DelayedStore {
+        async fn register_account(
+            &self,
+            account_pub: [u8; 32],
+            admission: &str,
+            max_bundle_v: u16,
+        ) -> StoreResult<()> {
+            self.inner
+                .register_account(account_pub, admission, max_bundle_v)
+                .await
+        }
+        async fn put_bundle(&self, bundle: PrekeyBundle) -> StoreResult<()> {
+            self.inner.put_bundle(bundle).await
+        }
+        async fn get_bundle(&self, target: &[u8; 32]) -> StoreResult<Option<PrekeyBundle>> {
+            self.inner.get_bundle(target).await
+        }
+        async fn total_otks(&self) -> StoreResult<u64> {
+            self.inner.total_otks().await
+        }
+        async fn mailbox_enqueue(
+            &self,
+            recipient_pub: [u8; 32],
+            blob: Vec<u8>,
+            arrived_at: u64,
+            expires_at: u64,
+        ) -> StoreResult<u64> {
+            self.inner
+                .mailbox_enqueue(recipient_pub, blob, arrived_at, expires_at)
+                .await
+        }
+        async fn mailbox_list_for_recipient(
+            &self,
+            recipient_pub: &[u8; 32],
+            now: u64,
+        ) -> StoreResult<Vec<MailboxEntry>> {
+            self.inner
+                .mailbox_list_for_recipient(recipient_pub, now)
+                .await
+        }
+        async fn mailbox_delete_by_ids(
+            &self,
+            recipient_pub: &[u8; 32],
+            ids: &[u64],
+        ) -> StoreResult<u64> {
+            self.inner.mailbox_delete_by_ids(recipient_pub, ids).await
+        }
+        async fn mailbox_purge_expired(&self, now: u64) -> StoreResult<u64> {
+            self.inner.mailbox_purge_expired(now).await
+        }
+        async fn mailbox_size_bytes_for_recipient(
+            &self,
+            recipient_pub: &[u8; 32],
+            now: u64,
+        ) -> StoreResult<u64> {
+            let bytes = self
+                .inner
+                .mailbox_size_bytes_for_recipient(recipient_pub, now)
+                .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            Ok(bytes)
+        }
+    }
+
+    /// N concurrent `mailbox_enqueue_with_quota` calls racing at the SAME offline recipient, with
+    /// envelopes sized large relative to the configured quota (near-`MAX_FRAME_LEN`, matching this
+    /// task's Deliverable 3 — the previously-documented "bounded, roughly one envelope" assumption
+    /// is what this proves, not merely "a small overrun"). Pre-fix (unserialized read-then-write)
+    /// this reliably overran `quota_mb` by multiples of `envelope_size`; post-fix the final byte
+    /// total must never exceed `quota_mb` by more than one envelope's worth, and quota must
+    /// genuinely have been enforced (not every racer can have been queued). Every racer is lined up
+    /// on a [`tokio::sync::Barrier`] immediately before calling `mailbox_enqueue_with_quota`, and
+    /// races against a [`DelayedStore`] (see its own doc comment for why) — the same real
+    /// `MailboxLocks`-guarded function under test either way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn mailbox_enqueue_with_quota_races_at_one_recipient_never_overrun_by_more_than_one_envelope(
+    ) {
+        let store = Arc::new(DelayedStore {
+            inner: MemoryStore::new(),
+        });
+        let locks = Arc::new(MailboxLocks::default());
+        let recipient = [42u8; 32];
+        let quota_mb: u32 = 1; // 1 MiB — fits exactly one near-maximal envelope, never two.
+        let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
+        // Comfortably under `federation::link::MAX_FRAME_LEN` (1 MiB) — "near-maximal" per
+        // Deliverable 3 — and large relative to the 1 MiB quota above.
+        let envelope_size: usize = 1_000_000;
+        let concurrency = 24;
+        let barrier = Arc::new(tokio::sync::Barrier::new(concurrency));
+
+        let mut handles = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let store = store.clone();
+            let locks = locks.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                mailbox_enqueue_with_quota(
+                    store.as_ref(),
+                    locks.as_ref(),
+                    recipient,
+                    vec![0u8; envelope_size],
+                    0,
+                    14,
+                    quota_mb,
+                )
+                .await
+                .unwrap()
+            }));
+        }
+
+        let mut queued = 0usize;
+        let mut quota_exceeded = 0usize;
+        for h in handles {
+            match h.await.unwrap() {
+                MailboxEnqueueOutcome::Queued(_) => queued += 1,
+                MailboxEnqueueOutcome::QuotaExceeded => quota_exceeded += 1,
+            }
+        }
+        assert_eq!(queued + quota_exceeded, concurrency);
+
+        // `now=0`: matches the `now=0` every racer above passed to `mailbox_enqueue_with_quota`
+        // (so `expires_at = 0 + 14 days`, always `> 0`) — this assertion is about the race's byte
+        // bound, not about task 9.3's expiry filter, so `0` never spuriously excludes a row here.
+        let total = store
+            .mailbox_size_bytes_for_recipient(&recipient, 0)
+            .await
+            .unwrap();
+        assert!(
+            total <= quota_bytes + envelope_size as u64,
+            "concurrent same-recipient enqueues overran quota_mb by more than one envelope's \
+             worth: total={total} quota_bytes={quota_bytes} envelope_size={envelope_size} \
+             queued={queued}"
+        );
+        assert!(
+            queued >= 1,
+            "at least one racer should have fit before the quota filled"
+        );
+        assert!(
+            queued < concurrency,
+            "quota must actually have been enforced — not every racer can have queued \
+             (queued={queued} of {concurrency})"
+        );
+    }
+
+    // -- task 9.2: quota exact-at-cap boundary (review finding F6) --------------------------------
+    //
+    // `mailbox_enqueue_with_quota` rejects on `current_bytes + blob.len() > quota_bytes` — a
+    // deliberate strict `>`, not `>=`. These two tests pin the boundary itself: filling the quota
+    // exactly is allowed, one byte past it is not. The existing quota tests above only exercise
+    // `quota_mb = 0` (the "obviously over" case) or a randomized race, neither of which proves this.
+
+    #[tokio::test]
+    async fn mailbox_enqueue_with_quota_allows_filling_the_quota_exactly() {
+        let store = MemoryStore::new();
+        let locks = MailboxLocks::default();
+        let recipient = [11u8; 32];
+        let quota_mb: u32 = 1;
+        let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
+
+        // Pre-fill directly (bypassing the quota gate, which isn't under test here) to
+        // `quota_bytes - 10`, so the `mailbox_enqueue_with_quota` call below with a 10-byte blob
+        // lands EXACTLY at the boundary: `current_bytes + blob.len() == quota_bytes`.
+        store
+            .mailbox_enqueue(recipient, vec![0u8; (quota_bytes - 10) as usize], 0, 1_000)
+            .await
+            .unwrap();
+
+        let outcome =
+            mailbox_enqueue_with_quota(&store, &locks, recipient, vec![0u8; 10], 0, 14, quota_mb)
+                .await
+                .unwrap();
+        assert!(
+            matches!(outcome, MailboxEnqueueOutcome::Queued(_)),
+            "filling the quota exactly must be allowed (strict `>` comparison, not `>=`)"
+        );
+        assert_eq!(
+            store
+                .mailbox_size_bytes_for_recipient(&recipient, 0)
+                .await
+                .unwrap(),
+            quota_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_enqueue_with_quota_rejects_one_byte_over_the_quota() {
+        let store = MemoryStore::new();
+        let locks = MailboxLocks::default();
+        let recipient = [12u8; 32];
+        let quota_mb: u32 = 1;
+        let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
+
+        // Pre-fill directly to exactly `quota_bytes`, so the next call's
+        // `current_bytes + blob.len()` is `quota_bytes + 1` — one byte over.
+        store
+            .mailbox_enqueue(recipient, vec![0u8; quota_bytes as usize], 0, 1_000)
+            .await
+            .unwrap();
+
+        let outcome =
+            mailbox_enqueue_with_quota(&store, &locks, recipient, vec![0u8; 1], 0, 14, quota_mb)
+                .await
+                .unwrap();
+        assert!(
+            matches!(outcome, MailboxEnqueueOutcome::QuotaExceeded),
+            "one byte past the quota must be rejected"
+        );
+        // The rejected attempt wrote nothing.
+        assert_eq!(
+            store
+                .mailbox_size_bytes_for_recipient(&recipient, 0)
+                .await
+                .unwrap(),
+            quota_bytes
         );
     }
 }
