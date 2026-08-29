@@ -3,7 +3,7 @@
 
 # Phase 9 — Review of Phase 8
 
-**Kind:** review · **Status:** planned — 10 fix-tasks ready · **Reviews phase(s):** Phase 8 (Offline
+**Kind:** review · **Status:** closed — 10/10 fix-tasks done · **Reviews phase(s):** Phase 8 (Offline
 Ciphertext Mailbox, tasks 8.1–8.17)
 
 ## Goal
@@ -77,7 +77,7 @@ race-fixed/TTL-filtered code paths from 9.1/9.3.
 - [x] **9.7** Federated-path `ttl_days == 0` test (F7) — [file](./9.7-federated-ttl-zero-test.md)
 - [x] **9.8** Lock `MailboxAck{ids:[]}` conformance vector (F8) — [file](./9.8-mailbox-ack-empty-conformance-vector.md)
 - [x] **9.9** Add `Mailbox::validate` config check (N1) — [file](./9.9-mailbox-config-validate.md)
-- [~] **9.10** Nit sweep: mailbox-drain proptest, `purge_loop` coverage, double-ack no-op test (N3, N4, N5; soft-depends on 9.1, 9.3) — [file](./9.10-phase-9-nit-sweep.md)
+- [x] **9.10** Nit sweep: mailbox-drain proptest, `purge_loop` coverage, double-ack no-op test (N3, N4, N5; soft-depends on 9.1, 9.3) — [file](./9.10-phase-9-nit-sweep.md)
 
 ## Exit criteria
 All fix-tasks (9.1–9.10) `[x]`, tree green, docs synced, findings closed per the report's verdict. Then:
