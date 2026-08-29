@@ -3,7 +3,7 @@
 
 # Phase 9 — Review of Phase 8
 
-**Kind:** review · **Status:** sweep complete, verdict recorded · **Reviews phase(s):** Phase 8 (Offline
+**Kind:** review · **Status:** planned — 10 fix-tasks ready · **Reviews phase(s):** Phase 8 (Offline
 Ciphertext Mailbox, tasks 8.1–8.17)
 
 ## Goal
@@ -58,9 +58,27 @@ the phase's top-priority should-fix.
 
 ## Tasks (todo)
 <!-- Filled by /plan-review-phase. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
-(populated by `/plan-review-phase` from [review-report.md](./review-report.md)'s 9 should-fix + 5 nit
-findings)
+Planned by the **planner** agent from [review-report.md](./review-report.md)'s 9 should-fix + 5 nit
+findings (N2 excluded — stays an unowned carry-forward for T14's own future task file, per the report's
+verdict). Landing order below follows the planner's dependency analysis: 9.1 first (top-priority DoS
+fix, per the review verdict); 9.2 has a **hard** dependency on 9.1 (its boundary test targets the exact
+function 9.1 modifies); 9.3 and 9.4 are **soft**-ordered after 9.1 (same `store.rs`/`ws.rs` mailbox code
+area — landing after 9.1 avoids rebase churn and lets 9.4 reuse 9.1's new locking primitive); 9.5
+finishes the `ws.rs`-touching tasks in one pass; 9.6–9.9 are each in files no other phase-9 task touches,
+so no ordering constraint; 9.10 (the bundled nit sweep) lands last so its new tests exercise the final
+race-fixed/TTL-filtered code paths from 9.1/9.3.
+
+- [ ] **9.1** Serialize mailbox quota check-and-enqueue; cap local route envelope size (F1) — [file](./9.1-mailbox-quota-race-and-local-size-cap.md)
+- [ ] **9.2** Quota exact-at-cap boundary test (F6; depends on 9.1) — [file](./9.2-mailbox-quota-boundary-test.md)
+- [ ] **9.3** Filter `expires_at` on mailbox reads (F5; soft-depends on 9.1) — [file](./9.3-mailbox-expires-at-read-filter.md)
+- [ ] **9.4** Fix drain/registration race window (F4; soft-depends on 9.1) — [file](./9.4-mailbox-drain-registration-race.md)
+- [ ] **9.5** Chunk `MailboxAck` delete into sub-999-parameter batches (F2) — [file](./9.5-mailbox-ack-chunk-delete.md)
+- [ ] **9.6** Document/validate client trust in `Deliver.mailbox_id` (F3) — [file](./9.6-mailbox-id-client-trust-boundary.md)
+- [ ] **9.7** Federated-path `ttl_days == 0` test (F7) — [file](./9.7-federated-ttl-zero-test.md)
+- [ ] **9.8** Lock `MailboxAck{ids:[]}` conformance vector (F8) — [file](./9.8-mailbox-ack-empty-conformance-vector.md)
+- [ ] **9.9** Add `Mailbox::validate` config check (N1) — [file](./9.9-mailbox-config-validate.md)
+- [ ] **9.10** Nit sweep: mailbox-drain proptest, `purge_loop` coverage, double-ack no-op test (N3, N4, N5; soft-depends on 9.1, 9.3) — [file](./9.10-phase-9-nit-sweep.md)
 
 ## Exit criteria
-All fix-tasks `[x]`, tree green, docs synced, findings closed per the report's verdict. Then:
+All fix-tasks (9.1–9.10) `[x]`, tree green, docs synced, findings closed per the report's verdict. Then:
 `/pick-next-phase` for the next build phase (T14, unblocked once this review clears).

@@ -169,10 +169,18 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   architect re-derivation from source. **Verdict: green to proceed — T14 is not blocked**, F1 is simply
   this review phase's top-priority should-fix. Full report:
   [phase-9/review-report.md](./phase-9/review-report.md).
-- **NEXT:** `/plan-review-phase` — turn phase-9's 9 should-fix + eligible nit findings into numbered
-  fix-tasks. N1 (no `Mailbox::validate` config check) and N3–N5 (three narrow test-coverage nits) are
-  small enough to fold into a fix-task each; N2 (the unregistered-metrics reminder for T14) is not a
-  fix-task — it stays a carry-forward for T14's own task file. The Phase-1 adversarial frontier remains
+- **NOW:** **Phase 9's findings are broken into 10 numbered fix-tasks** (9.1–9.10), planned by the
+  **planner** agent. F1 (top-priority DoS fix, per the review verdict) → **9.1**; F6 → **9.2** (hard
+  dependency on 9.1 — its boundary test targets the exact function 9.1 modifies for locking); F5 → **9.3**
+  and F4 → **9.4** (both soft-ordered after 9.1 — same `store.rs`/`ws.rs` mailbox code area, avoids
+  rebase churn and lets 9.4 reuse 9.1's new locking primitive); F2 → **9.5** (finishes the
+  `ws.rs`-touching tasks in one pass); F3 → **9.6**, F7 → **9.7**, F8 → **9.8**, N1 → **9.9** (each in
+  files no other phase-9 task touches, so no ordering constraint); N3+N4+N5 → **9.10**, a single bundled
+  nit-sweep task (matching the Phase 3/Phase 5 nit-sweep precedent), soft-ordered last so its new tests
+  exercise the final race-fixed/TTL-filtered code paths from 9.1/9.3. N2 (the unregistered-metrics
+  reminder) was **not** converted — stays an unowned carry-forward for T14's own future task file, per
+  the report's own verdict. Full breakdown: [phase-9/README.md](./phase-9/README.md#tasks-todo).
+- **NEXT:** `/next-task` — work Phase 9's fix-tasks, 9.1 first. The Phase-1 adversarial frontier remains
   an unowned carry-forward for a future `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08
   residuals are Phase-4-scoped follow-ups and stay listed below for a future phase.
 
@@ -613,7 +621,7 @@ wire-protocol questions T07 raises before any task started; full record and brea
 - [x] **8.17** Mailbox-drained messages arriving before a first-contact request is accepted must not be silently lost (fix-task found during 8.14's live demo) — [file](./phase-8/8.17-mailbox-ack-must-not-swallow-pending-request-messages.md)
 - [x] **8.14** Phase exit: full demo script + doc sync — [file](./phase-8/8.14-phase-exit-mailbox-demo.md)
 
-### Phase 9 — Review of Phase 8 · **in progress — report done, fix-tasks not yet planned** · [details](./phase-9/README.md)
+### Phase 9 — Review of Phase 8 · **in progress — 10 fix-tasks planned, 0/10 done** · [details](./phase-9/README.md)
 Review phase. Sweeps everything built since the Phase-7 review: Phase 8 — Offline Ciphertext Mailbox
 (tasks 8.1–8.17). No untracked out-of-band PRs landed in this window (confirmed: only PR #83
 `pick-next-phase` and PR #84, all of 8.1–8.17, merged between the two review points).
@@ -621,8 +629,19 @@ Review phase. Sweeps everything built since the Phase-7 review: Phase 8 — Offl
 folded in as fix-tasks), 5 nits (N1 folds in, N2 stays an unowned carry-forward for T14). Zero
 on-the-fly decisions need `/adr` ratification — Phase 8's one genuine on-the-fly decision (the
 mailbox-drain `Deliver.from` sentinel) was already ratified as ADR 0024 during the phase itself.
-**Verdict: green to proceed — T14 is not blocked.** Fix-tasks not yet broken out — next command is
-`/plan-review-phase`.
+**Verdict: green to proceed — T14 is not blocked.** 10 fix-tasks (9.1–9.10) planned by the **planner**
+agent; landing order and dependencies: [phase-9/README.md](./phase-9/README.md#tasks-todo).
+
+- [ ] **9.1** Serialize mailbox quota check-and-enqueue; cap local route envelope size (F1) — [file](./phase-9/9.1-mailbox-quota-race-and-local-size-cap.md)
+- [ ] **9.2** Quota exact-at-cap boundary test (F6; depends on 9.1) — [file](./phase-9/9.2-mailbox-quota-boundary-test.md)
+- [ ] **9.3** Filter `expires_at` on mailbox reads (F5; soft-depends on 9.1) — [file](./phase-9/9.3-mailbox-expires-at-read-filter.md)
+- [ ] **9.4** Fix drain/registration race window (F4; soft-depends on 9.1) — [file](./phase-9/9.4-mailbox-drain-registration-race.md)
+- [ ] **9.5** Chunk `MailboxAck` delete into sub-999-parameter batches (F2) — [file](./phase-9/9.5-mailbox-ack-chunk-delete.md)
+- [ ] **9.6** Document/validate client trust in `Deliver.mailbox_id` (F3) — [file](./phase-9/9.6-mailbox-id-client-trust-boundary.md)
+- [ ] **9.7** Federated-path `ttl_days == 0` test (F7) — [file](./phase-9/9.7-federated-ttl-zero-test.md)
+- [ ] **9.8** Lock `MailboxAck{ids:[]}` conformance vector (F8) — [file](./phase-9/9.8-mailbox-ack-empty-conformance-vector.md)
+- [ ] **9.9** Add `Mailbox::validate` config check (N1) — [file](./phase-9/9.9-mailbox-config-validate.md)
+- [ ] **9.10** Nit sweep: mailbox-drain proptest, `purge_loop` coverage, double-ack no-op test (N3, N4, N5; soft-depends on 9.1, 9.3) — [file](./phase-9/9.10-phase-9-nit-sweep.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
