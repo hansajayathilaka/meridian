@@ -105,9 +105,9 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<AppState>, peer_ip: IpA
     state.registry.add(account_pub, conn_id, tx.clone());
     state.metrics.conn_opened();
 
-    // The drain itself is still wrapped in the SAME per-recipient `MailboxLocks` shard task 9.1
-    // introduced for `mailbox_enqueue_with_quota`'s check-then-write (`state.mailbox_locks`, reused
-    // rather than inventing a second lock, per this task's own Scope) — not to catch every
+    // `drain_mailbox` below reads the mailbox under the SAME per-recipient `MailboxLocks` shard
+    // task 9.1 introduced for `mailbox_enqueue_with_quota`'s check-then-write (`state.mailbox_locks`,
+    // reused rather than inventing a second lock, per this task's own Scope) — not to catch every
     // conceivable interleaving (closing `handle_route`'s own unlocked check-then-act fully would
     // mean touching that path too, out of this task's Scope; see the task file's Risk note), but to
     // give a definite before/after ordering against a concurrent SAME-recipient mailbox write that
@@ -119,10 +119,14 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<AppState>, peer_ip: IpA
     // re-delivered live by the racing `Route` itself in that case — `deliver_one`'s own
     // `registry.is_connected` check already ran (and returned false) before that `Route` ever
     // reached the lock, so there is exactly one delivery path per envelope, never both.
-    {
-        let _drain_guard = state.mailbox_locks.lock_recipient(&account_pub).await;
-        drain_mailbox(&state, &tx, &account_pub).await;
-    }
+    //
+    // The lock is held ONLY across the `mailbox_list_for_recipient` read inside `drain_mailbox`
+    // (see its own doc comment) — never across the per-row `send`s that follow. A prior version of
+    // this fix held the lock across the whole drain including those sends, which let one slow or
+    // adversarial reader (auth, then simply stop draining the socket) stall the lock indefinitely
+    // and block every other local/federated sender routing to this recipient, or to any other
+    // recipient sharing this shard, on `mailbox_enqueue_with_quota` (review re-check of this task).
+    drain_mailbox(&state, &tx, &account_pub).await;
 
     // 4) Serve the authenticated session.
     serve(&state, &mut stream, &tx, &account_pub).await;
@@ -221,23 +225,32 @@ async fn serve(
 /// Task 8.7: push every row currently queued for `account_pub`, in `arrived_at`/`id` order, as
 /// `Deliver{from: MAILBOX_DRAIN_FROM_PLACEHOLDER, blob, mailbox_id: Some(id)}`. Called by
 /// [`handle_socket`] AFTER this connection is registered as reachable (task 9.4 — see that call
-/// site's doc comment for why the order flipped from the original "drain, then register"), under
-/// the recipient's `MailboxLocks` shard so a concurrent same-recipient mailbox write racing this
-/// drain gets a definite before/after ordering against it rather than an arbitrary interleaving.
-/// Best-effort: a store failure here drops the connection to neither a half-drained mailbox
-/// state nor a stuck handshake — it's logged nowhere (no client-id logging) and simply skips the
-/// drain, exactly like every other `Store` failure in this module already fails closed to "try
-/// again next time" rather than wedging the connection.
+/// site's doc comment for why the order flipped from the original "drain, then register").
+///
+/// The recipient's `MailboxLocks` shard (task 9.1, reused here per task 9.4) is held ONLY across
+/// the `mailbox_list_for_recipient` read below — released before any row is sent to the client —
+/// so a concurrent same-recipient mailbox write racing this drain gets a definite before/after
+/// ordering against the READ (see the call site's doc comment for the full race analysis), without
+/// blocking that write, or any other sender's `mailbox_enqueue_with_quota` call sharing this
+/// shard, on this connection's own read pace over the network. Best-effort: a store failure here
+/// drops the connection to neither a half-drained mailbox state nor a stuck handshake — it's
+/// logged nowhere (no client-id logging) and simply skips the drain, exactly like every other
+/// `Store` failure in this module already fails closed to "try again next time" rather than
+/// wedging the connection.
 async fn drain_mailbox(state: &Arc<AppState>, tx: &mpsc::Sender<Message>, account_pub: &[u8; 32]) {
-    // Task 9.3 (review finding F5): `now_secs()` excludes any row that has expired but not yet
-    // been physically reclaimed by the purge job — a reconnecting recipient must not receive an
-    // envelope that should already be gone.
-    let Ok(rows) = state
-        .store
-        .mailbox_list_for_recipient(account_pub, now_secs())
-        .await
-    else {
-        return;
+    let rows = {
+        let _drain_guard = state.mailbox_locks.lock_recipient(account_pub).await;
+        // Task 9.3 (review finding F5): `now_secs()` excludes any row that has expired but not yet
+        // been physically reclaimed by the purge job — a reconnecting recipient must not receive
+        // an envelope that should already be gone.
+        match state
+            .store
+            .mailbox_list_for_recipient(account_pub, now_secs())
+            .await
+        {
+            Ok(rows) => rows,
+            Err(_) => return,
+        }
     };
     for row in rows {
         send(

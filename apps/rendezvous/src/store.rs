@@ -197,17 +197,22 @@ const MAILBOX_LOCK_SHARDS: usize = 256;
 /// itself: it serializes calls for the SAME recipient identically regardless of which `Store`
 /// backend is in use (`MemoryStore` or `SqliteStore`) since the lock lives entirely in this crate,
 /// outside the trait — no new obligation on either backend impl, and no per-backend atomic-SQL
-/// special-casing to keep behaviorally identical to `MemoryStore`. Held only across the duration of
-/// one [`mailbox_enqueue_with_quota`] call, never across unrelated recipients' calls (bar the rare
-/// shard collision above) — the "keep the lock scope narrow" constraint this task's own notes call
-/// out.
+/// special-casing to keep behaviorally identical to `MemoryStore`. Held only across one bounded
+/// `Store` call — [`mailbox_enqueue_with_quota`]'s check-then-write, or (task 9.4) `ws::drain_mailbox`'s
+/// `mailbox_list_for_recipient` read — never across unrelated recipients' calls (bar the rare shard
+/// collision above) and, just as importantly, never across a `send` to a client socket or any other
+/// I/O the server doesn't control the pace of: an earlier version of the 9.4 fix held this lock
+/// across `drain_mailbox`'s per-row sends too, which let one slow or adversarial reader stall the
+/// lock indefinitely and block every other sender targeting this shard. This is the "keep the lock
+/// scope narrow" constraint both tasks' own notes call out.
 ///
 /// One instance lives on [`crate::state::AppState`] and is shared by the local route path
 /// (`ws::queue_to_mailbox`), the federated route path (`federation::inbound::handle_fed_route`),
-/// AND (task 9.4, review finding F4) `ws::handle_socket`'s own connection-setup sequence, which
-/// holds a recipient's shard across "register, then drain" — see that call site's doc comment for
-/// why. A local enqueue, a federated enqueue, and a reconnecting recipient's own drain, all racing
-/// at the same recipient, are therefore all serialized against EACH OTHER, not just pairwise.
+/// AND (task 9.4, review finding F4) `ws::drain_mailbox`'s own mailbox read, run right after this
+/// connection is registered as reachable — see that function's doc comment for why. A local
+/// enqueue, a federated enqueue, and a reconnecting recipient's own drain read, all racing at the
+/// same recipient, are therefore all serialized against EACH OTHER at the point they touch the
+/// `Store`, not just pairwise.
 pub struct MailboxLocks {
     shards: Vec<AsyncMutex<()>>,
 }
@@ -228,12 +233,13 @@ impl MailboxLocks {
     }
 
     /// Acquire the shard guarding `recipient`. Held by the returned guard until dropped — callers
-    /// must hold it across both the quota read and the enqueue write.
+    /// must hold it across the bounded `Store` call(s) they're serializing (e.g. both the quota
+    /// read and the enqueue write, for [`mailbox_enqueue_with_quota`]) and MUST release it before
+    /// any unbounded I/O such as a send to a client socket.
     ///
-    /// `pub(crate)` (not private): task 9.4 reuses this directly from `ws::handle_socket`'s
-    /// connection-setup sequence (register-then-drain, held across the drain) — see that call
-    /// site's own doc comment — rather than only ever being reached indirectly through
-    /// [`mailbox_enqueue_with_quota`].
+    /// `pub(crate)` (not private): task 9.4 reuses this directly from `ws::drain_mailbox` (held only
+    /// across its `mailbox_list_for_recipient` read — see that function's own doc comment) rather
+    /// than only ever being reached indirectly through [`mailbox_enqueue_with_quota`].
     pub(crate) async fn lock_recipient(
         &self,
         recipient: &[u8; 32],

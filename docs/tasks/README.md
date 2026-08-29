@@ -186,6 +186,18 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 
 ### Live carry-forwards (not owned by any open task)
+- **`handle_route`'s connectivity-check-then-mailbox-write is still two unlocked steps** (found by
+  task 9.4's own review, re-checking its fix for F4). 9.4 closed the specific race it targeted (a
+  `Route` landing between `drain_mailbox` finishing and `registry.add` running), but `handle_route`
+  itself (`apps/rendezvous/src/ws.rs`) checks `state.registry.is_connected`/delivers, or falls
+  through to `queue_to_mailbox`, without holding the recipient's `MailboxLocks` shard across both
+  steps — deliberately out of 9.4's declared "connection-setup sequence only" scope (see that task's
+  own doc comment in `ws.rs::handle_socket`). A narrower version of F4 remains possible in principle:
+  a message can still land in a recipient's mailbox after that recipient's own reconnect-drain has
+  already run, if `handle_route`'s check and write straddle the drain narrowly enough. No open task
+  owns closing this; pick up via a future `/plan-phase` if it proves more than theoretical (e.g. under
+  a live adversarial harness), which would mean threading `MailboxLocks` through `handle_route`'s own
+  check-then-act, not just connection-setup.
 - **RESOLVED into Phase 9's review — `MailboxAck`'s 4096-id cap is reachable, not merely theoretical**
   (originally task 8.7's review). Phase 9's sweep re-examined this and confirmed it non-blocking (no
   cross-account harm — `mailbox_delete_by_ids` scopes by `(recipient_pub, id)`, no existence oracle —
