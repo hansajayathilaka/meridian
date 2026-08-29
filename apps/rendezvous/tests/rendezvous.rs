@@ -583,6 +583,43 @@ async fn route_to_offline_peer_over_quota_is_rejected() {
     );
 }
 
+/// Task 9.1 (review finding F1, Deliverable 2): a local route with an over-`MAX_FRAME_LEN` blob is
+/// rejected with `bad_request`, the SAME error shape/code `handle_fed_route`'s own defense-in-depth
+/// oversized check already uses on the federated path (`federation_route.rs`'s
+/// `bs_defense_in_depth_oversized_check_rejects_directly`) — the local path lacked this check
+/// entirely before this task. Proven against a CONNECTED recipient (not merely an offline one), so
+/// this exercises the cap ahead of `deliver_one`, not incidentally via the (separate) quota check
+/// on the offline/mailbox-enqueue branch.
+#[tokio::test]
+async fn oversized_local_route_is_rejected_before_delivery() {
+    let url = spawn(config_open()).await;
+    let alice = new_acct("localhost");
+    let bob = new_acct("localhost");
+
+    let mut ac = alice.connect(&url).await.unwrap();
+    // Connected, so an accepted route would deliver live — proving the cap fires before that,
+    // not merely coinciding with some other rejection path.
+    let mut bc = bob.connect(&url).await.unwrap();
+
+    // 2 MiB: comfortably over `federation::link::MAX_FRAME_LEN` (1 MiB) regardless of CBOR/frame
+    // overhead — mirrors `federation_route.rs`'s identical oversized-payload choice.
+    let oversized = vec![0x41u8; 2 * 1024 * 1024];
+    let err = ac.route(bob.pubkey, oversized).await.unwrap_err();
+    match err {
+        SignalError::Server(ErrBody { code, .. }) => assert_eq!(code, error_codes::BAD_REQUEST),
+        other => panic!("expected bad_request, got {other:?}"),
+    }
+
+    // Bob's connection must never have received anything — the cap ran before any delivery
+    // attempt, exactly like the federated path's own pre-dial check.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), bc.next_deliver())
+            .await
+            .is_err(),
+        "an oversized envelope must never reach the recipient"
+    );
+}
+
 // -- admission ---------------------------------------------------------------
 
 #[tokio::test]

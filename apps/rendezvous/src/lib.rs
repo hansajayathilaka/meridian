@@ -37,7 +37,7 @@ use axum::Router;
 
 pub use config::Config;
 pub use state::AppState;
-pub use store::{MemoryStore, Store};
+pub use store::{MailboxLocks, MemoryStore, Store};
 
 /// Build the axum router: `/` (WSS signaling), `/healthz`, `/metrics`.
 pub fn build_app(state: Arc<AppState>) -> Router {

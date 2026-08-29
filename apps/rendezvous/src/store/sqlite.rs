@@ -261,7 +261,12 @@ fn row_to_entry(row: (i64, Vec<u8>, Vec<u8>, i64, i64, i64)) -> StoreResult<Mail
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::store::{
+        mailbox_enqueue_with_quota, MailboxEnqueueOutcome, MailboxLocks, MAILBOX_QUOTA_BYTES_PER_MB,
+    };
     use meridian_proto::BUNDLE_VERSION;
 
     fn bundle(key: [u8; 32], otks: usize) -> PrekeyBundle {
@@ -500,5 +505,73 @@ mod tests {
         let entries = store.mailbox_list_for_recipient(&recipient).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].blob, vec![42, 43]);
+    }
+
+    // -- task 9.1: mailbox quota check-then-write race (review finding F1) -----------------------
+    //
+    // Mirrors `store.rs`'s `MemoryStore` version of this test exactly (same recipient/quota/
+    // envelope-size/concurrency shape), proving [`MailboxLocks`] closes the race identically for
+    // the SQLite backend — pooled connections sharing one `sqlite::memory:` cache, same as a real
+    // multi-connection deployment would see.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn mailbox_enqueue_with_quota_races_at_one_recipient_never_overrun_by_more_than_one_envelope(
+    ) {
+        let store = Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap());
+        let locks = Arc::new(MailboxLocks::default());
+        let recipient = [42u8; 32];
+        let quota_mb: u32 = 1; // 1 MiB — fits exactly one near-maximal envelope, never two.
+        let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
+        let envelope_size: usize = 1_000_000;
+        let concurrency = 24;
+
+        let mut handles = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let store = store.clone();
+            let locks = locks.clone();
+            handles.push(tokio::spawn(async move {
+                mailbox_enqueue_with_quota(
+                    store.as_ref(),
+                    locks.as_ref(),
+                    recipient,
+                    vec![0u8; envelope_size],
+                    0,
+                    14,
+                    quota_mb,
+                )
+                .await
+                .unwrap()
+            }));
+        }
+
+        let mut queued = 0usize;
+        let mut quota_exceeded = 0usize;
+        for h in handles {
+            match h.await.unwrap() {
+                MailboxEnqueueOutcome::Queued(_) => queued += 1,
+                MailboxEnqueueOutcome::QuotaExceeded => quota_exceeded += 1,
+            }
+        }
+        assert_eq!(queued + quota_exceeded, concurrency);
+
+        let total = store
+            .mailbox_size_bytes_for_recipient(&recipient)
+            .await
+            .unwrap();
+        assert!(
+            total <= quota_bytes + envelope_size as u64,
+            "concurrent same-recipient enqueues overran quota_mb by more than one envelope's \
+             worth: total={total} quota_bytes={quota_bytes} envelope_size={envelope_size} \
+             queued={queued}"
+        );
+        assert!(
+            queued >= 1,
+            "at least one racer should have fit before the quota filled"
+        );
+        assert!(
+            queued < concurrency,
+            "quota must actually have been enforced — not every racer can have queued \
+             (queued={queued} of {concurrency})"
+        );
     }
 }

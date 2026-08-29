@@ -212,6 +212,12 @@ pub struct FedRouteDeps<'a> {
     pub metrics: &'a Metrics,
     pub store: &'a dyn Store,
     pub mailbox: &'a crate::config::Mailbox,
+    /// Task 9.1 (review finding F1): the same per-recipient lock registry the local route path
+    /// (`ws::queue_to_mailbox`) uses around `crate::store::mailbox_enqueue_with_quota` — shared,
+    /// via `AppState::mailbox_locks`, so a local and a federated enqueue racing at the same
+    /// recipient serialize against EACH OTHER, not just against callers on their own path. See
+    /// [`crate::store::MailboxLocks`]'s own doc comment.
+    pub mailbox_locks: &'a crate::store::MailboxLocks,
 }
 
 pub async fn handle_fed_route(
@@ -300,6 +306,7 @@ pub async fn handle_fed_route(
     }
     match crate::store::mailbox_enqueue_with_quota(
         deps.store,
+        deps.mailbox_locks,
         req.to,
         req.envelope.as_bytes().to_vec(),
         crate::ws::now_secs(),
@@ -483,6 +490,7 @@ pub async fn serve_link(mut link: FederationLink, state: Arc<AppState>) {
                         metrics: &state.metrics,
                         store: state.store.as_ref(),
                         mailbox: &state.config.mailbox,
+                        mailbox_locks: &state.mailbox_locks,
                     },
                     &origin_domains,
                     &metering_key,

@@ -504,6 +504,27 @@ async fn handle_route(
         }
     }
 
+    // Task 9.1 (review finding F1): local-route defense-in-depth size cap, matching the federated
+    // path's existing `MAX_FRAME_LEN` check (`federation::inbound::handle_fed_route`'s "architect
+    // decision #1" oversized-body check), which the local path lacked entirely before this task —
+    // an oversized envelope routed locally could previously reach `deliver_one`/the mailbox enqueue
+    // unchecked. Same error shape/code as the federated rejection: `error_codes::BAD_REQUEST`
+    // (`"bad_request"` on the wire, identical string to `fed_error_codes::BAD_REQUEST`) with the
+    // same message. This point is reached only for a LOCAL route (the federated branch above always
+    // returns first) — the federated path already gets its own equivalent cap from
+    // `route_foreign`'s pre-dial check plus B's own defense-in-depth check, unchanged by this task.
+    // Measured on `body.blob.0`'s raw length, the same quantity the federated check measures on
+    // `req.envelope`.
+    if body.blob.0.len() > crate::federation::link::MAX_FRAME_LEN {
+        return send_err(
+            tx,
+            frame.id,
+            error_codes::BAD_REQUEST,
+            "envelope too large to route",
+        )
+        .await;
+    }
+
     // Kept in case the recipient turns out to be offline and this falls through to the
     // mailbox-enqueue path below (T07) — both `deliver_one` and the tamper-hook plan below consume
     // `body.blob.0` regardless of whether the recipient is actually connected.
@@ -590,6 +611,7 @@ async fn queue_to_mailbox(
 ) {
     let outcome = crate::store::mailbox_enqueue_with_quota(
         state.store.as_ref(),
+        &state.mailbox_locks,
         recipient,
         blob,
         now_secs(),

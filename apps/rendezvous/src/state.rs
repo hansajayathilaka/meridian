@@ -13,7 +13,7 @@ use crate::config::{Config, DiscoveryMode};
 use crate::federation;
 use crate::metrics::Metrics;
 use crate::ratelimit::RateLimiter;
-use crate::store::Store;
+use crate::store::{MailboxLocks, Store};
 use crate::turn::TurnConfig;
 
 /// The live connections for one account key: `(conn_id, outbound sender)` per socket.
@@ -87,6 +87,12 @@ pub struct AppState {
     pub turn_limiter: RateLimiter,
     /// Resolved TURN minting config (empty secret ⇒ minting disabled).
     pub turn: TurnConfig,
+    /// Per-recipient locking for [`crate::store::mailbox_enqueue_with_quota`]'s check-then-write
+    /// (task 9.1, review finding F1) — shared by BOTH the local route path
+    /// (`ws::queue_to_mailbox`) and the federated route path (`federation::inbound::handle_fed_route`
+    /// via its `FedRouteDeps`), so a local and a federated enqueue racing at the same recipient are
+    /// serialized against each other too. See [`MailboxLocks`]'s own doc comment.
+    pub mailbox_locks: MailboxLocks,
     /// TEST HOOK (task 1.32): byte-level buffers for the replay/reorder/drop/cross-delivery relay
     /// attacks. Compiled in only under the `test-tamper-hook` cargo feature — this field does not
     /// exist in a default/release build (F17).
@@ -255,6 +261,7 @@ impl AppState {
             route_limiter,
             turn_limiter,
             turn,
+            mailbox_locks: MailboxLocks::default(),
             #[cfg(feature = "test-tamper-hook")]
             route_tamper: crate::route_tamper::RouteTamper::default(),
             federation,

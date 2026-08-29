@@ -13,6 +13,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use meridian_proto::PrekeyBundle;
+use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -156,20 +157,89 @@ pub enum MailboxEnqueueOutcome {
     QuotaExceeded,
 }
 
+/// Number of shards [`MailboxLocks`] stripes its per-recipient locking across. Fixed-size (not a
+/// `HashMap<[u8; 32], _>` entry per recipient that would grow unboundedly with every distinct
+/// recipient a server ever sees — no cleanup bookkeeping needed), and large enough that two
+/// *different* recipients landing in the same shard (and so incidentally serializing against each
+/// other, which is the one accepted imprecision of striping) is rare in practice.
+const MAILBOX_LOCK_SHARDS: usize = 256;
+
+/// Per-recipient serialization for [`mailbox_enqueue_with_quota`]'s check-then-write (task 9.1,
+/// review finding F1). The read (`Store::mailbox_size_bytes_for_recipient`) and write
+/// (`Store::mailbox_enqueue`) are two separate `Store` calls with no shared transaction — without
+/// an external lock, N concurrent callers targeting the SAME offline recipient can all read the
+/// same stale `current_bytes`, each independently decide "this still fits," and all enqueue,
+/// overrunning `quota_mb` by up to N x envelope size instead of the intended "at most one envelope
+/// over" bound.
+///
+/// A fixed-size striped lock (hash `recipient` into one of [`MAILBOX_LOCK_SHARDS`]
+/// `tokio::sync::Mutex`es) rather than a compare-and-swap primitive added to the [`Store`] trait
+/// itself: it serializes calls for the SAME recipient identically regardless of which `Store`
+/// backend is in use (`MemoryStore` or `SqliteStore`) since the lock lives entirely in this crate,
+/// outside the trait — no new obligation on either backend impl, and no per-backend atomic-SQL
+/// special-casing to keep behaviorally identical to `MemoryStore`. Held only across the duration of
+/// one [`mailbox_enqueue_with_quota`] call, never across unrelated recipients' calls (bar the rare
+/// shard collision above) — the "keep the lock scope narrow" constraint this task's own notes call
+/// out.
+///
+/// One instance lives on [`crate::state::AppState`] and is shared by both the local route path
+/// (`ws::queue_to_mailbox`) and the federated route path
+/// (`federation::inbound::handle_fed_route`), so a local and a federated enqueue racing at the same
+/// recipient are serialized against EACH OTHER too, not just against callers on the same path.
+/// Task 9.4 (the mailbox-drain/registration race) is expected to reuse this same primitive, per the
+/// phase's task-sequencing note.
+pub struct MailboxLocks {
+    shards: Vec<AsyncMutex<()>>,
+}
+
+impl Default for MailboxLocks {
+    fn default() -> Self {
+        Self {
+            shards: (0..MAILBOX_LOCK_SHARDS)
+                .map(|_| AsyncMutex::new(()))
+                .collect(),
+        }
+    }
+}
+
+impl MailboxLocks {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Acquire the shard guarding `recipient`. Held by the returned guard until dropped — callers
+    /// must hold it across both the quota read and the enqueue write.
+    async fn lock_recipient(&self, recipient: &[u8; 32]) -> tokio::sync::MutexGuard<'_, ()> {
+        // First 8 bytes of an already-uniformly-random Ed25519/X25519 pubkey as a shard selector —
+        // no need for a real hash function over key material that's already high-entropy.
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&recipient[..8]);
+        let shard = (u64::from_le_bytes(buf) as usize) % self.shards.len();
+        self.shards[shard].lock().await
+    }
+}
+
 /// Check `recipient`'s current mailbox usage against `quota_mb`, then enqueue `blob` if it fits.
 /// Shared by the local route path (task 8.5, `ws::handle_route`) and the federated route path
 /// (task 8.6, `federation::inbound::handle_fed_route`) so the quota math lives in exactly one
 /// place. Callers are responsible for the `ttl_days == 0` (mailbox disabled) short-circuit — this
 /// function always attempts to enqueue, matching the "quota is the only enqueue-time gate" scope
 /// of both call sites.
+///
+/// **Task 9.1 (review finding F1):** `locks` serializes this whole check-then-write against every
+/// OTHER concurrent call (from either route path) naming the same `recipient` — see
+/// [`MailboxLocks`]'s own doc comment for why a striped async lock, not a `Store`-trait
+/// compare-and-swap primitive, closes the race identically for both backends.
 pub async fn mailbox_enqueue_with_quota(
     store: &dyn Store,
+    locks: &MailboxLocks,
     recipient: [u8; 32],
     blob: Vec<u8>,
     now: u64,
     ttl_days: u32,
     quota_mb: u32,
 ) -> StoreResult<MailboxEnqueueOutcome> {
+    let _guard = locks.lock_recipient(&recipient).await;
     let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
     let current_bytes = store.mailbox_size_bytes_for_recipient(&recipient).await?;
     if current_bytes + blob.len() as u64 > quota_bytes {
@@ -328,6 +398,8 @@ pub use sqlite::SqliteStore;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[tokio::test]
@@ -503,6 +575,161 @@ mod tests {
                 .await
                 .unwrap(),
             0
+        );
+    }
+
+    // -- task 9.1: mailbox quota check-then-write race (review finding F1) -----------------------
+
+    /// A `Store` wrapper that inserts a short artificial delay inside
+    /// `mailbox_size_bytes_for_recipient`, AFTER the read completes but before it returns.
+    /// `MemoryStore`'s own operations never actually suspend (a `std::sync::Mutex` lock/read/
+    /// unlock, with no real I/O) — so [`mailbox_enqueue_with_quota`]'s read-then-write race window
+    /// against a raw `MemoryStore` is only ever as wide as two OS threads happening to execute that
+    /// tiny synchronous section at literally the same instant, which real scheduling rarely lines
+    /// up even under a `Barrier`-synchronized burst. Widening the window here makes a genuine race
+    /// (the SAME one a slower backend, or a busier server, would hit far more easily) deterministic
+    /// to observe in a fast unit test — it does not change what is being tested: the locking in
+    /// [`mailbox_enqueue_with_quota`] itself, exercised for real, unmodified, against this backend.
+    struct DelayedStore {
+        inner: MemoryStore,
+    }
+
+    #[async_trait]
+    impl Store for DelayedStore {
+        async fn register_account(
+            &self,
+            account_pub: [u8; 32],
+            admission: &str,
+            max_bundle_v: u16,
+        ) -> StoreResult<()> {
+            self.inner
+                .register_account(account_pub, admission, max_bundle_v)
+                .await
+        }
+        async fn put_bundle(&self, bundle: PrekeyBundle) -> StoreResult<()> {
+            self.inner.put_bundle(bundle).await
+        }
+        async fn get_bundle(&self, target: &[u8; 32]) -> StoreResult<Option<PrekeyBundle>> {
+            self.inner.get_bundle(target).await
+        }
+        async fn total_otks(&self) -> StoreResult<u64> {
+            self.inner.total_otks().await
+        }
+        async fn mailbox_enqueue(
+            &self,
+            recipient_pub: [u8; 32],
+            blob: Vec<u8>,
+            arrived_at: u64,
+            expires_at: u64,
+        ) -> StoreResult<u64> {
+            self.inner
+                .mailbox_enqueue(recipient_pub, blob, arrived_at, expires_at)
+                .await
+        }
+        async fn mailbox_list_for_recipient(
+            &self,
+            recipient_pub: &[u8; 32],
+        ) -> StoreResult<Vec<MailboxEntry>> {
+            self.inner.mailbox_list_for_recipient(recipient_pub).await
+        }
+        async fn mailbox_delete_by_ids(
+            &self,
+            recipient_pub: &[u8; 32],
+            ids: &[u64],
+        ) -> StoreResult<u64> {
+            self.inner.mailbox_delete_by_ids(recipient_pub, ids).await
+        }
+        async fn mailbox_purge_expired(&self, now: u64) -> StoreResult<u64> {
+            self.inner.mailbox_purge_expired(now).await
+        }
+        async fn mailbox_size_bytes_for_recipient(
+            &self,
+            recipient_pub: &[u8; 32],
+        ) -> StoreResult<u64> {
+            let bytes = self
+                .inner
+                .mailbox_size_bytes_for_recipient(recipient_pub)
+                .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            Ok(bytes)
+        }
+    }
+
+    /// N concurrent `mailbox_enqueue_with_quota` calls racing at the SAME offline recipient, with
+    /// envelopes sized large relative to the configured quota (near-`MAX_FRAME_LEN`, matching this
+    /// task's Deliverable 3 — the previously-documented "bounded, roughly one envelope" assumption
+    /// is what this proves, not merely "a small overrun"). Pre-fix (unserialized read-then-write)
+    /// this reliably overran `quota_mb` by multiples of `envelope_size`; post-fix the final byte
+    /// total must never exceed `quota_mb` by more than one envelope's worth, and quota must
+    /// genuinely have been enforced (not every racer can have been queued). Every racer is lined up
+    /// on a [`tokio::sync::Barrier`] immediately before calling `mailbox_enqueue_with_quota`, and
+    /// races against a [`DelayedStore`] (see its own doc comment for why) — the same real
+    /// `MailboxLocks`-guarded function under test either way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn mailbox_enqueue_with_quota_races_at_one_recipient_never_overrun_by_more_than_one_envelope(
+    ) {
+        let store = Arc::new(DelayedStore {
+            inner: MemoryStore::new(),
+        });
+        let locks = Arc::new(MailboxLocks::default());
+        let recipient = [42u8; 32];
+        let quota_mb: u32 = 1; // 1 MiB — fits exactly one near-maximal envelope, never two.
+        let quota_bytes = quota_mb as u64 * MAILBOX_QUOTA_BYTES_PER_MB;
+        // Comfortably under `federation::link::MAX_FRAME_LEN` (1 MiB) — "near-maximal" per
+        // Deliverable 3 — and large relative to the 1 MiB quota above.
+        let envelope_size: usize = 1_000_000;
+        let concurrency = 24;
+        let barrier = Arc::new(tokio::sync::Barrier::new(concurrency));
+
+        let mut handles = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let store = store.clone();
+            let locks = locks.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                mailbox_enqueue_with_quota(
+                    store.as_ref(),
+                    locks.as_ref(),
+                    recipient,
+                    vec![0u8; envelope_size],
+                    0,
+                    14,
+                    quota_mb,
+                )
+                .await
+                .unwrap()
+            }));
+        }
+
+        let mut queued = 0usize;
+        let mut quota_exceeded = 0usize;
+        for h in handles {
+            match h.await.unwrap() {
+                MailboxEnqueueOutcome::Queued(_) => queued += 1,
+                MailboxEnqueueOutcome::QuotaExceeded => quota_exceeded += 1,
+            }
+        }
+        assert_eq!(queued + quota_exceeded, concurrency);
+
+        let total = store
+            .mailbox_size_bytes_for_recipient(&recipient)
+            .await
+            .unwrap();
+        assert!(
+            total <= quota_bytes + envelope_size as u64,
+            "concurrent same-recipient enqueues overran quota_mb by more than one envelope's \
+             worth: total={total} quota_bytes={quota_bytes} envelope_size={envelope_size} \
+             queued={queued}"
+        );
+        assert!(
+            queued >= 1,
+            "at least one racer should have fit before the quota filled"
+        );
+        assert!(
+            queued < concurrency,
+            "quota must actually have been enforced — not every racer can have queued \
+             (queued={queued} of {concurrency})"
         );
     }
 }
