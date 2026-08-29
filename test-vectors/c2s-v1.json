@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "c2s wire-encoding conformance vectors for the federation-hint extension (F20): Fetch.hint, RouteBody.to_hint, and the new federation error codes — deterministic CBOR (fixed byte patterns, no RNG/wall-clock). Regenerate with `cargo run -p xtask -- vectors`. Spec: docs/api/wire-protocol.md, docs/api/federation-protocol-v1.md, apps/proto/src/msg.rs. The full historic c2s frame set (Challenge/Auth/Publish/Bundle/Deliver/TurnReq/TurnGrant) is proven only by apps/proto/tests/roundtrip.rs's hand-written round trips, a pre-existing gap this task does not widen into (see docs/tasks/phase-3/3.14-c2s-hint-conformance-vectors.md Scope). Extended in task 8.4 with the T07 mailbox wire fields added in 8.3 (RouteOk.queued, Deliver.mailbox_id, MailboxAck/MailboxAckOk, mailbox_full): the pre-8.3 vectors above stay byte-identical, and route-ok-delivered/deliver-no-mailbox-id additionally pin the backward-compatible (field-omitted) shape of RouteOk/Deliver.",
+  "note": "c2s wire-encoding conformance vectors for the federation-hint extension (F20): Fetch.hint, RouteBody.to_hint, and the new federation error codes — deterministic CBOR (fixed byte patterns, no RNG/wall-clock). Regenerate with `cargo run -p xtask -- vectors`. Spec: docs/api/wire-protocol.md, docs/api/federation-protocol-v1.md, apps/proto/src/msg.rs. The full historic c2s frame set (Challenge/Auth/Publish/Bundle/Deliver/TurnReq/TurnGrant) is proven only by apps/proto/tests/roundtrip.rs's hand-written round trips, a pre-existing gap this task does not widen into (see docs/tasks/phase-3/3.14-c2s-hint-conformance-vectors.md Scope). Extended in task 8.4 with the T07 mailbox wire fields added in 8.3 (RouteOk.queued, Deliver.mailbox_id, MailboxAck/MailboxAckOk, mailbox_full): the pre-8.3 vectors above stay byte-identical, and route-ok-delivered/deliver-no-mailbox-id additionally pin the backward-compatible (field-omitted) shape of RouteOk/Deliver. Extended in task 9.8 (review finding F8) with mailbox-ack-empty, locking the reachable MailboxAck{ids:[]} empty-array CBOR shape alongside the pre-existing non-empty mailbox-ack vector.",
   "vectors": [
     {
       "name": "fetch-no-hint",
@@ -130,6 +130,15 @@
         ]
       },
       "frame_hex": "a3626f706a4d61696c626f7841636b6269640a64626f647949a16369647383010203"
+    },
+    {
+      "name": "mailbox-ack-empty",
+      "op": "MailboxAck",
+      "id": 13,
+      "fields": {
+        "ids": []
+      },
+      "frame_hex": "a3626f706a4d61696c626f7841636b6269640d64626f647946a16369647380"
     },
     {
       "name": "mailbox-ack-ok",

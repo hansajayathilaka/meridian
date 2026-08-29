@@ -252,6 +252,21 @@ pub fn generate_c2s() -> Result<(), String> {
         serde_json::json!({ "ids": mailbox_ack.ids }),
     )?);
 
+    // MailboxAck — empty id list (task 9.8, review finding F8). Reachable whenever
+    // `discard_pending_mailbox_ack` empties the accumulator before a flush — proven for
+    // `meridian-proto`'s own encode/decode symmetry by
+    // `apps/proto/tests/roundtrip.rs::mailbox_ack_and_ack_ok_roundtrip`, but until now not
+    // byte-locked across implementations. Locks the empty-array CBOR shape (`0x80`) distinct
+    // from the non-empty `mailbox-ack` vector above.
+    let mailbox_ack_empty = MailboxAck { ids: vec![] };
+    vectors.push(build_vector(
+        "mailbox-ack-empty",
+        Op::MailboxAck,
+        13,
+        &mailbox_ack_empty,
+        serde_json::json!({ "ids": mailbox_ack_empty.ids }),
+    )?);
+
     // MailboxAckOk — empty body.
     let mailbox_ack_ok = MailboxAckOk {};
     vectors.push(build_vector(
@@ -288,7 +303,10 @@ pub fn generate_c2s() -> Result<(), String> {
                8.4 with the T07 mailbox wire fields added in 8.3 (RouteOk.queued, \
                Deliver.mailbox_id, MailboxAck/MailboxAckOk, mailbox_full): the pre-8.3 vectors \
                above stay byte-identical, and route-ok-delivered/deliver-no-mailbox-id \
-               additionally pin the backward-compatible (field-omitted) shape of RouteOk/Deliver."
+               additionally pin the backward-compatible (field-omitted) shape of RouteOk/Deliver. \
+               Extended in task 9.8 (review finding F8) with mailbox-ack-empty, locking the \
+               reachable MailboxAck{ids:[]} empty-array CBOR shape alongside the pre-existing \
+               non-empty mailbox-ack vector."
             .into(),
         vectors,
     };
