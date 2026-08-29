@@ -668,7 +668,7 @@ wire-protocol questions T07 raises before any task started; full record and brea
 - [x] **8.17** Mailbox-drained messages arriving before a first-contact request is accepted must not be silently lost (fix-task found during 8.14's live demo) — [file](./phase-8/8.17-mailbox-ack-must-not-swallow-pending-request-messages.md)
 - [x] **8.14** Phase exit: full demo script + doc sync — [file](./phase-8/8.14-phase-exit-mailbox-demo.md)
 
-### Phase 9 — Review of Phase 8 · **in progress — 10 fix-tasks planned, 0/10 done** · [details](./phase-9/README.md)
+### Phase 9 — Review of Phase 8 · **done** · [details](./phase-9/README.md)
 Review phase. Sweeps everything built since the Phase-7 review: Phase 8 — Offline Ciphertext Mailbox
 (tasks 8.1–8.17). No untracked out-of-band PRs landed in this window (confirmed: only PR #83
 `pick-next-phase` and PR #84, all of 8.1–8.17, merged between the two review points).
@@ -688,7 +688,7 @@ agent; landing order and dependencies: [phase-9/README.md](./phase-9/README.md#t
 - [x] **9.7** Federated-path `ttl_days == 0` test (F7) — [file](./phase-9/9.7-federated-ttl-zero-test.md)
 - [x] **9.8** Lock `MailboxAck{ids:[]}` conformance vector (F8) — [file](./phase-9/9.8-mailbox-ack-empty-conformance-vector.md)
 - [x] **9.9** Add `Mailbox::validate` config check (N1) — [file](./phase-9/9.9-mailbox-config-validate.md)
-- [~] **9.10** Nit sweep: mailbox-drain proptest, `purge_loop` coverage, double-ack no-op test (N3, N4, N5; soft-depends on 9.1, 9.3) — [file](./phase-9/9.10-phase-9-nit-sweep.md)
+- [x] **9.10** Nit sweep: mailbox-drain proptest, `purge_loop` coverage, double-ack no-op test (N3, N4, N5; soft-depends on 9.1, 9.3) — [file](./phase-9/9.10-phase-9-nit-sweep.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
