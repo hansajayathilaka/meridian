@@ -743,7 +743,7 @@ ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md]
 - [x] **10.5** Per-chunk AEAD (`k_f`, nonce = chunk index) (depends on 10.3) — [file](./phase-10/10.5-per-chunk-aead.md)
 - [x] **10.6** `mrd.file/1` `StreamType` implementation (depends on 10.3, 10.4, 10.5) — [file](./phase-10/10.6-filestream-type-impl.md)
 - [x] **10.7** Sender engine: chunking, backpressure, progress, multi-file batches (depends on 10.6) — [file](./phase-10/10.7-sender-engine.md)
-- [~] **10.8** Receiver engine: write-by-offset, incremental verification, corruption handling (depends on 10.6) — [file](./phase-10/10.8-receiver-engine.md)
+- [x] **10.8** Receiver engine: write-by-offset, incremental verification, corruption handling (depends on 10.6) — [file](./phase-10/10.8-receiver-engine.md)
 - [ ] **10.9** Resume protocol: in-stream missing-range bitmap + redial integration (depends on 10.7, 10.8) — [file](./phase-10/10.9-resume-protocol.md)
 - [ ] **10.10** CLI `meridian send` (depends on 10.7, 10.8, 10.9) — [file](./phase-10/10.10-cli-send-command.md)
 - [ ] **10.11** TUI surface: renderer + transfers pane + palette command (depends on 10.6) — [file](./phase-10/10.11-tui-surface.md)

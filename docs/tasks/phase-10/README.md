@@ -129,7 +129,7 @@ Tests/Reviews):
 
 **Wave 5 — engines (depend on 10.6)**
 - [x] **10.7** Sender engine: chunking, backpressure, progress, multi-file batches — [file](./10.7-sender-engine.md)
-- [~] **10.8** Receiver engine: write-by-offset, incremental verification, corruption handling — [file](./10.8-receiver-engine.md)
+- [x] **10.8** Receiver engine: write-by-offset, incremental verification, corruption handling — [file](./10.8-receiver-engine.md)
 - [ ] **10.9** Resume protocol: in-stream missing-range bitmap + redial integration (depends on 10.7, 10.8) — [file](./10.9-resume-protocol.md)
 
 **Wave 6 — client surfaces**

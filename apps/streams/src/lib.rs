@@ -9,12 +9,13 @@
 //! Task 10.3 scope: the `mrd.file/1` manifest schema ([`manifest`]) and the BLAKE3 merkle
 //! build/verify primitive ([`merkle`]) it depends on. Task 10.5 adds per-chunk AEAD ([`chunk`]).
 //! Task 10.6 adds the `StreamType` implementation + registration ([`file`]). Task 10.7 adds the
-//! sender engine ([`sender`]). The receiver engine is a later task in this phase (10.8).
+//! sender engine ([`sender`]); task 10.8 adds the receiver engine ([`receiver`]).
 
 pub mod chunk;
 pub mod file;
 pub mod manifest;
 pub mod merkle;
+pub mod receiver;
 pub mod sender;
 
 pub use chunk::{open_chunk, seal_chunk, ChunkError, ChunkFrame};
@@ -24,6 +25,7 @@ pub use file::{
 };
 pub use manifest::FileManifest;
 pub use merkle::{verify, Hash, MerkleProof, MerkleTree, ProofStep, Side, CHUNK_SIZE};
+pub use receiver::{FileReceiver, ReceiveError};
 pub use sender::{
     send_chunk_frame, send_file, send_files, FileSend, SendProgress, SenderConfig, SenderError,
 };
