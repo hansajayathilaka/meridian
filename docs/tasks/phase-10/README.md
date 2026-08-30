@@ -119,7 +119,7 @@ Tests/Reviews):
 - [x] **10.3** Scaffold `meridian-streams` + manifest schema + BLAKE3 merkle build/verify — [file](./10.3-streams-crate-manifest-merkle.md)
 
 **Wave 2 — substrate completion (depends on 10.1, 10.2)**
-- [~] **10.4** Generalize the session substrate to drive a second stream type — [file](./10.4-session-substrate-multi-stream.md)
+- [x] **10.4** Generalize the session substrate to drive a second stream type — [file](./10.4-session-substrate-multi-stream.md)
 
 **Wave 3 — file-type crypto/schema pieces (parallel with 10.4; depends on 10.3)**
 - [x] **10.5** Per-chunk AEAD (`k_f`, nonce = chunk index) — [file](./10.5-per-chunk-aead.md)

@@ -1268,3 +1268,206 @@ async fn relay_only_answer_aborts_before_any_signaling_send_on_a_leaked_host_can
         "the answer must never reach the signaling relay once a leaked candidate is observed"
     );
 }
+
+// -- task 10.4: generic multi-stream substrate ----------------------------------------------------
+
+/// (task 10.4) End-to-end proof of the generalized substrate over `LoopbackTransport`, driving a
+/// registered non-chat/non-ctrl "exotic" stream type — mirroring `apps/core/src/streams.rs`'s own
+/// test-only `Exotic` shape (mandatory, `reliable_ordered`, `Bidir`), but with interior state so a
+/// received frame is actually observable from outside `on_frame`'s synchronous callback: open,
+/// accept (both sides symmetrically open a real data channel — the deliverable this task adds),
+/// send a frame each way, confirm `on_frame` fires with correctly decrypted bytes on both ends, and
+/// confirm `stream_buffered_amount` reflects a real (loopback-backed) buffered amount right after a
+/// send, before the peer's `pump` drains it.
+#[tokio::test]
+async fn generic_stream_frames_round_trip_with_backpressure_query() {
+    use std::sync::Mutex;
+
+    struct Exotic {
+        received: Mutex<Vec<Vec<u8>>>,
+    }
+    impl Exotic {
+        fn new() -> Self {
+            Self {
+                received: Mutex::new(Vec::new()),
+            }
+        }
+        fn frames(&self) -> Vec<Vec<u8>> {
+            self.received.lock().unwrap().clone()
+        }
+    }
+    impl StreamType for Exotic {
+        fn name(&self) -> &'static str {
+            "mrd.exotic/9"
+        }
+        fn version(&self) -> u16 {
+            9
+        }
+        fn channel_cfg(&self) -> ChannelCfg {
+            ChannelCfg::reliable_ordered("mrd.exotic/9")
+        }
+        fn direction(&self) -> meridian_core::envelope::Direction {
+            meridian_core::envelope::Direction::Bidir
+        }
+        fn mandatory(&self) -> bool {
+            true
+        }
+        fn on_frame(&self, _sid: meridian_core::streams::StreamId, frame: &[u8]) {
+            self.received.lock().unwrap().push(frame.to_vec());
+        }
+    }
+
+    let mut alice = Peer::new("chat.a");
+    let mut bob = Peer::new("chat.b");
+    establish_ratchet(&mut alice, &mut bob);
+
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(LoopbackTransport::new(fabric.clone()));
+    let tb = Arc::new(LoopbackTransport::new(fabric.clone()));
+
+    let alice_exotic = Arc::new(Exotic::new());
+    let bob_exotic = Arc::new(Exotic::new());
+    let mut reg_a = StreamRegistry::with_builtins();
+    register_stream_type(&mut reg_a, alice_exotic.clone());
+    let mut reg_b = StreamRegistry::with_builtins();
+    register_stream_type(&mut reg_b, bob_exotic.clone());
+
+    let (ra, rb) = connect(
+        ta,
+        tb,
+        &mut alice,
+        &mut bob,
+        Arc::new(reg_a),
+        Arc::new(reg_b),
+    )
+    .await;
+    let mut asess = ra.expect("established");
+    let mut bsess = rb.expect("established");
+
+    let ahandle = alice.handle();
+    let bhandle = bob.handle();
+
+    // Alice opens the exotic stream; Bob's `decide_open` accepts it — the responder side of the
+    // symmetric data-channel open this task adds.
+    let sid = asess
+        .open_stream(
+            &alice.store,
+            &ahandle,
+            &mut alice.chat,
+            "mrd.exotic/9",
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    match bsess
+        .pump(&bob.store, &bhandle, &mut bob.chat)
+        .await
+        .unwrap()
+    {
+        Some(SessionEvent::StreamOpened(got, ty)) => {
+            assert_eq!(got, sid);
+            assert_eq!(ty, "mrd.exotic/9");
+        }
+        other => panic!("bob expected StreamOpened, got {other:?}"),
+    }
+    // Alice sees the Accept — the initiator side of the symmetric data-channel open.
+    match asess
+        .pump(&alice.store, &ahandle, &mut alice.chat)
+        .await
+        .unwrap()
+    {
+        Some(SessionEvent::StreamOpened(got, ty)) => {
+            assert_eq!(got, sid);
+            assert_eq!(ty, "mrd.exotic/9");
+        }
+        other => panic!("alice expected StreamOpened (accept), got {other:?}"),
+    }
+
+    // Alice -> Bob: encrypt-and-send via the new generic outbound path.
+    asess
+        .send_stream_frame(&mut alice.chat, sid, b"hello from alice")
+        .await
+        .unwrap();
+
+    // Backpressure query: right after the send and before Bob's `pump` has drained it, the
+    // loopback-backed buffered amount must reflect the (ratchet-framed, so larger than the bare
+    // plaintext) bytes actually queued — a synthetic buffered-amount reading, task 10.2's primitive
+    // exposed through this task's own query.
+    let buffered = asess.stream_buffered_amount(sid).await.unwrap();
+    assert!(
+        buffered > 0,
+        "buffered amount must reflect the just-queued frame before the peer drains it, got {buffered}"
+    );
+
+    // Bob's generic dispatch: decrypt via task 10.1's export primitive and call `on_frame` — no
+    // `SessionEvent` of its own (the substrate never interprets the bytes), so `pump` returns
+    // `Ok(None)`.
+    match bsess.pump(&bob.store, &bhandle, &mut bob.chat).await {
+        Ok(None) => {}
+        other => panic!("bob expected a silently-dispatched stream frame, got {other:?}"),
+    }
+    assert_eq!(bob_exotic.frames(), vec![b"hello from alice".to_vec()]);
+
+    // Draining the frame must bring the sender's own buffered-amount view back down.
+    assert_eq!(asess.stream_buffered_amount(sid).await.unwrap(), 0);
+
+    // Bob -> Alice, the mirror direction.
+    bsess
+        .send_stream_frame(&mut bob.chat, sid, b"hi alice")
+        .await
+        .unwrap();
+    match asess.pump(&alice.store, &ahandle, &mut alice.chat).await {
+        Ok(None) => {}
+        other => panic!("alice expected a silently-dispatched stream frame, got {other:?}"),
+    }
+    assert_eq!(alice_exotic.frames(), vec![b"hi alice".to_vec()]);
+
+    // Chat is completely unaffected by any of the above — no behavior change for `mrd.chat/1`.
+    asess
+        .send_chat(&alice.store, &ahandle, &mut alice.chat, "still works")
+        .await
+        .unwrap();
+    accept_first_p2p_message(
+        &mut bsess,
+        &bob.store,
+        &bhandle,
+        &mut bob.chat,
+        &alice.ik(),
+        "still works",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn send_stream_frame_on_an_unknown_stream_is_rejected() {
+    // A caller error (no such open, non-chat/ctrl stream), never a protocol round trip.
+    let mut alice = Peer::new("chat.a");
+    let mut bob = Peer::new("chat.b");
+    establish_ratchet(&mut alice, &mut bob);
+
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(LoopbackTransport::new(fabric.clone()));
+    let tb = Arc::new(LoopbackTransport::new(fabric.clone()));
+
+    let (ra, rb) = connect(
+        ta,
+        tb,
+        &mut alice,
+        &mut bob,
+        Arc::new(StreamRegistry::with_builtins()),
+        Arc::new(StreamRegistry::with_builtins()),
+    )
+    .await;
+    let mut asess = ra.unwrap();
+    let _bsess = rb.unwrap();
+
+    match asess.send_stream_frame(&mut alice.chat, 999, b"nope").await {
+        Err(SessionError::UnknownStream(999)) => {}
+        other => panic!("expected UnknownStream, got {other:?}"),
+    }
+    match asess.stream_buffered_amount(999).await {
+        Err(SessionError::UnknownStream(999)) => {}
+        other => panic!("expected UnknownStream, got {other:?}"),
+    }
+}
