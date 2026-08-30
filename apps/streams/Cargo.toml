@@ -6,16 +6,22 @@ license.workspace = true
 publish = false
 
 # T03/T09/T15/T16: additive stream types (chat, file, location, sticker, tunnel, fs). Home for the
-# `mrd.file/1` manifest schema + BLAKE3 merkle build/verify (T09, this task). Depends on
-# `meridian-proto` for the shared deterministic-CBOR wire helpers (`encode`/`decode`,
-# `bytes::{b32,bytes_vec}`) so stream payload types encode identically to every other content-shaped
-# wire type in the workspace (docs/architecture/stack.md §"Crate dependency direction").
+# `mrd.file/1` manifest schema + BLAKE3 merkle build/verify (T09, task 10.3) and per-chunk AEAD
+# (T09, task 10.5). Depends on `meridian-proto` for the shared deterministic-CBOR wire helpers
+# (`encode`/`decode`, `bytes::{b32,bytes_vec}`) so stream payload types encode identically to every
+# other content-shaped wire type in the workspace (docs/architecture/stack.md §"Crate dependency
+# direction"). `chacha20poly1305` is used directly here (task 10.5) rather than through
+# `meridian-crypto`, since per-chunk AEAD is ordinary symmetric encryption under an
+# already-derived/sealed key (`k_f`), not ratchet/session state — this keeps the crate's own
+# "additive stream type, zero core-crate edits" contract intact.
 # Out of scope for this task (later tasks in this phase): the `StreamType` trait impl (10.6),
-# per-chunk AEAD (10.5), sender/receiver engines (10.7/10.8).
+# sender/receiver engines (10.7/10.8).
 [dependencies]
 meridian-proto = { path = "../proto" }
 serde = { workspace = true }
 blake3 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 ciborium = { workspace = true }

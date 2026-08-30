@@ -2907,9 +2907,11 @@ name = "meridian-streams"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "chacha20poly1305",
  "ciborium",
  "meridian-proto",
  "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
