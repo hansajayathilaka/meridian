@@ -116,7 +116,7 @@ Tests/Reviews):
 **Wave 1 — independent substrate primitives**
 - [x] **10.1** Ratchet HKDF-export for per-stream keys — [file](./10.1-ratchet-hkdf-export.md)
 - [x] **10.2** `Transport::buffered_amount` backpressure primitive — [file](./10.2-transport-buffered-amount.md)
-- [~] **10.3** Scaffold `meridian-streams` + manifest schema + BLAKE3 merkle build/verify — [file](./10.3-streams-crate-manifest-merkle.md)
+- [x] **10.3** Scaffold `meridian-streams` + manifest schema + BLAKE3 merkle build/verify — [file](./10.3-streams-crate-manifest-merkle.md)
 
 **Wave 2 — substrate completion (depends on 10.1, 10.2)**
 - [ ] **10.4** Generalize the session substrate to drive a second stream type — [file](./10.4-session-substrate-multi-stream.md)
