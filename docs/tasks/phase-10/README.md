@@ -125,7 +125,7 @@ Tests/Reviews):
 - [x] **10.5** Per-chunk AEAD (`k_f`, nonce = chunk index) — [file](./10.5-per-chunk-aead.md)
 
 **Wave 4 — the `StreamType` implementation (depends on 10.3, 10.4, 10.5)**
-- [ ] **10.6** `mrd.file/1` `StreamType` implementation — [file](./10.6-filestream-type-impl.md)
+- [x] **10.6** `mrd.file/1` `StreamType` implementation — [file](./10.6-filestream-type-impl.md)
 
 **Wave 5 — engines (depend on 10.6)**
 - [ ] **10.7** Sender engine: chunking, backpressure, progress, multi-file batches — [file](./10.7-sender-engine.md)

@@ -2909,9 +2909,15 @@ dependencies = [
  "blake3",
  "chacha20poly1305",
  "ciborium",
+ "getrandom 0.3.4",
+ "meridian-core",
+ "meridian-identity",
  "meridian-proto",
+ "meridian-signaling",
+ "meridian-store",
  "serde",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]

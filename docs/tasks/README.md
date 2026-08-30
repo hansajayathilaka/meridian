@@ -741,7 +741,7 @@ ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md]
 - [x] **10.3** Scaffold `meridian-streams` + manifest schema + BLAKE3 merkle build/verify — [file](./phase-10/10.3-streams-crate-manifest-merkle.md)
 - [x] **10.4** Generalize the session substrate to drive a second stream type (depends on 10.1, 10.2) — [file](./phase-10/10.4-session-substrate-multi-stream.md)
 - [x] **10.5** Per-chunk AEAD (`k_f`, nonce = chunk index) (depends on 10.3) — [file](./phase-10/10.5-per-chunk-aead.md)
-- [ ] **10.6** `mrd.file/1` `StreamType` implementation (depends on 10.3, 10.4, 10.5) — [file](./phase-10/10.6-filestream-type-impl.md)
+- [x] **10.6** `mrd.file/1` `StreamType` implementation (depends on 10.3, 10.4, 10.5) — [file](./phase-10/10.6-filestream-type-impl.md)
 - [ ] **10.7** Sender engine: chunking, backpressure, progress, multi-file batches (depends on 10.6) — [file](./phase-10/10.7-sender-engine.md)
 - [ ] **10.8** Receiver engine: write-by-offset, incremental verification, corruption handling (depends on 10.6) — [file](./phase-10/10.8-receiver-engine.md)
 - [ ] **10.9** Resume protocol: in-stream missing-range bitmap + redial integration (depends on 10.7, 10.8) — [file](./phase-10/10.9-resume-protocol.md)
