@@ -32,12 +32,19 @@ chacha20poly1305 = { workspace = true }
 thiserror = { workspace = true }
 getrandom = { workspace = true }
 zeroize = { workspace = true }
+# Sender engine (task 10.7): the send loop is async (drives `P2pSession::send_stream_frame`/
+# `stream_buffered_amount`), the backpressure poll needs a non-blocking sleep, and progress events
+# use the same `tokio::sync::mpsc` channel idiom `meridian-core`'s own `P2pSession`/`SessionEvent`
+# plumbing already uses (`apps/core/src/session.rs`) — not a new async idiom for this workspace.
+tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 ciborium = { workspace = true }
 # Manifest-seal round-trip test (task 10.6): a real two-party X3DH + ratchet exchange, proving
 # `FileStream::build_open_params` genuinely routes `k_f` through the existing ratchet-sealing
-# primitive rather than a new mechanism.
+# primitive rather than a new mechanism. The same two-party harness (task 10.7) drives the sender
+# engine end to end over `LoopbackTransport` (re-exported through `meridian_core::transport`).
 meridian-identity = { path = "../identity" }
 meridian-store = { path = "../store" }
 meridian-signaling = { path = "../signaling" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

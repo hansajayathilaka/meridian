@@ -43,7 +43,10 @@
 
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use meridian_proto::{decode, encode, CodecError};
 
 /// Failures opening a sealed chunk.
 #[derive(Debug, Error)]
@@ -105,6 +108,58 @@ pub fn open_chunk(k_f: &[u8; 32], i: u64, sealed: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| ChunkError::Crypto)
 }
 
+/// The `mrd.file/1` **wire** chunk frame — `{i: uint, data: bstr}` per
+/// `docs/api/wire-protocol.md` §6 — sent as the full body of every `send_stream_frame` call the
+/// sender engine (task 10.7) makes while a transfer is in flight. `data` is exactly one call's
+/// worth of [`seal_chunk`] output for chunk index `i`; this type owns only the CBOR envelope around
+/// it, mirroring [`crate::manifest::FileManifest`]'s own `encode`/`decode` pattern (same
+/// deterministic-CBOR helpers, same `bytes_vec` byte-string encoding for the opaque payload).
+///
+/// This lives here (rather than in `sender.rs`/`receiver.rs`) because it is the wire contract this
+/// module's own doc already describes (`{i, data}`) — `seal_chunk`/`open_chunk` produce/consume
+/// `data` alone, and this type is the one place that pairs it with `i` for the wire, so both the
+/// receiver engine (task 10.8, [`crate::receiver`]) and the sender engine (task 10.7,
+/// [`crate::sender`]) build/parse frames against the exact same canonical type — never two
+/// independently-hand-rolled CBOR shapes that could silently drift apart.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkFrame {
+    /// The chunk index this frame claims to carry.
+    pub i: u64,
+    /// The AEAD-sealed chunk bytes ([`seal_chunk`]'s output).
+    #[serde(with = "meridian_proto::bytes::bytes_vec")]
+    pub data: Vec<u8>,
+}
+
+impl ChunkFrame {
+    /// Deterministic-CBOR encode — this is the exact `bytes` [`crate::sender`] hands to
+    /// `P2pSession::send_stream_frame`.
+    // NB: `core::result::Result` here, not this module's own `Result<T>` alias (which is fixed to
+    // `ChunkError`) — `encode`/`decode` fail with `CodecError`, a distinct error from `ChunkError`.
+    pub fn encode(&self) -> core::result::Result<Vec<u8>, CodecError> {
+        encode(self)
+    }
+
+    /// Decode a chunk frame from previously-decrypted plaintext bytes (the output of the
+    /// session substrate's own ratchet `open`/export step — this type never touches ciphertext).
+    /// Every byte off the wire is hostile; this never panics on malformed input, only returns
+    /// [`CodecError`].
+    pub fn decode(bytes: &[u8]) -> core::result::Result<Self, CodecError> {
+        decode(bytes)
+    }
+}
+
+impl std::fmt::Debug for ChunkFrame {
+    /// Deliberately omits the sealed chunk bytes themselves (up to 64 KiB of ciphertext per frame is
+    /// noisy, and this crate's convention is to never print bulk payload bytes — see
+    /// [`crate::receiver::FileReceiver`]'s own `Debug` impl) in favor of just its length.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkFrame")
+            .field("i", &self.i)
+            .field("data_len", &self.data.len())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +218,30 @@ mod tests {
             sealed_0, sealed_1,
             "distinct chunk indices must yield distinct ciphertexts for identical plaintext"
         );
+    }
+
+    #[test]
+    fn chunk_frame_round_trips_and_data_is_a_cbor_byte_string() {
+        // Wire-shape pin (`docs/api/wire-protocol.md` §6): `{i: uint, data: bstr}`, `data` encoded
+        // as a CBOR byte string (major type 2), not an array of small integers — matching every
+        // other opaque-bytes field in this crate/workspace (`bytes_vec`).
+        let frame = ChunkFrame {
+            i: 7,
+            data: vec![0xEE; 40],
+        };
+        let bytes = frame.encode().unwrap();
+        assert_eq!(ChunkFrame::decode(&bytes).unwrap(), frame);
+
+        let value: ciborium::value::Value = ciborium::from_reader(bytes.as_slice()).unwrap();
+        let ciborium::value::Value::Map(entries) = value else {
+            panic!("chunk frame must encode as a CBOR map");
+        };
+        for (key, val) in entries {
+            if let ciborium::value::Value::Text(field) = key {
+                if field == "data" {
+                    assert!(matches!(val, ciborium::value::Value::Bytes(_)));
+                }
+            }
+        }
     }
 }
