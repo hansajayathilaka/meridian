@@ -223,9 +223,29 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   deprioritized. Not bundled with T10 or T14 — no code-path overlap, unlike Phase 4's forced T08+T17
   bundle. Full dependency-check rationale: [phase-10/README.md](./phase-10/README.md). T10 and T14 both
   remain valid, unblocked choices for a later build phase.
-- **NEXT:** `/plan-phase` — break T09 into tasks. The Phase-1 adversarial frontier remains an unowned
-  carry-forward for a future `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08 residuals
-  are Phase-4-scoped follow-ups and stay listed below for a future phase.
+- **NOW:** **Phase 10 planned — 17 tasks (10.1–10.17) across 9 dependency waves.** Two architect
+  consults ran first (Phase-8-style, before task breakdown): the session substrate
+  (`apps/core/src/session.rs`) never finished driving a second stream type beyond hardcoded chat/ctrl —
+  it negotiates `Open`/`Accept` over `mrd.ctrl/1` but never opens a real second data channel or
+  dispatches inbound frames to a registered `StreamType`. Ruled legitimate substrate-completion work
+  (T04's own `open_stream` doc comment already anticipated "T09 is the first second stream type to
+  drive it"), split into a dedicated task (10.4, zero file-transfer-specific logic, reviewed to confirm
+  it) landing before the actual `mrd.file/1` type (10.6, which still shows zero diffs to any core
+  crate) — fix shape is symmetric explicit `add_data_channel` on both sides, confirmed against both the
+  real webrtc-rs backend and the loopback test transport. Second consult: per-stream keys need a new
+  `DoubleRatchet` HKDF-export primitive (`apps/crypto`) — already-accepted design per
+  `stream-types-v1.md`/the crypto-protocols skill, so no new ADR, but mandatory security-reviewer
+  sign-off (task 10.1). Planning also surfaced two related, previously-unnamed substrate gaps: no
+  generic outbound `send_stream_frame`/backpressure primitive exists (10.2/10.4), and
+  `wire-protocol.md`'s documented `Resume` ctrl frame was never implemented and can't be without the
+  same core-crate-leakage problem — resolved as an in-stream message instead (10.9), with the doc
+  correction landing at 10.12. Full record:
+  [phase-10/README.md](./phase-10/README.md#architect-consult-substratewire-shape-decisions-settled-before-task-breakdown),
+  full breakdown: [phase-10/README.md](./phase-10/README.md#tasks-todo).
+- **NEXT:** `/next-task` — Wave 1 (10.1, 10.2, 10.3, 10.13) has no intra-phase dependencies and can
+  start immediately. The Phase-1 adversarial frontier remains an unowned carry-forward for a future
+  `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08 residuals are Phase-4-scoped
+  follow-ups and stay listed below for a future phase.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -698,14 +718,41 @@ agent; landing order and dependencies: [phase-9/README.md](./phase-9/README.md#t
 - [x] **9.9** Add `Mailbox::validate` config check (N1) — [file](./phase-9/9.9-mailbox-config-validate.md)
 - [x] **9.10** Nit sweep: mailbox-drain proptest, `purge_loop` coverage, double-ack no-op test (N3, N4, N5; soft-depends on 9.1, 9.3) — [file](./phase-9/9.10-phase-9-nit-sweep.md)
 
-### Phase 10 — File Transfer Stream · **planning** · [details](./phase-10/README.md)
+### Phase 10 — File Transfer Stream · **in progress — 17 tasks planned, 0/17 done** · [details](./phase-10/README.md)
 Build phase. **[T09 — File Transfer Stream](../architecture/features/09-file-transfer.md)** alone:
-`mrd.file/1` as a pure stream-type extension (manifest-on-ctrl, 64 KiB AEAD-chunked, backpressure,
+`mrd.file/1` as a stream-type extension (manifest-on-ctrl, 64 KiB AEAD-chunked, backpressure,
 resume-via-bitmap, incremental subtree verification, TUI inline preview/progress). Dep T04 done since
 Phase 0. Chosen over T10/T14 (both also technically unblocked) on priority tier (P2 vs T14's P3) and the
 critical-path test — T09 is the sole gate on T11/T16 and transitively T12/T13/T15, T14 gates nothing.
-Full rationale: [phase-10/README.md](./phase-10/README.md). Task breakdown not yet done — `/plan-phase`
-next.
+Full pick rationale: [phase-10/README.md](./phase-10/README.md#dependency-check).
+
+Two architect consults ran before task breakdown (Phase-8-style): (1) `apps/core/src/session.rs`'s
+Open/Accept/pump machinery never finished driving a second stream type (never opens a real data channel
+or dispatches frames beyond hardcoded chat/ctrl) — real substrate-completion work, split into its own
+task (10.4) landing strictly before the actual `mrd.file/1` type (10.6), which itself still shows zero
+diffs to any core crate; (2) per-stream keys need a new `DoubleRatchet` HKDF-export primitive
+(`apps/crypto`) — already-accepted design per `stream-types-v1.md`/the crypto-protocols skill, no new
+ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md](./phase-10/README.md#architect-consult-substratewire-shape-decisions-settled-before-task-breakdown).
+17 tasks (10.1–10.17) across 9 dependency waves, planned by the **planner** agent:
+[phase-10/README.md](./phase-10/README.md#tasks-todo).
+
+- [ ] **10.1** Ratchet HKDF-export for per-stream keys — [file](./phase-10/10.1-ratchet-hkdf-export.md)
+- [ ] **10.2** `Transport::buffered_amount` backpressure primitive — [file](./phase-10/10.2-transport-buffered-amount.md)
+- [ ] **10.3** Scaffold `meridian-streams` + manifest schema + BLAKE3 merkle build/verify — [file](./phase-10/10.3-streams-crate-manifest-merkle.md)
+- [ ] **10.4** Generalize the session substrate to drive a second stream type (depends on 10.1, 10.2) — [file](./phase-10/10.4-session-substrate-multi-stream.md)
+- [ ] **10.5** Per-chunk AEAD (`k_f`, nonce = chunk index) (depends on 10.3) — [file](./phase-10/10.5-per-chunk-aead.md)
+- [ ] **10.6** `mrd.file/1` `StreamType` implementation (depends on 10.3, 10.4, 10.5) — [file](./phase-10/10.6-filestream-type-impl.md)
+- [ ] **10.7** Sender engine: chunking, backpressure, progress, multi-file batches (depends on 10.6) — [file](./phase-10/10.7-sender-engine.md)
+- [ ] **10.8** Receiver engine: write-by-offset, incremental verification, corruption handling (depends on 10.6) — [file](./phase-10/10.8-receiver-engine.md)
+- [ ] **10.9** Resume protocol: in-stream missing-range bitmap + redial integration (depends on 10.7, 10.8) — [file](./phase-10/10.9-resume-protocol.md)
+- [ ] **10.10** CLI `meridian send` (depends on 10.7, 10.8, 10.9) — [file](./phase-10/10.10-cli-send-command.md)
+- [ ] **10.11** TUI surface: renderer + transfers pane + palette command (depends on 10.6) — [file](./phase-10/10.11-tui-surface.md)
+- [ ] **10.12** `mrd.file/1` spec section + wire/design doc corrections (depends on 10.4, 10.6, 10.9) — [file](./phase-10/10.12-spec-doc-sync.md)
+- [ ] **10.13** netns rig: loss/RTT injection profiles — [file](./phase-10/10.13-netns-loss-rtt-profiles.md)
+- [ ] **10.14** Soak test: 1 GiB / 10 GiB transfers + throughput report (depends on 10.10, 10.13) — [file](./phase-10/10.14-soak-test-throughput.md)
+- [ ] **10.15** Kill/resume test automation (depends on 10.9, 10.10, 10.13) — [file](./phase-10/10.15-kill-resume-automation.md)
+- [ ] **10.16** Corrupted-chunk adversarial test (depends on 10.8) — [file](./phase-10/10.16-corrupted-chunk-adversarial-test.md)
+- [ ] **10.17** Phase exit: acceptance demo + third-party implementability check + doc sync (depends on all above) — [file](./phase-10/10.17-phase-exit-demo.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
