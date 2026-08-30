@@ -737,7 +737,7 @@ ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md]
 [phase-10/README.md](./phase-10/README.md#tasks-todo).
 
 - [x] **10.1** Ratchet HKDF-export for per-stream keys — [file](./phase-10/10.1-ratchet-hkdf-export.md)
-- [~] **10.2** `Transport::buffered_amount` backpressure primitive — [file](./phase-10/10.2-transport-buffered-amount.md)
+- [x] **10.2** `Transport::buffered_amount` backpressure primitive — [file](./phase-10/10.2-transport-buffered-amount.md)
 - [~] **10.3** Scaffold `meridian-streams` + manifest schema + BLAKE3 merkle build/verify — [file](./phase-10/10.3-streams-crate-manifest-merkle.md)
 - [ ] **10.4** Generalize the session substrate to drive a second stream type (depends on 10.1, 10.2) — [file](./phase-10/10.4-session-substrate-multi-stream.md)
 - [ ] **10.5** Per-chunk AEAD (`k_f`, nonce = chunk index) (depends on 10.3) — [file](./phase-10/10.5-per-chunk-aead.md)

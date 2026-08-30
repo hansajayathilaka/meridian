@@ -129,6 +129,25 @@ pub trait Transport: Send + Sync {
     /// Send opaque bytes on a data channel. The substrate frames ratchet-sealed envelopes here.
     async fn send(&self, s: &SessionHandle, ch: &ChannelId, data: &[u8]) -> Result<()>;
 
+    /// The number of bytes currently queued for send on `ch` — data already handed to
+    /// [`send`](Transport::send) that has not yet drained out of the channel's outbound buffer
+    /// (the real backend's SCTP association queue; the loopback fabric's own in-memory queue
+    /// depth). The substrate/stream-type layer uses this as a backpressure read primitive: a bulk
+    /// sender (T09) polls it against a low-watermark before queuing more instead of flooding the
+    /// channel. This method only adds the read primitive — no watermark/callback/pause mechanism
+    /// exists yet (that is task 10.7's job).
+    ///
+    /// A mandatory method, not a default-returning-`0` fallback: both in-tree backends can report
+    /// a real value directly, and a silent `0` default would be a footgun for a third-party
+    /// `Transport` implementor who forgot to override it, masking backpressure bugs rather than
+    /// surfacing them.
+    ///
+    /// `Result<u64>`, matching every other method on this trait, even though no in-tree backend
+    /// expects the query itself to fail in normal operation: `UnknownSession`/`UnknownChannel` on a
+    /// stale or mismatched handle is still a real, reportable error, not a value a caller should
+    /// mistake for "zero bytes buffered."
+    async fn buffered_amount(&self, s: &SessionHandle, ch: &ChannelId) -> Result<u64>;
+
     /// Await the next inbound frame across any of the session's data channels, or `None` when the
     /// session has closed. Returns the channel it arrived on so the substrate can demultiplex
     /// (ctrl vs. chat vs. a stream).

@@ -671,6 +671,20 @@ impl Transport for WebRtcTransport {
         Ok(rx.recv().await)
     }
 
+    async fn buffered_amount(&self, s: &SessionHandle, ch: &ChannelId) -> Result<u64> {
+        let sess = self.get_session(s)?;
+        let dc = {
+            let map = sess.channels.lock().unwrap();
+            map.get(ch)
+                .ok_or(TransportError::UnknownChannel)?
+                .dc
+                .clone()
+        };
+        // The real SCTP outbound queue depth (bytes handed to `send()` not yet flushed) — see
+        // `close()`'s drain loop above, which already relies on this same call.
+        Ok(dc.buffered_amount().await as u64)
+    }
+
     async fn selected_path(&self, s: &SessionHandle) -> Result<Path> {
         self.selected_path_detail(s).await.map(|d| d.class)
     }

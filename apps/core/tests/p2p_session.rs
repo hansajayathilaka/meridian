@@ -1110,6 +1110,9 @@ impl Transport for LeakyTransport {
     async fn recv(&self, s: &SessionHandle) -> TransportResult<Option<(ChannelId, Vec<u8>)>> {
         self.0.recv(s).await
     }
+    async fn buffered_amount(&self, s: &SessionHandle, ch: &ChannelId) -> TransportResult<u64> {
+        self.0.buffered_amount(s, ch).await
+    }
     async fn selected_path(&self, s: &SessionHandle) -> TransportResult<Path> {
         self.0.selected_path(s).await
     }
