@@ -28,11 +28,11 @@
 
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{CryptoError, Result};
 use crate::primitives::{
-    aead_open, aead_seal, dh, gen_dh, header_open, header_seal, kdf_ck, kdf_rk,
+    aead_open, aead_seal, dh, gen_dh, header_open, header_seal, hkdf, kdf_ck, kdf_rk,
 };
 
 /// Maximum messages that may be skipped within a single receiving chain before a message that
@@ -55,6 +55,15 @@ const HEADER_LEN: usize = 40;
 /// (task 6.5).
 const AAD_DOMAIN: &[u8] = b"mrd.env/2";
 
+/// Fixed, crate-private HKDF salt for [`DoubleRatchet::encrypt_and_export`]/
+/// [`DoubleRatchet::decrypt_and_export`]'s caller-facing `HKDF(mk, info)` (task 10.1,
+/// `docs/api/stream-types-v1.md` §"Stream framing": `stream_key = HKDF(ratchet_export, info = ...)`).
+/// Deliberately **not** the all-zero salt [`aead_seal`]/[`aead_open`] use for their own internal
+/// `mk`-keyed HKDF (`MSG_INFO`) — using a distinct salt domain-separates this export from that
+/// ciphertext-key derivation so the two can never collide, even in the (practically impossible)
+/// case that a caller's opaque `info` happened to equal `MSG_INFO`.
+const EXPORT_SALT: [u8; 32] = *b"MeridianRatchetExportSaltV1_0000";
+
 /// A decoded ratchet header: `(ratchet_public_key, previous_chain_length, message_number)`.
 type Header = ([u8; 32], u32, u32);
 
@@ -65,6 +74,18 @@ struct Skipped {
     hk: [u8; 32],
     n: u32,
     mk: [u8; 32],
+}
+
+/// Zeroize `mk` whenever a `Skipped` entry is dropped — whether via `zeroize_secrets`'s explicit
+/// loop, a consuming `Vec::remove` in [`DoubleRatchet::try_skipped`] once the key is used, or the
+/// eviction `Vec::drain` in [`DoubleRatchet::skip_message_keys`] once the retention cap is
+/// exceeded. Field type stays plain `[u8; 32]` (not `Zeroizing<[u8; 32]>`) so `Skipped` keeps
+/// deriving `Serialize`/`Deserialize` for the encrypted session store without a manual impl; this
+/// `Drop` gives the same "always cleared, no matter which path removes the entry" guarantee.
+impl Drop for Skipped {
+    fn drop(&mut self) {
+        self.mk.zeroize();
+    }
 }
 
 /// Serializable Double Ratchet state for one peer-device session. Persisted (sealed at rest) so a
@@ -262,6 +283,10 @@ impl DoubleRatchet {
             .hks
             .ok_or(CryptoError::BadKey("no sending header key yet"))?;
         let (next_ck, mk) = kdf_ck(&cks);
+        // Wrapped immediately: if `header_seal`/`aead_seal` below fails and returns early via `?`,
+        // `mk` is still cleared on drop instead of silently dropping the plaintext-in-memory copy
+        // (security-reviewer finding on task 10.1).
+        let mk = Zeroizing::new(mk);
         self.cks = Some(next_ck);
 
         let header = encode_header(&self.dhs_pub, self.pn, self.ns);
@@ -271,6 +296,58 @@ impl DoubleRatchet {
         let aad = self.message_aad(preamble, &enc_header);
         let ct = aead_seal(&mk, plaintext, &aad)?;
         Ok(frame(&enc_header, &ct))
+    }
+
+    /// Like [`Self::encrypt`], but additionally derives and returns a caller-scoped export of the
+    /// one message key (`mk`) consumed for this ciphertext: `HKDF(mk, info)`. `info` is fully
+    /// opaque to this crate — the caller (`apps/crypto/src/session.rs`, and eventually a stream
+    /// type per `docs/api/stream-types-v1.md`'s `stream_key = HKDF(ratchet_export, info = "mrd/stream/"
+    /// ‖ type ‖ sid)`) owns its exact byte encoding; this crate has no knowledge of stream types or
+    /// stream ids (`TODO: confirm` — the concrete encoding is pinned by task 10.12's spec doc, not
+    /// here).
+    ///
+    /// **Never returns `mk` itself, `cks`, `ckr`, or `rk` — only the one-way HKDF export of the one
+    /// `mk` this call already consumed.** `mk` is used to seal `plaintext` exactly as in
+    /// [`Self::encrypt`], then zeroized immediately after the export is derived (see
+    /// [`export_and_zeroize`]) — it never leaves this function. Because the export is a fresh HKDF
+    /// output keyed by `mk` (rather than `mk` reused or passed through), it cannot be inverted back
+    /// to `mk`, nor does it grant any way to derive other messages' keys in this chain: it is scoped
+    /// to exactly this one already-consumed `mk`. The returned key is caller-owned like any other
+    /// secret this crate hands back — **the caller is responsible for zeroizing its own copy**; this
+    /// crate cannot reach into caller-owned storage to do so.
+    pub fn encrypt_and_export(
+        &mut self,
+        plaintext: &[u8],
+        preamble: &[u8],
+        info: &[u8],
+    ) -> Result<(Vec<u8>, [u8; 32])> {
+        let cks = self
+            .cks
+            .ok_or(CryptoError::BadKey("no sending chain established yet"))?;
+        let hks = self
+            .hks
+            .ok_or(CryptoError::BadKey("no sending header key yet"))?;
+        let (next_ck, mk) = kdf_ck(&cks);
+        // Wrapped immediately for the same reason as in `encrypt`: `header_seal`/`aead_seal` below
+        // can fail via `?` before `export_and_zeroize`'s own explicit clear ever runs.
+        let mut mk = Zeroizing::new(mk);
+        self.cks = Some(next_ck);
+
+        let header = encode_header(&self.dhs_pub, self.pn, self.ns);
+        let enc_header = header_seal(&hks, &header)?;
+        self.ns += 1;
+
+        let aad = self.message_aad(preamble, &enc_header);
+        let ct = aead_seal(&mk, plaintext, &aad)?;
+        // `export_and_zeroize` still takes `&mut [u8; 32]` and still explicitly zeroizes it
+        // in-place (deref-coerced here to the buffer this `Zeroizing` owns) — kept rather than
+        // simplified away, since `export_and_zeroize_clears_the_message_key_after_deriving_the_export`
+        // pins that exact behavior against a plain (non-`Zeroizing`) array and must keep passing
+        // unmodified. It also clears strictly earlier than this function's `Zeroizing` would on
+        // drop, so it is not merely redundant duplication.
+        let exported = export_and_zeroize(&mut mk, info);
+
+        Ok((frame(&enc_header, &ct), exported))
     }
 
     /// Ratchet-decrypt a framed ratchet message, advancing the ratchet (DH step / skipped keys) as
@@ -295,37 +372,27 @@ impl DoubleRatchet {
     /// reflecting the tampering) — see this module's `preamble_binding` tests below for the
     /// regression this guards against.
     pub fn decrypt(&mut self, message: &[u8], preamble: &[u8]) -> Result<Vec<u8>> {
-        let (enc_header, ct) = unframe(message).ok_or(CryptoError::Malformed)?;
-
-        if let Some(pt) = self.try_skipped(preamble, enc_header, ct)? {
-            return Ok(pt);
-        }
-
-        let (header, is_dh_ratchet) = self.decrypt_header(enc_header)?;
-        let (dh_pub, pn, n) = header;
-
-        // From here on every mutation lands on `scratch`, not `self` — see the doc comment above.
-        let mut scratch = self.checkpoint();
-
-        if is_dh_ratchet {
-            scratch.skip_message_keys(pn)?;
-            scratch.dh_ratchet(dh_pub);
-        }
-        scratch.skip_message_keys(n)?;
-
-        let ckr = scratch.ckr.ok_or(CryptoError::UndecryptableHeader)?;
-        let (next_ck, mk) = kdf_ck(&ckr);
-        scratch.ckr = Some(next_ck);
-        scratch.nr += 1;
-
-        let aad = scratch.message_aad(preamble, enc_header);
-        let pt = aead_open(&mk, ct, &aad)?;
-
-        // Only now, with authentication proven, does the advanced state become real. `scratch`'s
-        // predecessor (the old `self`) is dropped in place by this assignment, which zeroizes its
-        // secrets exactly as `Drop` normally would.
-        *self = scratch;
+        let (pt, mut mk) = self.decrypt_core(message, preamble)?;
+        mk.zeroize();
         Ok(pt)
+    }
+
+    /// Like [`Self::decrypt`], but additionally derives and returns a caller-scoped export of the
+    /// one message key (`mk`) consumed to authenticate and open this message: `HKDF(mk, info)`. See
+    /// [`Self::encrypt_and_export`]'s doc comment for the full contract (`info` opacity, one-way
+    /// export, zeroization, caller ownership) — it applies identically here, on the receive side.
+    /// This includes the out-of-order/skipped-message path: whichever `mk` actually decrypted
+    /// `message` (freshly derived from the receiving chain, or a retained skipped key) is the one
+    /// exported — never any other message's key in this chain.
+    pub fn decrypt_and_export(
+        &mut self,
+        message: &[u8],
+        preamble: &[u8],
+        info: &[u8],
+    ) -> Result<(Vec<u8>, [u8; 32])> {
+        let (pt, mut mk) = self.decrypt_core(message, preamble)?;
+        let exported = export_and_zeroize(&mut mk, info);
+        Ok((pt, exported))
     }
 
     /// The fixed component of this session's AAD — `"mrd.env/2" ‖ IK_initiator ‖ IK_responder`
@@ -338,6 +405,55 @@ impl DoubleRatchet {
     }
 
     // -- internals -----------------------------------------------------------
+
+    /// Shared core of [`Self::decrypt`]/[`Self::decrypt_and_export`]: does everything the module
+    /// doc comment on [`Self::decrypt`] describes (skipped-key lookup, header decrypt, failure-atomic
+    /// DH-ratchet-via-`checkpoint`, AEAD open), but additionally surfaces the raw `mk` that was
+    /// consumed so the export variant can HKDF-derive from it before either caller zeroizes it.
+    /// Crate-private: `mk` must never reach a `pub` return type un-derived — see
+    /// [`Self::decrypt_and_export`]'s doc comment for why only the HKDF export is public.
+    fn decrypt_core(&mut self, message: &[u8], preamble: &[u8]) -> Result<(Vec<u8>, [u8; 32])> {
+        let (enc_header, ct) = unframe(message).ok_or(CryptoError::Malformed)?;
+
+        if let Some((pt, mk)) = self.try_skipped(preamble, enc_header, ct)? {
+            return Ok((pt, mk));
+        }
+
+        let (header, is_dh_ratchet) = self.decrypt_header(enc_header)?;
+        let (dh_pub, pn, n) = header;
+
+        // From here on every mutation lands on `scratch`, not `self` — see the doc comment on
+        // `decrypt` above.
+        let mut scratch = self.checkpoint();
+
+        if is_dh_ratchet {
+            scratch.skip_message_keys(pn)?;
+            scratch.dh_ratchet(dh_pub);
+        }
+        scratch.skip_message_keys(n)?;
+
+        let ckr = scratch.ckr.ok_or(CryptoError::UndecryptableHeader)?;
+        let (next_ck, mk) = kdf_ck(&ckr);
+        // Wrapped immediately: `aead_open` below is the routine adversary-triggered failure path
+        // (tampered/replayed/forged envelope) and returns early via `?` before reaching the
+        // `Ok((pt, mk))` below — `mk` must still be cleared on that path, not just dropped as a
+        // plain array (security-reviewer finding on task 10.1).
+        let mk = Zeroizing::new(mk);
+        scratch.ckr = Some(next_ck);
+        scratch.nr += 1;
+
+        let aad = scratch.message_aad(preamble, enc_header);
+        let pt = aead_open(&mk, ct, &aad)?;
+
+        // Only now, with authentication proven, does the advanced state become real. `scratch`'s
+        // predecessor (the old `self`) is dropped in place by this assignment, which zeroizes its
+        // secrets exactly as `Drop` normally would.
+        *self = scratch;
+        // `*mk` copies the 32 bytes out before `mk` (the `Zeroizing` local) drops at the end of
+        // this scope and clears its own copy; the returned copy is the caller's responsibility to
+        // zeroize, exactly as before this change (see `decrypt`/`decrypt_and_export` below).
+        Ok((pt, *mk))
+    }
 
     /// The full per-message AAD (ADR 0016 C3): `self.ad ‖ preamble ‖ enc_header`, i.e.
     /// `"mrd.env/2" ‖ AD ‖ prekey_preamble ‖ enc_header`. See [`Self::decrypt`]'s doc comment for
@@ -415,12 +531,16 @@ impl DoubleRatchet {
         Ok(())
     }
 
+    /// Look up and consume a retained skipped-message key matching this header/message-number,
+    /// returning both the plaintext and the raw `mk` used, so [`Self::decrypt_core`] can hand the
+    /// latter on to the export variants. `Ok(None)` means "not a skipped message" (fall through to
+    /// the normal receiving-chain path in `decrypt_core`), not a failure.
     fn try_skipped(
         &mut self,
         preamble: &[u8],
         enc_header: &[u8],
         ct: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<(Vec<u8>, [u8; 32])>> {
         let mut found: Option<(usize, [u8; 32])> = None;
         for (i, s) in self.skipped.iter().enumerate() {
             if let Some(h) = header_open(&s.hk, enc_header) {
@@ -434,11 +554,31 @@ impl DoubleRatchet {
         let Some((i, mk)) = found else {
             return Ok(None);
         };
+        // Wrapped immediately for the same reason as in `decrypt_core`: `aead_open` below is the
+        // routine adversary-triggered failure path and returns early via `?`.
+        let mk = Zeroizing::new(mk);
         let aad = self.message_aad(preamble, enc_header);
         let pt = aead_open(&mk, ct, &aad)?;
+        // The removed `Skipped` entry's own copy of `mk` is zeroized on drop by `impl Drop for
+        // Skipped`, regardless of this local's separate `Zeroizing` wrapper.
         self.skipped.remove(i);
-        Ok(Some(pt))
+        Ok(Some((pt, *mk)))
     }
+}
+
+/// Derive `HKDF(mk, info)` (the caller-facing "ratchet export" — task 10.1) and then zeroize `mk`
+/// in place. Factored out of [`DoubleRatchet::encrypt_and_export`]/
+/// [`DoubleRatchet::decrypt_and_export`] so both call the exact same code path, and so this crate's
+/// own tests can pin the zeroization invariant by calling it directly rather than only inferring it
+/// indirectly through a whole `encrypt`/`decrypt` call.
+///
+/// Uses [`EXPORT_SALT`] (fixed, crate-private) rather than `info` itself as the HKDF salt, so this
+/// derivation is domain-separated from [`aead_seal`]/[`aead_open`]'s own internal `mk`-keyed HKDF
+/// even if `info` happens to collide with that internal derivation's fixed info string.
+fn export_and_zeroize(mk: &mut [u8; 32], info: &[u8]) -> [u8; 32] {
+    let exported: [u8; 32] = hkdf(&EXPORT_SALT, mk, info);
+    mk.zeroize();
+    exported
 }
 
 /// Prepend [`AAD_DOMAIN`] to a session's raw X3DH `AD`, producing the fixed AAD component baked
@@ -640,5 +780,148 @@ mod tests {
             "the genuinely-received preamble must still decrypt after the rejected attempt",
         );
         assert_eq!(pt, b"hello, bob");
+    }
+
+    // -- task 10.1: ratchet HKDF-export for per-stream keys -------------------------------------
+    //
+    // Invariant 5 (FS/PCS non-regression) is pinned by `apps/crypto/tests/session_roundtrip.rs`'s
+    // `forward_secrecy_snapshot_cannot_decrypt_past` / `post_compromise_security_heals_after_round_trip`,
+    // which this task leaves byte-for-byte unmodified; `cargo nextest run -p meridian-crypto` runs
+    // it alongside the invariants 1-4 pinned here.
+
+    /// Invariant 1 (one-wayness): the export API must never return the raw `mk` it consumed. Proxy
+    /// check: since `aead_seal`/`aead_open` derive their AEAD key+nonce solely from `mk`, feeding
+    /// the *exported* value back in as if it were `mk` must fail to open the very ciphertext it was
+    /// consumed to produce — if `exported == mk`, this would succeed.
+    #[test]
+    fn encrypt_and_export_never_returns_the_raw_message_key() {
+        let (mut alice, mut bob, _raw_ad) = test_pair();
+        let preamble: Vec<u8> = Vec::new();
+        let info = b"mrd/stream/test/one-wayness";
+
+        let (msg, exported) = alice
+            .encrypt_and_export(b"payload", &preamble, info)
+            .unwrap();
+
+        let (enc_header, ct) = unframe(&msg).unwrap();
+        let aad = alice.message_aad(&preamble, enc_header);
+        assert!(
+            aead_open(&exported, ct, &aad).is_err(),
+            "the exported key must never be usable as the raw mk that sealed this message"
+        );
+
+        // The real mk still does the real job, reached only through the normal (never-raw-exposed)
+        // decrypt path.
+        let (pt, _exported_recv) = bob.decrypt_and_export(&msg, &preamble, info).unwrap();
+        assert_eq!(pt, b"payload");
+    }
+
+    /// Invariant 2 (no skip-ahead leak): holding the export for one message in a chain must not let
+    /// a caller derive or otherwise use another message's key in that same chain. Builds three
+    /// messages, has the receiver decrypt them out of order (exercising the skipped-key path for
+    /// two of them), and checks pairwise distinctness plus that the third message's export cannot
+    /// open either of the other two's ciphertexts.
+    #[test]
+    fn exporting_one_message_does_not_leak_other_messages_keys_in_the_same_chain() {
+        let (mut alice, mut bob, _raw_ad) = test_pair();
+        let preamble: Vec<u8> = Vec::new();
+        let info = b"mrd/stream/test/skip-ahead";
+
+        let (m0, exp0_send) = alice.encrypt_and_export(b"m0", &preamble, info).unwrap();
+        let (m1, _) = alice.encrypt_and_export(b"m1", &preamble, info).unwrap();
+        let (m2, _) = alice.encrypt_and_export(b"m2", &preamble, info).unwrap();
+
+        // Bob receives m2 first: this DH-ratchets his receiving chain and stashes skipped keys for
+        // messages 0 and 1 without ever exporting them.
+        let (pt2, exp2) = bob.decrypt_and_export(&m2, &preamble, info).unwrap();
+        assert_eq!(pt2, b"m2");
+
+        // exp2 must not open m0's or m1's ciphertext as if it were their raw mk.
+        let (eh0, ct0) = unframe(&m0).unwrap();
+        let (eh1, ct1) = unframe(&m1).unwrap();
+        let aad0 = bob.message_aad(&preamble, eh0);
+        let aad1 = bob.message_aad(&preamble, eh1);
+        assert!(
+            aead_open(&exp2, ct0, &aad0).is_err(),
+            "message 2's export must not decrypt message 0"
+        );
+        assert!(
+            aead_open(&exp2, ct1, &aad1).is_err(),
+            "message 2's export must not decrypt message 1"
+        );
+
+        // Bob now catches up via the retained skipped keys; each export is independent, and the
+        // sender/receiver sides agree for message 0.
+        let (pt0, exp0) = bob.decrypt_and_export(&m0, &preamble, info).unwrap();
+        let (pt1, exp1) = bob.decrypt_and_export(&m1, &preamble, info).unwrap();
+        assert_eq!(pt0, b"m0");
+        assert_eq!(pt1, b"m1");
+
+        assert_ne!(exp0, exp1);
+        assert_ne!(exp1, exp2);
+        assert_ne!(exp0, exp2);
+        assert_eq!(
+            exp0, exp0_send,
+            "sender and receiver must agree on message 0's export"
+        );
+    }
+
+    /// Invariant 3 (determinism): the same synchronized ratchet state plus the same `info` on both
+    /// peers must yield an identical exported key (the round trip a real stream OPEN performs), and
+    /// a different `info` against the very same `mk` must yield a different export (i.e. `info`
+    /// genuinely participates in the derivation, this isn't a constant). `test_pair()` builds fully
+    /// deterministic ratchet state (fixed keys, no RNG), so two independent calls to it produce
+    /// byte-identical starting states, letting the second half of this test isolate `info`'s effect
+    /// from `mk`'s.
+    #[test]
+    fn same_synchronized_state_and_info_on_both_peers_yields_identical_export() {
+        let (mut alice, mut bob, _raw_ad) = test_pair();
+        let preamble: Vec<u8> = Vec::new();
+        let info = b"mrd/stream/file/sid-0001";
+
+        let (msg, exported_by_sender) = alice
+            .encrypt_and_export(b"open-stream", &preamble, info)
+            .unwrap();
+        let (pt, exported_by_receiver) = bob.decrypt_and_export(&msg, &preamble, info).unwrap();
+
+        assert_eq!(pt, b"open-stream");
+        assert_eq!(
+            exported_by_sender, exported_by_receiver,
+            "both ends of one synchronized ratchet message must derive the identical export"
+        );
+
+        let (mut alice2, _bob2, _raw_ad2) = test_pair();
+        let (_msg2, exported_with_different_info) = alice2
+            .encrypt_and_export(b"open-stream", &preamble, b"different-info")
+            .unwrap();
+        assert_ne!(
+            exported_by_sender, exported_with_different_info,
+            "different info against the same mk must yield a different export"
+        );
+    }
+
+    /// Invariant 4 (zeroization): `mk` is cleared immediately after the HKDF-export is derived.
+    /// Exercises [`export_and_zeroize`] directly — the exact routine `encrypt_and_export`/
+    /// `decrypt_and_export` call — mirroring how `drop_zeroizes_all_secret_fields_including_header_keys`
+    /// above tests `zeroize_secrets` directly rather than only inferring it via `Drop`.
+    #[test]
+    fn export_and_zeroize_clears_the_message_key_after_deriving_the_export() {
+        let mut mk = [0x77u8; 32];
+        let original = mk;
+
+        let exported = export_and_zeroize(&mut mk, b"mrd/stream/test/zeroize");
+
+        assert_eq!(
+            mk, [0u8; 32],
+            "mk must be zeroized immediately after HKDF-derivation"
+        );
+        assert_ne!(
+            exported, [0u8; 32],
+            "sanity: the export itself is not the degenerate all-zero case"
+        );
+        assert_ne!(
+            exported, original,
+            "the export must differ from the pre-zeroization mk value"
+        );
     }
 }

@@ -114,9 +114,9 @@ Dependency waves (full task files hold the Definition of Task detail — Goal/Sc
 Tests/Reviews):
 
 **Wave 1 — independent substrate primitives**
-- [ ] **10.1** Ratchet HKDF-export for per-stream keys — [file](./10.1-ratchet-hkdf-export.md)
-- [ ] **10.2** `Transport::buffered_amount` backpressure primitive — [file](./10.2-transport-buffered-amount.md)
-- [ ] **10.3** Scaffold `meridian-streams` + manifest schema + BLAKE3 merkle build/verify — [file](./10.3-streams-crate-manifest-merkle.md)
+- [x] **10.1** Ratchet HKDF-export for per-stream keys — [file](./10.1-ratchet-hkdf-export.md)
+- [~] **10.2** `Transport::buffered_amount` backpressure primitive — [file](./10.2-transport-buffered-amount.md)
+- [~] **10.3** Scaffold `meridian-streams` + manifest schema + BLAKE3 merkle build/verify — [file](./10.3-streams-crate-manifest-merkle.md)
 
 **Wave 2 — substrate completion (depends on 10.1, 10.2)**
 - [ ] **10.4** Generalize the session substrate to drive a second stream type — [file](./10.4-session-substrate-multi-stream.md)
@@ -140,7 +140,7 @@ Tests/Reviews):
 - [ ] **10.12** `mrd.file/1` spec section + wire/design doc corrections (depends on 10.4, 10.6, 10.9) — [file](./10.12-spec-doc-sync.md)
 
 **Wave 8 — test infrastructure**
-- [ ] **10.13** netns rig: loss/RTT injection profiles (independent, can run in Wave 1) — [file](./10.13-netns-loss-rtt-profiles.md)
+- [~] **10.13** netns rig: loss/RTT injection profiles (independent, can run in Wave 1) — [file](./10.13-netns-loss-rtt-profiles.md)
 - [ ] **10.14** Soak test: 1 GiB / 10 GiB transfers + throughput report (depends on 10.10, 10.13) — [file](./10.14-soak-test-throughput.md)
 - [ ] **10.15** Kill/resume test automation (depends on 10.9, 10.10, 10.13) — [file](./10.15-kill-resume-automation.md)
 - [ ] **10.16** Corrupted-chunk adversarial test (depends on 10.8) — [file](./10.16-corrupted-chunk-adversarial-test.md)

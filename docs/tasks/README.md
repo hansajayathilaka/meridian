@@ -736,9 +736,9 @@ ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md]
 17 tasks (10.1–10.17) across 9 dependency waves, planned by the **planner** agent:
 [phase-10/README.md](./phase-10/README.md#tasks-todo).
 
-- [ ] **10.1** Ratchet HKDF-export for per-stream keys — [file](./phase-10/10.1-ratchet-hkdf-export.md)
-- [ ] **10.2** `Transport::buffered_amount` backpressure primitive — [file](./phase-10/10.2-transport-buffered-amount.md)
-- [ ] **10.3** Scaffold `meridian-streams` + manifest schema + BLAKE3 merkle build/verify — [file](./phase-10/10.3-streams-crate-manifest-merkle.md)
+- [x] **10.1** Ratchet HKDF-export for per-stream keys — [file](./phase-10/10.1-ratchet-hkdf-export.md)
+- [~] **10.2** `Transport::buffered_amount` backpressure primitive — [file](./phase-10/10.2-transport-buffered-amount.md)
+- [~] **10.3** Scaffold `meridian-streams` + manifest schema + BLAKE3 merkle build/verify — [file](./phase-10/10.3-streams-crate-manifest-merkle.md)
 - [ ] **10.4** Generalize the session substrate to drive a second stream type (depends on 10.1, 10.2) — [file](./phase-10/10.4-session-substrate-multi-stream.md)
 - [ ] **10.5** Per-chunk AEAD (`k_f`, nonce = chunk index) (depends on 10.3) — [file](./phase-10/10.5-per-chunk-aead.md)
 - [ ] **10.6** `mrd.file/1` `StreamType` implementation (depends on 10.3, 10.4, 10.5) — [file](./phase-10/10.6-filestream-type-impl.md)
@@ -748,7 +748,7 @@ ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md]
 - [ ] **10.10** CLI `meridian send` (depends on 10.7, 10.8, 10.9) — [file](./phase-10/10.10-cli-send-command.md)
 - [ ] **10.11** TUI surface: renderer + transfers pane + palette command (depends on 10.6) — [file](./phase-10/10.11-tui-surface.md)
 - [ ] **10.12** `mrd.file/1` spec section + wire/design doc corrections (depends on 10.4, 10.6, 10.9) — [file](./phase-10/10.12-spec-doc-sync.md)
-- [ ] **10.13** netns rig: loss/RTT injection profiles — [file](./phase-10/10.13-netns-loss-rtt-profiles.md)
+- [~] **10.13** netns rig: loss/RTT injection profiles — [file](./phase-10/10.13-netns-loss-rtt-profiles.md)
 - [ ] **10.14** Soak test: 1 GiB / 10 GiB transfers + throughput report (depends on 10.10, 10.13) — [file](./phase-10/10.14-soak-test-throughput.md)
 - [ ] **10.15** Kill/resume test automation (depends on 10.9, 10.10, 10.13) — [file](./phase-10/10.15-kill-resume-automation.md)
 - [ ] **10.16** Corrupted-chunk adversarial test (depends on 10.8) — [file](./phase-10/10.16-corrupted-chunk-adversarial-test.md)
