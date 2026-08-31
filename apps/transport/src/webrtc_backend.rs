@@ -19,6 +19,87 @@
 //! (`add_data_channel` rejects a label whose derived id collides with a different label already on
 //! the session, rather than silently cross-wiring two streams).
 //!
+//! ## SCTP max-message-size: the default is too small for a full `mrd.file/1` chunk (task 10.18 fix)
+//! `webrtc-sctp`'s (and thus `webrtc-rs`'s) built-in default `max_message_size` is 65536 bytes
+//! (`SctpMaxMessageSize::DEFAULT_MESSAGE_SIZE`, RFC 8841 §6.1's own default) — too small for a "full"
+//! 64 KiB `mrd.file/1` chunk once its own layers of framing are added on top: 65536 bytes of
+//! plaintext, plus the per-chunk XChaCha20-Poly1305 tag (16 bytes,
+//! `apps/streams/src/chunk.rs::seal_chunk`), plus the deterministic-CBOR `ChunkFrame{i, data}`
+//! envelope's own map/key/byte-string-length overhead (14 bytes for a full chunk — measured directly
+//! via `ChunkFrame::encode`, not estimated), plus the 1-byte resume-vs-chunk discriminator
+//! (`apps/streams/src/resume.rs::FRAME_TAG_CHUNK`), plus the outer Double Ratchet frame this whole
+//! blob is then sealed under a second time (`apps/crypto/src/ratchet.rs`: a 2-byte big-endian header
+//! length prefix + an 80-byte encrypted header [24-byte random nonce + 40-byte header plaintext +
+//! 16-byte Poly1305 tag] + a second 16-byte Poly1305 tag on the message ciphertext itself) — a
+//! measured total of **65665 bytes** for one of the first 24 chunks of a file (65536 + 16 + 14 + 1 +
+//! 2 + 80 + 16 = 65665), 129 bytes over the 65536-byte default — CBOR's variable-length uint
+//! encoding of the chunk index grows that 14-byte figure by 1-4 bytes for later chunks (index ≥ 24,
+//! ≥ 256, ≥ 65536), so a chunk late in a very large file can land a few bytes above 65665; the chosen
+//! 256 KiB ceiling (below) has ~196 KiB of headroom regardless, so this doesn't change the fix, only
+//! the precision of this comment. `WebRtcTransport::new()` built its
+//! `SettingEngine` with no override, so both a dialer and an answerer negotiated that same
+//! too-small ceiling — every multi-chunk file transfer failed deterministically on its first full
+//! chunk (`docs/testing/soak-file-transfer-throughput.md`; found independently by tasks 10.14/10.15).
+//!
+//! **Two changes are both required, not just one** — confirmed by reading `webrtc-rs` 0.17.1's own
+//! source (the pinned `webrtc-sctp`/`webrtc` crates under `~/.cargo/registry`), not just its public
+//! API docs:
+//! 1. [`SettingEngine::set_sctp_max_message_size_can_send`] raises *our own* willingness to send
+//!    large messages. But `RTCSctpTransport::start`'s `calc_message_size` computes the actual, live
+//!    ceiling as `min(what the peer's SDP declares it can receive, what we're willing to send)` — and
+//!    `webrtc-rs` 0.17.1's own SDP writer (`add_data_media_section`, `peer_connection/sdp/mod.rs`)
+//!    **never emits an `a=max-message-size` line at all**, on either side, under any `SettingEngine`
+//!    configuration. Left at that, `get_application_media_section_max_message_size` always returns
+//!    `None` when parsing the peer's SDP, so `calc_message_size` falls back to the RFC's own
+//!    65536-byte default for "what the peer can receive" — meaning raising only `can_send` on both
+//!    sides would silently do **nothing**: `calc_message_size(65536, can_send_size)` still returns
+//!    `65536` whenever `can_send_size >= 65536` (see the vendored
+//!    `webrtc-sctp-0.17.1/src/sctp_transport/mod.rs`'s `calc_message_size`, and that crate's own
+//!    gated test `test_given_remote_max_message_size_is_none_when_data_channel_can_send_max_message_size_respected_on_send`,
+//!    which proves exactly this — it asserts `ErrOutboundPacketTooLarge` at 65536 bytes even with
+//!    `can_send` set to `Unbounded`, precisely because nothing declared a larger *receive* ceiling).
+//! 2. So [`with_max_message_size_attr`] appends `a=max-message-size:<SCTP_MAX_MESSAGE_SIZE>` directly
+//!    to the raw SDP text — applied lazily inside [`Transport::local_description`] itself, computed
+//!    fresh from the pristine cached `pending_offer`/`committed_local_sdp` on every call, **not** at
+//!    the point those are cached. That distinction matters: webrtc-rs's own `set_local_description`
+//!    independently re-validates whatever text it is given against its *internal* snapshot of the
+//!    just-generated offer/answer, byte-for-byte, rejecting any mismatch outright
+//!    (`ErrSDPDoesNotMatchOffer`/`ErrSDPDoesNotMatchAnswer`) — so the text passed to
+//!    `set_local_description` must stay exactly what `create_offer`/`create_answer` produced, while
+//!    only the text this backend actually *asserts to the peer* (`local_description()`'s return
+//!    value) carries the extra attribute. Since `apps/core/src/session.rs`'s `dial_with_config`/
+//!    `answer_with_config` send exactly `local_description()`'s bytes to the peer inside the
+//!    ratchet-encrypted ctrl envelope, the peer's own `set_remote_description` parses this line and
+//!    sees our declared ceiling — the same mechanism `webrtc-rs`'s own test suite exercises by
+//!    hand-appending the attribute to a test SDP (see [`with_max_message_size_attr`]'s own doc for
+//!    why the attribute must be applied at the `local_description()` read boundary, not at write
+//!    time, given that internal webrtc-rs validation).
+//! 3. Steps 1 and 2 together are still only half the fix, and this half is easy to miss because it
+//!    fails *silently* rather than with an error like step 1's: they raise the **send**-side ceiling
+//!    end to end, but `RTCDataChannel::on_message`'s own doc comment already warns "OnMessage can
+//!    currently receive messages up to 16384 bytes in size" — and empirically (confirmed by this
+//!    module's own gated regression test, before this third fix was added) the real behavior is
+//!    worse than a truncation: `RTCDataChannel::read_loop`'s internal read buffer is a fixed,
+//!    non-configurable `webrtc::data_channel::DATA_CHANNEL_BUFFER_SIZE` (`u16::MAX` = 65535 bytes),
+//!    and `webrtc_data::DataChannel::read_data_channel` returns `Error::ErrShortBuffer` whenever a
+//!    reassembled message is larger than the caller's buffer — which `RTCDataChannel::read_loop`
+//!    treats as a hard error, **closing the channel** rather than delivering anything. So even with
+//!    steps 1–2 in place, sending one `SCTP_MAX_MESSAGE_SIZE`-sized message over the stock
+//!    `on_message` callback API silently kills the channel before the receiver ever sees it — no
+//!    error surfaces to the sender (`send()` already returned `Ok`), and no message ever reaches
+//!    `recv()`. `SettingEngine::detach_data_channels()` (set once in `WebRtcTransport::new`) disables
+//!    that internal read loop for every channel on this backend; `add_data_channel` then calls
+//!    `RTCDataChannel::detach()` from its `on_open` handler and drives its own read loop
+//!    ([`detached_channel_read_loop`]) with a buffer sized to [`SCTP_MAX_MESSAGE_SIZE`] instead.
+//!
+//! Both peers run identical code (`WebRtcTransport::new()` is the single shared constructor for
+//! both `dial` and `answer` — `apps/core/src/session.rs` calls it identically on both paths), so both
+//! declare (via step 2), honor (via step 1), and actually deliver (via step 3)
+//! [`SCTP_MAX_MESSAGE_SIZE`]-sized messages symmetrically regardless of which side dials and which
+//! answers — proven, not just asserted, by this module's own
+//! `multi_chunk_file_transfer_completes_over_real_sctp` gated test (`apps/transport/tests/webrtc_backend.rs`),
+//! which sends real multi-chunk-sized messages in *both* directions over one connected pair.
+//!
 //! ## Offer/answer without a role hint
 //! [`Transport::local_description`] and [`Transport::local_fingerprint`] are synchronous per the
 //! trait contract (core-api-contracts: "cached at creation / on renegotiation"), but creating a
@@ -99,10 +180,10 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
 
 use webrtc::api::media_engine::MediaEngine;
-use webrtc::api::setting_engine::SettingEngine;
+use webrtc::api::setting_engine::{SctpMaxMessageSize, SettingEngine};
 use webrtc::api::{APIBuilder, API};
+use webrtc::data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice::candidate::{CandidatePairState, CandidateType};
@@ -188,6 +269,25 @@ const ICE_DISCONNECTED_TIMEOUT: Duration = Duration::from_secs(3);
 const ICE_FAILED_TIMEOUT: Duration = Duration::from_secs(9);
 const ICE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 
+/// (task 10.18) The negotiated SCTP association ceiling this backend declares (in SDP, via
+/// [`with_max_message_size_attr`]) and honors (via `SettingEngine::set_sctp_max_message_size_can_send`
+/// in [`WebRtcTransport::new`]) on both the dial and answer paths — see the module doc's "SCTP
+/// max-message-size" section for why *both* halves are required against real `webrtc-rs` 0.17.1
+/// peers, and why this is symmetric regardless of which side dials.
+///
+/// 256 KiB. A measured full `mrd.file/1` chunk needs ~65665 bytes on the wire for one of the first 24
+/// chunks of a file (module doc has the byte-by-byte accounting: 65536-byte plaintext + 16-byte
+/// chunk AEAD tag + 14 bytes of CBOR `ChunkFrame` framing + 1-byte frame-kind discriminator + 2-byte
+/// ratchet header-length prefix + 80-byte encrypted ratchet header + 16-byte ratchet AEAD tag; CBOR's
+/// variable-length chunk-index encoding adds a few more bytes for a chunk later in a very large
+/// file) — comfortably (~4x) under this value,
+/// while still leaving headroom for any other single-frame payload this substrate ever puts on one
+/// SCTP message (a resume bitmap, a future stream type's own frame) without needing to re-tune this
+/// constant every time chunk-adjacent framing grows by a few bytes. 256 KiB is also not a
+/// stack-specific outlier: it is the same order of magnitude several real-world WebRTC
+/// implementations already treat as an unremarkable default receive ceiling.
+const SCTP_MAX_MESSAGE_SIZE: u32 = 256 * 1024;
+
 fn backend_err(e: impl std::fmt::Display) -> TransportError {
     TransportError::Backend(e.to_string())
 }
@@ -213,6 +313,78 @@ fn parse_fingerprint(sdp: &str) -> Option<Fingerprint> {
         }
     }
     None
+}
+
+/// (task 10.18) Append the `a=max-message-size` attribute this backend declares to a local SDP
+/// offer/answer's raw text — see the module doc's "SCTP max-message-size" section for why this
+/// manual step is required (webrtc-rs 0.17.1 never writes this attribute itself, on either side, no
+/// matter how `SettingEngine` is configured).
+///
+/// **Called only from [`Transport::local_description`], lazily, on every read — never at the point
+/// `pending_offer`/`committed_local_sdp` are cached.** That is deliberate, not incidental: webrtc-rs's
+/// own `set_local_description` re-validates whatever text it is given against its *internal*
+/// snapshot of the just-generated offer/answer, byte-for-byte, and rejects any mismatch outright
+/// (`Error::ErrSDPDoesNotMatchOffer`/`ErrSDPDoesNotMatchAnswer` — confirmed empirically: an earlier
+/// version of this fix mutated the text before `set_local_description` and every gated test in
+/// `apps/transport/tests/webrtc_backend.rs` failed with exactly that error). So the text passed to
+/// `set_local_description` must stay byte-identical to whatever `create_offer`/`create_answer`
+/// produced; only the text actually asserted to the peer (`local_description()`'s return value, and
+/// thus what `apps/core/src/session.rs` hands to the peer's `set_remote_description`) carries the
+/// extra attribute. Computing it fresh from the pristine cached copy on every call (rather than
+/// mutating the cached copy in place) also means repeat calls to `local_description()` never
+/// accumulate multiple copies of the line.
+///
+/// Safe to append at the very end of the whole SDP text unconditionally — a data-channel-only
+/// session always has exactly one `m=application` media section and nothing after it for the
+/// appended line to be mistakenly attributed to (see [`Transport::add_ice_candidate`]'s own
+/// `sdp_mline_index: 0` for the same one-media-section assumption already relied on elsewhere in
+/// this file).
+///
+/// Debug-asserts the input never already carries this attribute: `webrtc-rs` 0.17.1 never writes it
+/// (that's why this function exists at all), but a future point-release upgrade fixing that upstream
+/// gap would otherwise get silently duplicated into two conflicting `a=max-message-size` lines,
+/// exactly the kind of upgrade-time regression this function's whole existence is meant to guard
+/// against, not reintroduce. If this assertion ever fires, `SCTP_MAX_MESSAGE_SIZE`/this workaround
+/// should be revisited against whatever `webrtc-rs` version triggered it.
+fn with_max_message_size_attr(mut sdp: String) -> String {
+    debug_assert!(
+        !sdp.contains("a=max-message-size:"),
+        "webrtc-rs's SDP writer already emitted a=max-message-size — this workaround (task 10.18) \
+         is stale for the pinned webrtc-rs version and would now duplicate the line"
+    );
+    sdp.push_str(&format!("a=max-message-size:{SCTP_MAX_MESSAGE_SIZE}\r\n"));
+    sdp
+}
+
+/// (task 10.18) Drives one detached data channel's inbound reads, forwarding each fully-reassembled
+/// message into `tx` — the replacement for `RTCDataChannel::on_message`'s internal read loop (see
+/// [`with_max_message_size_attr`]'s call site in `add_data_channel` for why that internal loop's
+/// fixed, non-configurable buffer cannot carry a message above `webrtc::data_channel`'s hardcoded
+/// `DATA_CHANNEL_BUFFER_SIZE` (`u16::MAX` = 65535 bytes) — silently closing the channel instead of
+/// delivering anything larger). `buf` is sized to [`SCTP_MAX_MESSAGE_SIZE`], the same ceiling this
+/// backend negotiates for sending, so nothing this backend could ever legally send to itself is too
+/// big to read back. Runs until the underlying stream reports EOF/closed (`Ok((0, _))`), a read
+/// error (peer reset, association torn down), or `tx`'s receiver is gone (the session itself was
+/// dropped) — every exit path is a quiet `return`, matching `RTCDataChannel::read_loop`'s own
+/// close-on-EOF-or-error behavior, since a background per-channel task has no caller left to report
+/// an error to by the time any of those happen.
+async fn detached_channel_read_loop(
+    dc: Arc<DetachedDataChannel>,
+    cid: ChannelId,
+    tx: mpsc::UnboundedSender<(ChannelId, Vec<u8>)>,
+) {
+    let mut buf = vec![0u8; SCTP_MAX_MESSAGE_SIZE as usize];
+    loop {
+        match dc.read_data_channel(&mut buf).await {
+            Ok((0, _)) => return,
+            Ok((n, _is_string)) => {
+                if tx.send((cid, buf[..n].to_vec())).is_err() {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 struct ChanState {
@@ -268,12 +440,25 @@ impl WebRtcTransport {
     /// data-only, so the media engine carries no codecs). Infallible: building the `API` object only
     /// assembles config, it never touches the network.
     ///
-    /// The one non-default knob: `set_ice_timeouts` (see [`ICE_DISCONNECTED_TIMEOUT`] /
-    /// [`ICE_FAILED_TIMEOUT`] / [`ICE_KEEPALIVE_INTERVAL`]'s docs) — without it, `webrtc-ice`'s own
-    /// defaults leave the ICE agent's internal "give up on `Checking`" horizon (30s) past
-    /// [`WAIT_TIMEOUT`] (15s), so a real NAT's permanently-unreachable host/srflx pairs under
-    /// `IcePolicy::Direct`/`PreferRelay` (`RTCIceTransportPolicy::All`) leave us timing out before
-    /// the agent would ever have moved on to nominate the (working) relay-vs-relay pair.
+    /// Three non-default knobs:
+    /// - `set_ice_timeouts` (see [`ICE_DISCONNECTED_TIMEOUT`] / [`ICE_FAILED_TIMEOUT`] /
+    ///   [`ICE_KEEPALIVE_INTERVAL`]'s docs) — without it, `webrtc-ice`'s own defaults leave the ICE
+    ///   agent's internal "give up on `Checking`" horizon (30s) past [`WAIT_TIMEOUT`] (15s), so a
+    ///   real NAT's permanently-unreachable host/srflx pairs under `IcePolicy::Direct`/`PreferRelay`
+    ///   (`RTCIceTransportPolicy::All`) leave us timing out before the agent would ever have moved
+    ///   on to nominate the (working) relay-vs-relay pair.
+    /// - `set_sctp_max_message_size_can_send` (see [`SCTP_MAX_MESSAGE_SIZE`] and the module doc's
+    ///   "SCTP max-message-size" section) — task 10.18: raises the *send*-side ceiling. Without it
+    ///   (and without [`with_max_message_size_attr`]'s matching SDP change, applied at every
+    ///   offer/answer generation point below), `webrtc-sctp`'s 65536-byte default silently rejects a
+    ///   single full `mrd.file/1` chunk outbound.
+    /// - `detach_data_channels` — task 10.18's other, easy-to-miss half: raising the send ceiling
+    ///   alone still leaves the *receive* side capped, because `RTCDataChannel::on_message`'s
+    ///   internal read loop uses a fixed, non-configurable 65535-byte buffer and closes the channel
+    ///   outright on anything larger rather than truncating. Detaching hands channels back to us as
+    ///   raw streams (`add_data_channel` drives its own read loop via
+    ///   [`detached_channel_read_loop`], buffered to [`SCTP_MAX_MESSAGE_SIZE`]) instead of relying
+    ///   on that internal loop.
     pub fn new() -> Self {
         let mut setting_engine = SettingEngine::default();
         setting_engine.set_ice_timeouts(
@@ -281,6 +466,9 @@ impl WebRtcTransport {
             Some(ICE_FAILED_TIMEOUT),
             Some(ICE_KEEPALIVE_INTERVAL),
         );
+        setting_engine
+            .set_sctp_max_message_size_can_send(SctpMaxMessageSize::Bounded(SCTP_MAX_MESSAGE_SIZE));
+        setting_engine.detach_data_channels();
         let api = APIBuilder::new()
             .with_media_engine(MediaEngine::default())
             .with_setting_engine(setting_engine)
@@ -477,21 +665,34 @@ impl Transport for WebRtcTransport {
             dc.ready_state() == RTCDataChannelState::Open,
         ));
         let ready_notify = Arc::new(Notify::new());
+        // (task 10.18) Detach-and-drive-our-own-reads, rather than `RTCDataChannel::on_message` —
+        // see the module doc's "SCTP max-message-size" section, part 3: `on_message`'s internal
+        // read loop uses a fixed, non-configurable `DATA_CHANNEL_BUFFER_SIZE` (`u16::MAX` = 65535
+        // bytes) buffer and, on any single message that reassembles to *more* than that, closes the
+        // channel outright rather than truncating or erroring gracefully — silently swallowing
+        // exactly the >64 KiB messages this fix exists to carry. `SettingEngine::detach_data_channels`
+        // (set once, for every channel, in `WebRtcTransport::new`) disables that internal read loop
+        // entirely in favor of the raw stream handed back by `RTCDataChannel::detach`, so here we
+        // read it ourselves with a buffer sized to [`SCTP_MAX_MESSAGE_SIZE`].
         {
             let ready_flag = ready_flag.clone();
             let ready_notify = ready_notify.clone();
+            let tx = sess.inbox_tx.clone();
+            let dc_for_detach = dc.clone();
             dc.on_open(Box::new(move || {
                 ready_flag.store(true, Ordering::SeqCst);
                 ready_notify.notify_waiters();
-                Box::pin(async {})
-            }));
-        }
-        {
-            let tx = sess.inbox_tx.clone();
-            dc.on_message(Box::new(move |msg: DataChannelMessage| {
                 let tx = tx.clone();
+                let dc_for_detach = dc_for_detach.clone();
                 Box::pin(async move {
-                    let _ = tx.send((cid, msg.data.to_vec()));
+                    // `detach()` only fails if `detach_data_channels` wasn't enabled (it always is,
+                    // here) or the channel isn't open yet (it just was, per `handle_open`'s own
+                    // ordering — `data_channel` is stored before `on_open` fires) — never expected
+                    // to fail in practice, but if it somehow did, the honest behavior is "this
+                    // channel never delivers anything" rather than a panic.
+                    if let Ok(detached) = dc_for_detach.detach().await {
+                        tokio::spawn(detached_channel_read_loop(detached, cid, tx));
+                    }
                 })
             }));
         }
@@ -528,11 +729,21 @@ impl Transport for WebRtcTransport {
 
     fn local_description(&self, s: &SessionHandle) -> Result<Sdp> {
         let sess = self.get_session(s)?;
+        // (task 10.18) `with_max_message_size_attr` is applied here, at the read boundary, rather
+        // than at write time when `committed_local_sdp`/`pending_offer` are cached — see the module
+        // doc's "SCTP max-message-size" section and [`with_max_message_size_attr`]'s own doc for
+        // why: webrtc-rs's `set_local_description` independently re-checks whatever text it's given
+        // against its *own* internal snapshot of the just-generated offer/answer (byte-for-byte,
+        // rejecting any mismatch as `ErrSDPDoesNotMatchOffer`/`ErrSDPDoesNotMatchAnswer`), so the
+        // text handed to `set_local_description` must stay exactly what `create_offer`/
+        // `create_answer` produced. Only the text this trait method actually asserts to the peer —
+        // computed fresh from the pristine cached copy on every call, never accumulating repeat
+        // appends across multiple calls — carries the extra attribute.
         if let Some(sdp) = sess.committed_local_sdp.lock().unwrap().clone() {
-            return Ok(Sdp(sdp.into_bytes()));
+            return Ok(Sdp(with_max_message_size_attr(sdp).into_bytes()));
         }
         if let Some(sdp) = sess.pending_offer.lock().unwrap().clone() {
-            return Ok(Sdp(sdp.into_bytes()));
+            return Ok(Sdp(with_max_message_size_attr(sdp).into_bytes()));
         }
         Err(TransportError::Backend(
             "local description requested before any data channel was added".into(),
@@ -796,5 +1007,23 @@ mod tests {
             Some(Fingerprint("sha-256 AB:CD:EF".into()))
         );
         assert_eq!(parse_fingerprint("v=0\r\n"), None);
+    }
+
+    #[test]
+    fn max_message_size_attr_is_appended_and_parseable_by_webrtc_rs_own_reader() {
+        // (task 10.18) Guards the exact mechanism the module doc's "SCTP max-message-size" section
+        // relies on: webrtc-rs 0.17.1 never writes this line itself, so this crate must, and it must
+        // land somewhere webrtc-rs's own SDP attribute reader will actually find it (i.e. inside the
+        // one `m=application` media section, not after it / outside any section).
+        let sdp = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n\
+                    m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+                    c=IN IP4 0.0.0.0\r\na=sctp-port:5000\r\n";
+        let out = with_max_message_size_attr(sdp.to_string());
+        assert!(out.ends_with(&format!("a=max-message-size:{SCTP_MAX_MESSAGE_SIZE}\r\n")));
+        assert_eq!(
+            out.matches("a=max-message-size:").count(),
+            1,
+            "must append exactly once, not accumulate across repeated calls to the same text"
+        );
     }
 }

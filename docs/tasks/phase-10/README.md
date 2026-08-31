@@ -146,7 +146,7 @@ Tests/Reviews):
 - [x] **10.16** Corrupted-chunk adversarial test (depends on 10.8) — [file](./10.16-corrupted-chunk-adversarial-test.md)
 
 **Wave 8.5 — fix, discovered by 10.14/10.15's real-transport tests**
-- [ ] **10.18** Fix: real `WebRtcTransport` can't send a full 64 KiB `mrd.file/1` chunk (depends on
+- [x] **10.18** Fix: real `WebRtcTransport` can't send a full 64 KiB `mrd.file/1` chunk (depends on
   10.7) — [file](./10.18-sctp-max-message-size-fix.md)
 
 **Wave 9 — phase exit**

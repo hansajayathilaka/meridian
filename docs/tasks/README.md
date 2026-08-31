@@ -273,6 +273,21 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   is run over real WebRTC) until this lands. No open task owns the fix (needs a real ctrl-channel
   renegotiation design — architect-review territory, not a config change like 10.18's) — pick up via
   a future `/plan-phase`.
+- **`Transport::recv()` has no bounded timeout anywhere in its call chain, so a genuinely stalled
+  real-network path (WebRTC/ICE/SCTP) hangs forever with no error on either side** instead of failing
+  loudly and fast. Found by task 10.18's own review: while running that task's required test matrix
+  under heavy concurrent system load (several parallel `cargo`/`clippy` jobs on a 4-vCPU sandbox), a
+  pre-existing, unmodified `meridian-core` test (`ice_restart_keeps_the_live_channel_flowing`) stalled
+  for ~31 minutes before being killed. Investigated directly and confirmed this is **not** a regression
+  from 10.18's own detach/read-loop change: the same class of stall (3 of 6 runs failing to complete
+  within 120s, vs. a normal 15–50s) reproduces identically on the pre-fix tree under equivalent
+  concurrent load, so it is a pre-existing characteristic of real-network WebRTC tests under severe CPU
+  starvation on this specific sandbox (plausibly ICE/SCTP retry-timer backoff compounding when the
+  async runtime can't service timers promptly) — not something 10.18 introduced. Genuinely risky in
+  production too, not just in a resource-starved CI sandbox: any real network stall with no local
+  timeout leaves a caller of `recv()` blocked indefinitely with no way to notice or recover. No open
+  task owns adding a bounded timeout (either at the `Transport::recv()` trait-method level, or at each
+  real call site) — pick up via a future `/plan-phase`.
 - **`apps/tui`'s extension registry has no public seam for a feature module to register into a *live*
   session, and `chat.rs`'s transcript renderer never consults the shared registry at all** (found by
   task 10.11's own review). Confirmed: `apps/tui/src/app.rs`'s `register_builtin_commands` is a
@@ -827,7 +842,7 @@ ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md]
 - [x] **10.14** Soak test: 1 GiB / 10 GiB transfers + throughput report (depends on 10.10, 10.13) — [file](./phase-10/10.14-soak-test-throughput.md)
 - [x] **10.15** Kill/resume test automation (depends on 10.9, 10.10, 10.13) — [file](./phase-10/10.15-kill-resume-automation.md)
 - [x] **10.16** Corrupted-chunk adversarial test (depends on 10.8) — [file](./phase-10/10.16-corrupted-chunk-adversarial-test.md)
-- [ ] **10.18** Fix: real `WebRtcTransport` can't send a full 64 KiB `mrd.file/1` chunk (depends on 10.7) — [file](./phase-10/10.18-sctp-max-message-size-fix.md)
+- [x] **10.18** Fix: real `WebRtcTransport` can't send a full 64 KiB `mrd.file/1` chunk (depends on 10.7) — [file](./phase-10/10.18-sctp-max-message-size-fix.md)
 - [ ] **10.17** Phase exit: acceptance demo + third-party implementability check + doc sync (depends on all above, including 10.18) — [file](./phase-10/10.17-phase-exit-demo.md)
 
 ## Legend / how to read
