@@ -150,7 +150,7 @@ Tests/Reviews):
   10.7) — [file](./10.18-sctp-max-message-size-fix.md)
 
 **Wave 9 — phase exit**
-- [ ] **10.17** Phase exit: acceptance demo + third-party implementability check + doc sync (depends on all above, including 10.18) — [file](./10.17-phase-exit-demo.md)
+- [x] **10.17** Phase exit: acceptance demo + third-party implementability check + doc sync (depends on all above, including 10.18) — [file](./10.17-phase-exit-demo.md). Task itself fully executed; verdict is a blocking finding, not a clean pass — see its Outcome.
 
 ## Exit criteria
 All tasks `[x]`, tree green (`cargo build --workspace`, `cargo fmt --all -- --check`,
@@ -158,3 +158,18 @@ All tasks `[x]`, tree green (`cargo build --workspace`, `cargo fmt --all -- --ch
 (1 GiB / 10 GiB soak transfers on the netns rig with loss/RTT profiles, kill/resume automation) runs
 end-to-end per the spec's "Working output" section, plus the reference third-party implementability
 check (task 10.17). Then `/start-review-phase`.
+
+**Status as of task 10.17 (2026-08-31): NOT met — held open by a real, live-reconfirmed finding, per
+Phase 4/7's own "don't lower the bar" precedent.** All 18 tasks are individually `[x]`; tree is green
+workspace-wide; docs are synced; the reference third-party `mrd.echo/1` implementability check
+**PASSED**. But the feature's own acceptance demo does not run end-to-end: `meridian send` over the
+real `WebRtcTransport` correctly completes a genuine multi-chunk transfer (confirming task 10.18's
+fix in the real CLI path), but the network-cut → ICE-restart → resume → verified-match sequence the
+spec's own demo script names does not complete, live-reconfirmed against a real netns/veth cut —
+`WebRtcTransport::ice_restart` does not restore connectivity, a known, pre-existing gap named in
+`apps/transport/src/webrtc_backend.rs`'s own module doc and first empirically confirmed by task
+10.15. Full record: [10.17's Outcome](./10.17-phase-exit-demo.md#outcome) and
+[demo transcript](./10.17-demo-transcript.md). **This phase does not proceed to
+`/start-review-phase` until a gap-closure task for that resumability gap lands and 10.17's exit gate
+is re-run clean** — see [docs/tasks/README.md](../README.md)'s "Live carry-forwards" and ▶ NOW/NEXT
+sections for the up-to-date pointer.

@@ -246,6 +246,37 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   start immediately. The Phase-1 adversarial frontier remains an unowned carry-forward for a future
   `/plan-phase` if capacity allows; the six Phase-4-named TUI/T08 residuals are Phase-4-scoped
   follow-ups and stay listed below for a future phase.
+- **NOW:** **Phase 10 (File Transfer Stream) — 17/18 tasks done (10.1–10.16, 10.18); 10.17
+  (phase-exit demo + third-party implementability check + doc sync) has now run live, but Phase 10
+  does NOT close cleanly.** `meridian send` real-CLI, real-rendezvous, real-`WebRtcTransport`
+  multi-chunk transfer is a genuine **PASS** (byte-identical `sha256sum`, confirms task 10.18's SCTP
+  fix in the actual CLI path, not just its own regression test) — but the demo script's own
+  network-cut → `ICE restart… reconnected` → resume → verified-match sequence reproduces, live, the
+  known, pre-existing `WebRtcTransport::ice_restart` no-op gap (see "Live carry-forwards" below):
+  after a genuine 15s veth cut and restore, `ice_restart()` returns `Ok` on both sides and the
+  receiver correctly computes a resume bitmap, but the data channel never actually recovers, so the
+  transfer never completes post-cut. `meridian send` itself also has zero automatic drop-detection/
+  resume wiring (confirmed directly in `apps/cli/src/send.rs`), so the spec's literal one-process
+  demo narration isn't reachable through the shipped CLI at all today, independent of the transport
+  gap. The reference third-party `mrd.echo/1` implementability check **PASSED**: a fresh `rust-dev`
+  agent given only `docs/api/stream-types-v1.md` (no task/phase briefing) implemented a real,
+  compiling, tested `mrd.echo/1` `StreamType` end to end in one pass with low design struggle — all 6
+  of its tests (independently re-run and confirmed) pass; its one substantive documentation finding
+  (a stale `stream-type-authoring` skill section already superseded by the authoritative spec doc) is
+  now a new carry-forward below. Doc-sync and the full workspace gate
+  (`cargo build`/`fmt`/`clippy --features webrtc` and default, full touched-crate test suites) are all
+  clean. Full record: [10.17's Outcome](./phase-10/10.17-phase-exit-demo.md#outcome) and
+  [demo transcript](./phase-10/10.17-demo-transcript.md). **Per this task's own explicit instructions
+  and the Phase 4/7 precedent for a real finding hit during an exit gate, this is recorded as a
+  phase-exit-blocking finding, not silently downgraded to a pass**: Phase 10 stays open until a
+  gap-closure task for the `ice_restart` real-transport resumability gap (architect-review territory —
+  a session-layer ctrl-channel ICE-renegotiation design, not a config change) lands and this exit gate
+  is re-run clean, mirroring exactly how Phase 7's F1 held that phase's own closure open.
+- **NEXT:** open a gap-closure task (via a future `/plan-phase`/`/new-task`) for the `ice_restart`
+  real-transport resumability gap, then re-run task 10.17's exit gate. Phase 10 is not yet eligible for
+  `/start-review-phase` until that re-run passes cleanly (or the team makes an explicit, documented
+  decision to accept the current state and close anyway — not done here, per this task's own scope of
+  verify-and-report, not decide).
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -273,6 +304,43 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   is run over real WebRTC) until this lands. No open task owns the fix (needs a real ctrl-channel
   renegotiation design — architect-review territory, not a config change like 10.18's) — pick up via
   a future `/plan-phase`.
+- **RE-CONFIRMED LIVE by task 10.17's phase-exit demo, for the actual `mrd.file/1` kill/resume
+  scenario (not just 10.15's chat-only `probe`)**: with task 10.18's SCTP fix landed, a real
+  multi-chunk transfer (24 chunks) now sends 15/24 chunks correctly before a genuine 15s veth cut;
+  after the cut is restored, `ice_restart()` returns `Ok` on both sides and the receiver correctly
+  computes and sends a resume bitmap (9/24 missing, the expected count) — but the sender never
+  receives it and the receiver never receives the resent chunks, exactly as this gap's own prior
+  description predicted. See [10.17's demo transcript](./phase-10/10.17-demo-transcript.md) (Part 2).
+  This means the feature spec's own literal acceptance-demo script (`meridian send` narrating
+  cut→ICE-restart→resume→verified-match in one live process) **does not pass** over the real
+  transport today — recorded honestly as a phase-exit-blocking finding per that task's own
+  instructions, not silently downgraded. Still no open task owns the fix.
+- **NEW (found by task 10.17): `tools/netns-kill-resume.sh`'s own pre-flight self-check
+  (`need_veth_linkstate`) has an environment-dependent false-negative bug**, independent of the
+  `ice_restart` gap above. It names its probe veth/netns interfaces `kr-probe-a-$$`/
+  `kr-probe-b-$$` (`$$` = the invoking shell's PID); in any sandbox/CI runner whose PID has reached
+  5 digits (common for any long-running container — confirmed live on this sandbox, PID `21039`),
+  the resulting interface name (`kr-probe-a-21039`, 16 bytes) exceeds Linux's 15-usable-byte
+  `IFNAMSIZ` limit, so `ip link add ... type veth peer name ...` itself fails and the script reports
+  "not usable in this environment — skipping" even though the real capability it needs works fine
+  (confirmed manually, and via the script's own `run()`, which uses short, fixed, well-under-the-limit
+  names like `kr-a`/`ns-kr-a` and does work). Net effect: this harness silently no-ops (exit 0, no
+  failure signal) on any host/CI runner with a long-lived shell, which is exactly the kind of
+  environment a real CI scheduler would use — a false "skipped, nothing to see" rather than a false
+  failure, arguably the worse direction for a security/resumability-relevant test to fail silently
+  in. No open task owns fixing the probe's naming scheme (e.g. a short fixed counter instead of
+  `$$`, or truncating/hashing the PID) — pick up via a future `/plan-phase`.
+- **NEW (found by task 10.17's third-party `mrd.echo/1` implementability check): `.claude/skills/
+  stream-type-authoring/SKILL.md` step 3 is stale relative to the authoritative
+  `docs/api/stream-types-v1.md`.** The skill still says to "derive per-stream keys via HKDF-export
+  from the ratchet... one ratchet step at OPEN, fast AEAD after," but `stream-types-v1.md`'s own
+  "Stream framing" section explicitly supersedes that ("one Double Ratchet step per frame call, not
+  once at OPEN, as an earlier draft of this section had it... No stream type consumes this export
+  today") and matches what `apps/core/src/session.rs` actually does. A from-scratch implementer who
+  reads the skill file instead of (or before) the full spec doc would design against the wrong,
+  superseded mechanism. Non-blocking for the third-party check itself (the fresh agent read the
+  authoritative doc and correctly followed it over the stale skill), but the skill file itself
+  should be corrected. No open task owns this — pick up via a future `/plan-phase` doc-sync.
 - **`Transport::recv()` has no bounded timeout anywhere in its call chain, so a genuinely stalled
   real-network path (WebRTC/ICE/SCTP) hangs forever with no error on either side** instead of failing
   loudly and fast. Found by task 10.18's own review: while running that task's required test matrix
