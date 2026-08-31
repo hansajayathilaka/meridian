@@ -114,33 +114,33 @@ Dependency waves (full task files hold the Definition of Task detail — Goal/Sc
 Tests/Reviews):
 
 **Wave 1 — independent substrate primitives**
-- [ ] **10.1** Ratchet HKDF-export for per-stream keys — [file](./10.1-ratchet-hkdf-export.md)
-- [ ] **10.2** `Transport::buffered_amount` backpressure primitive — [file](./10.2-transport-buffered-amount.md)
-- [ ] **10.3** Scaffold `meridian-streams` + manifest schema + BLAKE3 merkle build/verify — [file](./10.3-streams-crate-manifest-merkle.md)
+- [x] **10.1** Ratchet HKDF-export for per-stream keys — [file](./10.1-ratchet-hkdf-export.md)
+- [x] **10.2** `Transport::buffered_amount` backpressure primitive — [file](./10.2-transport-buffered-amount.md)
+- [x] **10.3** Scaffold `meridian-streams` + manifest schema + BLAKE3 merkle build/verify — [file](./10.3-streams-crate-manifest-merkle.md)
 
 **Wave 2 — substrate completion (depends on 10.1, 10.2)**
-- [ ] **10.4** Generalize the session substrate to drive a second stream type — [file](./10.4-session-substrate-multi-stream.md)
+- [x] **10.4** Generalize the session substrate to drive a second stream type — [file](./10.4-session-substrate-multi-stream.md)
 
 **Wave 3 — file-type crypto/schema pieces (parallel with 10.4; depends on 10.3)**
-- [ ] **10.5** Per-chunk AEAD (`k_f`, nonce = chunk index) — [file](./10.5-per-chunk-aead.md)
+- [x] **10.5** Per-chunk AEAD (`k_f`, nonce = chunk index) — [file](./10.5-per-chunk-aead.md)
 
 **Wave 4 — the `StreamType` implementation (depends on 10.3, 10.4, 10.5)**
-- [ ] **10.6** `mrd.file/1` `StreamType` implementation — [file](./10.6-filestream-type-impl.md)
+- [x] **10.6** `mrd.file/1` `StreamType` implementation — [file](./10.6-filestream-type-impl.md)
 
 **Wave 5 — engines (depend on 10.6)**
-- [ ] **10.7** Sender engine: chunking, backpressure, progress, multi-file batches — [file](./10.7-sender-engine.md)
-- [ ] **10.8** Receiver engine: write-by-offset, incremental verification, corruption handling — [file](./10.8-receiver-engine.md)
-- [ ] **10.9** Resume protocol: in-stream missing-range bitmap + redial integration (depends on 10.7, 10.8) — [file](./10.9-resume-protocol.md)
+- [x] **10.7** Sender engine: chunking, backpressure, progress, multi-file batches — [file](./10.7-sender-engine.md)
+- [x] **10.8** Receiver engine: write-by-offset, incremental verification, corruption handling — [file](./10.8-receiver-engine.md)
+- [x] **10.9** Resume protocol: in-stream missing-range bitmap + redial integration (depends on 10.7, 10.8) — [file](./10.9-resume-protocol.md)
 
 **Wave 6 — client surfaces**
-- [ ] **10.10** CLI `meridian send` (depends on 10.7, 10.8, 10.9) — [file](./10.10-cli-send-command.md)
-- [ ] **10.11** TUI surface: renderer + transfers pane + palette command (depends on 10.6) — [file](./10.11-tui-surface.md)
+- [~] **10.10** CLI `meridian send` (depends on 10.7, 10.8, 10.9) — [file](./10.10-cli-send-command.md)
+- [x] **10.11** TUI surface: renderer + transfers pane + palette command (depends on 10.6) — [file](./10.11-tui-surface.md)
 
 **Wave 7 — spec + docs**
-- [ ] **10.12** `mrd.file/1` spec section + wire/design doc corrections (depends on 10.4, 10.6, 10.9) — [file](./10.12-spec-doc-sync.md)
+- [x] **10.12** `mrd.file/1` spec section + wire/design doc corrections (depends on 10.4, 10.6, 10.9) — [file](./10.12-spec-doc-sync.md)
 
 **Wave 8 — test infrastructure**
-- [ ] **10.13** netns rig: loss/RTT injection profiles (independent, can run in Wave 1) — [file](./10.13-netns-loss-rtt-profiles.md)
+- [x] **10.13** netns rig: loss/RTT injection profiles (independent, can run in Wave 1) — [file](./10.13-netns-loss-rtt-profiles.md)
 - [ ] **10.14** Soak test: 1 GiB / 10 GiB transfers + throughput report (depends on 10.10, 10.13) — [file](./10.14-soak-test-throughput.md)
 - [ ] **10.15** Kill/resume test automation (depends on 10.9, 10.10, 10.13) — [file](./10.15-kill-resume-automation.md)
 - [ ] **10.16** Corrupted-chunk adversarial test (depends on 10.8) — [file](./10.16-corrupted-chunk-adversarial-test.md)

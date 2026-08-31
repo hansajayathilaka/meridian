@@ -139,6 +139,22 @@ impl Session {
         preamble_bytes(self.outbound_prekey())
     }
 
+    /// Like [`Self::encrypt`], but additionally returns the caller-scoped export of the one message
+    /// key (`mk`) this call consumed — `HKDF(mk, info)`, task 10.1's
+    /// [`DoubleRatchet::encrypt_and_export`]. `info` is fully opaque to this crate (and to
+    /// `DoubleRatchet` below it); see that method's own doc comment for the full one-way,
+    /// never-`mk` contract. First consumer: task 10.4's generic P2P-session-substrate stream-frame
+    /// path (`apps/core/src/session.rs`), which keys `info` by the stream's type/sid so two
+    /// different streams' per-frame exports can never be confused with each other.
+    pub fn encrypt_and_export(
+        &mut self,
+        plaintext: &[u8],
+        info: &[u8],
+    ) -> Result<(Vec<u8>, [u8; 32])> {
+        let preamble = self.outbound_preamble_bytes();
+        self.ratchet.encrypt_and_export(plaintext, &preamble, info)
+    }
+
     /// Ratchet-decrypt an inbound ratchet message. Marks the session confirmed on success.
     ///
     /// `preamble` MUST be the caller's [`preamble_bytes`]-shaped (or, at the wire layer,
@@ -152,6 +168,22 @@ impl Session {
         self.confirmed = true;
         self.prekey = None;
         Ok(pt)
+    }
+
+    /// Like [`Self::decrypt`], but additionally returns the caller-scoped export of the one message
+    /// key consumed to authenticate and open `message` — see [`Self::encrypt_and_export`]'s doc for
+    /// the shared contract (task 10.1's [`DoubleRatchet::decrypt_and_export`]). Marks the session
+    /// confirmed on success, exactly like [`Self::decrypt`].
+    pub fn decrypt_and_export(
+        &mut self,
+        message: &[u8],
+        preamble: &[u8],
+        info: &[u8],
+    ) -> Result<(Vec<u8>, [u8; 32])> {
+        let (pt, exported) = self.ratchet.decrypt_and_export(message, preamble, info)?;
+        self.confirmed = true;
+        self.prekey = None;
+        Ok((pt, exported))
     }
 
     /// This session's own prekey material, but only when [`needs_prekey`](Self::needs_prekey)

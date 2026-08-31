@@ -41,6 +41,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use zeroize::Zeroize;
+
 use meridian_envelope::ctrl::ChanCfgWire;
 use meridian_envelope::{ChatContent, CtrlFrame, MessageId, SignalContent, StreamAdvert};
 use meridian_identity::{KeyHandle, SecretStore};
@@ -52,7 +54,7 @@ use meridian_transport::{
 use crate::relay::{self, GatherClasses};
 
 use crate::chat::{ChatError, ChatState};
-use crate::streams::{CapabilityError, StreamRegistry};
+use crate::streams::{CapabilityError, StreamId, StreamRegistry};
 use crate::trust::TrustStore;
 
 /// Channel-0 label — always opened first, reliable/ordered (§5.3).
@@ -61,6 +63,40 @@ pub const CTRL_LABEL: &str = "mrd.ctrl/1";
 pub const CHAT_LABEL: &str = "mrd.chat/1";
 const CTRL_SID: u64 = 0;
 const CHAT_SID: u64 = 1;
+
+/// (task 10.4) Deterministic per-stream data-channel label both sides derive independently from
+/// the wire-negotiated `(type, sid)` pair — the initiator from what it itself requested via
+/// [`P2pSession::open_stream`], the responder from the `CtrlFrame::Open` it received — mirroring
+/// [`CTRL_LABEL`]/[`CHAT_LABEL`] being fixed, sid-implicit constants for the two special-cased
+/// channels. Both in-tree backends only require the two sides to agree on the label *string*: the
+/// real webrtc-rs backend derives its negotiated SCTP stream id purely from the label
+/// (`webrtc_backend::stream_id_for_label`, whose own doc already says this scheme "extends to
+/// per-stream channels without change"), and `LoopbackTransport::send` wires the two ends together
+/// by matching labels. Including `sid` (not just `ty`) keeps two opens of the *same* type in one
+/// session from colliding on the same label.
+fn stream_channel_label(ty: &str, sid: StreamId) -> String {
+    format!("{ty}#{sid}")
+}
+
+/// (task 10.4) The `info` parameter to `meridian_crypto::Session::encrypt_and_export`/
+/// `decrypt_and_export` (task 10.1) for a generic stream frame. `docs/api/stream-types-v1.md`
+/// already specifies the target shape as accepted design — `HKDF(ratchet_export, info =
+/// "mrd/stream/" ‖ type ‖ sid)` — but task 10.1's own doc comment explicitly defers the concrete
+/// byte encoding to "task 10.12's spec doc", not to this task. **This function is this task's own
+/// on-the-fly pin of that encoding** (flagged here, not a re-litigation of 10.1's design): task
+/// 10.12 is expected to formalize — and, if it lands on something different, correct — this exact
+/// byte layout in the spec doc. Nothing downstream of the HKDF call depends on the encoding being
+/// any particular shape, only that both peers compute the identical bytes; chosen encoding here is
+/// the ASCII domain tag, then the type name's UTF-8 bytes, then the stream id as 8 big-endian bytes
+/// (both peers already know `(ty, sid)` for any stream they have open — see
+/// [`stream_channel_label`] — so this needs no extra negotiation of its own).
+fn stream_export_info(ty: &str, sid: StreamId) -> Vec<u8> {
+    let mut info = Vec::with_capacity(b"mrd/stream/".len() + ty.len() + 8);
+    info.extend_from_slice(b"mrd/stream/");
+    info.extend_from_slice(ty.as_bytes());
+    info.extend_from_slice(&sid.to_be_bytes());
+    info
+}
 
 /// (1.33) How long [`dial_established`] will wait for the peer's answer before giving up. Bounds
 /// the *dialer's* wait specifically — the responder's wait for the offer is unchanged (it already
@@ -171,6 +207,14 @@ pub enum SessionError {
         code: String,
         reason: String,
     },
+    /// (task 10.4) [`P2pSession::send_stream_frame`]/[`P2pSession::stream_buffered_amount`] was
+    /// called for a stream id this session has no open, non-chat/ctrl data channel for — never
+    /// opened, still awaiting the peer's `Accept`, or `mrd.chat/1`'s own reserved sid (which uses
+    /// [`P2pSession::send_chat`]/[`P2pSession::send_chat_content`] instead, never this generic
+    /// path). A local caller error, not a protocol outcome — distinct from
+    /// [`SessionError::StreamRejected`], which is the *peer's* own explicit refusal of an `Open`.
+    #[error("no open data channel for stream {0}")]
+    UnknownStream(u64),
     /// The relay closed before signaling completed.
     #[error("signaling ended before the session was established")]
     SignalingEnded,
@@ -412,7 +456,34 @@ pub struct P2pSession<T: Transport> {
     peer_ik: [u8; 32],
     ctrl_ch: ChannelId,
     chat_ch: ChannelId,
-    labels: HashMap<ChannelId, &'static str>,
+    /// Channel → stream-type-name label. `ctrl_ch`/`chat_ch` are always the two fixed constants
+    /// ([`CTRL_LABEL`]/[`CHAT_LABEL`]); every other entry is a dynamically-registered
+    /// [`StreamType::name`](crate::streams::StreamType::name) for a stream this session has
+    /// actually opened a data channel for. (task 10.4: generalized from a `&'static str`-only map
+    /// so any registered type — not just the two built-ins — can be recorded here; see `pump`'s
+    /// demux and the `Open`/`Accept` arms of `handle_ctrl`, the only writers.)
+    labels: HashMap<ChannelId, String>,
+    /// (task 10.4) `ChannelId ⇄ StreamId` bookkeeping for every *non*-chat/ctrl stream this session
+    /// has an open data channel for. `pump`'s generic demux uses `channel_of_stream` to recover a
+    /// frame's `sid` from the `ChannelId` it arrived on (needed to build the per-stream HKDF
+    /// `info`, [`stream_export_info`]); [`P2pSession::send_stream_frame`]/
+    /// [`P2pSession::stream_buffered_amount`] use `stream_channels` to go the other way, from a
+    /// caller-supplied `sid`. Deliberately excludes ctrl/chat (channels 0/1) — those are
+    /// special-cased everywhere else in this module and chat sends through the dedicated `chat_ch`
+    /// field directly, so a `sid → ChannelId` lookup for either is never needed. Both maps are
+    /// always written together, in lock step, by the one place either is ever populated
+    /// (`handle_ctrl`'s `Open`/`Accept` arms) — never independently.
+    channel_of_stream: HashMap<ChannelId, StreamId>,
+    stream_channels: HashMap<StreamId, ChannelId>,
+    /// (task 10.4) sid → the type name *this side* requested via
+    /// [`open_stream`](Self::open_stream) and is still awaiting the peer's `Accept`/`Reject` for.
+    /// Consumed (removed) the moment that decision arrives (`handle_ctrl`'s `Accept`/`Reject`
+    /// arms), so this only ever holds genuinely in-flight opens. Needed because `CtrlFrame::Accept`
+    /// carries only `sid` (wire-protocol §"Channel 0"), never the type — the *initiator* is the
+    /// only side that already knows which type it asked to open, so it alone needs to remember it
+    /// in order to derive the same channel label the responder derived from the `Open` frame it
+    /// received (`decide_open`'s caller, in the `Open` arm below).
+    pending_opens: HashMap<StreamId, String>,
     registry: Arc<StreamRegistry>,
     peer_caps: Vec<StreamAdvert>,
     open_streams: BTreeSet<u64>,
@@ -569,8 +640,9 @@ impl<T: Transport> P2pSession<T> {
     /// point in action — core-api-contracts `open_stream`). The type MUST be registered locally; the
     /// peer's `Accept`/`Reject` is surfaced through [`pump`](Self::pump) as
     /// [`SessionEvent::StreamOpened`] or a [`SessionError::StreamRejected`], matching the async ctrl
-    /// protocol. Returns the assigned stream id. T04 only exercises this for `mrd.chat/1`; T09 (file
-    /// transfer) is the first second stream type to drive it — with zero core edits.
+    /// protocol. Returns the assigned stream id. (task 10.4) On `Accept`, `pump` symmetrically opens
+    /// this stream's own data channel (see `stream_channel_label`) — T09 (file transfer) is the
+    /// first real second stream type to drive this end to end, with zero core edits of its own.
     pub async fn open_stream(
         &mut self,
         store: &dyn SecretStore,
@@ -590,6 +662,10 @@ impl<T: Transport> P2pSession<T> {
         self.next_sid += 1;
         let sid = self.next_sid;
         let cfg = st.channel_cfg();
+        // (task 10.4) Remembered so this side's own `handle_ctrl` `Accept` arm can later derive the
+        // same channel label the responder derived from the `Open` frame it received — the wire's
+        // `Accept{sid}` carries no type of its own (wire-protocol §"Channel 0").
+        self.pending_opens.insert(sid, ty.to_string());
         self.send_ctrl(
             store,
             handle,
@@ -608,6 +684,58 @@ impl<T: Transport> P2pSession<T> {
         )
         .await?;
         Ok(sid)
+    }
+
+    /// (task 10.4) Encrypt `bytes` via task 10.1's `encrypt_and_export` and send them on stream
+    /// `sid`'s data channel — the only outbound path a
+    /// [`StreamType`](crate::streams::StreamType) impl can ever push bytes through, since
+    /// [`StreamType::on_frame`](crate::streams::StreamType::on_frame) is synchronous with no return
+    /// channel of its own. `sid` must be a stream this session already has an open, non-chat/ctrl
+    /// data channel for — i.e. `Accept` has already been processed on **this** side (see
+    /// `stream_channels`'s doc comment); `mrd.chat/1` keeps using
+    /// [`send_chat`](Self::send_chat)/[`send_chat_content`](Self::send_chat_content) instead,
+    /// unchanged, and is never reachable through this generic path (its sid is never recorded in
+    /// `stream_channels`).
+    pub async fn send_stream_frame(
+        &mut self,
+        chat: &mut ChatState,
+        sid: StreamId,
+        bytes: &[u8],
+    ) -> Result<(), SessionError> {
+        let ch = self
+            .stream_channels
+            .get(&sid)
+            .copied()
+            .ok_or(SessionError::UnknownStream(sid))?;
+        let ty = self
+            .labels
+            .get(&ch)
+            .cloned()
+            .ok_or(SessionError::UnknownStream(sid))?;
+        let info = stream_export_info(&ty, sid);
+        let (blob, mut exported) = chat.seal_stream_frame(&self.peer_ik, bytes, &info)?;
+        // No consumer for the per-frame export exists yet (task 10.4 only exposes the ratchet
+        // primitive; a future stream-key consumer is a downstream task's job) — zeroize it here
+        // rather than leaving an unused copy of derived key material on the stack (security-reviewer
+        // finding on task 10.4; matches apps/crypto's zeroize-secret-material discipline).
+        exported.zeroize();
+        self.transport.send(&self.conn, &ch, &blob).await?;
+        Ok(())
+    }
+
+    /// (task 10.4, task 10.2) How many bytes are currently queued for send on `sid`'s data channel —
+    /// a direct pass-through of [`Transport::buffered_amount`], exposed here so a bulk sender
+    /// engine (task 10.7) can poll it against its own low-watermark before calling
+    /// [`send_stream_frame`](Self::send_stream_frame) again — this substrate only exposes the read,
+    /// it invents no watermark/pause/throttling policy of its own (see `Transport::buffered_amount`'s
+    /// own doc comment for the same boundary one layer down).
+    pub async fn stream_buffered_amount(&self, sid: StreamId) -> Result<u64, SessionError> {
+        let ch = self
+            .stream_channels
+            .get(&sid)
+            .copied()
+            .ok_or(SessionError::UnknownStream(sid))?;
+        Ok(self.transport.buffered_amount(&self.conn, &ch).await?)
     }
 
     /// Restart ICE on a network change, keeping the session and ratchet alive (invariant 5). The
@@ -635,7 +763,7 @@ impl<T: Transport> P2pSession<T> {
         let Some((cid, blob)) = self.transport.recv(&self.conn).await? else {
             return Ok(Some(SessionEvent::Closed));
         };
-        match self.labels.get(&cid).copied() {
+        match self.labels.get(&cid).cloned() {
             Some(l) if l == CHAT_LABEL => {
                 if self.chat_first_contact_gate {
                     // (task 2.14) Force the gate on this content frame regardless of what
@@ -676,8 +804,45 @@ impl<T: Transport> P2pSession<T> {
                     Ok(Some(SessionEvent::Chat(content)))
                 }
             }
-            _ => {
-                // Treat anything else (ctrl, or a not-yet-labelled channel) as a ctrl frame.
+            Some(l) if l == CTRL_LABEL => {
+                let frame = self.open_ctrl(store, handle, chat, &blob)?;
+                self.handle_ctrl(store, handle, chat, frame).await
+            }
+            Some(ty) => {
+                // (task 10.4) Generic dispatch for any other registered, already-open stream type
+                // — this is the demux gap the pre-10.4 substrate had: everything that wasn't
+                // `mrd.chat/1` was force-decoded as ctrl. Resolve the frame's `sid` from the
+                // channel it arrived on, decrypt generically via task 10.1's `decrypt_and_export`
+                // (keyed by this stream's type/sid, see `stream_export_info`), then hand the
+                // decrypted bytes to the registered type's own `on_frame` — the substrate never
+                // interprets the bytes itself.
+                match self.channel_of_stream.get(&cid).copied() {
+                    Some(sid) => {
+                        let info = stream_export_info(&ty, sid);
+                        let (pt, mut exported) =
+                            chat.open_stream_frame(&self.peer_ik, &blob, &info)?;
+                        // See the matching note in `send_stream_frame`: no consumer for the
+                        // per-frame export exists yet, so zeroize rather than leave it unused.
+                        exported.zeroize();
+                        if let Some(st) = self.registry.get(&ty) {
+                            st.on_frame(sid, &pt);
+                        }
+                        Ok(None)
+                    }
+                    None => {
+                        // Structurally unreachable — `labels` and `channel_of_stream` are always
+                        // written together for a non-chat/ctrl channel (see that field's doc,
+                        // `handle_ctrl`'s `Open`/`Accept` arms are the only writers) — but handled
+                        // rather than assumed: fall back to the pre-10.4 default (ctrl decode)
+                        // rather than invent new error semantics for a case that can't be
+                        // triggered given that invariant.
+                        let frame = self.open_ctrl(store, handle, chat, &blob)?;
+                        self.handle_ctrl(store, handle, chat, frame).await
+                    }
+                }
+            }
+            None => {
+                // A channel with no label yet at all — matches the pre-10.4 default exactly.
                 let frame = self.open_ctrl(store, handle, chat, &blob)?;
                 self.handle_ctrl(store, handle, chat, frame).await
             }
@@ -838,6 +1003,29 @@ impl<T: Transport> P2pSession<T> {
                 let decision = self.decide_open(sid, &ty, &params, chat);
                 match decision {
                     crate::streams::OpenDecision::Accept => {
+                        // (task 10.4) Symmetric data-channel open, responder side. Chat's channel
+                        // is already provisioned and labelled at session construction
+                        // (`dial_established`/`answer_established` eagerly open `CHAT_LABEL` on
+                        // both sides before the ctrl handshake ever runs), so this only opens a
+                        // *new* channel for a genuinely non-chat stream — mirroring the
+                        // initiator's own handling of the matching `Accept` below.
+                        if ty != CHAT_LABEL {
+                            if let Some(st) = self.registry.get(&ty) {
+                                let mut cfg = st.channel_cfg();
+                                cfg.label = stream_channel_label(&ty, sid);
+                                let ch = self.transport.add_data_channel(&self.conn, cfg).await?;
+                                self.labels.insert(ch, ty.clone());
+                                self.channel_of_stream.insert(ch, sid);
+                                self.stream_channels.insert(sid, ch);
+                            }
+                            // `None` here would mean `decide_open` returned `Accept` for a type
+                            // this registry doesn't have — structurally unreachable, since
+                            // `decide_open` only reaches `Accept` via `st.on_open`, which already
+                            // required `self.registry.get(ty)` to succeed — but handled via `if
+                            // let` rather than `.expect()`, so a future refactor that breaks this
+                            // invariant fails safe (no channel opened, `Accept` still sent) instead
+                            // of panicking on a peer-triggerable path.
+                        }
                         self.send_ctrl(store, handle, chat, &CtrlFrame::Accept { sid })
                             .await?;
                         self.open_streams.insert(sid);
@@ -856,13 +1044,38 @@ impl<T: Transport> P2pSession<T> {
                 }
             }
             CtrlFrame::Accept { sid } => {
+                // (task 10.4) Chat's `Accept` stays special-cased exactly as before: its channel
+                // already exists (see the `Open` arm's comment above), and it is never recorded in
+                // `pending_opens` (its `Open` is sent directly by `handshake`, never through
+                // `open_stream`).
+                if sid == CHAT_SID {
+                    self.open_streams.insert(sid);
+                    return Ok(Some(SessionEvent::StreamOpened(
+                        sid,
+                        CHAT_LABEL.to_string(),
+                    )));
+                }
+                // (task 10.4) Symmetric data-channel open, initiator side: derive the same label
+                // the responder derived from our `Open`, using the type we remembered when we sent
+                // it (the wire's `Accept{sid}` carries no type of its own).
+                let ty = self
+                    .pending_opens
+                    .remove(&sid)
+                    .ok_or(SessionError::UnknownStream(sid))?;
+                if let Some(st) = self.registry.get(&ty) {
+                    let mut cfg = st.channel_cfg();
+                    cfg.label = stream_channel_label(&ty, sid);
+                    let ch = self.transport.add_data_channel(&self.conn, cfg).await?;
+                    self.labels.insert(ch, ty.clone());
+                    self.channel_of_stream.insert(ch, sid);
+                    self.stream_channels.insert(sid, ch);
+                }
                 self.open_streams.insert(sid);
-                Ok(Some(SessionEvent::StreamOpened(
-                    sid,
-                    CHAT_LABEL.to_string(),
-                )))
+                Ok(Some(SessionEvent::StreamOpened(sid, ty)))
             }
             CtrlFrame::Reject { sid, code, reason } => {
+                // No channel was ever opened for a rejected stream — just forget we were waiting.
+                self.pending_opens.remove(&sid);
                 Err(SessionError::StreamRejected { sid, code, reason })
             }
             CtrlFrame::Close { sid, .. } => {
@@ -1129,7 +1342,13 @@ async fn dial_established<T: Transport>(
         peer_ik,
         ctrl_ch,
         chat_ch,
-        labels: HashMap::from([(ctrl_ch, CTRL_LABEL), (chat_ch, CHAT_LABEL)]),
+        labels: HashMap::from([
+            (ctrl_ch, CTRL_LABEL.to_string()),
+            (chat_ch, CHAT_LABEL.to_string()),
+        ]),
+        channel_of_stream: HashMap::new(),
+        stream_channels: HashMap::new(),
+        pending_opens: HashMap::new(),
         registry,
         peer_caps: Vec::new(),
         open_streams: BTreeSet::from([CTRL_SID]),
@@ -1368,7 +1587,13 @@ async fn answer_established<T: Transport>(
         peer_ik,
         ctrl_ch,
         chat_ch,
-        labels: HashMap::from([(ctrl_ch, CTRL_LABEL), (chat_ch, CHAT_LABEL)]),
+        labels: HashMap::from([
+            (ctrl_ch, CTRL_LABEL.to_string()),
+            (chat_ch, CHAT_LABEL.to_string()),
+        ]),
+        channel_of_stream: HashMap::new(),
+        stream_channels: HashMap::new(),
+        pending_opens: HashMap::new(),
         registry,
         peer_caps: Vec::new(),
         open_streams: BTreeSet::from([CTRL_SID]),

@@ -222,6 +222,71 @@ async fn ice_restart_keeps_the_live_channel_flowing() {
     assert_eq!(ta.recv(&sa).await.unwrap().unwrap().1, b"after restart");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn buffered_amount_rises_under_backpressure_and_drains_as_peer_receives() {
+    // (10.2) Send faster than the peer drains — the peer never calls `recv()` during the send
+    // burst — and prove `buffered_amount` is a real, changing value: non-zero while the sender's
+    // own SCTP outbound queue backs up, then back down to zero once the peer actually consumes it.
+    let (ta, sa, tb, sb) = connect_pair().await;
+    let ca = ta
+        .add_data_channel(&sa, ChannelCfg::reliable_ordered("mrd.chat/1"))
+        .await
+        .unwrap();
+    tb.add_data_channel(&sb, ChannelCfg::reliable_ordered("mrd.chat/1"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ta.buffered_amount(&sa, &ca).await.unwrap(),
+        0,
+        "nothing queued before any send"
+    );
+
+    // Each chunk sits comfortably under the SCTP default max-message-size (64 KiB); the total
+    // volume (3 MiB) comfortably exceeds the default 1 MiB receive window, so with nobody
+    // draining on the other end the sender's own outbound queue cannot fully flush.
+    let chunk = vec![0xABu8; 32 * 1024];
+    let chunk_count: usize = 96;
+    for _ in 0..chunk_count {
+        ta.send(&sa, &ca, &chunk).await.unwrap();
+    }
+
+    let buffered = ta.buffered_amount(&sa, &ca).await.unwrap();
+    assert!(
+        buffered > 0,
+        "expected a non-zero buffered amount after sending {} bytes with no drain on the peer",
+        chunk_count * chunk.len()
+    );
+
+    // Now let tb actually drain it, and confirm ta's buffered_amount falls back to zero.
+    let total = chunk_count * chunk.len();
+    let mut received = 0usize;
+    let drain = async {
+        while received < total {
+            let (_cid, data) = tb.recv(&sb).await.unwrap().unwrap();
+            received += data.len();
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), drain)
+        .await
+        .expect("drain timed out");
+
+    // Poll until the sender's own queue reports empty — bounded, since a real (if local) network
+    // still needs a moment for the last SACKs to land after the last byte is read.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let now = ta.buffered_amount(&sa, &ca).await.unwrap();
+        if now == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "buffered_amount never drained back to 0 (stuck at {now})"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Regression test for 1.30 (`docs/tasks/phase-1/1.30-turn-tcp-dependency-gap.md`): under
 /// `IcePolicy::RelayOnly` against a TURN server whose UDP path never answers — exactly what a
 /// UDP-blocked NAT/firewall looks like from the ICE agent's perspective, and (per the pinned

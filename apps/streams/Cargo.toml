@@ -1,0 +1,50 @@
+[package]
+name = "meridian-streams"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# T03/T09/T15/T16: additive stream types (chat, file, location, sticker, tunnel, fs). Home for the
+# `mrd.file/1` manifest schema + BLAKE3 merkle build/verify (T09, task 10.3), per-chunk AEAD (T09,
+# task 10.5), and the `StreamType` implementation + registration (T09, task 10.6). Depends on
+# `meridian-proto` for the shared deterministic-CBOR wire helpers (`encode`/`decode`,
+# `bytes::{b32,bytes_vec}`) so stream payload types encode identically to every other content-shaped
+# wire type in the workspace, and on `meridian-core` for the `StreamType`/`PolicyCtx`/`OpenDecision`
+# trait surface (`meridian_core::streams`), `ChannelCfg` (`meridian_core::transport`), `Direction`
+# (`meridian_core::envelope`), and `ChatState::seal_bytes` (`meridian_core::chat`) — the existing
+# ratchet-sealing primitive `mrd.file/1`'s manifest reuses rather than inventing a new one
+# (docs/architecture/stack.md §"Crate dependency direction": `streams` depends on `core`, never the
+# reverse — this is additive, not a core-crate edit; CODEOWNERS/the stream-type-authoring skill only
+# forbid editing files *inside* `meridian-core`, not depending on its public API to implement
+# `StreamType`). `chacha20poly1305` is used directly here (task 10.5) rather than through
+# `meridian-crypto`, since per-chunk AEAD is ordinary symmetric encryption under an
+# already-derived/sealed key (`k_f`), not ratchet/session state — this keeps the crate's own
+# "additive stream type, zero core-crate edits" contract intact.
+# Out of scope for this task (later tasks in this phase): the sender engine (10.7), the receiver
+# engine / merkle verification wiring (10.8), resume (10.9), CLI/TUI surfaces (10.10/10.11).
+[dependencies]
+meridian-proto = { path = "../proto" }
+meridian-core = { path = "../core" }
+serde = { workspace = true }
+blake3 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+thiserror = { workspace = true }
+getrandom = { workspace = true }
+zeroize = { workspace = true }
+# Sender engine (task 10.7): the send loop is async (drives `P2pSession::send_stream_frame`/
+# `stream_buffered_amount`), the backpressure poll needs a non-blocking sleep, and progress events
+# use the same `tokio::sync::mpsc` channel idiom `meridian-core`'s own `P2pSession`/`SessionEvent`
+# plumbing already uses (`apps/core/src/session.rs`) — not a new async idiom for this workspace.
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+ciborium = { workspace = true }
+# Manifest-seal round-trip test (task 10.6): a real two-party X3DH + ratchet exchange, proving
+# `FileStream::build_open_params` genuinely routes `k_f` through the existing ratchet-sealing
+# primitive rather than a new mechanism. The same two-party harness (task 10.7) drives the sender
+# engine end to end over `LoopbackTransport` (re-exported through `meridian_core::transport`).
+meridian-identity = { path = "../identity" }
+meridian-store = { path = "../store" }
+meridian-signaling = { path = "../signaling" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }

@@ -1,0 +1,63 @@
+# Scheduled runner for tools/netns-netem.sh's smoke test (task 10.13). Not part of the blocking
+# push/PR pipeline: unlike tools/netns-nat-matrix.sh's rig (test-nat-matrix in ci.yml, which needs
+# only root/NET_ADMIN — reliably present via GitHub-hosted runners' passwordless sudo), this rig
+# additionally needs a kernel built with CONFIG_NET_SCH_NETEM. That module was confirmed ABSENT on
+# at least one real sandboxed dev-container kernel during this task's own implementation (a genuine
+# kernel-capability gap the script's own need_netem() detects and skips gracefully on, exit 0 — see
+# that function's comment) — so this follows task 3.12's `--ignored`/scheduled-job precedent rather
+# than assuming every runner has it, exactly as 10.13's own task file calls for. GitHub-hosted
+# ubuntu-latest runners' stock kernel is expected to have CONFIG_NET_SCH_NETEM (it is a very
+# commonly relied-on scheduler well beyond this repo), but this workflow existing as `schedule` +
+# `workflow_dispatch` rather than blocking-gate is the safety net either way: a runner without it
+# gets a clean, informative skip here instead of ever blocking a PR.
+#
+# This is pure test infrastructure (10.13's own scope) with no file-transfer test yet consuming it —
+# 10.14 (soak throughput) and 10.15 (kill/resume automation) are its real future consumers, both
+# already flagged in their own task files as needing this same `--ignored`/scheduled treatment. This
+# workflow proves the infra itself works in CI ahead of those; it is expected to grow additional
+# steps (or a sibling workflow) once 10.14/10.15 land.
+name: netns-netem-smoke
+
+on:
+  schedule:
+    # Offset from capacity-check.yml (Monday 06:00 UTC) and p2p-wire-proof.yml (Monday 07:00 UTC) so
+    # the three scheduled, privileged/longer-running jobs don't contend for the same runner-queue
+    # moment. TODO: confirm desired cadence — weekly chosen as a reasonable default, matching the
+    # other two; no cadence is specified anywhere in docs/operations/, and there's no on-call
+    # rotation yet to action a red run (docs/operations/runbook.md's own on-call TODO) — the same
+    # open question both existing scheduled workflows already carry for their own schedules.
+    - cron: "0 8 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  netns-netem-smoke:
+    name: netem loss/RTT injection smoke test (tools/netns-netem.sh)
+    runs-on: ubuntu-latest
+    # A full smoke-all run drives ~3000 pings total across both profiles (baseline + RTT + the
+    # 1500-ping loss measurement each), dominated by the loss measurement's 50ms interval — roughly
+    # 2.5-3 minutes of ping time; 10 minutes gives real headroom for setup/teardown/runner variance
+    # without masking a genuine hang for hours unattended.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Without this, a runner that ever lost CONFIG_NET_SCH_NETEM would make tools/netns-netem.sh's
+      # own need_netem() gracefully skip (exit 0) — by design for a dev sandbox that genuinely lacks
+      # it (see that function's comment) — but here, on ubuntu-latest, that graceful skip would turn
+      # a real regression into a permanently-green no-op instead of a red run: this job's stock
+      # kernel is expected to carry the module (a very commonly relied-on scheduler well beyond this
+      # repo), so its absence here would itself be news worth failing loudly on, not swallowing.
+      - name: Fail loudly if netem is unexpectedly unavailable on this runner
+        run: |
+          if ! sudo modprobe sch_netem 2>/tmp/netem-probe.err; then
+            echo "::error::CONFIG_NET_SCH_NETEM unavailable on ubuntu-latest — was believed present; investigate before trusting this job's green runs."
+            cat /tmp/netem-probe.err
+            exit 1
+          fi
+
+      # iproute2 (ip/tc) and iputils-ping ship preinstalled on GitHub-hosted ubuntu-latest images;
+      # no build step needed at all — this rig has no dependency on the Rust workspace.
+      - name: netem loss/RTT injection smoke test (file-transfer profile + high-loss check)
+        run: sudo bash tools/netns-netem.sh smoke-all

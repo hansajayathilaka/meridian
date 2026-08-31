@@ -23,6 +23,8 @@ pub trait Transport: Send + Sync {
     // Data plane (T04, additive to the frozen negotiation subset above): move bytes + observe path.
     async fn send(&self, s: &SessionHandle, ch: &ChannelId, data: &[u8]) -> Result<()>;
     async fn recv(&self, s: &SessionHandle) -> Result<Option<(ChannelId, Vec<u8>)>>;
+    // Backpressure read primitive (T09/10.2): bytes queued for send on `ch`, not yet drained.
+    async fn buffered_amount(&self, s: &SessionHandle, ch: &ChannelId) -> Result<u64>;
     async fn local_candidates(&self, s: &SessionHandle) -> Result<Vec<IceCandidate>>;
     async fn selected_path(&self, s: &SessionHandle) -> Result<Path>;
     async fn close(&self, s: &SessionHandle) -> Result<()>;
@@ -80,4 +82,4 @@ Implemented in T04 by [`meridian-core::streams`](../../apps/core/src/streams.rs)
 [stream-types-v1.md](./stream-types-v1.md).
 
 ## Stability policy
-Traits above are **semver-stable from Phase 1**. Additive stream types never change them (enforced: CODEOWNERS on the core crate, D12). Envelope/bundle *wire* changes go through the `v` bump + capability negotiation in DOC-01 §7, never a silent break.
+Traits above are **semver-stable from Phase 1**. Additive stream types never change them (enforced: CODEOWNERS on the core crate, D12). Envelope/bundle *wire* changes go through the `v` bump + capability negotiation in DOC-01 §7, never a silent break. Core traits (`Transport`, `SecretStore`) may still gain new *mandatory* methods pre-1.0 while only in-tree implementors exist (e.g. `Transport::buffered_amount`, task 10.2); once a third-party/out-of-tree implementor lands, further additions must be default-methods or go through a major-version bump.

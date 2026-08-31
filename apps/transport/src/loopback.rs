@@ -11,6 +11,7 @@
 //! asserted, so the forced-mismatch teardown test has something real to catch.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -22,7 +23,12 @@ use crate::types::{
 };
 use crate::{Result, Transport, TransportError};
 
-type Inbox = mpsc::UnboundedReceiver<(ChannelId, Vec<u8>)>;
+/// An inbox item carries, alongside the delivered `(channel, bytes)` pair, the *sender's own*
+/// per-channel queued-byte counter that [`Transport::buffered_amount`] reads — so draining an item
+/// here (in [`LoopbackTransport::recv`]) is exactly what brings the sender's reported buffered
+/// amount back down, mirroring a real backend where `buffered_amount` falls as bytes actually leave
+/// the local outbound queue.
+type Inbox = mpsc::UnboundedReceiver<(ChannelId, Vec<u8>, Arc<AtomicU64>)>;
 
 /// Shared switchboard connecting the sessions of every [`LoopbackTransport`] built from it. Cheap to
 /// clone (an `Arc`); clone it once per peer.
@@ -46,7 +52,11 @@ struct Sess {
     /// records a corrupted value here so the substrate's §4.6 check trips.
     remote_fp: Option<Fingerprint>,
     peer: Option<u64>,
-    channels: Vec<(String, ChannelId)>,
+    /// `(label, my channel id, bytes sent on this channel not yet drained by the peer's recv)`.
+    /// The counter is this session's own [`Transport::buffered_amount`] view of its outbound
+    /// queue: [`LoopbackTransport::send`] increments it, and the corresponding `Arc` travels with
+    /// each queued item so the peer's [`LoopbackTransport::recv`] decrements it on dequeue.
+    channels: Vec<(String, ChannelId, Arc<AtomicU64>)>,
     local_candidates: Vec<IceCandidate>,
     ice_generation: u32,
     policy: IcePolicy,
@@ -55,7 +65,7 @@ struct Sess {
     /// The simulated NAT/egress condition governing which pair wins.
     scenario: NatScenario,
     mitm: bool,
-    tx: mpsc::UnboundedSender<(ChannelId, Vec<u8>)>,
+    tx: mpsc::UnboundedSender<(ChannelId, Vec<u8>, Arc<AtomicU64>)>,
 }
 
 impl LoopbackFabric {
@@ -288,7 +298,8 @@ impl Transport for LoopbackTransport {
                 .sessions
                 .get_mut(&s.0)
                 .ok_or(TransportError::UnknownSession)?;
-            sess.channels.push((cfg.label, cid));
+            sess.channels
+                .push((cfg.label, cid, Arc::new(AtomicU64::new(0))));
             Ok(cid)
         })
     }
@@ -409,21 +420,22 @@ impl Transport for LoopbackTransport {
     }
 
     async fn send(&self, s: &SessionHandle, ch: &ChannelId, data: &[u8]) -> Result<()> {
-        // Resolve the sending channel's label and the peer, then deliver to the peer's channel that
-        // carries the same label (creating it if the peer opened channels in a different order).
-        let (label, peer_id) = self.with_inner(|inner| {
+        // Resolve the sending channel's label, its own queued-byte counter (for buffered_amount),
+        // and the peer, then deliver to the peer's channel that carries the same label (creating
+        // it if the peer opened channels in a different order).
+        let (label, counter, peer_id) = self.with_inner(|inner| {
             let sess = inner
                 .sessions
                 .get(&s.0)
                 .ok_or(TransportError::UnknownSession)?;
-            let label = sess
+            let (label, counter) = sess
                 .channels
                 .iter()
-                .find(|(_, cid)| cid == ch)
-                .map(|(l, _)| l.clone())
+                .find(|(_, cid, _)| cid == ch)
+                .map(|(l, _, c)| (l.clone(), c.clone()))
                 .ok_or(TransportError::UnknownChannel)?;
             let peer_id = sess.peer.ok_or(TransportError::NoPath)?;
-            Ok::<_, TransportError>((label, peer_id))
+            Ok::<_, TransportError>((label, counter, peer_id))
         })?;
 
         let (peer_cid, peer_tx) = self.with_inner(|inner| {
@@ -432,21 +444,29 @@ impl Transport for LoopbackTransport {
                 .sessions
                 .get_mut(&peer_id)
                 .ok_or(TransportError::Closed)?;
-            let cid = match peer.channels.iter().find(|(l, _)| *l == label) {
-                Some((_, cid)) => *cid,
+            let cid = match peer.channels.iter().find(|(l, _, _)| *l == label) {
+                Some((_, cid, _)) => *cid,
                 None => {
                     *next_channel += 1;
                     let cid = ChannelId(*next_channel);
-                    peer.channels.push((label.clone(), cid));
+                    peer.channels
+                        .push((label.clone(), cid, Arc::new(AtomicU64::new(0))));
                     cid
                 }
             };
             Ok::<_, TransportError>((cid, peer.tx.clone()))
         })?;
 
+        // Count these bytes as queued on our own channel *before* handing them to the peer's
+        // inbox, and let the peer's `recv` bring the counter back down when it actually dequeues
+        // this item — exactly the send-fast/drain-slow window `buffered_amount` exists to expose.
+        counter.fetch_add(data.len() as u64, Ordering::SeqCst);
+
         // A closed peer just drops the frame (a lost packet), never an error that would tear down
-        // the sender — the substrate decides teardown, not the pipe.
-        let _ = peer_tx.send((peer_cid, data.to_vec()));
+        // the sender — the substrate decides teardown, not the pipe. On that path the counter we
+        // just bumped is never drained by a `recv()` that will never come; that's consistent with
+        // a real backend too (a vanished peer leaves `buffered_amount` stuck non-zero until close).
+        let _ = peer_tx.send((peer_cid, data.to_vec(), counter));
         Ok(())
     }
 
@@ -460,7 +480,27 @@ impl Transport for LoopbackTransport {
             .cloned()
             .ok_or(TransportError::UnknownSession)?;
         let mut rx = inbox.lock().await;
-        Ok(rx.recv().await)
+        match rx.recv().await {
+            Some((cid, data, counter)) => {
+                counter.fetch_sub(data.len() as u64, Ordering::SeqCst);
+                Ok(Some((cid, data)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn buffered_amount(&self, s: &SessionHandle, ch: &ChannelId) -> Result<u64> {
+        self.with_inner(|inner| {
+            let sess = inner
+                .sessions
+                .get(&s.0)
+                .ok_or(TransportError::UnknownSession)?;
+            sess.channels
+                .iter()
+                .find(|(_, cid, _)| cid == ch)
+                .map(|(_, _, counter)| counter.load(Ordering::SeqCst))
+                .ok_or(TransportError::UnknownChannel)
+        })
     }
 
     async fn selected_path(&self, s: &SessionHandle) -> Result<Path> {
@@ -669,6 +709,74 @@ mod tests {
         assert!(matches!(
             a.selected_path(&sa).await,
             Err(TransportError::NoPath)
+        ));
+    }
+
+    #[tokio::test]
+    async fn buffered_amount_rises_on_send_and_drains_on_recv() {
+        // Sending faster than the peer drains (no `recv()` call in between) must accumulate a
+        // real, non-zero buffered amount on the *sender's* own channel, and each subsequent
+        // `recv()` on the peer must bring it back down by exactly that message's length.
+        let fabric = LoopbackFabric::new();
+        let a = LoopbackTransport::new(fabric.clone());
+        let b = LoopbackTransport::new(fabric.clone());
+
+        let sa = a.new_session(IceConfig::default()).await.unwrap();
+        let sb = b.new_session(IceConfig::default()).await.unwrap();
+
+        let ca = a
+            .add_data_channel(&sa, ChannelCfg::reliable_ordered("mrd.chat/1"))
+            .await
+            .unwrap();
+        b.add_data_channel(&sb, ChannelCfg::reliable_ordered("mrd.chat/1"))
+            .await
+            .unwrap();
+
+        let offer = a.local_description(&sa).unwrap();
+        let answer = b.local_description(&sb).unwrap();
+        b.set_remote_description(&sb, offer).await.unwrap();
+        a.set_remote_description(&sa, answer).await.unwrap();
+
+        assert_eq!(
+            a.buffered_amount(&sa, &ca).await.unwrap(),
+            0,
+            "nothing queued before any send"
+        );
+
+        a.send(&sa, &ca, b"hello").await.unwrap();
+        a.send(&sa, &ca, b"world!").await.unwrap();
+        assert_eq!(
+            a.buffered_amount(&sa, &ca).await.unwrap(),
+            11,
+            "two undrained sends should accumulate (5 + 6 bytes)"
+        );
+
+        let (_cid, first) = b.recv(&sb).await.unwrap().unwrap();
+        assert_eq!(first, b"hello");
+        assert_eq!(
+            a.buffered_amount(&sa, &ca).await.unwrap(),
+            6,
+            "draining the first message should bring the counter down by its length"
+        );
+
+        let (_cid, second) = b.recv(&sb).await.unwrap().unwrap();
+        assert_eq!(second, b"world!");
+        assert_eq!(
+            a.buffered_amount(&sa, &ca).await.unwrap(),
+            0,
+            "fully drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_amount_rejects_an_unknown_channel() {
+        let fabric = LoopbackFabric::new();
+        let a = LoopbackTransport::new(fabric);
+        let sa = a.new_session(IceConfig::default()).await.unwrap();
+        let bogus = ChannelId(u64::MAX);
+        assert!(matches!(
+            a.buffered_amount(&sa, &bogus).await,
+            Err(TransportError::UnknownChannel)
         ));
     }
 }

@@ -11,6 +11,7 @@ members = [
   "apps/crypto",
   "apps/transport",
   "apps/signaling",
+  "apps/streams",
   "apps/cli",
   "apps/tui",
   "apps/rendezvous",
@@ -64,6 +65,8 @@ x25519-dalek = { version = "2.0.1", features = ["static_secrets", "zeroize"] }
 # seeded from an external X3DH root key — see the ADR).
 sha2 = "0.10.8"
 sha1 = "0.10.7"
+# File merkle / content addressing (T09/T15; crypto-protocols skill: "Hash/merkle = blake3").
+blake3 = "1.5"
 hkdf = "0.12.4"
 hmac = "0.12.1"
 chacha20poly1305 = "0.10.1"

@@ -1832,6 +1832,49 @@ impl ChatState {
         }
     }
 
+    /// (task 10.4) Ratchet-encrypt an outbound generic-stream-frame plaintext for `peer_ik`,
+    /// returning the ciphertext frame alongside task 10.1's caller-scoped `HKDF(mk, info)` export —
+    /// the P2P session substrate's generic outbound path for any non-chat/non-ctrl registered
+    /// stream type (`P2pSession::send_stream_frame`).
+    ///
+    /// **Deliberately not a [`MessageEnvelope`] wrapper**, unlike [`seal_bytes`](Self::seal_bytes):
+    /// a stream frame carries no `eid`/prekey material of its own to begin with — a stream can only
+    /// be opened over `mrd.ctrl/1` (`CtrlFrame::Open`/`Accept`) once that channel's own handshake
+    /// has already exchanged and confirmed at least one full round trip, so by the time any stream
+    /// frame is ever sent, [`Session::needs_prekey`] is always `false` on both sides. The `eid`
+    /// dedup / prekey-reattachment machinery `MessageEnvelope` exists for therefore has nothing to
+    /// do here — the double ratchet's own single-use message keys already give each frame the same
+    /// anti-replay property a byte-identical duplicate would need. `info` is caller-opaque (see
+    /// [`Session::encrypt_and_export`]'s doc); `session.rs` derives it from the stream's type/sid.
+    pub(crate) fn seal_stream_frame(
+        &mut self,
+        peer_ik: &[u8; 32],
+        plaintext: &[u8],
+        info: &[u8],
+    ) -> Result<(Vec<u8>, [u8; 32]), ChatError> {
+        let session = self.sessions.get_mut(peer_ik).ok_or(ChatError::NoSession)?;
+        Ok(session.encrypt_and_export(plaintext, info)?)
+    }
+
+    /// The receive-side half of [`seal_stream_frame`](Self::seal_stream_frame): ratchet-decrypt an
+    /// inbound generic-stream-frame blob from `peer_ik`, returning the plaintext alongside the same
+    /// caller-scoped export. `info` MUST be the identical bytes the sender used to encrypt (the
+    /// stream's type/sid) — this is symmetric, unlike the chat/ctrl AAD preamble, since a stream
+    /// frame carries no prekey material for the two sides to ever disagree about. The session must
+    /// already exist (see [`seal_stream_frame`](Self::seal_stream_frame)'s doc for why a stream
+    /// frame is only ever sent post-confirmation): this never performs X3DH/responder establishment
+    /// the way [`open_bytes`](Self::open_bytes) does for a first-contact envelope.
+    pub(crate) fn open_stream_frame(
+        &mut self,
+        peer_ik: &[u8; 32],
+        blob: &[u8],
+        info: &[u8],
+    ) -> Result<(Vec<u8>, [u8; 32]), ChatError> {
+        let session = self.sessions.get_mut(peer_ik).ok_or(ChatError::NoSession)?;
+        let preamble = preamble_aad_bytes(&None);
+        Ok(session.decrypt_and_export(blob, &preamble, info)?)
+    }
+
     /// Shared X3DH-responder establishment, used both by [`open_bytes`](Self::open_bytes)'s
     /// first-contact branch and by its task-4.9 fallback recovery attempt.
     ///

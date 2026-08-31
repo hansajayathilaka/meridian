@@ -4,21 +4,20 @@
 //! deployment — instead of the in-process simulation [`crate::LoopbackTransport`] provides.
 //!
 //! ## Negotiated (pre-arranged) data channels
-//! Today the substrate only ever opens exactly two data channels per session — `mrd.ctrl/1` and
-//! `mrd.chat/1` — at dial/answer time (`apps/core/src/session.rs` `dial_with_config`/
-//! `answer_with_config`); `open_stream` for additional stream types multiplexes over `mrd.ctrl/1` at
-//! the ctrl-protocol layer instead of calling [`Transport::add_data_channel`] again. That is the
-//! *current* T04 session-layer behavior, not a permanent constraint: system-design §5.3 and
-//! `stream-types-v1.md` describe a future where an accepted stream opens its *own* new SCTP data
-//! channel labeled with the stream id (T09/T15/T16). If both peers called `create_data_channel(label)`
-//! in-band (the WebRTC default), each side would end up with *two* channels per label — the one it
-//! created locally, and a second one delivered via `on_data_channel` for the peer's independent call
-//! with the same label. We sidestep that by using WebRTC's **negotiated** mode: both sides derive the
-//! *same* SCTP stream id from the channel label via [`stream_id_for_label`] (pure function, no
-//! coordination needed) and create the channel with `negotiated: Some(id)`, so there is exactly one
-//! logical channel per label, symmetrically — a scheme that extends to per-stream channels without
-//! change (`add_data_channel` rejects a label whose derived id collides with a different label
-//! already on the session, rather than silently cross-wiring two streams).
+//! `mrd.ctrl/1` and `mrd.chat/1` open at dial/answer time (`apps/core/src/session.rs`
+//! `dial_with_config`/`answer_with_config`); every other registered stream type (T09 file transfer,
+//! and future T15/T16 types) opens its *own* new SCTP data channel labeled `"{type}#{sid}"`, on
+//! accept — both peers call [`Transport::add_data_channel`] symmetrically: the responder when it
+//! decides to accept (alongside sending `Accept` on `mrd.ctrl/1`), the initiator on receiving that
+//! `Accept` (`session.rs`'s `Open`- and `Accept`-handling arms both call it). If both peers called
+//! `create_data_channel(label)` in-band (the WebRTC default), each side would end up with *two*
+//! channels per label — the one it created locally, and a second one delivered via `on_data_channel`
+//! for the peer's independent call with the same label. We sidestep that by using WebRTC's
+//! **negotiated** mode: both sides derive the *same* SCTP stream id from the channel label via
+//! [`stream_id_for_label`] (pure function, no coordination needed) and create the channel with
+//! `negotiated: Some(id)`, so there is exactly one logical channel per label, symmetrically
+//! (`add_data_channel` rejects a label whose derived id collides with a different label already on
+//! the session, rather than silently cross-wiring two streams).
 //!
 //! ## Offer/answer without a role hint
 //! [`Transport::local_description`] and [`Transport::local_fingerprint`] are synchronous per the
@@ -669,6 +668,20 @@ impl Transport for WebRtcTransport {
         let sess = self.get_session(s)?;
         let mut rx = sess.inbox_rx.lock().await;
         Ok(rx.recv().await)
+    }
+
+    async fn buffered_amount(&self, s: &SessionHandle, ch: &ChannelId) -> Result<u64> {
+        let sess = self.get_session(s)?;
+        let dc = {
+            let map = sess.channels.lock().unwrap();
+            map.get(ch)
+                .ok_or(TransportError::UnknownChannel)?
+                .dc
+                .clone()
+        };
+        // The real SCTP outbound queue depth (bytes handed to `send()` not yet flushed) — see
+        // `close()`'s drain loop above, which already relies on this same call.
+        Ok(dc.buffered_amount().await as u64)
     }
 
     async fn selected_path(&self, s: &SessionHandle) -> Result<Path> {
