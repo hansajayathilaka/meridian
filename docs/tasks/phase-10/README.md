@@ -130,11 +130,11 @@ Tests/Reviews):
 **Wave 5 — engines (depend on 10.6)**
 - [x] **10.7** Sender engine: chunking, backpressure, progress, multi-file batches — [file](./10.7-sender-engine.md)
 - [x] **10.8** Receiver engine: write-by-offset, incremental verification, corruption handling — [file](./10.8-receiver-engine.md)
-- [ ] **10.9** Resume protocol: in-stream missing-range bitmap + redial integration (depends on 10.7, 10.8) — [file](./10.9-resume-protocol.md)
+- [x] **10.9** Resume protocol: in-stream missing-range bitmap + redial integration (depends on 10.7, 10.8) — [file](./10.9-resume-protocol.md)
 
 **Wave 6 — client surfaces**
 - [ ] **10.10** CLI `meridian send` (depends on 10.7, 10.8, 10.9) — [file](./10.10-cli-send-command.md)
-- [ ] **10.11** TUI surface: renderer + transfers pane + palette command (depends on 10.6) — [file](./10.11-tui-surface.md)
+- [x] **10.11** TUI surface: renderer + transfers pane + palette command (depends on 10.6) — [file](./10.11-tui-surface.md)
 
 **Wave 7 — spec + docs**
 - [ ] **10.12** `mrd.file/1` spec section + wire/design doc corrections (depends on 10.4, 10.6, 10.9) — [file](./10.12-spec-doc-sync.md)

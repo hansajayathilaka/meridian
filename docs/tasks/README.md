@@ -249,6 +249,49 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 
 ### Live carry-forwards (not owned by any open task)
+- **No `StreamType::on_reconnect` hook (or reconnect `SessionEvent`) exists to automatically trigger
+  post-redial behavior for a stream type** (found by task 10.9's own review, ratifying task 10.9's
+  resume protocol). `P2pSession::ice_restart()` (`apps/core/src/session.rs`) renegotiates ICE and
+  preserves data channels/ratchet state, but emits no `SessionEvent` and calls back into no
+  `StreamType` hook — confirmed `StreamType` (`apps/core/src/streams.rs`) has only `on_open`/`on_frame`
+  today. Task 10.9's own scope correctly forbids a core-crate edit to close this, so it exposes
+  `meridian_streams::{send_resume_bitmap, watch_resume}` as explicit calls an application-level
+  session-lifecycle layer must make itself immediately after its own `ice_restart()` returns, rather
+  than automatic wiring — a real, correctly-descoped gap, not a defect in 10.9's own shipped code. No
+  open task owns adding the hook itself (likely `StreamType::on_reconnect(&self, sid: StreamId)` or a
+  new `SessionEvent::Reconnected` variant plumbed through `pump`/`handle_ctrl`, with `FileStream`
+  wired to call `send_resume_bitmap` from it once it exists) — pick up via a future `/plan-phase`
+  (this phase's own 10.10 CLI/10.17 phase-exit demo should call the manual primitives directly in the
+  meantime, since the automatic hook won't land before this phase closes).
+- **`apps/tui`'s extension registry has no public seam for a feature module to register into a *live*
+  session, and `chat.rs`'s transcript renderer never consults the shared registry at all** (found by
+  task 10.11's own review). Confirmed: `apps/tui/src/app.rs`'s `register_builtin_commands` is a
+  private free function called only once, from `App::new_with_config` — nothing outside `app.rs` can
+  add a `PaletteCommand`/`MessageRenderer` into a running app's `SurfaceRegistry`. Compounding this,
+  `apps/tui/src/screens/chat.rs::transcript_registry` builds a fresh, hardcoded
+  `MessageRendererRegistry` containing only `ChatMessageRenderer` on every render call — it never reads
+  `App`'s own `SurfaceRegistry.renderers()` — a pre-existing, already-documented task-4.20 gap. Net
+  effect: task 10.11's `mrd.file/1` TUI surface (`apps/tui/src/streams/file.rs`) is fully built and
+  tested against a `SurfaceRegistry` directly, but is not reachable by an actual running client today —
+  a live transcript entry would still fall back to `[unsupported: ...]`. Closing this needs both halves
+  together: a public `App`-level registration seam (e.g. `App::register_extension`) *and*
+  `chat.rs::transcript_registry` reading from it instead of hardcoding `ChatMessageRenderer`. No open
+  task owns this — pick up via a future `/plan-phase` (Phase-4-scoped, since it's a registry-mechanism
+  gap, not specific to file transfer).
+- **`MessageRenderer::render`'s `Vec<Line<'static>>` return type structurally cannot carry a sixel/kitty
+  inline-image escape sequence to a real terminal** (found by task 10.11's own review, verified against
+  `ratatui-core`'s own source). `ratatui`'s `Buffer::set_stringn` strips all control characters before
+  drawing (pinned by the crate's own existing test,
+  `apps/tui/tests/surface_registry.rs::hostile_stream_type_control_bytes_are_stripped_when_actually_drawn_to_a_buffer`),
+  and a sixel/kitty sequence is definitionally built from control bytes (ESC/APC) — so no
+  `MessageRenderer` impl can ever emit one through this trait as currently shaped, on any terminal,
+  regardless of real capability detection. Task 10.11 correctly always renders the text/progress
+  fallback given this constraint (`apps/tui/src/streams/file.rs`'s `detect_image_protocol` is real and
+  tested, but its result is currently unreachable through `render`). Closing this needs a
+  raw-passthrough rendering path bypassing `Buffer` (what crates like `ratatui-image` do) — a
+  layout-engine-level capability this crate doesn't have. No open task owns this — pick up via a future
+  `/plan-phase` if inline previews are prioritized; until then, `mrd.file/1`'s "sixel/kitty where the
+  terminal supports it" (feature spec) is honestly unmet, not silently degraded.
 - **`handle_route`'s connectivity-check-then-mailbox-write is still two unlocked steps** (found by
   task 9.4's own review, re-checking its fix for F4). 9.4 closed the specific race it targeted (a
   `Route` landing between `drain_mailbox` finishing and `registry.add` running), but `handle_route`
@@ -744,9 +787,9 @@ ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md]
 - [x] **10.6** `mrd.file/1` `StreamType` implementation (depends on 10.3, 10.4, 10.5) — [file](./phase-10/10.6-filestream-type-impl.md)
 - [x] **10.7** Sender engine: chunking, backpressure, progress, multi-file batches (depends on 10.6) — [file](./phase-10/10.7-sender-engine.md)
 - [x] **10.8** Receiver engine: write-by-offset, incremental verification, corruption handling (depends on 10.6) — [file](./phase-10/10.8-receiver-engine.md)
-- [ ] **10.9** Resume protocol: in-stream missing-range bitmap + redial integration (depends on 10.7, 10.8) — [file](./phase-10/10.9-resume-protocol.md)
+- [x] **10.9** Resume protocol: in-stream missing-range bitmap + redial integration (depends on 10.7, 10.8) — [file](./phase-10/10.9-resume-protocol.md)
 - [ ] **10.10** CLI `meridian send` (depends on 10.7, 10.8, 10.9) — [file](./phase-10/10.10-cli-send-command.md)
-- [ ] **10.11** TUI surface: renderer + transfers pane + palette command (depends on 10.6) — [file](./phase-10/10.11-tui-surface.md)
+- [x] **10.11** TUI surface: renderer + transfers pane + palette command (depends on 10.6) — [file](./phase-10/10.11-tui-surface.md)
 - [ ] **10.12** `mrd.file/1` spec section + wire/design doc corrections (depends on 10.4, 10.6, 10.9) — [file](./phase-10/10.12-spec-doc-sync.md)
 - [x] **10.13** netns rig: loss/RTT injection profiles — [file](./phase-10/10.13-netns-loss-rtt-profiles.md)
 - [ ] **10.14** Soak test: 1 GiB / 10 GiB transfers + throughput report (depends on 10.10, 10.13) — [file](./phase-10/10.14-soak-test-throughput.md)
