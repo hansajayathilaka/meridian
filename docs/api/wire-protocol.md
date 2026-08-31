@@ -113,13 +113,29 @@ Open     = {sid: uint, type: tstr, params: map, chan: {reliable: bool, ordered: 
 Accept   = {sid} | Reject = {sid, code, reason}
 Close    = {sid, status}
 Keepalive= {t}                        ; also carries flow-control hints
-Resume   = {sid, bitmap: bstr}        ; file/fs range resume
 ```
 Unknown `type` in `Open` ⇒ `Reject{code: unsupported}` — never a session error. All ctrl frames are ratchet-sealed like any payload.
 
+**Correction (task 10.12):** an earlier revision of this section listed `Resume = {sid, bitmap: bstr}`
+here as a `mrd.ctrl/1` frame for file/fs range resume. That frame was never implemented and, per T09's
+settled design (architect-ratified at task 10.9's review), never will be: `CtrlFrame`
+(`apps/envelope/src/ctrl.rs`) has no `Resume` variant, and adding one would force it and
+`session.rs::handle_ctrl`'s exhaustive match to grow a file-transfer-specific arm — exactly the
+core-crate leakage the stream-type extension contract exists to reject. Resume instead rides
+**in-stream**, over `mrd.file/1`'s own already-open data channel, documented in
+[stream-types-v1.md](./stream-types-v1.md)'s `mrd.file/1` section — the authority for that shape.
+
 ## 6. Stream framing
 
-Data-channel payloads: `uint32-le length ‖ AEAD_stream_key(seq_nonce, cbor_body)`. Stream keys: `HKDF(ratchet_export, info = "mrd/stream/" ‖ type ‖ sid)` — one ratchet step at OPEN, then symmetric AEAD with monotonic nonces (FS at stream granularity, §5.3). `mrd.file/1` chunk body: `{i: uint, data: bstr}`, AEAD key = per-file `k_f`, nonce = `i`.
+Every stream frame is ratchet-sealed directly, one Double Ratchet step per frame (not a separately
+derived stream cipher applied once at `OPEN`, as an earlier revision of this section had it); the
+exact mechanism, including the currently-unused per-frame HKDF export, is specified in
+[stream-types-v1.md](./stream-types-v1.md)'s "Stream framing" section — the authority for this
+section. `mrd.file/1` chunk body (an inner layer riding inside that outer ratchet-sealed frame):
+`{i: uint, data: bstr}`, AEAD = XChaCha20-Poly1305, key = per-file `k_f`, nonce = `i` as 8 bytes
+little-endian followed by 16 zero bytes, no AAD, ciphertext = raw AEAD output with no nonce prepended.
+Exact construction, resume-in-stream framing, and backpressure behavior are pinned in
+stream-types-v1.md's `mrd.file/1` section, which is the authority for those details too.
 
 ## 7. Versioning & PQ slot
 

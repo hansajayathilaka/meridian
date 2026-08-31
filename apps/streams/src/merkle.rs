@@ -30,10 +30,11 @@
 //!   specifically to avoid the classic Merkle "duplicate the last leaf" second-preimage weakness
 //!   (an attacker being able to present a tree of `n` leaves as equally valid evidence for a
 //!   different `n+1`-leaf multiset).
-//! - **Zero-chunk (empty file) convention:** `TODO: confirm` with the T09 spec (task 10.12) —
-//!   no design doc pins this case. Until then, [`MerkleTree::from_chunks`] treats "no chunks" as a
-//!   single virtual leaf `BLAKE3(b"")`, so `root()`/proof construction stay total functions instead
-//!   of panicking on a plausible real input (an empty file upload).
+//! - **Zero-chunk (empty file) convention:** pinned by task 10.12 (`docs/api/stream-types-v1.md`'s
+//!   `mrd.file/1` section). [`MerkleTree::from_chunks`] treats "no chunks" as a single virtual leaf
+//!   whose hash is `leaf_hash(&[])` — i.e. `BLAKE3(0x00)` (the leaf domain-separation byte still
+//!   applies; this is not bare `BLAKE3(b"")`) — so `root()`/proof construction stay total functions
+//!   instead of panicking on a plausible real input (an empty file upload).
 //!
 //! ## Proofs
 //! [`MerkleTree::proof`] returns the sibling hash (and its left/right position) at every level on

@@ -292,6 +292,28 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   layout-engine-level capability this crate doesn't have. No open task owns this — pick up via a future
   `/plan-phase` if inline previews are prioritized; until then, `mrd.file/1`'s "sixel/kitty where the
   terminal supports it" (feature spec) is honestly unmet, not silently degraded.
+- **`mrd.file/1`'s per-chunk merkle proof has no pinned wire delivery mechanism** (found by task 10.12's
+  doc-sync pass, tracing `apps/streams/src/receiver.rs`'s own `TODO: confirm`). The wire chunk body
+  (`docs/api/wire-protocol.md` §6, `apps/streams/src/chunk.rs::ChunkFrame`) is exactly `{i: uint,
+  data: bstr}` — no proof field — yet `FileReceiver::receive_frame` (task 10.8) requires a
+  `MerkleProof` for `i` as a caller-supplied argument to do its own per-chunk verification, and task
+  10.8's own module doc explicitly defers *how* that proof reaches the receiver to "whoever wires this
+  engine to a live transport" — no such wiring exists yet (10.10/10.11 wire progress/UI, not proof
+  delivery). Two candidate directions are already named, neither chosen: a proof-per-chunk extension
+  to the wire shape, or a full proof set (or the flat leaf-hash list one can be rebuilt from) exchanged
+  once via `mrd.ctrl/1` or the manifest. `docs/api/stream-types-v1.md`'s `mrd.file/1` section (task
+  10.12) documents this gap explicitly rather than inventing a resolution. No open task owns closing
+  it — pick up via a future `/plan-phase` (likely alongside whatever task first drives
+  `meridian-streams` end-to-end over a real transport in production, since a loopback test can supply
+  proofs out of band the way `receiver.rs`'s own tests already do, masking the gap until then).
+- **Reshare/dedup of identical file ciphertext is design-permitted but unimplemented** (feature spec's
+  own out-of-scope note, `docs/architecture/features/09-file-transfer.md`: "reshare/dedup of identical
+  ciphertext to other peers (design allows it, §7.2 — record as follow-up)"). The per-file-key design
+  (`docs/architecture/system-design.md` §7.2) means the same sealed ciphertext could in principle be
+  offered to a second authorized peer by sealing a fresh `enc(k_f under that peer's ratchet)` alone,
+  without re-encrypting the file — but no code path in `meridian-streams` does this today: every
+  transfer, even of a file already sent once, generates and seals an independent fresh `k_f`. No open
+  task owns building it — pick up via a future `/plan-phase` if cross-peer reshare becomes a priority.
 - **`handle_route`'s connectivity-check-then-mailbox-write is still two unlocked steps** (found by
   task 9.4's own review, re-checking its fix for F4). 9.4 closed the specific race it targeted (a
   `Route` landing between `drain_mailbox` finishing and `registry.add` running), but `handle_route`
@@ -788,9 +810,9 @@ ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md]
 - [x] **10.7** Sender engine: chunking, backpressure, progress, multi-file batches (depends on 10.6) — [file](./phase-10/10.7-sender-engine.md)
 - [x] **10.8** Receiver engine: write-by-offset, incremental verification, corruption handling (depends on 10.6) — [file](./phase-10/10.8-receiver-engine.md)
 - [x] **10.9** Resume protocol: in-stream missing-range bitmap + redial integration (depends on 10.7, 10.8) — [file](./phase-10/10.9-resume-protocol.md)
-- [ ] **10.10** CLI `meridian send` (depends on 10.7, 10.8, 10.9) — [file](./phase-10/10.10-cli-send-command.md)
+- [~] **10.10** CLI `meridian send` (depends on 10.7, 10.8, 10.9) — [file](./phase-10/10.10-cli-send-command.md)
 - [x] **10.11** TUI surface: renderer + transfers pane + palette command (depends on 10.6) — [file](./phase-10/10.11-tui-surface.md)
-- [ ] **10.12** `mrd.file/1` spec section + wire/design doc corrections (depends on 10.4, 10.6, 10.9) — [file](./phase-10/10.12-spec-doc-sync.md)
+- [x] **10.12** `mrd.file/1` spec section + wire/design doc corrections (depends on 10.4, 10.6, 10.9) — [file](./phase-10/10.12-spec-doc-sync.md)
 - [x] **10.13** netns rig: loss/RTT injection profiles — [file](./phase-10/10.13-netns-loss-rtt-profiles.md)
 - [ ] **10.14** Soak test: 1 GiB / 10 GiB transfers + throughput report (depends on 10.10, 10.13) — [file](./phase-10/10.14-soak-test-throughput.md)
 - [ ] **10.15** Kill/resume test automation (depends on 10.9, 10.10, 10.13) — [file](./phase-10/10.15-kill-resume-automation.md)
