@@ -43,10 +43,14 @@
 //!
 //! ## Wire encoding
 //! Every chunk sent goes out as a [`crate::chunk::ChunkFrame`] (`{i: uint, data: bstr}`,
-//! `docs/api/wire-protocol.md` §6), CBOR-encoded via [`crate::chunk::ChunkFrame::encode`] — the
-//! exact `bytes` handed to `send_stream_frame`. [`crate::chunk::ChunkFrame`] is the single
-//! canonical type for this shape, shared with the receiver engine (task 10.8,
-//! [`crate::receiver`]), so the two sides can never independently drift on the wire shape.
+//! `docs/api/wire-protocol.md` §6), CBOR-encoded via [`crate::chunk::ChunkFrame::encode`], then (as
+//! of task 10.9) prefixed with a one-byte discriminator ([`crate::resume::FRAME_TAG_CHUNK`]) — the
+//! exact `bytes` [`send_chunk_frame`] hands to `send_stream_frame`; see [`crate::resume`]'s module
+//! doc for why: once resume messages can ride the same channel, `FileStream::on_frame` needs a way
+//! to tell the two frame kinds apart. [`crate::chunk::ChunkFrame`]'s own CBOR body is unchanged —
+//! only the outer framing gained a byte — and it remains the single canonical type for that shape,
+//! shared with the receiver engine (task 10.8, [`crate::receiver`]), so the two sides can never
+//! independently drift on the wire shape.
 //!
 //! ## Reordering: chunk `i` carries its own position, deliberately never inferred from call order
 //! The channel is reliable + unordered ([`crate::file::FileStream::channel_cfg`]): the transport
@@ -56,9 +60,18 @@
 //! explicit `i` and bakes it into the frame it sends, so calling it for chunk 5 before chunk 2
 //! produces exactly the same two frames (order-independent) as calling it the other way around.
 //! [`send_chunk_frame`] is `pub` specifically so this property is unit-testable in isolation (see
-//! this module's tests) and so a future resume engine (task 10.9) — which will need to (re)send an
-//! arbitrary, non-contiguous subset of chunk indices — has a ready-made per-chunk primitive rather
-//! than needing to re-derive one from [`send_files`]'s whole-file loop.
+//! this module's tests) and so [`send_missing_chunks`] (task 10.9's resume engine) — which needs to
+//! (re)send an arbitrary, non-contiguous subset of chunk indices — has a ready-made per-chunk
+//! primitive rather than needing to re-derive one from [`send_files`]'s whole-file loop.
+//!
+//! ## Resume (task 10.9)
+//! [`send_missing_chunks`] is the sender-side half: given an inbound [`crate::resume::ResumeRequest`]
+//! (delivered via [`crate::file::FileStream::watch_resume`]'s channel — `on_frame` cannot itself
+//! call this async function), it resends exactly the chunk indices the bitmap marks missing, reusing
+//! [`send_chunk_frame`]/[`wait_for_capacity`] unchanged. [`send_resume_bitmap`] is the receiver-side
+//! half: sends the current missing-range bitmap derived from a live [`crate::receiver::FileReceiver`].
+//! Neither function is wired to an automatic redial callback — see [`crate::resume`]'s module doc
+//! for exactly why no such hook exists in `meridian-core` today.
 
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -73,6 +86,8 @@ use meridian_proto::CodecError;
 
 use crate::chunk::{seal_chunk, ChunkFrame};
 use crate::merkle::CHUNK_SIZE;
+use crate::receiver::FileReceiver;
+use crate::resume::{tag_frame, ResumeRequest, FRAME_TAG_CHUNK, FRAME_TAG_RESUME};
 
 /// Errors from the sender engine. Both variants pass through an underlying error verbatim; neither
 /// ever carries `k_f` or plaintext chunk bytes.
@@ -286,7 +301,61 @@ pub async fn send_chunk_frame<T: Transport>(
     chunk: &[u8],
 ) -> Result<(), SenderError> {
     let sealed = seal_chunk(k_f, i, chunk);
-    let bytes = ChunkFrame { i, data: sealed }.encode()?;
+    let body = ChunkFrame { i, data: sealed }.encode()?;
+    // (task 10.9) One leading discriminator byte ahead of the unchanged `ChunkFrame` body — see
+    // `crate::resume`'s module doc's "Wire framing" section — so `FileStream::on_frame` can tell a
+    // bulk chunk frame apart from an in-stream resume message on the same data channel.
+    let bytes = tag_frame(FRAME_TAG_CHUNK, body);
+    session.send_stream_frame(chat, sid, &bytes).await?;
+    Ok(())
+}
+
+/// (task 10.9) Resume: resends only the chunks a peer's [`ResumeRequest`] bitmap marks missing,
+/// reusing this module's own per-chunk send primitive ([`send_chunk_frame`]) and backpressure
+/// policy ([`wait_for_capacity`]) — filtered to the missing set, never a parallel send path. `data`
+/// must be the exact same file bytes originally sent (identical [`CHUNK_SIZE`] chunking); `data`'s
+/// own chunk count is this call's authoritative `leaf_count` — never `resume`'s own bitmap length,
+/// which [`ResumeRequest::missing_indices`] already refuses to read past (see that function's own
+/// doc). Returns the chunk indices actually resent, in ascending order, so a caller can compute
+/// e.g. this task's own re-send-ratio acceptance bound.
+pub async fn send_missing_chunks<T: Transport>(
+    session: &mut P2pSession<T>,
+    chat: &mut ChatState,
+    sid: StreamId,
+    k_f: &[u8; 32],
+    data: &[u8],
+    resume: &ResumeRequest,
+    cfg: &SenderConfig,
+) -> Result<Vec<u64>, SenderError> {
+    let chunks: Vec<&[u8]> = data.chunks(CHUNK_SIZE).collect();
+    let leaf_count = chunks.len().max(1);
+    let missing = resume.missing_indices(leaf_count);
+    for &i in &missing {
+        // A zero-byte file's single virtual leaf has no real chunk bytes at all (mirrors
+        // `crate::receiver`'s own `leaf_count_for_size` convention) — resend an empty chunk rather
+        // than index out of `chunks`, which is itself empty in that case.
+        let chunk = chunks.get(i as usize).copied().unwrap_or(&[]);
+        wait_for_capacity(|| session.stream_buffered_amount(sid), cfg).await?;
+        send_chunk_frame(session, chat, sid, k_f, i, chunk).await?;
+    }
+    Ok(missing)
+}
+
+/// (task 10.9) The receiver's half of resume: sends the current missing-range bitmap, derived from
+/// `receiver`'s own bookkeeping ([`FileReceiver::received_offsets`]/[`FileReceiver::leaf_count`]),
+/// over `sid`'s already-open `mrd.file/1` data channel. Callers invoke this once the stream is
+/// confirmed live again after a session redial — see `crate::resume`'s module doc ("Redial trigger")
+/// for exactly what signal is, and importantly is not, available today to drive that call
+/// automatically.
+pub async fn send_resume_bitmap<T: Transport>(
+    session: &mut P2pSession<T>,
+    chat: &mut ChatState,
+    sid: StreamId,
+    receiver: &FileReceiver,
+) -> Result<(), SenderError> {
+    let resume = ResumeRequest::from_received(receiver.received_offsets(), receiver.leaf_count());
+    let body = resume.encode()?;
+    let bytes = tag_frame(FRAME_TAG_RESUME, body);
     session.send_stream_frame(chat, sid, &bytes).await?;
     Ok(())
 }

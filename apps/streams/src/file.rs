@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
 use meridian_core::chat::{ChatError, ChatState};
@@ -27,6 +28,7 @@ use meridian_core::transport::ChannelCfg;
 use meridian_proto::CodecError;
 
 use crate::manifest::FileManifest;
+use crate::resume::{ResumeRequest, FRAME_TAG_CHUNK, FRAME_TAG_RESUME};
 
 /// Registry name for this stream type, including its version suffix — see
 /// [`StreamType::name`]/[`StreamType::version`].
@@ -167,6 +169,18 @@ pub struct FileStream {
     /// must itself be synchronous — this closure *is* that seam.
     ask_user: Arc<AskUserFn>,
     transfers: Mutex<HashMap<StreamId, TransferState>>,
+    /// (task 10.9) Sender-side watchers for an inbound in-stream resume message, keyed by `sid`.
+    /// Populated only by [`FileStream::watch_resume`], which the caller that *sent* (opened) a
+    /// `mrd.file/1` transfer registers right after opening it, so that when the peer later sends a
+    /// [`crate::resume::FRAME_TAG_RESUME`] frame back on that same stream, `on_frame` has somewhere
+    /// to deliver it (an mpsc channel, not a return value — `on_frame` is a synchronous trait method
+    /// with no way to itself call the async `send_stream_frame`/`send_missing_chunks`, so the actual
+    /// resend is driven by whatever async caller is watching this channel). A receiver-side
+    /// `FileStream` (one that instead accepted this `sid` via `on_open`) never registers a watcher
+    /// here, so a resume frame arriving at the receiver — which the protocol never sends in that
+    /// direction — is simply dropped, matching `on_frame`'s existing "ignore what nobody is tracking"
+    /// default for chunk frames on an unaccepted stream.
+    resume_watchers: Mutex<HashMap<StreamId, mpsc::UnboundedSender<ResumeRequest>>>,
 }
 
 impl Default for FileStream {
@@ -196,6 +210,7 @@ impl FileStream {
             auto_accept_image_max_bytes,
             ask_user: Arc::new(ask_user),
             transfers: Mutex::new(HashMap::new()),
+            resume_watchers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -203,6 +218,21 @@ impl FileStream {
     /// tracking) that stream. For the receiver engine (10.8) and tests.
     pub fn transfer(&self, sid: StreamId) -> Option<TransferState> {
         self.transfers.lock().ok()?.get(&sid).cloned()
+    }
+
+    /// (task 10.9) Registers this `sid` as a sender-side transfer to watch for an inbound in-stream
+    /// resume message, returning the receiving half of the channel `on_frame` delivers one to. The
+    /// caller (the sender engine, or whoever is orchestrating a redial-triggered resume — see
+    /// `crate::resume`'s module doc for the redial-trigger gap this crate cannot itself close) is
+    /// expected to call this once, right after opening the transfer via
+    /// `P2pSession::open_stream`/`FileStream::build_open_params`, then `.recv().await` this channel
+    /// concurrently with the rest of its send loop.
+    pub fn watch_resume(&self, sid: StreamId) -> mpsc::UnboundedReceiver<ResumeRequest> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        if let Ok(mut watchers) = self.resume_watchers.lock() {
+            watchers.insert(sid, tx);
+        }
+        rx
     }
 
     /// Records the accepted transfer's manifest and returns the `Accept` decision. The only writer
@@ -328,15 +358,48 @@ impl StreamType for FileStream {
     }
 
     /// Inbound frame dispatch into the per-transfer state (task 10.6's own scope: buffering only —
-    /// decode/verify/write is task 10.8's receiver engine). Frames for a stream this side never
-    /// accepted (e.g. this is the sender's own side, which never calls `on_open` for a stream it
-    /// itself opened) are silently dropped, matching the trait's documented default ("ignores")
-    /// rather than growing unbounded state for a transfer with no captured manifest.
+    /// decode/verify/write is task 10.8's receiver engine) plus, as of task 10.9, the resume-frame
+    /// dispatch. Every inbound `mrd.file/1` in-stream frame now carries a one-byte discriminator
+    /// (`crate::resume`'s module doc, "Wire framing") ahead of its actual body:
+    /// - [`FRAME_TAG_CHUNK`]: the body (with the tag byte stripped) is buffered exactly as before —
+    ///   `pending_chunks` still holds bare `ChunkFrame`-encoded bytes, byte-for-byte identical to
+    ///   what task 10.7/10.8 already produce/consume, only for a stream this side accepted (e.g. the
+    ///   sender's own side, which never calls `on_open` for a stream it itself opened, is silently
+    ///   dropped, matching the trait's documented default rather than growing unbounded state for a
+    ///   transfer with no captured manifest).
+    /// - [`FRAME_TAG_RESUME`]: decoded as a [`ResumeRequest`] and forwarded to whichever
+    ///   [`watch_resume`](Self::watch_resume) caller registered a watcher for this `sid` (the
+    ///   sender's own side); dropped silently if nobody is watching (e.g. it arrived at the
+    ///   receiver's own side, where the protocol never sends one) or if it fails to decode (every
+    ///   byte off the wire is hostile — never panics).
+    /// - anything else (an unrecognized tag byte, or an empty frame with no tag at all) is dropped
+    ///   without touching any state, exactly like a malformed manifest at `on_open`.
     fn on_frame(&self, sid: StreamId, frame: &[u8]) {
-        if let Ok(mut transfers) = self.transfers.lock() {
-            if let Some(state) = transfers.get_mut(&sid) {
-                state.pending_chunks.push(frame.to_vec());
+        let Some((&tag, body)) = frame.split_first() else {
+            return;
+        };
+        match tag {
+            FRAME_TAG_CHUNK => {
+                if let Ok(mut transfers) = self.transfers.lock() {
+                    if let Some(state) = transfers.get_mut(&sid) {
+                        state.pending_chunks.push(body.to_vec());
+                    }
+                }
             }
+            FRAME_TAG_RESUME => {
+                if let Ok(resume) = ResumeRequest::decode(body) {
+                    if let Ok(watchers) = self.resume_watchers.lock() {
+                        if let Some(tx) = watchers.get(&sid) {
+                            // A dropped/gone-away watcher is not this dispatch's problem — the
+                            // frame is simply not actionable by anyone anymore; ignore the send
+                            // failure rather than treat it as an error (mirrors `sender.rs`'s own
+                            // `emit_progress` convention for a disconnected receiver).
+                            let _ = tx.send(resume);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -504,11 +567,19 @@ mod tests {
         assert!(matches!(decision, OpenDecision::Reject { ref code, .. } if code == "invalid"));
     }
 
+    /// (task 10.9) Prepends the chunk-frame discriminator byte — every real in-stream `mrd.file/1`
+    /// frame now carries one (`crate::resume`'s module doc, "Wire framing") — so these tests can
+    /// still feed `on_frame` arbitrary placeholder "chunk" bytes without needing a real
+    /// `ChunkFrame`-encoded body.
+    fn tagged_chunk(body: &[u8]) -> Vec<u8> {
+        crate::resume::tag_frame(FRAME_TAG_CHUNK, body.to_vec())
+    }
+
     #[test]
     fn on_frame_buffers_only_for_a_stream_this_side_accepted() {
         let fs = FileStream::new(MAX);
         // No prior `on_open`/accept for sid 5: frames must be dropped, not buffered anywhere.
-        fs.on_frame(5, b"stray chunk frame");
+        fs.on_frame(5, &tagged_chunk(b"stray chunk frame"));
         assert!(fs.transfer(5).is_none());
 
         let m = manifest("cat.png", 1);
@@ -516,13 +587,76 @@ mod tests {
             fs.on_open(5, &m.encode().unwrap(), &ctx(false)),
             OpenDecision::Accept
         );
-        fs.on_frame(5, b"chunk-a");
-        fs.on_frame(5, b"chunk-b");
+        fs.on_frame(5, &tagged_chunk(b"chunk-a"));
+        fs.on_frame(5, &tagged_chunk(b"chunk-b"));
         let recorded = fs.transfer(5).unwrap();
         assert_eq!(
             recorded.pending_chunks,
             vec![b"chunk-a".to_vec(), b"chunk-b".to_vec()]
         );
+    }
+
+    #[test]
+    fn on_frame_strips_the_tag_byte_leaving_pending_chunks_byte_for_byte_identical() {
+        // Regression pin for the wire-framing change itself: `pending_chunks` must hold exactly the
+        // pre-10.9 `ChunkFrame`-encoded bytes (task 10.7/10.8's own shape), never the tag byte.
+        let fs = FileStream::new(MAX);
+        let m = manifest("cat.png", 1);
+        fs.on_open(1, &m.encode().unwrap(), &ctx(false));
+        let real_chunk_frame = crate::chunk::ChunkFrame {
+            i: 3,
+            data: vec![0xEE; 12],
+        }
+        .encode()
+        .unwrap();
+        fs.on_frame(1, &tagged_chunk(&real_chunk_frame));
+        let recorded = fs.transfer(1).unwrap();
+        assert_eq!(recorded.pending_chunks, vec![real_chunk_frame.clone()]);
+        // And it must still decode as a normal `ChunkFrame`, exactly as `sender_engine.rs`'s tests
+        // rely on.
+        let decoded = crate::chunk::ChunkFrame::decode(&recorded.pending_chunks[0]).unwrap();
+        assert_eq!(decoded.i, 3);
+    }
+
+    #[test]
+    fn on_frame_routes_a_resume_frame_to_its_registered_watcher() {
+        let fs = FileStream::new(MAX);
+        let mut rx = fs.watch_resume(9);
+        let resume = ResumeRequest {
+            bitmap: vec![0b0000_0110],
+        };
+        let tagged = crate::resume::tag_frame(FRAME_TAG_RESUME, resume.encode().unwrap());
+        fs.on_frame(9, &tagged);
+        let received = rx.try_recv().expect("resume must be delivered");
+        assert_eq!(received, resume);
+    }
+
+    #[test]
+    fn on_frame_drops_a_resume_frame_with_no_registered_watcher_without_panicking() {
+        let fs = FileStream::new(MAX);
+        let resume = ResumeRequest { bitmap: vec![0xFF] };
+        let tagged = crate::resume::tag_frame(FRAME_TAG_RESUME, resume.encode().unwrap());
+        // No `watch_resume` call for sid 42 at all — must not panic, must not affect `transfers`.
+        fs.on_frame(42, &tagged);
+        assert!(fs.transfer(42).is_none());
+    }
+
+    #[test]
+    fn on_frame_drops_an_unknown_tag_and_an_empty_frame_without_panicking() {
+        let fs = FileStream::new(MAX);
+        let m = manifest("cat.png", 1);
+        fs.on_open(2, &m.encode().unwrap(), &ctx(false));
+        fs.on_frame(2, &[0xFFu8, 1, 2, 3]); // unrecognized tag
+        fs.on_frame(2, &[]); // empty: no tag byte at all
+        assert!(fs.transfer(2).unwrap().pending_chunks.is_empty());
+    }
+
+    #[test]
+    fn on_frame_drops_a_malformed_resume_body_without_panicking() {
+        let fs = FileStream::new(MAX);
+        let _rx = fs.watch_resume(7);
+        let garbage = crate::resume::tag_frame(FRAME_TAG_RESUME, b"not valid cbor".to_vec());
+        fs.on_frame(7, &garbage); // must not panic
     }
 
     #[test]
