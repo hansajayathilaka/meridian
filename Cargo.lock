@@ -2731,6 +2731,7 @@ dependencies = [
  "meridian-proto",
  "meridian-rendezvous",
  "meridian-signaling",
+ "meridian-streams",
  "meridian-tui",
  "rcgen",
  "rpassword",
@@ -2740,6 +2741,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "zeroize",
 ]
 
 [[package]]

@@ -133,7 +133,7 @@ Tests/Reviews):
 - [x] **10.9** Resume protocol: in-stream missing-range bitmap + redial integration (depends on 10.7, 10.8) — [file](./10.9-resume-protocol.md)
 
 **Wave 6 — client surfaces**
-- [~] **10.10** CLI `meridian send` (depends on 10.7, 10.8, 10.9) — [file](./10.10-cli-send-command.md)
+- [x] **10.10** CLI `meridian send` (depends on 10.7, 10.8, 10.9) — [file](./10.10-cli-send-command.md)
 - [x] **10.11** TUI surface: renderer + transfers pane + palette command (depends on 10.6) — [file](./10.11-tui-surface.md)
 
 **Wave 7 — spec + docs**

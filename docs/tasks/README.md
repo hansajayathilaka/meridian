@@ -810,7 +810,7 @@ ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md]
 - [x] **10.7** Sender engine: chunking, backpressure, progress, multi-file batches (depends on 10.6) — [file](./phase-10/10.7-sender-engine.md)
 - [x] **10.8** Receiver engine: write-by-offset, incremental verification, corruption handling (depends on 10.6) — [file](./phase-10/10.8-receiver-engine.md)
 - [x] **10.9** Resume protocol: in-stream missing-range bitmap + redial integration (depends on 10.7, 10.8) — [file](./phase-10/10.9-resume-protocol.md)
-- [~] **10.10** CLI `meridian send` (depends on 10.7, 10.8, 10.9) — [file](./phase-10/10.10-cli-send-command.md)
+- [x] **10.10** CLI `meridian send` (depends on 10.7, 10.8, 10.9) — [file](./phase-10/10.10-cli-send-command.md)
 - [x] **10.11** TUI surface: renderer + transfers pane + palette command (depends on 10.6) — [file](./phase-10/10.11-tui-surface.md)
 - [x] **10.12** `mrd.file/1` spec section + wire/design doc corrections (depends on 10.4, 10.6, 10.9) — [file](./phase-10/10.12-spec-doc-sync.md)
 - [x] **10.13** netns rig: loss/RTT injection profiles — [file](./phase-10/10.13-netns-loss-rtt-profiles.md)
