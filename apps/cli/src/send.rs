@@ -952,11 +952,10 @@ fn print_progress_bar(p: &SendProgress) {
 /// capturing stdout.
 #[cfg(any(test, feature = "webrtc"))]
 fn render_progress_bar(bytes_sent: u64, total_bytes: u64, bytes_per_sec: f64) -> String {
-    let pct: u64 = if total_bytes == 0 {
-        100
-    } else {
-        ((bytes_sent.saturating_mul(100)) / total_bytes).min(100)
-    };
+    let pct: u64 = bytes_sent
+        .saturating_mul(100)
+        .checked_div(total_bytes)
+        .map_or(100, |p| p.min(100));
     // A 10-wide bar, filled proportionally (rounded to the nearest tenth). The feature spec's own
     // demo script's `▓▓▓▓▓░░░░` for "38%" is a 9-wide, hand-illustrated sketch, not a literal
     // render of a real percentage under any consistent formula (5/9 ≈ 56%, not 38%) — this matches
