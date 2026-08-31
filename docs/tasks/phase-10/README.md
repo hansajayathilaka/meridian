@@ -141,12 +141,16 @@ Tests/Reviews):
 
 **Wave 8 — test infrastructure**
 - [x] **10.13** netns rig: loss/RTT injection profiles (independent, can run in Wave 1) — [file](./10.13-netns-loss-rtt-profiles.md)
-- [~] **10.14** Soak test: 1 GiB / 10 GiB transfers + throughput report (depends on 10.10, 10.13) — [file](./10.14-soak-test-throughput.md)
-- [~] **10.15** Kill/resume test automation (depends on 10.9, 10.10, 10.13) — [file](./10.15-kill-resume-automation.md)
+- [x] **10.14** Soak test: 1 GiB / 10 GiB transfers + throughput report (depends on 10.10, 10.13) — [file](./10.14-soak-test-throughput.md)
+- [x] **10.15** Kill/resume test automation (depends on 10.9, 10.10, 10.13) — [file](./10.15-kill-resume-automation.md)
 - [x] **10.16** Corrupted-chunk adversarial test (depends on 10.8) — [file](./10.16-corrupted-chunk-adversarial-test.md)
 
+**Wave 8.5 — fix, discovered by 10.14/10.15's real-transport tests**
+- [ ] **10.18** Fix: real `WebRtcTransport` can't send a full 64 KiB `mrd.file/1` chunk (depends on
+  10.7) — [file](./10.18-sctp-max-message-size-fix.md)
+
 **Wave 9 — phase exit**
-- [ ] **10.17** Phase exit: acceptance demo + third-party implementability check + doc sync (depends on all above) — [file](./10.17-phase-exit-demo.md)
+- [ ] **10.17** Phase exit: acceptance demo + third-party implementability check + doc sync (depends on all above, including 10.18) — [file](./10.17-phase-exit-demo.md)
 
 ## Exit criteria
 All tasks `[x]`, tree green (`cargo build --workspace`, `cargo fmt --all -- --check`,
