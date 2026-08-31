@@ -98,3 +98,16 @@ meridian-signaling = { path = "../signaling", features = ["test-support"] }
 # mutation-check's actual coverage.
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+
+# Task 10.15's netns kill/resume driver examples use meridian_core::transport::WebRtcTransport
+# directly, which is only re-exported when meridian-core's own `webrtc` feature is on (see
+# apps/transport/src/lib.rs's `#[cfg(feature = "webrtc")]` gate) — required-features keeps a
+# default (non-webrtc) `cargo build --examples`/`cargo check --workspace` from trying to compile
+# either example without it.
+[[example]]
+name = "kill_resume_netns_drive"
+required-features = ["webrtc"]
+
+[[example]]
+name = "netns_ice_restart_probe"
+required-features = ["webrtc"]
