@@ -40,6 +40,7 @@ pub mod screens;
 pub mod session;
 pub mod statusbar;
 pub mod store;
+pub mod streams;
 pub mod surface;
 pub mod terminal;
 pub mod theme;
