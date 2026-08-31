@@ -24,6 +24,7 @@ mod directory;
 mod doctor;
 mod opacity;
 mod policy;
+mod send;
 mod session;
 mod session_connect;
 #[cfg(feature = "tui")]
@@ -129,6 +130,32 @@ enum TopCommand {
     Session {
         #[command(subcommand)]
         cmd: SessionCommand,
+    },
+    /// Resumable P2P file transfer (T09): send one or more files to a peer over a real, direct
+    /// session (cross-process counterpart to `session connect`, same key-order role decision). See
+    /// `apps/cli/src/send.rs`'s module doc for the responder-side receiving behavior and its
+    /// recorded `TODO: confirm` gaps.
+    Send {
+        /// The peer's full `mrd1:…@domain` ID.
+        id: String,
+        /// One or more files to send. Required for both roles' invocations (see `send.rs`'s module
+        /// doc: on the responder side these are not sent, only their count feeds `--expect`'s
+        /// default).
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Rendezvous WebSocket URL.
+        #[arg(long, default_value = "ws://127.0.0.1:8443")]
+        server: String,
+        /// Directory received files are written to (responder role only).
+        #[arg(long, default_value = ".")]
+        out: PathBuf,
+        /// How many inbound files to wait to fully receive before exiting (responder role only).
+        /// Defaults to this invocation's own `<path>...` count — see `send.rs`'s module doc.
+        #[arg(long)]
+        expect: Option<usize>,
+        /// Headless: emit one JSON object per event instead of the human-readable transcript.
+        #[arg(long)]
+        json: bool,
     },
     /// Connectivity diagnostic (T05): which candidate classes work and where the path is blocked.
     Doctor {
@@ -378,6 +405,14 @@ fn main() -> ExitCode {
         TopCommand::FetchBundle { id, server, tamper } => cmd_fetch_bundle(&id, &server, tamper),
         TopCommand::Chat { id, server, json } => cmd_chat(&id, &server, json),
         TopCommand::Session { cmd } => run_session(cmd),
+        TopCommand::Send {
+            id,
+            paths,
+            server,
+            out,
+            expect,
+            json,
+        } => cmd_send(&id, paths, &server, &out, expect, json),
         TopCommand::Doctor { json } => run_doctor(json),
         TopCommand::Config { cmd } => run_config(cmd),
         TopCommand::Demo { cmd } => run_demo(cmd),
@@ -682,6 +717,47 @@ fn cmd_chat(id: &str, server: &str, json: bool) -> Result<ExitCode, String> {
             peer_ik,
             peer_label: peer.to_id_string(),
             peer_hint: peer.hint().to_string(),
+            json,
+        }),
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// File transfer (T09)
+// ---------------------------------------------------------------------------
+
+fn cmd_send(
+    id: &str,
+    paths: Vec<PathBuf>,
+    server: &str,
+    out: &Path,
+    expect: Option<usize>,
+    json: bool,
+) -> Result<ExitCode, String> {
+    let descriptor = AccountDescriptor::load()?;
+    let account_pub = account_pub_bytes(&descriptor)?;
+    let peer = parse_id(id).map_err(|e| e.to_string())?;
+    let peer_ik = *peer.pubkey();
+    let store = load_store(&descriptor)?;
+    let handle = KeyHandle::from_label(&descriptor.label);
+    // Defaults to this invocation's own `<path>...` count — see `send.rs`'s module doc on why the
+    // responder role has no better signal available today.
+    let expect = expect.unwrap_or(paths.len());
+
+    block_on(
+        runtime()?,
+        send::run(send::SendArgs {
+            server: server.to_string(),
+            store: store.as_ref(),
+            handle: &handle,
+            account_pub,
+            peer_ik,
+            peer_label: peer.to_id_string(),
+            peer_hint: peer.hint().to_string(),
+            paths,
+            out_dir: out.to_path_buf(),
+            expect,
             json,
         }),
     )?;

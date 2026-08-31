@@ -1,0 +1,81 @@
+# Scheduled + workflow_dispatch runner for tools/soak-file-transfer.sh (task 10.14 — the feature
+# spec's named 1 GiB/10 GiB soak test + throughput report feeding ADR-6, docs/architecture/adr/
+# 0006-terminal-transport.md). Mirrors netns-netem-smoke.yml's structure (task 10.13's own
+# precedent): schedule + workflow_dispatch, not the blocking push/PR gate — this needs root/
+# NET_ADMIN for its `netns` leg (same posture as netns-netem-smoke.yml) and, for a real 1 GiB/10 GiB
+# run, materially more time/disk than the default push/PR pipeline should ever assume.
+#
+# EXPECTED TO BE RED on its first runs: task 10.14's own report
+# (docs/testing/soak-file-transfer-throughput.md) found a blocking, pre-existing defect — the real
+# WebRtcTransport cannot send a full 64 KiB mrd.file/1 chunk (SCTP's default max-message-size is
+# smaller than one sealed chunk) — so both legs below will fail the moment they attempt any
+# transfer needing more than one chunk. That is a real, correctly-loud finding (see the report's
+# "Headline finding" section), not a flaky workflow; it should stay red until that defect is fixed
+# (see the report's carry-forward note), at which point this workflow's default sizes should be
+# raised toward the feature spec's actual 1 GiB/10 GiB named soak sizes via workflow_dispatch
+# inputs or a dedicated follow-up job with an appropriately larger disk/time budget.
+name: soak-file-transfer
+
+on:
+  schedule:
+    # Offset from capacity-check.yml (Monday 06:00 UTC), p2p-wire-proof.yml (07:00) and
+    # netns-netem-smoke.yml (08:00) so the scheduled, longer-running/privileged jobs don't contend
+    # for the same runner-queue moment. TODO: confirm desired cadence — weekly chosen as a
+    # reasonable default matching the existing three; no cadence is specified anywhere in
+    # docs/operations/, the same open question those three already carry for their own schedules.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+    inputs:
+      size_mib:
+        description: "Test file size in MiB for both legs (default: a small smoke size, not the feature spec's full 1 GiB/10 GiB, to keep a manual dispatch fast while the known SCTP defect is unfixed)"
+        required: false
+        default: "2"
+
+jobs:
+  soak-file-transfer:
+    name: meridian send soak throughput (tools/soak-file-transfer.sh)
+    runs-on: ubuntu-latest
+    # A real 1 GiB/10 GiB run needs much more than this once the SCTP fix (carry-forward in
+    # docs/testing/soak-file-transfer-throughput.md) lands; this default budget only covers the
+    # small smoke sizes both legs use today (see the size_mib input default above).
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build meridian (--features webrtc) and meridian-rendezvous
+        run: |
+          cargo build -p meridian-cli --features webrtc --bin meridian
+          cargo build -p meridian-rendezvous --bin meridian-rendezvous
+
+      - name: loopback leg (no root, no netns) — the always-available honest data point
+        run: |
+          bash tools/soak-file-transfer.sh loopback \
+            --size-mib "${{ github.event.inputs.size_mib || '2' }}" --timeout-secs 120
+
+      # Same fail-loudly posture as netns-netem-smoke.yml's own preflight: a runner that ever lost
+      # CONFIG_NET_SCH_NETEM would make need_netem() gracefully skip (by design for a genuinely
+      # netem-less sandbox) — but ubuntu-latest is expected to carry the module, so its absence
+      # here is itself news worth failing on, not silently swallowing into a permanent no-op.
+      - name: Fail loudly if netem is unexpectedly unavailable on this runner
+        run: |
+          if ! sudo modprobe sch_netem 2>/tmp/netem-probe.err; then
+            echo "::error::CONFIG_NET_SCH_NETEM unavailable on ubuntu-latest — was believed present; investigate before trusting this job's green runs."
+            cat /tmp/netem-probe.err
+            exit 1
+          fi
+
+      # No env vars threaded through `sudo` here (it drops almost all of them by default,
+      # `env_reset`, unless explicitly kept) — unnecessary anyway: `tools/soak-file-transfer.sh`
+      # resolves both binaries relative to its own `cd "$(dirname "$0")/.."`-derived repo root,
+      # which sudo preserves (a filesystem-path computation, not an environment lookup).
+      - name: netns leg (root + netem) — the feature spec's named file-transfer profile
+        run: |
+          sudo bash tools/soak-file-transfer.sh netns \
+            --size-mib "${{ github.event.inputs.size_mib || '2' }}" --profile file-transfer --timeout-secs 120
+
+      - name: Force cleanup (in case a failed step left a topology up)
+        if: always()
+        run: sudo bash tools/soak-file-transfer.sh netns down || true

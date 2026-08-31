@@ -249,20 +249,30 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 
 
 ### Live carry-forwards (not owned by any open task)
-- **No `StreamType::on_reconnect` hook (or reconnect `SessionEvent`) exists to automatically trigger
-  post-redial behavior for a stream type** (found by task 10.9's own review, ratifying task 10.9's
-  resume protocol). `P2pSession::ice_restart()` (`apps/core/src/session.rs`) renegotiates ICE and
-  preserves data channels/ratchet state, but emits no `SessionEvent` and calls back into no
-  `StreamType` hook — confirmed `StreamType` (`apps/core/src/streams.rs`) has only `on_open`/`on_frame`
-  today. Task 10.9's own scope correctly forbids a core-crate edit to close this, so it exposes
-  `meridian_streams::{send_resume_bitmap, watch_resume}` as explicit calls an application-level
-  session-lifecycle layer must make itself immediately after its own `ice_restart()` returns, rather
-  than automatic wiring — a real, correctly-descoped gap, not a defect in 10.9's own shipped code. No
-  open task owns adding the hook itself (likely `StreamType::on_reconnect(&self, sid: StreamId)` or a
-  new `SessionEvent::Reconnected` variant plumbed through `pump`/`handle_ctrl`, with `FileStream`
-  wired to call `send_resume_bitmap` from it once it exists) — pick up via a future `/plan-phase`
-  (this phase's own 10.10 CLI/10.17 phase-exit demo should call the manual primitives directly in the
-  meantime, since the automatic hook won't land before this phase closes).
+- **`WebRtcTransport::ice_restart` does not actually restore connectivity after a real network
+  change — it is a documented no-op over the real backend, only tested against `LoopbackTransport`'s
+  local-only contract until task 10.15 empirically exercised it for real.** This is not a new defect:
+  `apps/transport/src/webrtc_backend.rs`'s own module doc (lines 70–91) already named it "ICE restart
+  does not (yet) fulfill the resumability promise (known gap)," flagged for architect review as "a
+  not-yet-numbered successor to [task] 1.15," since closing it needs a ctrl-channel renegotiation
+  message to carry a restart offer to the peer — `P2pSession::ice_restart` has no session-layer
+  signaling path today, calling the backend on one side with no envelope round trip. Task 10.15's
+  `tools/netns-kill-resume.sh probe` confirmed this empirically for the first time: cutting a real
+  veth for 15s (past the backend's own 9s `ICE_FAILED_TIMEOUT`), restoring it, then calling
+  `ice_restart()` on both sides — the sender's send call returns `Ok(())` with no error, but the peer
+  never receives it even 25s later. **Compounding finding** (originally filed here as a narrower
+  "no `StreamType::on_reconnect` hook" gap by task 10.9's own review): even if a hook existed to
+  automatically fire `meridian_streams::send_resume_bitmap`/`watch_resume` after `ice_restart()`
+  returns, it would still fail over the real backend today, since `ice_restart()` itself doesn't
+  restore the connection — the missing hook and the no-op restart are two layers of the same
+  unresolved resumability promise, and closing either alone doesn't fix the demo script's own
+  "network cut → reconnect → resume" scenario over real WebRTC. Confirmed harmless over
+  `LoopbackTransport` (used by every `meridian-streams`/`meridian-cli` test in this phase), so nothing
+  built in Phase 10 is *wrong* — task 10.10's CLI and task 10.17's phase-exit demo should run their
+  resume/reconnect scenario over loopback (or document the real-transport gap explicitly if the demo
+  is run over real WebRTC) until this lands. No open task owns the fix (needs a real ctrl-channel
+  renegotiation design — architect-review territory, not a config change like 10.18's) — pick up via
+  a future `/plan-phase`.
 - **`apps/tui`'s extension registry has no public seam for a feature module to register into a *live*
   session, and `chat.rs`'s transcript renderer never consults the shared registry at all** (found by
   task 10.11's own review). Confirmed: `apps/tui/src/app.rs`'s `register_builtin_commands` is a
@@ -810,14 +820,15 @@ ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md]
 - [x] **10.7** Sender engine: chunking, backpressure, progress, multi-file batches (depends on 10.6) — [file](./phase-10/10.7-sender-engine.md)
 - [x] **10.8** Receiver engine: write-by-offset, incremental verification, corruption handling (depends on 10.6) — [file](./phase-10/10.8-receiver-engine.md)
 - [x] **10.9** Resume protocol: in-stream missing-range bitmap + redial integration (depends on 10.7, 10.8) — [file](./phase-10/10.9-resume-protocol.md)
-- [~] **10.10** CLI `meridian send` (depends on 10.7, 10.8, 10.9) — [file](./phase-10/10.10-cli-send-command.md)
+- [x] **10.10** CLI `meridian send` (depends on 10.7, 10.8, 10.9) — [file](./phase-10/10.10-cli-send-command.md)
 - [x] **10.11** TUI surface: renderer + transfers pane + palette command (depends on 10.6) — [file](./phase-10/10.11-tui-surface.md)
 - [x] **10.12** `mrd.file/1` spec section + wire/design doc corrections (depends on 10.4, 10.6, 10.9) — [file](./phase-10/10.12-spec-doc-sync.md)
 - [x] **10.13** netns rig: loss/RTT injection profiles — [file](./phase-10/10.13-netns-loss-rtt-profiles.md)
-- [ ] **10.14** Soak test: 1 GiB / 10 GiB transfers + throughput report (depends on 10.10, 10.13) — [file](./phase-10/10.14-soak-test-throughput.md)
-- [ ] **10.15** Kill/resume test automation (depends on 10.9, 10.10, 10.13) — [file](./phase-10/10.15-kill-resume-automation.md)
-- [ ] **10.16** Corrupted-chunk adversarial test (depends on 10.8) — [file](./phase-10/10.16-corrupted-chunk-adversarial-test.md)
-- [ ] **10.17** Phase exit: acceptance demo + third-party implementability check + doc sync (depends on all above) — [file](./phase-10/10.17-phase-exit-demo.md)
+- [x] **10.14** Soak test: 1 GiB / 10 GiB transfers + throughput report (depends on 10.10, 10.13) — [file](./phase-10/10.14-soak-test-throughput.md)
+- [x] **10.15** Kill/resume test automation (depends on 10.9, 10.10, 10.13) — [file](./phase-10/10.15-kill-resume-automation.md)
+- [x] **10.16** Corrupted-chunk adversarial test (depends on 10.8) — [file](./phase-10/10.16-corrupted-chunk-adversarial-test.md)
+- [ ] **10.18** Fix: real `WebRtcTransport` can't send a full 64 KiB `mrd.file/1` chunk (depends on 10.7) — [file](./phase-10/10.18-sctp-max-message-size-fix.md)
+- [ ] **10.17** Phase exit: acceptance demo + third-party implementability check + doc sync (depends on all above, including 10.18) — [file](./phase-10/10.17-phase-exit-demo.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.

@@ -24,9 +24,18 @@ tui = ["dep:meridian-tui"]
 
 [dependencies]
 meridian-core = { path = "../core" }
+# `meridian send` (T09, task 10.10): wires the already-built `mrd.file/1` sender/receiver engines
+# (`send_file`/`FileStream`/merkle/per-chunk-AEAD helpers) to a live `P2pSession` — this crate stays
+# orchestration-only per `apps/cli/CLAUDE.md`; every byte of chunking/AEAD/merkle logic lives here.
+meridian-streams = { path = "../streams" }
 # Optional, gated by the `tui` feature above (default-on). ADR 0020 condition 3: meridian-cli depends
 # on meridian-tui, never the reverse — checked by tools/lint-tui-no-cli.sh.
 meridian-tui = { path = "../tui", optional = true }
+# `send.rs`'s per-transfer `k_f` (unsealed from the ratchet, held across the receiver loop's whole
+# lifetime) needs the same `Zeroizing` wrapping every other holder of this key uses
+# (`meridian_streams::file`/`meridian_streams::receiver`) — not re-exported by `meridian-streams`, so
+# this crate takes its own direct edge on it.
+zeroize = { workspace = true }
 # `keyring` (the all-in-one v1 wrapper) installs a real platform credential store for `--store os`.
 keyring = "4.1.4"
 clap = { workspace = true }
@@ -53,6 +62,10 @@ tempfile = { workspace = true }
 # audit (`apps/cli/src/opacity.rs::run_mailbox_at_rest_audit`) — needs genuine on-disk `.db` bytes
 # to scan, not the in-memory `MemoryStore`.
 meridian-rendezvous = { path = "../rendezvous", features = ["test-tamper-hook", "sqlite"] }
+# Task 10.15's real-netns kill/resume driver example (`kill_resume_netns_drive`): the same
+# `SignalRelay` trait `meridian-core` already uses `#[async_trait::async_trait]` for.
+async-trait = { workspace = true }
+
 tokio = { workspace = true, features = ["rt", "macros", "net", "sync", "time", "io-util"] }
 # Task 2.9: two-org in-process s2s mTLS harness for the federation-error acceptance test
 # (mirrors apps/rendezvous/tests/federation_fetch.rs's PKI fixture).
@@ -85,3 +98,16 @@ meridian-signaling = { path = "../signaling", features = ["test-support"] }
 # mutation-check's actual coverage.
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+
+# Task 10.15's netns kill/resume driver examples use meridian_core::transport::WebRtcTransport
+# directly, which is only re-exported when meridian-core's own `webrtc` feature is on (see
+# apps/transport/src/lib.rs's `#[cfg(feature = "webrtc")]` gate) — required-features keeps a
+# default (non-webrtc) `cargo build --examples`/`cargo check --workspace` from trying to compile
+# either example without it.
+[[example]]
+name = "kill_resume_netns_drive"
+required-features = ["webrtc"]
+
+[[example]]
+name = "netns_ice_restart_probe"
+required-features = ["webrtc"]
