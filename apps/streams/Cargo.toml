@@ -48,3 +48,8 @@ meridian-identity = { path = "../identity" }
 meridian-store = { path = "../store" }
 meridian-signaling = { path = "../signaling" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
+# Task 10.15's kill-resume-simulated test: a literal `sha256` comparison, matching the demo
+# script's own "sha256sum on both ends -> identical" acceptance wording, alongside the BLAKE3 root
+# check every other test in this crate already does.
+sha2 = { workspace = true }
+hex = { workspace = true }

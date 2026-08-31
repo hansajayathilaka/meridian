@@ -2721,6 +2721,7 @@ name = "meridian-cli"
 version = "0.0.0"
 dependencies = [
  "age",
+ "async-trait",
  "clap",
  "figment",
  "getrandom 0.3.4",
@@ -2912,12 +2913,14 @@ dependencies = [
  "chacha20poly1305",
  "ciborium",
  "getrandom 0.3.4",
+ "hex",
  "meridian-core",
  "meridian-identity",
  "meridian-proto",
  "meridian-signaling",
  "meridian-store",
  "serde",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "zeroize",

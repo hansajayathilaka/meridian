@@ -62,6 +62,10 @@ tempfile = { workspace = true }
 # audit (`apps/cli/src/opacity.rs::run_mailbox_at_rest_audit`) — needs genuine on-disk `.db` bytes
 # to scan, not the in-memory `MemoryStore`.
 meridian-rendezvous = { path = "../rendezvous", features = ["test-tamper-hook", "sqlite"] }
+# Task 10.15's real-netns kill/resume driver example (`kill_resume_netns_drive`): the same
+# `SignalRelay` trait `meridian-core` already uses `#[async_trait::async_trait]` for.
+async-trait = { workspace = true }
+
 tokio = { workspace = true, features = ["rt", "macros", "net", "sync", "time", "io-util"] }
 # Task 2.9: two-org in-process s2s mTLS harness for the federation-error acceptance test
 # (mirrors apps/rendezvous/tests/federation_fetch.rs's PKI fixture).
