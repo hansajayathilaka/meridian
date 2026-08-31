@@ -814,9 +814,9 @@ ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md]
 - [x] **10.11** TUI surface: renderer + transfers pane + palette command (depends on 10.6) — [file](./phase-10/10.11-tui-surface.md)
 - [x] **10.12** `mrd.file/1` spec section + wire/design doc corrections (depends on 10.4, 10.6, 10.9) — [file](./phase-10/10.12-spec-doc-sync.md)
 - [x] **10.13** netns rig: loss/RTT injection profiles — [file](./phase-10/10.13-netns-loss-rtt-profiles.md)
-- [ ] **10.14** Soak test: 1 GiB / 10 GiB transfers + throughput report (depends on 10.10, 10.13) — [file](./phase-10/10.14-soak-test-throughput.md)
-- [ ] **10.15** Kill/resume test automation (depends on 10.9, 10.10, 10.13) — [file](./phase-10/10.15-kill-resume-automation.md)
-- [ ] **10.16** Corrupted-chunk adversarial test (depends on 10.8) — [file](./phase-10/10.16-corrupted-chunk-adversarial-test.md)
+- [~] **10.14** Soak test: 1 GiB / 10 GiB transfers + throughput report (depends on 10.10, 10.13) — [file](./phase-10/10.14-soak-test-throughput.md)
+- [~] **10.15** Kill/resume test automation (depends on 10.9, 10.10, 10.13) — [file](./phase-10/10.15-kill-resume-automation.md)
+- [x] **10.16** Corrupted-chunk adversarial test (depends on 10.8) — [file](./phase-10/10.16-corrupted-chunk-adversarial-test.md)
 - [ ] **10.17** Phase exit: acceptance demo + third-party implementability check + doc sync (depends on all above) — [file](./phase-10/10.17-phase-exit-demo.md)
 
 ## Legend / how to read
