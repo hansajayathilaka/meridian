@@ -173,6 +173,16 @@ fn signal_content_roundtrips() {
             dtls_fp: "sha-256 EF:01".into(),
             ice: vec![],
         },
+        SignalContent::IceRestartOffer {
+            sdp: b"v=loopback\ntoken=3\n".to_vec(),
+            dtls_fp: "sha-256 AB:CD".into(),
+            ice: vec!["candidate:host 3".into()],
+        },
+        SignalContent::IceRestartAnswer {
+            sdp: b"v=loopback\ntoken=4\n".to_vec(),
+            dtls_fp: "sha-256 EF:01".into(),
+            ice: vec![],
+        },
         SignalContent::IceTrickle {
             candidates: vec!["candidate:srflx 2".into()],
         },

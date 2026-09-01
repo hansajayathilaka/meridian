@@ -67,8 +67,16 @@ from the envelope actually received (never a locally recomputed value — see
 Recipients check `v == 2` (hard reject on any other value, never a downgrade), cross-check
 `sender_pub` against the routing `from`, and authenticate+decrypt `ct` via the ratchet AEAD — there is
 no separate signature-verify step. `ct` plaintext (post-ratchet) is a `Content` union: `x3dh_init`,
-`sdp_offer{sdp, dtls_fp, ice[]}`, `sdp_answer{…}`, `ice_trickle{…}`, `chat{…}`,
-`ring{stream_type, params}`, `receipt{…}`.
+`sdp_offer{sdp, dtls_fp, ice[]}`, `sdp_answer{…}`, `ice_restart_offer{sdp, dtls_fp, ice[]}`,
+`ice_restart_answer{…}`, `ice_trickle{…}`, `chat{…}`, `ring{stream_type, params}`, `receipt{…}`.
+`ice_restart_offer`/`ice_restart_answer` ([ADR 0025](../adr/0025-ice-restart-renegotiation.md)) are the
+same session-substrate tier as `sdp_offer`/`sdp_answer` and the identical wire shape — a fresh SDP
+offer/answer round trip for an already-established session whose P2P path has degraded, not the
+initial session establishment, and deliberately *not* a `mrd.ctrl/1` `CtrlFrame` addition (§5), since
+an ICE restart may be needed precisely when the ctrl data channel itself is degraded or dead. Unlike
+`sdp_offer`/`sdp_answer`'s hard-fail delivery contract, sending an ICE-restart offer/answer accepts
+mailbox-queued delivery (§2's `route_ok{queued}`) as a normal outcome, since a live ratchet session
+already exists to fall back on (ADR 0025).
 
 > **Two former known deviations from §1's rules — now closed:**
 > 1. **Leading `v` field.** The now-superseded v1 envelope had none — its version existed only as the
