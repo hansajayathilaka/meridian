@@ -149,8 +149,18 @@ Tests/Reviews):
 - [x] **10.18** Fix: real `WebRtcTransport` can't send a full 64 KiB `mrd.file/1` chunk (depends on
   10.7) — [file](./10.18-sctp-max-message-size-fix.md)
 
-**Wave 9 — phase exit**
+**Wave 9 — phase exit (first attempt)**
 - [x] **10.17** Phase exit: acceptance demo + third-party implementability check + doc sync (depends on all above, including 10.18) — [file](./10.17-phase-exit-demo.md). Task itself fully executed; verdict is a blocking finding, not a clean pass — see its Outcome.
+
+**Wave 9.5 — gap-closure fix for 10.17's blocking finding ([ADR 0025](../../adr/0025-ice-restart-renegotiation.md))**
+- [ ] **10.19** Real `Transport::ice_restart` (webrtc-rs primitive) (depends on 10.18) — [file](./10.19-real-transport-ice-restart.md)
+- [ ] **10.20** Wire types: `SignalContent::IceRestartOffer`/`Answer` (independent) — [file](./10.20-ice-restart-wire-types.md)
+- [ ] **10.21** Tolerant (mailbox-eligible) restart delivery (depends on 10.20) — [file](./10.21-tolerant-restart-delivery.md)
+- [ ] **10.22** `P2pSession::ice_restart` real signaling — symmetric, glare-safe, layered fingerprint check (depends on 10.19, 10.20, 10.21) — [file](./10.22-session-ice-restart-signaling.md)
+- [ ] **10.23** CLI/demo wiring for the new signature (depends on 10.22) — [file](./10.23-cli-ice-restart-wiring.md)
+
+**Wave 10 — phase exit (re-run)**
+- [ ] **10.24** Phase exit-gate re-run (depends on 10.19–10.23) — [file](./10.24-phase-exit-gate-rerun.md)
 
 ## Exit criteria
 All tasks `[x]`, tree green (`cargo build --workspace`, `cargo fmt --all -- --check`,

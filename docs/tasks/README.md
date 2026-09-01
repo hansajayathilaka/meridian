@@ -272,11 +272,16 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   gap-closure task for the `ice_restart` real-transport resumability gap (architect-review territory —
   a session-layer ctrl-channel ICE-renegotiation design, not a config change) lands and this exit gate
   is re-run clean, mirroring exactly how Phase 7's F1 held that phase's own closure open.
-- **NEXT:** open a gap-closure task (via a future `/plan-phase`/`/new-task`) for the `ice_restart`
-  real-transport resumability gap, then re-run task 10.17's exit gate. Phase 10 is not yet eligible for
-  `/start-review-phase` until that re-run passes cleanly (or the team makes an explicit, documented
-  decision to accept the current state and close anyway — not done here, per this task's own scope of
-  verify-and-report, not decide).
+- **NEXT:** the gap-closure fix is now planned and underway. [ADR 0025](../adr/0025-ice-restart-renegotiation.md)
+  (architect-reviewed) decided the mechanism: ICE-restart offers/answers ride the same tolerant,
+  mailbox-eligible signaling path T07 already built (never a standing relay connection held open for a
+  session's lifetime, preserving feature 04's "servers out of the data path" property), one symmetric
+  glare-safe `P2pSession::ice_restart` method reusing the existing dial/answer identity-key tie-break,
+  and a layered fingerprint check (the ordinary asserted-vs-negotiated cross-check plus a new assertion
+  against the session's own cached fingerprint). Broken into tasks
+  [10.19](./phase-10/10.19-real-transport-ice-restart.md)–[10.24](./phase-10/10.24-phase-exit-gate-rerun.md)
+  (Wave 9.5/10 in `phase-10/README.md`) — 10.24 re-runs task 10.17's exit gate. Phase 10 is not yet
+  eligible for `/start-review-phase` until that re-run passes cleanly.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -301,9 +306,10 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   `LoopbackTransport` (used by every `meridian-streams`/`meridian-cli` test in this phase), so nothing
   built in Phase 10 is *wrong* — task 10.10's CLI and task 10.17's phase-exit demo should run their
   resume/reconnect scenario over loopback (or document the real-transport gap explicitly if the demo
-  is run over real WebRTC) until this lands. No open task owns the fix (needs a real ctrl-channel
-  renegotiation design — architect-review territory, not a config change like 10.18's) — pick up via
-  a future `/plan-phase`.
+  is run over real WebRTC) until this lands. **Now owned**: [ADR 0025](../adr/0025-ice-restart-renegotiation.md)
+  decided the mechanism (tolerant, mailbox-eligible signaling — not a `mrd.ctrl/1` ctrl-channel
+  message, since the channel needing repair can't reliably carry its own repair signal) and tasks
+  [10.19–10.24](./phase-10/10.19-real-transport-ice-restart.md) implement it.
 - **RE-CONFIRMED LIVE by task 10.17's phase-exit demo, for the actual `mrd.file/1` kill/resume
   scenario (not just 10.15's chat-only `probe`)**: with task 10.18's SCTP fix landed, a real
   multi-chunk transfer (24 chunks) now sends 15/24 chunks correctly before a genuine 15s veth cut;
@@ -314,7 +320,9 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   This means the feature spec's own literal acceptance-demo script (`meridian send` narrating
   cut→ICE-restart→resume→verified-match in one live process) **does not pass** over the real
   transport today — recorded honestly as a phase-exit-blocking finding per that task's own
-  instructions, not silently downgraded. Still no open task owns the fix.
+  instructions, not silently downgraded. **Now owned** — see [ADR 0025](../adr/0025-ice-restart-renegotiation.md)
+  and tasks 10.19–10.24 above; task [10.23](./phase-10/10.23-cli-ice-restart-wiring.md) re-runs this
+  exact scenario for real, and [10.24](./phase-10/10.24-phase-exit-gate-rerun.md) re-runs the exit gate.
 - **NEW (found by task 10.17): `tools/netns-kill-resume.sh`'s own pre-flight self-check
   (`need_veth_linkstate`) has an environment-dependent false-negative bug**, independent of the
   `ice_restart` gap above. It names its probe veth/netns interfaces `kr-probe-a-$$`/
@@ -911,7 +919,13 @@ ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md]
 - [x] **10.15** Kill/resume test automation (depends on 10.9, 10.10, 10.13) — [file](./phase-10/10.15-kill-resume-automation.md)
 - [x] **10.16** Corrupted-chunk adversarial test (depends on 10.8) — [file](./phase-10/10.16-corrupted-chunk-adversarial-test.md)
 - [x] **10.18** Fix: real `WebRtcTransport` can't send a full 64 KiB `mrd.file/1` chunk (depends on 10.7) — [file](./phase-10/10.18-sctp-max-message-size-fix.md)
-- [x] **10.17** Phase exit: acceptance demo + third-party implementability check + doc sync (depends on all above, including 10.18) — [file](./phase-10/10.17-phase-exit-demo.md)
+- [x] **10.17** Phase exit (first attempt): acceptance demo + third-party implementability check + doc sync (depends on all above, including 10.18) — [file](./phase-10/10.17-phase-exit-demo.md). Fully executed; verdict is a blocking finding (`ice_restart` no-op), not a clean pass.
+- [ ] **10.19** Real `Transport::ice_restart` (webrtc-rs primitive) (depends on 10.18) — [file](./phase-10/10.19-real-transport-ice-restart.md)
+- [ ] **10.20** Wire types: `SignalContent::IceRestartOffer`/`Answer` — [file](./phase-10/10.20-ice-restart-wire-types.md)
+- [ ] **10.21** Tolerant (mailbox-eligible) restart delivery (depends on 10.20) — [file](./phase-10/10.21-tolerant-restart-delivery.md)
+- [ ] **10.22** `P2pSession::ice_restart` real signaling (depends on 10.19, 10.20, 10.21) — [file](./phase-10/10.22-session-ice-restart-signaling.md)
+- [ ] **10.23** CLI/demo wiring for the new `ice_restart` signature (depends on 10.22) — [file](./phase-10/10.23-cli-ice-restart-wiring.md)
+- [ ] **10.24** Phase exit-gate re-run (depends on 10.19–10.23) — [file](./phase-10/10.24-phase-exit-gate-rerun.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
