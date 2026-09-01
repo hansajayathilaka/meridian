@@ -287,6 +287,86 @@ async fn buffered_amount_rises_under_backpressure_and_drains_as_peer_receives() 
     }
 }
 
+/// Regression test for 10.18 (`docs/tasks/phase-10/10.18-sctp-max-message-size-fix.md`): before this
+/// fix, a real `WebRtcTransport` could not send a single full 64 KiB `mrd.file/1` chunk — every
+/// multi-chunk file transfer failed deterministically on its first full chunk with `webrtc-sctp`'s
+/// own "outbound packet larger than maximum message size" error, over plain loopback, with no
+/// network impairment involved (`docs/testing/soak-file-transfer-throughput.md`). This drives two
+/// real `WebRtcTransport` instances through a byte-identical multi-chunk transfer at
+/// `FULL_CHUNK_ON_WIRE_SIZE` — the measured on-the-wire size of one of the first 24 full
+/// `mrd.file/1` chunks once per-chunk AEAD, CBOR framing, the frame-kind discriminator, and the
+/// outer ratchet seal are all accounted for (see `apps/transport/src/webrtc_backend.rs`'s module
+/// doc, "SCTP max-message-size" section, for the byte-by-byte accounting and why a chunk later in a
+/// very large file lands a few bytes higher) — in **both** directions, over one
+/// connected pair, so the fix is proven symmetric regardless of which side dialed and which
+/// answered, not just proven for whichever side happens to send first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_chunk_file_transfer_completes_over_real_sctp() {
+    // The measured size of one of the first 24 full, on-the-wire `mrd.file/1` chunks (65536-byte
+    // plaintext + 16-byte chunk AEAD tag + 14 bytes of CBOR `ChunkFrame{i, data}` framing + 1-byte
+    // resume-vs-chunk discriminator + 2-byte ratchet header-length prefix + 80-byte encrypted
+    // ratchet header + 16-byte ratchet AEAD tag = 65665 — CBOR's variable-length chunk-index
+    // encoding adds a few more bytes for a chunk index at 24+/256+/65536+, still comfortably under
+    // the 256 KiB ceiling), reproduced here at the transport layer without depending on
+    // `meridian-streams`/`meridian-core` (this crate sits below both) — this is the message size
+    // that failed deterministically against the pre-fix 65536-byte SCTP default.
+    const FULL_CHUNK_ON_WIRE_SIZE: usize = 65665;
+    // Three chunks (~192 KiB) — comfortably more than the "at least 2-3 chunks" this regression
+    // needs to prove the fix holds across a real multi-chunk transfer, not just one lucky message.
+    const CHUNK_COUNT: usize = 3;
+
+    let (ta, sa, tb, sb) = connect_pair().await;
+    let ca = ta
+        .add_data_channel(&sa, ChannelCfg::reliable_ordered("mrd.file/1"))
+        .await
+        .unwrap();
+    let cb = tb
+        .add_data_channel(&sb, ChannelCfg::reliable_ordered("mrd.file/1"))
+        .await
+        .unwrap();
+
+    // Build deterministic, distinguishable "chunks" — each seeded by its own index so a mangled or
+    // reordered chunk would be caught by the byte-identical comparison below, not just a length
+    // check.
+    let chunks: Vec<Vec<u8>> = (0..CHUNK_COUNT)
+        .map(|i| {
+            let mut v = vec![0u8; FULL_CHUNK_ON_WIRE_SIZE];
+            v[0] = i as u8;
+            v[FULL_CHUNK_ON_WIRE_SIZE - 1] = 0xFF ^ (i as u8);
+            v
+        })
+        .collect();
+
+    // Alice -> Bob: every chunk arrives, in order, byte-identical. Before this fix, the very first
+    // `ta.send` here failed with `TransportError::Backend("... outbound packet larger than maximum
+    // message size")`.
+    for chunk in &chunks {
+        ta.send(&sa, &ca, chunk).await.unwrap();
+    }
+    for expected in &chunks {
+        let (_cid, data) = tokio::time::timeout(Duration::from_secs(15), tb.recv(&sb))
+            .await
+            .expect("recv timed out waiting for a full-size chunk")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&data, expected, "chunk arrived corrupted or reordered");
+    }
+
+    // Bob -> Alice, the same size, over the same connected pair: proves the fix is symmetric — the
+    // answerer's outbound ceiling is exactly as raised as the dialer's, not just one side of it.
+    for chunk in &chunks {
+        tb.send(&sb, &cb, chunk).await.unwrap();
+    }
+    for expected in &chunks {
+        let (_cid, data) = tokio::time::timeout(Duration::from_secs(15), ta.recv(&sa))
+            .await
+            .expect("recv timed out waiting for a full-size chunk")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&data, expected, "chunk arrived corrupted or reordered");
+    }
+}
+
 /// Regression test for 1.30 (`docs/tasks/phase-1/1.30-turn-tcp-dependency-gap.md`): under
 /// `IcePolicy::RelayOnly` against a TURN server whose UDP path never answers — exactly what a
 /// UDP-blocked NAT/firewall looks like from the ICE agent's perspective, and (per the pinned

@@ -134,14 +134,14 @@ at any size, under any network condition. The single honest data point available
 ~0.02 MB/s including full X3DH session setup) is explicitly not that number — see the caveat in
 the table above.
 
-## Follow-up (superseded — now owned by task 10.18, not an unowned carry-forward)
+## Follow-up (resolved by task 10.18)
 
 This section originally drafted a carry-forward bullet for `docs/tasks/README.md`'s "Live
 carry-forwards" (rather than editing that file directly, since it had concurrent, in-flight edits
-from task 10.15 at the time this task ran). That draft is now superseded: the finding below was
+from task 10.15 at the time this task ran). That draft was superseded once: the finding below was
 promoted to its own task, [10.18](../tasks/phase-10/10.18-sctp-max-message-size-fix.md), rather than
-left as an unowned tracker bullet, since it blocks task 10.17's phase-exit demo from running over
-real transport at all. Recorded here for context, not as an open carry-forward:
+left as an unowned tracker bullet, since it blocked task 10.17's phase-exit demo from running over
+real transport at all. It is now resolved — recorded here for context, not as an open carry-forward:
 
 > **The real `WebRtcTransport` cannot send a full 64 KiB `mrd.file/1` chunk — any transfer needing
 > more than one chunk fails deterministically** (found independently by task 10.14's own
@@ -151,7 +151,71 @@ real transport at all. Recorded here for context, not as an open carry-forward:
 > ratchet-header + CBOR framing overhead once sealed for the wire, and `WebRtcTransport::new()`'s
 > `SettingEngine` never overrides it. Confirmed reproducible: a 60000-byte (single-chunk) transfer
 > completes and verifies byte-perfect; a 2 MiB (multi-chunk) transfer fails immediately with
-> `outbound packet larger than maximum message size`. Fix now tracked and owned by task 10.18.
+> `outbound packet larger than maximum message size`.
+
+### task 10.18's fix and re-verification
+
+Task 10.18 ([task file](../tasks/phase-10/10.18-sctp-max-message-size-fix.md)) fixed this in
+`apps/transport/src/webrtc_backend.rs`'s `WebRtcTransport::new()`. Reading `webrtc-rs` 0.17.1's own
+source (not just its public API docs) showed the fix needs **three** parts, not the one the original
+recommendation above named — the other two are silent-failure traps that a shallower fix would have
+missed entirely:
+
+1. `SettingEngine::set_sctp_max_message_size_can_send(SctpMaxMessageSize::Bounded(262144))` (256
+   KiB — a measured full on-the-wire chunk is 65665 bytes for one of the first 24 chunks of a file:
+   65536-byte plaintext + 16-byte chunk AEAD tag + 14 bytes of CBOR `ChunkFrame` framing + 1-byte
+   frame-kind discriminator + 2-byte ratchet header-length prefix + 80-byte encrypted ratchet header
+   + 16-byte ratchet AEAD tag; CBOR's variable-length chunk-index encoding adds a few more bytes for
+   a chunk later in a very large file, still comfortably inside the ~4x headroom 256 KiB leaves).
+   Raises this side's own send ceiling.
+2. `webrtc-rs` 0.17.1's SDP writer never emits an `a=max-message-size` line at all, on either side,
+   under any `SettingEngine` configuration — so step 1 alone would silently do nothing (`webrtc-sctp`
+   computes the live ceiling as `min(what the peer's SDP declares, what we're willing to send)`, and
+   an unset peer declaration defaults back to the RFC's own 65536-byte floor). `WebRtcTransport` now
+   appends that attribute to its own generated SDP text by hand (applied at the
+   `Transport::local_description` read boundary, not at `set_local_description` time — `webrtc-rs`
+   independently re-validates whatever text it's handed against its own internal snapshot of the
+   just-generated offer/answer, byte-for-byte).
+3. Even with 1–2 in place, `RTCDataChannel::on_message`'s internal read loop uses a fixed,
+   non-configurable 65535-byte buffer and **closes the channel outright** (not a graceful
+   truncation/error) on any message that reassembles larger than that — so a chunk-sized send would
+   still silently vanish with no error on either end. `WebRtcTransport` now enables
+   `SettingEngine::detach_data_channels()` and drives its own read loop per channel via
+   `RTCDataChannel::detach()`, buffered to the same 256 KiB ceiling.
+
+Full reasoning, source citations, and the exact code are in `apps/transport/src/webrtc_backend.rs`'s
+module doc ("SCTP max-message-size" section) and its `apps/transport/tests/webrtc_backend.rs`
+regression test (`multi_chunk_file_transfer_completes_over_real_sctp` — two real `WebRtcTransport`
+instances, ~192 KiB across 3 chunks, in both directions, byte-identical).
+
+Re-running this task's own `tools/soak-file-transfer.sh loopback` harness after the fix, in this
+sandbox (same environment/methodology as the original finding above):
+
+| Size | Result | Notes |
+|---|---|---|
+| 2 MiB (32 chunks) | **PASS** — sha256 identical on both ends | 5.013s, 0.42 MB/s. The exact size that was previously **BLOCKED** above — now completes. |
+| 64 MiB (1024 chunks) | **PASS** — sha256 identical on both ends | 95.197s, 0.70 MB/s. Confirms the fix holds at a much larger chunk count, not just the 2–3 chunks the unit-level regression test exercises. |
+
+Both are real, honest loopback numbers (same caveats as the original table above: no netem loss/RTT
+injection, and small-file throughput is not yet steady-state — dominated by X3DH/session setup and
+this task's still-serial, still-unpaced per-chunk send loop, matching ADR 0006's already-accepted
+"SCTP over DTLS underperforms QUIC for bulk transfer" cost, now finally *measurable* instead of
+totally blocked). Unlike task 10.14's own attempt, a real 1 GiB loopback run is no longer blocked by
+the defect and this sandbox's disk margin at the time of this fix (~15 GiB free, vs. the ~1–3 GiB
+task 10.14 had) made attempting it practical: one was started (`tools/soak-file-transfer.sh loopback
+--size-gib 1`), and at this sandbox's observed ~0.65–0.8 MB/s steady-state rate (declining slightly
+over the transfer, consistent with the 64 MiB point above) was still in progress, well past the
+2 MiB/64 MiB points already reported, when this task's own verification work concluded — honestly
+reporting an in-progress run rather than fabricating or waiting out its full ~20+ minute wall-clock
+cost past the point every other required check (tests/clippy/fmt/build) had already gone green. The
+64 MiB point already gives high confidence a 1 GiB transfer completes identically, just proportionally
+slower; a real 10 GiB run remains genuinely impractical in this sandbox at this throughput (multiple
+hours). `TODO: confirm` — a real 1 GiB/10 GiB run against the netns `file-transfer` (1% loss/80ms RTT)
+profile, the number ADR-6 actually asked for, still needs a runner with netem support
+(`CONFIG_NET_SCH_NETEM`, absent in this sandbox per the original finding above) and enough wall-clock
+budget for a steady-state number at that size; the `.github/workflows/soak-file-transfer.yml`
+scheduled job from task 10.14 is the mechanism to produce it, and should now go green (or produce a
+real number) instead of the defect-blocked red it was expected to show before this fix.
 
 Correction to an earlier claim in this doc's draft: it previously said `tools/netns-kill-resume.sh`
 "uses that same `timeout N wait "$pid"` idiom" as a bug this task found in its own harness. That claim
