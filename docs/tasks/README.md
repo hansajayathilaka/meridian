@@ -520,6 +520,48 @@ evaporate:
   was judged correct since none blocks anything else in this phase). No task currently owns this;
   pick up via a future `/plan-phase` doc-sync sweep (not urgent — none is security-critical prose,
   unlike the sites 6.7 already fixed).
+- **RESOLVED, no residual: task 10.22's `ice_restart` answerer-path offer/answer misclassification**
+  (found independently by a security review and a combined architect/code review of the uncommitted
+  10.22 diff, fixed in the same task before landing). The original implementation had the
+  answerer's own side call `Transport::ice_restart` on itself — once unconditionally at the top of
+  `P2pSession::ice_restart` before the offerer/answerer role split even happened, and a second time
+  redundantly inside `answer_restart_offer` — before ever processing the peer's genuine restart
+  offer. Two independent defects compounded: (a) `WebRtcTransport::set_remote_description`'s
+  offer-vs-answer inference (`committed_local_sdp.is_some()`) is valid only for the one-shot original
+  dial/answer handshake, so on a second incoming SDP it misclassified the peer's genuine offer as an
+  answer to our own (self-generated, never-sent) restart offer — "working" only because `webrtc-rs`
+  0.17.1's JSEP state machine validates the asserted `type` transition, not the SDP content itself,
+  for this narrow (DTLS-cert-unchanged, single-data-channel) case; (b) independently, and more
+  fundamentally, the pre-emptive self-restart also would have left the real `RTCPeerConnection` in
+  `have-local-offer` signaling state, which `webrtc-0.17.1`'s own `check_next_signaling_state` (read
+  directly) only ever accepts a `SetRemote(Answer)`/`SetRemote(Pranswer)` transition out of — so, had
+  only the redundant inner call been removed while the top-level unconditional call stayed, applying
+  the peer's genuine offer next would have failed outright with a real signaling-state error instead
+  of the original silent mislabeling; both call sites had to be corrected together, not just one.
+  Fixed by:
+  a new, commit-state-independent `Transport::set_remote_offer_and_answer` (implemented in both
+  `WebRtcTransport` and `LoopbackTransport`, `apps/transport/src/lib.rs`/`webrtc_backend.rs`/
+  `loopback.rs`) that always treats its argument as a genuine offer and always drives a real
+  `create_answer`/`set_local_description` round trip; and restructuring
+  `P2pSession::ice_restart`/`answer_restart_offer` (`apps/core/src/session.rs`) so `Transport::ice_restart`
+  is called **only** on a side that is actually about to send its own fresh offer (the
+  lexicographically-smaller side immediately, or the larger side's own post-glare-window fallback),
+  never on the side that ends up answering the peer's genuine offer — matching real JSEP semantics,
+  where answering an ICE-restart offer via `create_answer` itself produces fresh local ICE parameters
+  on the answering side, with no separate self-restart call needed or correct. The layered fingerprint
+  check (`verify_restart_fingerprint`) needed no changes and was reconfirmed still passing unweakened.
+  **No residual on the offer/answer-inference concern itself** — the fix is structural (a new,
+  unconditional trait method), not a narrower patch of the same heuristic. A separate, pre-existing,
+  already-in-code-documented residual is *not* resolved by this fix and remains accepted as-is (see
+  `RESTART_GLARE_WINDOW`'s own doc comment, `apps/core/src/session.rs`): if the lexicographically-
+  smaller-key peer calls its own `ice_restart()` more than `RESTART_GLARE_WINDOW` (5s) after the
+  larger-key side has already timed out waiting and fallen through to sending its own offer, both
+  sides can end up simultaneously offering and discarding each other's offer while waiting for an
+  answer neither side's tie-break logic will ever send — a mutual timeout rather than a completed
+  restart. ADR 0025's design only claims to resolve the common concurrent-restart case, not every
+  possible timing skew between the two independent calls; a caller hitting this can simply retry
+  `ice_restart()`. No open task owns closing this narrower race — pick up via a future `/plan-phase`
+  if it proves to matter in practice (e.g. via real-world restart telemetry).
 > live in each task file's **Outcome** section (and the phase README) — not here. This block carries
 > only what is *currently actionable* plus obligations no open task owns.
 
@@ -923,7 +965,7 @@ ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md]
 - [x] **10.19** Real `Transport::ice_restart` (webrtc-rs primitive) (depends on 10.18) — [file](./phase-10/10.19-real-transport-ice-restart.md)
 - [x] **10.20** Wire types: `SignalContent::IceRestartOffer`/`Answer` — [file](./phase-10/10.20-ice-restart-wire-types.md)
 - [x] **10.21** Tolerant (mailbox-eligible) restart delivery (depends on 10.20) — [file](./phase-10/10.21-tolerant-restart-delivery.md)
-- [ ] **10.22** `P2pSession::ice_restart` real signaling (depends on 10.19, 10.20, 10.21) — [file](./phase-10/10.22-session-ice-restart-signaling.md)
+- [x] **10.22** `P2pSession::ice_restart` real signaling (depends on 10.19, 10.20, 10.21) — [file](./phase-10/10.22-session-ice-restart-signaling.md)
 - [ ] **10.23** CLI/demo wiring for the new `ice_restart` signature (depends on 10.22) — [file](./phase-10/10.23-cli-ice-restart-wiring.md)
 - [ ] **10.24** Phase exit-gate re-run (depends on 10.19–10.23) — [file](./phase-10/10.24-phase-exit-gate-rerun.md)
 
