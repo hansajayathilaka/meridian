@@ -304,6 +304,49 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   [demo transcript](./phase-10/10.24-demo-transcript.md); closure summary:
   [phase-10/README.md](./phase-10/README.md#exit-criteria). Phase 10 is now ready for a future
   `/start-review-phase`.
+- **NOW:** **Phase 11 (review of Phase 10) opened — sweep complete, verdict recorded.**
+  [Report](./phase-11/review-report.md): 10 findings — **1 blocking** (F1: `P2pSession::open_stream`
+  assigns `sid`s from a purely local, uncoordinated per-side counter, so two peers concurrently opening
+  the same bidirectional stream type — exactly `mrd.file/1`'s registered shape — race to an identical
+  wire label; deterministically reproducible today on `LoopbackTransport` alone, and binds two
+  `RTCDataChannel`s to one negotiated SCTP stream on the real backend), 9 should-fix (F2–F10: `ice_restart`
+  skips the existing `relay-only` fail-closed candidate check; an unbounded inbound chunk buffer;
+  the real CLI path's own claimed bit-flip rejection is untested end-to-end; two resume boundary cases
+  untested; the `RESTART_GLARE_WINDOW` timeout-fallback branch has zero coverage; no conformance vectors
+  for any of this phase's new wire surfaces; `mrd.file/1`'s incremental per-chunk verifier has no live
+  caller in the real send path; the soak doc's own numbers are incomplete pending a real-runner
+  confirmation; no CI wiring for the kill-resume rig despite its blocking rationale having cleared), 5
+  nits (N1 folds into F2's fix-task; N2–N4 informational/deferred; N5 promoted straight to a tracker
+  carry-forward, not a fix-task, since it's currently dormant/unreachable). Diff range `804f204` (Phase 9
+  close) `..` `e3836dd` (current `main`); confirmed via `git log --merges` — only Phase 10's own four
+  build-batch PRs (#89–#92), its `pick-next-phase` PR (#88), and one trivial untracked dependabot bump
+  (#86, a 6-line devcontainer lockfile change) landed in this window. All four reviewers ran real test
+  suites and confirmed ADR 0025 and the stream-type extension contract hold in the shipped code — 1000+
+  tests green across `meridian-streams`/`meridian-core` (default + `--features webrtc`)/
+  `meridian-transport` (default + `--features webrtc`)/`meridian-tui`, zero failures, zero `#[ignore]`s
+  in any touched crate. One should-fix item is a **correction**, not a new gap: the
+  `netns-kill-resume.sh` PID false-negative this tracker still listed as live was already fixed by task
+  10.23 — corrected in this tracker's own carry-forward list rather than re-flagged. Zero on-the-fly
+  decisions need `/adr` ratification — task 10.22's mid-phase `ice_restart` signaling fix was
+  independently re-derived as an implementation-level bugfix within ADR 0025's existing scope, not a
+  design change. **Verdict: blocked until F1 lands**, then green for the next build phase (T10 or T14).
+  Full report: [phase-11/review-report.md](./phase-11/review-report.md).
+- **NOW:** **Phase 11's findings are broken into 10 numbered fix-tasks** (11.1–11.10), planned by the
+  **planner** agent. F1 (blocking) → **11.1** (lands first: the `sid`-collision fix, architect-ratified
+  before or as part of its own task). **11.2** and **11.6** are soft-ordered after 11.1 (and, for 11.6,
+  after 11.2 too) — all three touch the same `apps/core/src/session.rs` `open_stream`/`ice_restart` area,
+  avoiding rebase churn though none is a functional dependency of another. **11.3** (F3+N1) has no
+  dependency; **11.4** soft-depends on it (same `run_responder`/`finalize_transfer` functions). **11.5**
+  has no dependency. **11.7** (conformance vectors) is sequenced before **11.8** (the proof-delivery
+  mechanism decision) so it locks in the four already-shipped, stable wire shapes now rather than waiting
+  on 11.8's own architect consult — if 11.8 extends the chunk wire shape, that's a follow-up vector
+  amendment flagged as 11.8's own residual, not a reason to block 11.7. **11.9** (devops-owned, docs-only,
+  mirrors the branch-protection `TODO: confirm` precedent) and **11.10** (new CI workflow for the
+  kill-resume rig) are each independent of everything else. N2–N4 stay informational/deferred, not
+  converted; N5 was already promoted straight to a tracker carry-forward (below), not a fix-task. Full
+  breakdown: [phase-11/README.md](./phase-11/README.md#tasks-todo).
+- **NEXT:** `/next-task` — no fix-task in this batch is blocked; task-picker should return 11.1 first per
+  the report's own priority (the phase's one blocking finding).
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -329,21 +372,16 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   [phase-10/README.md](./phase-10/README.md#exit-criteria). Two narrower residuals from this same fix
   remain, both correctly non-blocking and separately tracked below: the `RESTART_GLARE_WINDOW`
   mutual-timeout race, and a post-restart readiness race found by 10.23's own re-run.
-- **NEW (found by task 10.17): `tools/netns-kill-resume.sh`'s own pre-flight self-check
-  (`need_veth_linkstate`) has an environment-dependent false-negative bug**, independent of the
-  `ice_restart` gap above. It names its probe veth/netns interfaces `kr-probe-a-$$`/
-  `kr-probe-b-$$` (`$$` = the invoking shell's PID); in any sandbox/CI runner whose PID has reached
-  5 digits (common for any long-running container — confirmed live on this sandbox, PID `21039`),
-  the resulting interface name (`kr-probe-a-21039`, 16 bytes) exceeds Linux's 15-usable-byte
-  `IFNAMSIZ` limit, so `ip link add ... type veth peer name ...` itself fails and the script reports
-  "not usable in this environment — skipping" even though the real capability it needs works fine
-  (confirmed manually, and via the script's own `run()`, which uses short, fixed, well-under-the-limit
-  names like `kr-a`/`ns-kr-a` and does work). Net effect: this harness silently no-ops (exit 0, no
-  failure signal) on any host/CI runner with a long-lived shell, which is exactly the kind of
-  environment a real CI scheduler would use — a false "skipped, nothing to see" rather than a false
-  failure, arguably the worse direction for a security/resumability-relevant test to fail silently
-  in. No open task owns fixing the probe's naming scheme (e.g. a short fixed counter instead of
-  `$$`, or truncating/hashing the PID) — pick up via a future `/plan-phase`.
+- **RESOLVED (Phase 10, task 10.23): `tools/netns-kill-resume.sh`'s pre-flight self-check PID
+  false-negative is fixed, not merely re-flagged.** Originally found by task 10.17 (the probe veth/netns
+  interface names `kr-probe-a-$$`/`kr-probe-b-$$` exceeded Linux's 15-usable-byte `IFNAMSIZ` limit on
+  any PID ≥ 5 digits, causing a silent false "skipped" no-op). Phase 11's review swept this and confirmed
+  by direct code reading that task 10.23 already zero-pads the PID to 6 fixed digits
+  (`tools/netns-kill-resume.sh`), closing the overflow. This tracker previously kept carrying the
+  original finding forward past its actual fix — corrected here per
+  [phase-11/review-report.md](./phase-11/review-report.md)'s "Coverage / test gaps" section. (A related,
+  still-open gap remains: no CI workflow runs this rig at all, now that the SCTP-fix rationale for
+  omitting one no longer holds — tracked as fix-task 11.10, F10.)
 - **NEW (found by task 10.17's third-party `mrd.echo/1` implementability check): `.claude/skills/
   stream-type-authoring/SKILL.md` step 3 is stale relative to the authoritative
   `docs/api/stream-types-v1.md`.** The skill still says to "derive per-stream keys via HKDF-export
@@ -593,6 +631,14 @@ evaporate:
   `ice_restart()` returns, or before a caller sends immediately afterward. Pick up via a future
   `/plan-phase`, alongside the already-tracked `RESTART_GLARE_WINDOW` and `on_reconnect`-hook
   residuals this compounds with.
+- **NEW (found by task 10.4's own review, surfaced to this tracker by Phase 11's sweep, N5):
+  `CtrlFrame::Close`'s handler doesn't clean up the per-stream bookkeeping it created.**
+  `apps/core/src/session.rs`'s `handle_ctrl` `Close` arm only removes the `open_streams` entry, leaving
+  `labels`/`channel_of_stream`/`stream_channels` dangling. Currently dormant/unreachable: no code path
+  in Phase 10 ever sends `Close` for a file transfer (only the pre-existing, unrelated
+  capability-mismatch teardown path sends it). Non-blocking today, but real leaked bookkeeping the
+  moment a future stream type (or a `mrd.file/1` extension) starts sending `Close` mid-session. No open
+  task owns this — pick up via a future `/plan-phase` when a stream type first needs `Close`.
 > live in each task file's **Outcome** section (and the phase README) — not here. This block carries
 > only what is *currently actionable* plus obligations no open task owns.
 
@@ -1002,6 +1048,29 @@ an earlier, independently-discovered SCTP defect) closed the phase — 24/24 don
 - [x] **10.22** `P2pSession::ice_restart` real signaling (depends on 10.19, 10.20, 10.21) — [file](./phase-10/10.22-session-ice-restart-signaling.md)
 - [x] **10.23** CLI/demo wiring for the new `ice_restart` signature (depends on 10.22) — [file](./phase-10/10.23-cli-ice-restart-wiring.md). Fully executed; `run` (the feature-defining kill/resume scenario) now genuinely passes live — see [transcript](./phase-10/10.23-demo-transcript.md); the smaller `probe` companion still fails live, for a new, distinct readiness-race reason recorded there, not the old `ice_restart` no-op.
 - [x] **10.24** Phase exit-gate re-run (depends on 10.19–10.23) — [file](./phase-10/10.24-phase-exit-gate-rerun.md). Verdict: GO — Phase 10's exit criteria are met, phase closed (24/24).
+
+### Phase 11 — Review of Phase 10 · **open — sweep complete, verdict recorded** · [details](./phase-11/README.md)
+Review phase. Sweeps everything built since the Phase-9 review: Phase 10 — File Transfer Stream (tasks
+10.1–10.24). No untracked out-of-band PRs of substance landed in this window (one trivial dependabot
+devcontainer-lockfile bump, PR #86, confirmed via `git log --merges`).
+[Report](./phase-11/review-report.md): 10 findings — **1 blocking** (F1), 9 should-fix (F2–F10), 5 nits
+(N1 folds into F3's fix-task, N2–N4 stay informational/deferred, N5 promoted straight to this tracker's
+carry-forward list). Zero on-the-fly decisions need `/adr` ratification — task 10.22's mid-phase
+`ice_restart` signaling fix was independently re-derived as an implementation-level bugfix within
+ADR 0025's existing scope. **Verdict: blocked until F1 lands**, then green for the next build phase (T10
+or T14). 10 fix-tasks (11.1–11.10) planned by the **planner** agent; landing order and dependencies:
+[phase-11/README.md](./phase-11/README.md#tasks-todo).
+
+- [ ] **11.1** Namespace `open_stream`'s `sid`/channel-label derivation to fix concurrent-open collisions (F1, blocking) — [file](./phase-11/11.1-fix-open-stream-sid-collision.md)
+- [ ] **11.2** Enforce relay-only on `ice_restart`'s freshly-gathered candidates (F2; soft-depends on 11.1) — [file](./phase-11/11.2-ice-restart-relay-only-enforcement.md)
+- [ ] **11.3** Bound/restructure `mrd.file/1`'s `pending_chunks` buffer and its O(n) rescan (F3 + N1) — [file](./phase-11/11.3-bound-pending-chunks-buffer.md)
+- [ ] **11.4** Real-CLI-path bit-flip rejection test (F4; soft-depends on 11.3) — [file](./phase-11/11.4-cli-bitflip-rejection-test.md)
+- [ ] **11.5** Resume boundary tests: 0 chunks received / all-but-last chunk (F5) — [file](./phase-11/11.5-resume-boundary-tests.md)
+- [ ] **11.6** Make `RESTART_GLARE_WINDOW` test-overridable; cover the timeout-fallback branch (F6; soft-depends on 11.1, 11.2) — [file](./phase-11/11.6-restart-glare-window-timeout-test.md)
+- [ ] **11.7** Conformance vectors for Phase 10's new wire surfaces (F7) — [file](./phase-11/11.7-file-transfer-conformance-vectors.md)
+- [ ] **11.8** Wire `FileReceiver`'s per-chunk verification into the real send path, or narrow the claim (F8) — [file](./phase-11/11.8-chunk-proof-delivery-mechanism.md)
+- [ ] **11.9** Confirm `soak-file-transfer.yml` ran clean post-10.18 on a real runner (F9, devops-owned, docs-only) — [file](./phase-11/11.9-soak-workflow-runner-confirmation.md)
+- [ ] **11.10** Add scheduled/`workflow_dispatch` CI for `netns-kill-resume.sh` (F10) — [file](./phase-11/11.10-netns-kill-resume-ci-workflow.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
