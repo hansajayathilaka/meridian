@@ -148,28 +148,39 @@
 //! `Notify` wait for the pattern this would need, and why it can't reuse it here) — reviewed and
 //! accepted for this task's scope; a real fix belongs in the session layer, not this transport.
 //!
-//! ## ICE restart does not (yet) fulfill the resumability promise (known gap)
-//! [`Transport::ice_restart`] does **not** invoke webrtc-rs's real ICE-agent restart
-//! (`create_offer` with `ice_restart: true`). Verified empirically while building this backend: on
-//! an already-connected `RTCPeerConnection`, that call rotates the local ICE ufrag/pwd and
-//! re-triggers gathering immediately, which knocks the live candidate pair out from under the
-//! active DTLS/SCTP association — with no peer-side coordination to bring up a replacement, sends
-//! made afterward hang forever. `apps/core`'s `P2pSession::ice_restart` has no session-layer
-//! signaling path to carry a restart offer to the peer (it calls this on one side with no envelope
-//! round trip, mirroring `LoopbackTransport::ice_restart`'s already-local-only contract), so
-//! invoking the real primitive here would violate the trait's explicit "keep the session alive"
-//! promise rather than fulfill it — this only resets local candidate-gathering bookkeeping, leaving
-//! the already-open data channels completely untouched.
+//! ## ICE restart: real local primitive, pending peer signaling (task 10.19 / ADR 0025)
+//! [`Transport::ice_restart`] now invokes webrtc-rs's real ICE-agent restart —
+//! `RTCPeerConnection::create_offer` with [`RTCOfferOptions`]'s `ice_restart: true`, followed by
+//! `set_local_description` with the result — mirroring exactly how `dial_established`'s first offer
+//! is produced and committed (see "Offer/answer without a role hint" above): local candidate-gathering
+//! bookkeeping (`local_candidates`/`gather_done_flag`) is reset first, then the new offer is committed
+//! as `committed_local_sdp`, so [`Transport::local_description`]/[`Transport::local_fingerprint`]/
+//! [`Transport::local_candidates`] all immediately reflect the restarted state the same way they do
+//! for the very first offer. Confirmed by reading `webrtc-ice` 0.17.1's own `Agent::restart` (the
+//! `webrtc-rs` 0.17.1 dependency this crate pins): it generates a fresh local ufrag/pwd, clears the
+//! selected candidate pair and every previously-known candidate, and re-triggers gathering — a real
+//! restart, not a relabeled no-op (the gated test
+//! `ice_restart_produces_a_genuinely_new_local_offer_without_disturbing_channels_or_fingerprint` in
+//! `apps/transport/tests/webrtc_backend.rs` proves the ufrag/pwd actually change). The DTLS
+//! certificate is never touched by any of this — `create_offer`/`set_local_description` never
+//! recreate the `RTCPeerConnection` — so [`Transport::local_fingerprint`] is provably byte-identical
+//! before and after (also proven by that same test), which is the invariant a later task's layered
+//! fingerprint cross-check (ADR 0025) depends on holding at the transport level.
 //!
-//! Be precise about what that buys and doesn't: it proves a call to `ice_restart` never *breaks* an
-//! already-working connection (the gated tests below exercise exactly that). It does **not** yet
-//! fulfill system-design §5.2/§7.3's "resumable... ICE restarts on network change" promise or
-//! feature-04's acceptance criterion — if the local address genuinely changes (Wi-Fi→LTE), nothing
-//! here gathers or exchanges the new candidates the peer would need to find the new path, so
-//! connectivity will *not* actually resume. Closing that gap needs a ctrl-channel renegotiation
-//! message (ADR 0006/0014-relevant; flagged for architect review; 1.16/1.22/1.24-1.27 do not
-//! touch this gap, so it remains a not-yet-numbered successor to 1.15; network-roaming support
-//! should not ship claiming this works until it lands).
+//! **This is only the local half.** Exactly as before, `apps/core`'s `P2pSession::ice_restart` (as
+//! of this task) has no session-layer signaling path to carry the resulting offer to the peer — ADR
+//! 0025 designs that delivery (a tolerant, mailbox-eligible `IceRestartOffer`/`IceRestartAnswer`
+//! round trip over `SignalRelay`, not the data channel the restart may itself be repairing) as
+//! separate, later tasks (10.20–10.23). Calling only this primitive, on one or both sides of an
+//! already-connected pair, with no peer coordination, still knocks the live candidate pair out from
+//! under the active DTLS/SCTP association exactly as the old module doc warned — `Agent::restart`
+//! unilaterally deletes the selected pair and rotates local credentials regardless of whether the
+//! peer ever learns about it. Only once the full round trip lands does a restart actually leave the
+//! session resumable; until then, invoking this transport primitive by itself does not fulfill
+//! system-design §5.2/§7.3's "resumable... ICE restarts on network change" promise or feature-04's
+//! acceptance criterion. `LoopbackTransport::ice_restart` stays an explicit, documented no-op per
+//! ADR 0025 — the loopback fabric has no real network to restart, so there is nothing for it to
+//! simulate.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -190,6 +201,7 @@ use webrtc::ice::candidate::{CandidatePairState, CandidateType};
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::ice_transport::ice_server::RTCIceServer as WrtcIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::offer_answer_options::RTCOfferOptions;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
@@ -839,12 +851,41 @@ impl Transport for WebRtcTransport {
 
     async fn ice_restart(&self, s: &SessionHandle) -> Result<()> {
         let sess = self.get_session(s)?;
-        // Deliberately does not call webrtc-rs's real ICE-agent restart — see module docs "ICE
-        // restart is a no-op on the wire today" for why that would break the live connection
-        // without session-layer peer coordination. Only local candidate-gathering bookkeeping is
-        // reset; the already-open data channels are left completely untouched.
+        // (task 10.19 / ADR 0025) The real primitive: `create_offer(ice_restart: true)` rotates
+        // the ICE agent's local ufrag/pwd and re-triggers gathering (`webrtc-ice`'s own
+        // `Agent::restart`, confirmed by reading its source: it clears the selected candidate pair
+        // and every known candidate, then re-gathers), producing a fresh offer exactly the way
+        // `dial_established`'s first offer was produced (mirrored below) — see module docs' "ICE
+        // restart: real local primitive, pending peer signaling" section for the full picture and
+        // what this alone does/doesn't buy.
+        //
+        // Reset local candidate-gathering bookkeeping *before* triggering the restart, not after,
+        // so a caller that immediately calls `local_candidates()` once this returns waits on the
+        // *new* gathering pass's own completion signal rather than racing whatever `on_ice_candidate`
+        // callbacks the restart itself is about to fire as a side effect of `create_offer` below.
         sess.local_candidates.lock().unwrap().clear();
         sess.gather_done_flag.store(false, Ordering::SeqCst);
+
+        let options = RTCOfferOptions {
+            ice_restart: true,
+            ..Default::default()
+        };
+        let offer = sess
+            .pc
+            .create_offer(Some(options))
+            .await
+            .map_err(backend_err)?;
+        let desc = RTCSessionDescription::offer(offer.sdp.clone()).map_err(backend_err)?;
+        sess.pc
+            .set_local_description(desc)
+            .await
+            .map_err(backend_err)?;
+        // Mirrors `ensure_committed`'s own cache update for the very first offer: `committed_local_sdp`
+        // is what `Transport::local_description`/`local_fingerprint` read from, so both immediately
+        // reflect the restarted state, and `pending_offer` is cleared since there is nothing left to
+        // lazily commit — we just committed directly.
+        *sess.committed_local_sdp.lock().unwrap() = Some(offer.sdp);
+        *sess.pending_offer.lock().unwrap() = None;
         Ok(())
     }
 

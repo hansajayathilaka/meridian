@@ -198,28 +198,92 @@ async fn send_immediately_before_close_is_still_delivered() {
     assert_eq!(data, b"final message before close");
 }
 
+/// Pull an `a=ice-ufrag:`/`a=ice-pwd:` value out of raw SDP text — mirrors
+/// `webrtc_backend::parse_fingerprint`'s own style for reading a single attribute line, but that
+/// helper is private to the crate, so the test re-implements the same trivial line scan rather than
+/// reaching into crate internals.
+fn sdp_attr<'a>(sdp: &'a str, prefix: &str) -> &'a str {
+    sdp.lines()
+        .find_map(|l| l.trim_end_matches('\r').strip_prefix(prefix))
+        .unwrap_or_else(|| panic!("SDP carried no {prefix} line:\n{sdp}"))
+}
+
+/// Regression test for task 10.19 (`docs/tasks/phase-10/10.19-real-transport-ice-restart.md`) / ADR
+/// 0025: `WebRtcTransport::ice_restart` now invokes webrtc-rs's real ICE-agent restart instead of
+/// only resetting local candidate-gathering bookkeeping.
+///
+/// **What this test does and does not prove.** It proves the *local* half of a restart is real and
+/// well-behaved: (a) the restarted `local_description()` carries a genuinely different ICE
+/// ufrag/pwd than before (not a relabeled no-op), (b) calling `ice_restart()` alone — with no peer
+/// coordination — does not corrupt this side's own already-open data channel bookkeeping, and (c)
+/// the DTLS fingerprint is byte-identical before and after (the cert must never rotate across a
+/// restart). It deliberately does **not** call the real primitive on an already-connected pair and
+/// then assert the channel keeps flowing end to end: per ADR 0025 and this crate's own module docs,
+/// a real ICE restart with no peer-side signaling unilaterally deletes the local ICE agent's
+/// selected candidate pair, so a peer that never receives the restarted offer has no way to bring
+/// up a replacement — the full resumability promise needs the signaling round trip landing in
+/// 10.21/10.22, not this task alone. A reader should not mistake this test for proof that gap is
+/// closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ice_restart_keeps_the_live_channel_flowing() {
+async fn ice_restart_produces_a_genuinely_new_local_offer_without_disturbing_channels_or_fingerprint(
+) {
     let (ta, sa, tb, sb) = connect_pair().await;
     let ca = ta
         .add_data_channel(&sa, ChannelCfg::reliable_ordered("mrd.chat/1"))
         .await
         .unwrap();
-    let cb = tb
-        .add_data_channel(&sb, ChannelCfg::reliable_ordered("mrd.chat/1"))
+    tb.add_data_channel(&sb, ChannelCfg::reliable_ordered("mrd.chat/1"))
         .await
         .unwrap();
 
+    // Warm the channel up so we know the connection genuinely completed before restarting it.
     ta.send(&sa, &ca, b"before restart").await.unwrap();
     assert_eq!(tb.recv(&sb).await.unwrap().unwrap().1, b"before restart");
 
-    // A real local ICE-transport restart on both sides (see webrtc_backend module docs for why
-    // this is local-only) must not tear down the live data channel.
-    ta.ice_restart(&sa).await.unwrap();
-    tb.ice_restart(&sb).await.unwrap();
+    let sdp_before = ta.local_description(&sa).unwrap();
+    let sdp_before = std::str::from_utf8(&sdp_before.0).unwrap();
+    let ufrag_before = sdp_attr(sdp_before, "a=ice-ufrag:").to_string();
+    let pwd_before = sdp_attr(sdp_before, "a=ice-pwd:").to_string();
+    let fp_before = ta.local_fingerprint(&sa).unwrap();
 
-    tb.send(&sb, &cb, b"after restart").await.unwrap();
-    assert_eq!(ta.recv(&sa).await.unwrap().unwrap().1, b"after restart");
+    ta.ice_restart(&sa).await.unwrap();
+
+    // (a) The restarted local description carries genuinely different ICE credentials — proof
+    // this is a real restart, not the old no-op relabeled.
+    let sdp_after = ta.local_description(&sa).unwrap();
+    let sdp_after = std::str::from_utf8(&sdp_after.0).unwrap();
+    let ufrag_after = sdp_attr(sdp_after, "a=ice-ufrag:").to_string();
+    let pwd_after = sdp_attr(sdp_after, "a=ice-pwd:").to_string();
+    assert_ne!(
+        ufrag_before, ufrag_after,
+        "ice_restart() did not rotate the local ICE ufrag"
+    );
+    assert_ne!(
+        pwd_before, pwd_after,
+        "ice_restart() did not rotate the local ICE pwd"
+    );
+
+    // (c) The DTLS fingerprint must never rotate across a restart — no `RTCPeerConnection` is ever
+    // recreated, only the ICE agent's own credentials/candidates. A later task's layered
+    // fingerprint cross-check (ADR 0025) depends on this holding at the transport level.
+    let fp_after = ta.local_fingerprint(&sa).unwrap();
+    assert_eq!(
+        fp_before, fp_after,
+        "DTLS fingerprint changed across an ICE restart — the cert must be stable"
+    );
+
+    // (b) The already-open data channel's local API surface is untouched by calling the local-only
+    // restart primitive by itself: `send()` still accepts bytes into the SCTP outbound queue and
+    // `buffered_amount()` still reads back a value, without erroring or panicking. This does *not*
+    // assert `tb` ever receives this message — with no peer coordination (out of this task's
+    // scope), the underlying candidate pair `ta` just abandoned is exactly what `tb` still has
+    // selected, so delivery is not expected to succeed until the signaling round trip lands.
+    ta.send(&sa, &ca, b"after local-only restart, no peer coordination")
+        .await
+        .unwrap();
+    ta.buffered_amount(&sa, &ca)
+        .await
+        .expect("buffered_amount must still be a valid, readable local channel property");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
