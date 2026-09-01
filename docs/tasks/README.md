@@ -911,7 +911,7 @@ ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md]
 - [x] **10.15** Kill/resume test automation (depends on 10.9, 10.10, 10.13) — [file](./phase-10/10.15-kill-resume-automation.md)
 - [x] **10.16** Corrupted-chunk adversarial test (depends on 10.8) — [file](./phase-10/10.16-corrupted-chunk-adversarial-test.md)
 - [x] **10.18** Fix: real `WebRtcTransport` can't send a full 64 KiB `mrd.file/1` chunk (depends on 10.7) — [file](./phase-10/10.18-sctp-max-message-size-fix.md)
-- [ ] **10.17** Phase exit: acceptance demo + third-party implementability check + doc sync (depends on all above, including 10.18) — [file](./phase-10/10.17-phase-exit-demo.md)
+- [x] **10.17** Phase exit: acceptance demo + third-party implementability check + doc sync (depends on all above, including 10.18) — [file](./phase-10/10.17-phase-exit-demo.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
