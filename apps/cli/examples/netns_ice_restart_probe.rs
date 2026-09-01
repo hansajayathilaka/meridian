@@ -30,6 +30,13 @@
 //! task's scope to fix (per that module's own doc: needs a ctrl-channel renegotiation message, ADR/
 //! architect-review territory). Flagged here for a follow-up task rather than silently worked around.
 //!
+//! **Update (task 10.23, post ADR 0025/tasks 10.19–10.22)**: the gap recorded above is now fixed —
+//! `P2pSession::ice_restart` performs a real, symmetric SDP offer/answer round trip over a
+//! freshly-(re)connected [`SignalRelay`] instead of the old local-only no-op, and this probe was
+//! updated to call it that way (see `FileRelay::new`/`reconnect` below). Re-run live on this same
+//! sandbox's rig as part of 10.23 — see `docs/tasks/phase-10/10.23-demo-transcript.md` for the
+//! current, real transcript and verdict rather than relying on this historical write-up alone.
+//!
 //! Usage: `netns_ice_restart_probe a <rundir>` / `netns_ice_restart_probe b <rundir>` — driven by
 //! `tools/netns-kill-resume.sh probe` the same way the file-transfer driver is.
 
@@ -99,7 +106,8 @@ fn read_exact_file(path: &Path, n: usize) -> Vec<u8> {
     buf
 }
 
-/// Identical shape to `kill_resume_netns_drive.rs`'s own `FileRelay` — see that file's module doc.
+/// Identical shape to `kill_resume_netns_drive.rs`'s own `FileRelay` — see that file's module doc,
+/// including its `new`/`reconnect` split (task 10.23, ADR 0025).
 struct FileRelay {
     outbox: PathBuf,
     inbox: PathBuf,
@@ -108,7 +116,21 @@ struct FileRelay {
 }
 
 impl FileRelay {
+    /// This test-only relay's analogue of a real `SignalingClient::connect()` — see
+    /// `kill_resume_netns_drive.rs::FileRelay::new`'s identical doc.
     fn new(outbox: PathBuf, inbox: PathBuf, peer_ik: [u8; 32]) -> Self {
+        Self::open(outbox, inbox, peer_ik, 0)
+    }
+
+    /// (task 10.23, ADR 0025) A fresh reconnection scoped to exactly one bounded `ice_restart()`
+    /// attempt, carrying `read_pos` forward rather than resetting it — see
+    /// `kill_resume_netns_drive.rs::FileRelay::reconnect`'s identical doc for why this test double
+    /// must preserve it (a raw append-only file, not a real recipient-keyed mailbox).
+    fn reconnect(outbox: PathBuf, inbox: PathBuf, peer_ik: [u8; 32], read_pos: u64) -> Self {
+        Self::open(outbox, inbox, peer_ik, read_pos)
+    }
+
+    fn open(outbox: PathBuf, inbox: PathBuf, peer_ik: [u8; 32], read_pos: u64) -> Self {
         OpenOptions::new()
             .create(true)
             .append(true)
@@ -118,7 +140,7 @@ impl FileRelay {
             outbox,
             inbox,
             peer_ik,
-            read_pos: 0,
+            read_pos,
         }
     }
 }
@@ -223,6 +245,11 @@ async fn run_a(rundir: &Path) -> Result<(), String> {
         "[probe:a] connected: path={:?} reason={}",
         info.path, info.reason
     );
+    // (task 10.23, ADR 0025) Not held open for the session's remaining lifetime — mirrors
+    // production's `client.close()` right after dial/answer. Only the already-consumed read offset
+    // survives, threaded into the fresh relay reconnected right before `ice_restart()` below.
+    let relay_read_pos = relay.read_pos;
+    drop(relay);
     // The very first chat message on a session clears the responder's first-contact gate
     // (`ChatError::MessageRequest`) rather than surfacing as an ordinary `SessionEvent::Chat` — its
     // own content is consumed by `accept_request`, not delivered a second time. Send a throwaway
@@ -239,12 +266,20 @@ async fn run_a(rundir: &Path) -> Result<(), String> {
     touch(&rundir.join("a_ready_for_cut"));
     wait_for_file(&rundir.join("cut_restored"), "the veth restore marker").await?;
     println!("[probe:a] link restored — calling ice_restart()…");
-    // (task 10.22) Reusing the already-in-scope `relay` is the minimal, reasonable update for this
-    // test-only probe's new signature (ADR 0025's "reconnect transiently" pattern; a genuinely
-    // fresh reconnect here is 10.23's job).
-    sess.ice_restart(&mut relay, &store, &handle, &mut chat)
+    // (task 10.23, ADR 0025) A fresh, transiently-reconnected relay scoped to exactly this one
+    // bounded restart attempt, dropped again right after — see `kill_resume_netns_drive.rs`'s
+    // matching comment for why this reconnection is a structural stand-in for this particular file-
+    // based test double, kept honest so the call-site *shape* matches what a real caller must do.
+    let mut restart_relay = FileRelay::reconnect(
+        rundir.join("a_to_b.bin"),
+        rundir.join("b_to_a.bin"),
+        peer_ik,
+        relay_read_pos,
+    );
+    sess.ice_restart(&mut restart_relay, &store, &handle, &mut chat)
         .await
         .map_err(|e| format!("ice_restart: {e}"))?;
+    drop(restart_relay);
     println!("[probe:a] ice_restart() returned Ok — sending ping-after-cut…");
 
     tokio::time::timeout(
@@ -318,6 +353,10 @@ async fn run_b(rundir: &Path) -> Result<(), String> {
         "[probe:b] connected: path={:?} reason={} — waiting for ping-before-cut",
         info.path, info.reason
     );
+    // (task 10.23, ADR 0025) See `run_a`'s matching comment: not held open for the session's
+    // remaining lifetime; the read offset survives into the restart-scoped reconnect below.
+    let relay_read_pos = relay.read_pos;
+    drop(relay);
 
     loop {
         match sess.pump(&store, &handle, &mut chat).await {
@@ -339,9 +378,18 @@ async fn run_b(rundir: &Path) -> Result<(), String> {
     touch(&rundir.join("b_ready_for_cut"));
     wait_for_file(&rundir.join("cut_restored"), "the veth restore marker").await?;
     println!("[probe:b] link restored — calling ice_restart()…");
-    sess.ice_restart(&mut relay, &store, &handle, &mut chat)
+    // (task 10.23, ADR 0025) See `run_a`'s matching comment: a fresh, transiently-reconnected relay
+    // scoped to exactly this one bounded restart attempt, dropped again right after.
+    let mut restart_relay = FileRelay::reconnect(
+        rundir.join("b_to_a.bin"),
+        rundir.join("a_to_b.bin"),
+        peer_ik,
+        relay_read_pos,
+    );
+    sess.ice_restart(&mut restart_relay, &store, &handle, &mut chat)
         .await
         .map_err(|e| format!("ice_restart: {e}"))?;
+    drop(restart_relay);
     println!("[probe:b] ice_restart() returned Ok — waiting for ping-after-cut…");
 
     tokio::time::timeout(POST_RESTORE_TIMEOUT, async {

@@ -130,7 +130,32 @@ struct FileRelay {
 }
 
 impl FileRelay {
+    /// Opens (idempotently creating) this side's outbox file — this test-only relay's analogue of a
+    /// real `SignalingClient::connect()` to the rendezvous. Used for the initial dial/answer
+    /// connection; see [`FileRelay::reconnect`] for the restart-scoped counterpart task 10.23 adds.
     fn new(outbox: PathBuf, inbox: PathBuf, peer_ik: [u8; 32]) -> Self {
+        Self::open(outbox, inbox, peer_ik, 0)
+    }
+
+    /// (task 10.23, ADR 0025) A fresh reconnection scoped to exactly one bounded `ice_restart()`
+    /// attempt — this driver's call-site counterpart to `dial`/`answer` each being handed their own
+    /// freshly-constructed relay, so a real caller copying this shape does not mistake "reuse the
+    /// dial-time relay for the session's entire lifetime" for the correct pattern. `read_pos` must
+    /// be threaded through from the prior connection rather than reset to `0`: this driver's
+    /// `FileRelay` is a raw, append-only byte stream shared over the host mount namespace (see the
+    /// module doc), not a real mailbox — a genuine reconnect to a rendezvous mailbox naturally
+    /// starts fresh (undelivered envelopes are keyed by recipient identity, not by stream
+    /// position), but this double has no such keying, so resetting `read_pos` to `0` would re-feed
+    /// this driver's own already-consumed dial-time `SdpOffer`/`SdpAnswer` bytes back through
+    /// `ChatState`'s ratchet a second time on "reconnect" — a real, self-inflicted decrypt failure
+    /// (the Double Ratchet never allows replaying an already-used message key), not a faithful
+    /// simulation of anything a real caller would ever hit. Preserving `read_pos` is this double's
+    /// own honesty requirement to stay a faithful stand-in, not a shortcut.
+    fn reconnect(outbox: PathBuf, inbox: PathBuf, peer_ik: [u8; 32], read_pos: u64) -> Self {
+        Self::open(outbox, inbox, peer_ik, read_pos)
+    }
+
+    fn open(outbox: PathBuf, inbox: PathBuf, peer_ik: [u8; 32], read_pos: u64) -> Self {
         OpenOptions::new()
             .create(true)
             .append(true)
@@ -140,7 +165,7 @@ impl FileRelay {
             outbox,
             inbox,
             peer_ik,
-            read_pos: 0,
+            read_pos,
         }
     }
 }
@@ -304,6 +329,14 @@ async fn run_sender(rundir: &Path, input: &Path, split: usize) -> Result<(), Str
     .await
     .map_err(|e| format!("dial: {e}"))?;
     println!("[drive:sender] connected.");
+    // (task 10.23, ADR 0025) The dial-time relay is not held open for the session's remaining
+    // lifetime — mirrors production's `client.close()` immediately after `dial_with_config`/
+    // `answer_with_config` establish (`session_connect.rs`/`send.rs`). Only the already-consumed
+    // read offset survives, threaded into the fresh relay this driver reconnects with right before
+    // `ice_restart()` below (see `FileRelay::reconnect`'s own doc for why that offset — not a reset
+    // to 0 — is this test double's honest equivalent of "reconnect").
+    let relay_read_pos = relay.read_pos;
+    drop(relay);
 
     sess.send_chat(&store, &handle, &mut chat, "kill-resume-drive hello")
         .await
@@ -362,15 +395,25 @@ async fn run_sender(rundir: &Path, input: &Path, split: usize) -> Result<(), Str
 
     wait_for_file(&rundir.join("cut_restored"), "the veth restore marker").await?;
     println!("[drive:sender] link restored per the harness — calling ice_restart()…");
-    // (task 10.22) `ice_restart` now needs a real, symmetric signaling round trip — reusing the
-    // same `relay` this side dialed with is the minimal, reasonable choice here (ADR 0025's
-    // "reconnect transiently" pattern doesn't require a *fresh* relay, only that the connection not
-    // be held open for the session's entire remaining lifetime "just in case"; this driver's
-    // file-based `FileRelay` costs nothing to keep around between the dial and this one restart
-    // attempt). Wiring a genuinely fresh reconnect here is 10.23's job, not this task's.
-    sess.ice_restart(&mut relay, &store, &handle, &mut chat)
+    // (task 10.23, ADR 0025) A fresh, transiently-reconnected relay, scoped only to this one bounded
+    // restart attempt and dropped again right after — never the dial-time relay held open "just in
+    // case". This driver's file-based `FileRelay` has no real network connection to reopen (it's
+    // just two paths on a shared mount namespace, per the module doc), so this reconnection is a
+    // structural stand-in rather than something that changes behavior for this particular test
+    // double — its purpose is to keep this call site's *shape* honest for anyone copying this
+    // pattern into a real caller (`session_connect.rs`/`send.rs`), where the equivalent really is a
+    // fresh `SignalingClient::connect()` + `RendezvousRelay::new()` right here, not a long-held
+    // connection.
+    let mut restart_relay = FileRelay::reconnect(
+        rundir.join("a_to_b.bin"),
+        rundir.join("b_to_a.bin"),
+        peer_ik,
+        relay_read_pos,
+    );
+    sess.ice_restart(&mut restart_relay, &store, &handle, &mut chat)
         .await
         .map_err(|e| format!("ice_restart: {e}"))?;
+    drop(restart_relay);
     println!("[drive:sender] ice_restart() returned Ok — waiting for bob's resume bitmap…");
 
     let mut resume_rx = file_stream.watch_resume(sid);
@@ -493,6 +536,11 @@ async fn run_receiver(rundir: &Path, output: &Path, split: usize) -> Result<(), 
     .await
     .map_err(|e| format!("answer: {e}"))?;
     println!("[drive:receiver] connected.");
+    // (task 10.23, ADR 0025) See the sender's own matching comment: the dial-time relay isn't held
+    // open for the session's remaining lifetime — only the already-consumed read offset survives,
+    // threaded into the fresh relay reconnected right before `ice_restart()` below.
+    let relay_read_pos = relay.read_pos;
+    drop(relay);
 
     let mut sid: Option<StreamId> = None;
     let mut manifest: Option<FileManifest> = None;
@@ -537,11 +585,18 @@ async fn run_receiver(rundir: &Path, output: &Path, split: usize) -> Result<(), 
     // and we don't want to block this side's own ability to notice the marker).
     wait_for_file(&rundir.join("cut_restored"), "the veth restore marker").await?;
     println!("[drive:receiver] link restored per the harness — calling ice_restart()…");
-    // (task 10.22) See the sender's own matching comment: reusing the already-in-scope `relay` is
-    // the minimal, reasonable update for this test-only driver's new signature.
-    sess.ice_restart(&mut relay, &store, &handle, &mut chat)
+    // (task 10.23, ADR 0025) See the sender's own matching comment: a fresh, transiently-reconnected
+    // relay for exactly this one bounded restart attempt, dropped again right after.
+    let mut restart_relay = FileRelay::reconnect(
+        rundir.join("b_to_a.bin"),
+        rundir.join("a_to_b.bin"),
+        peer_ik,
+        relay_read_pos,
+    );
+    sess.ice_restart(&mut restart_relay, &store, &handle, &mut chat)
         .await
         .map_err(|e| format!("ice_restart: {e}"))?;
+    drop(restart_relay);
 
     // Phase 3: send the resume bitmap directly (task 10.9's real wire shape — the receiver-side half
     // of `send_resume_bitmap`, built from this driver's own real-production-style bookkeeping rather
