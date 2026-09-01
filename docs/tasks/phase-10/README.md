@@ -155,7 +155,7 @@ Tests/Reviews):
 **Wave 9.5 — gap-closure fix for 10.17's blocking finding ([ADR 0025](../../adr/0025-ice-restart-renegotiation.md))**
 - [x] **10.19** Real `Transport::ice_restart` (webrtc-rs primitive) (depends on 10.18) — [file](./10.19-real-transport-ice-restart.md)
 - [x] **10.20** Wire types: `SignalContent::IceRestartOffer`/`Answer` (independent) — [file](./10.20-ice-restart-wire-types.md)
-- [ ] **10.21** Tolerant (mailbox-eligible) restart delivery (depends on 10.20) — [file](./10.21-tolerant-restart-delivery.md)
+- [x] **10.21** Tolerant (mailbox-eligible) restart delivery (depends on 10.20) — [file](./10.21-tolerant-restart-delivery.md)
 - [ ] **10.22** `P2pSession::ice_restart` real signaling — symmetric, glare-safe, layered fingerprint check (depends on 10.19, 10.20, 10.21) — [file](./10.22-session-ice-restart-signaling.md)
 - [ ] **10.23** CLI/demo wiring for the new signature (depends on 10.22) — [file](./10.23-cli-ice-restart-wiring.md)
 
