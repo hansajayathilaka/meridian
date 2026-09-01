@@ -3,8 +3,8 @@
 
 # Phase 11 — Review of Phase 10
 
-**Kind:** review · **Status:** in progress — sweep running · **Reviews phase(s):** Phase 10 (File
-Transfer Stream, tasks 10.1–10.24)
+**Kind:** review · **Status:** sweep complete, verdict recorded — blocked until F1 lands ·
+**Reviews phase(s):** Phase 10 (File Transfer Stream, tasks 10.1–10.24)
 
 ## Goal
 Sweep everything built since the Phase-9 review for bugs, gaps, loopholes, and on-the-fly decisions
@@ -65,8 +65,21 @@ reviews (not new findings, but re-examined for severity/ownership in this pass) 
 - The `RESTART_GLARE_WINDOW` mutual-timeout race and the post-restart DTLS/SCTP readiness race (both
   found by the `ice_restart` gap-closure wave, tasks 10.22/10.23 — non-blocking, non-security).
 
-Findings, on-the-fly decisions, and coverage gaps: `review-report.md` (sweep in progress — this link
-becomes live once that file lands in this same PR).
+Findings, on-the-fly decisions, and coverage gaps: [review-report.md](./review-report.md). **10
+findings — 1 blocking (F1), 9 should-fix (F2–F10), 5 nits (N1–N5).** N1 folds into F2's fix-task (same
+data structure); N2–N4 are informational/deferred, not converted; N5 (the `CtrlFrame::Close` cleanup gap,
+re-confirmed from task 10.4's own recorded residual but never previously surfaced to the master
+tracker) is dormant/unreachable today and promoted straight to a tracker carry-forward rather than a
+fix-task. One should-fix (F10 in the report, the stale `netns-kill-resume.sh` PID carry-forward) is a
+**correction**, not a new gap: task 10.23 already fixed it — the master tracker's carry-forward list
+should drop that item. Zero on-the-fly decisions need `/adr` ratification — the one candidate (task
+10.22's mid-phase `ice_restart` signaling fix) was independently re-derived as an implementation-level
+bugfix within ADR 0025's existing scope, not a design change. **Verdict: blocked until F1 lands** — a
+real, deterministically-reproducible `sid`-collision defect in `P2pSession::open_stream` when both
+peers concurrently open the same bidirectional stream type (exactly `mrd.file/1`'s registered shape),
+found by code-reviewer and reproducible today on `LoopbackTransport` alone. Mirrors the Phase-7/Phase-10
+precedent for a phase-exit-blocking finding recorded rather than downgraded. Full report:
+[review-report.md](./review-report.md).
 
 ## Tasks (todo)
 <!-- Filled by /plan-review-phase. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
