@@ -239,7 +239,10 @@ async fn run_a(rundir: &Path) -> Result<(), String> {
     touch(&rundir.join("a_ready_for_cut"));
     wait_for_file(&rundir.join("cut_restored"), "the veth restore marker").await?;
     println!("[probe:a] link restored — calling ice_restart()…");
-    sess.ice_restart()
+    // (task 10.22) Reusing the already-in-scope `relay` is the minimal, reasonable update for this
+    // test-only probe's new signature (ADR 0025's "reconnect transiently" pattern; a genuinely
+    // fresh reconnect here is 10.23's job).
+    sess.ice_restart(&mut relay, &store, &handle, &mut chat)
         .await
         .map_err(|e| format!("ice_restart: {e}"))?;
     println!("[probe:a] ice_restart() returned Ok — sending ping-after-cut…");
@@ -336,7 +339,7 @@ async fn run_b(rundir: &Path) -> Result<(), String> {
     touch(&rundir.join("b_ready_for_cut"));
     wait_for_file(&rundir.join("cut_restored"), "the veth restore marker").await?;
     println!("[probe:b] link restored — calling ice_restart()…");
-    sess.ice_restart()
+    sess.ice_restart(&mut relay, &store, &handle, &mut chat)
         .await
         .map_err(|e| format!("ice_restart: {e}"))?;
     println!("[probe:b] ice_restart() returned Ok — waiting for ping-after-cut…");

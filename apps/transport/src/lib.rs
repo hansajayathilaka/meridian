@@ -101,7 +101,35 @@ pub trait Transport: Send + Sync {
     fn local_description(&self, s: &SessionHandle) -> Result<Sdp>;
 
     /// Apply the peer's session description (decrypted from its envelope). Links the two ends.
+    ///
+    /// Implementations infer offer-vs-answer from local commit state (whether this side has
+    /// already committed a local description): a heuristic that is correct exactly when the
+    /// currently-committed local description is *this side's own not-yet-answered offer* — true
+    /// for the dialer at the original handshake, and true again for whichever side just called
+    /// [`ice_restart`](Transport::ice_restart) and is now awaiting the peer's matching answer
+    /// (task 10.22/[ADR 0025](../../../docs/adr/0025-ice-restart-renegotiation.md)) — regardless
+    /// of how many times a session has restarted. It is **not** valid when `sdp` is instead a
+    /// fresh, peer-initiated offer arriving while this side's own committed local description is
+    /// stale/unrelated (the ICE-restart *answerer*'s case: it has old committed state from an
+    /// earlier point in the session, not an outstanding offer of its own) — callers in that
+    /// situation, who already know from their own protocol-level role decision that `sdp` is a
+    /// genuine offer they must answer for real, should call
+    /// [`set_remote_offer_and_answer`](Transport::set_remote_offer_and_answer) instead.
     async fn set_remote_description(&self, s: &SessionHandle, sdp: Sdp) -> Result<()>;
+
+    /// Process `sdp` as a genuine remote **offer** and produce a genuine local **answer** via the
+    /// real create-answer/set-local-description round trip, unconditionally — never inferring
+    /// offer-vs-answer from local commit state the way [`set_remote_description`](Transport::set_remote_description)
+    /// does. For use whenever a caller already knows, from its own protocol-level role decision
+    /// (not from this trait), that it is receiving a genuine offer and must answer it for real —
+    /// e.g. the answering side of an ICE restart (task 10.22 / ADR 0025), where a local
+    /// description is already committed from earlier in the session's life (the original
+    /// handshake, or this side's own prior [`ice_restart`](Transport::ice_restart) call) and so
+    /// `set_remote_description`'s "already committed ⇒ must be an answer" inference would
+    /// misclassify the peer's genuine offer. Commits the resulting real answer as the new local
+    /// description (like `set_remote_description`'s own offer-handling branch), so a subsequent
+    /// [`local_description`](Transport::local_description) call returns it.
+    async fn set_remote_offer_and_answer(&self, s: &SessionHandle, sdp: Sdp) -> Result<()>;
 
     /// Add a trickled ICE candidate decrypted from a peer envelope.
     async fn add_ice_candidate(&self, s: &SessionHandle, c: IceCandidate) -> Result<()>;

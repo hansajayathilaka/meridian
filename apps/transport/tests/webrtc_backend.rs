@@ -286,6 +286,103 @@ async fn ice_restart_produces_a_genuinely_new_local_offer_without_disturbing_cha
         .expect("buffered_amount must still be a valid, readable local channel property");
 }
 
+/// Regression test for task 10.22's confirmed answerer-path defect (see
+/// `docs/tasks/README.md`'s "Live carry-forwards" entry for the full writeup, and
+/// [`Transport::set_remote_offer_and_answer`]'s own doc comment in `apps/transport/src/lib.rs`):
+/// `WebRtcTransport::set_remote_description`'s offer-vs-answer inference from
+/// `committed_local_sdp.is_some()` is valid only for the *original*, one-shot dial/answer
+/// handshake — never at a later point in the session where a local description is already
+/// committed on both sides regardless of role. This reproduces the exact defect directly against
+/// the real backend (no `apps/core` session-layer scaffolding needed to see it), then proves
+/// [`Transport::set_remote_offer_and_answer`] processes the identical genuine peer offer correctly.
+///
+/// **What would have failed before the fix.** Before `set_remote_offer_and_answer` existed, the
+/// only way to process the peer's genuine restart offer was `set_remote_description`, which this
+/// test shows silently "succeeds" (a real, valid JSEP transition, since the answerer had *also*
+/// pre-committed its own restart offer — putting the real `RTCPeerConnection` in
+/// `have-local-offer` signaling state, where `SetRemote(Answer)` is a legal transition regardless
+/// of the SDP's actual content) while producing a **hollow, wrong result**: `local_description()`
+/// afterward is byte-identical to what it was before — proving `create_answer` never ran and no
+/// genuine answer to the peer's offer was ever produced. `set_remote_offer_and_answer` closes
+/// this: called with the exact same peer offer, it drives a real `create_answer`/
+/// `set_local_description` round trip and produces a genuinely new local description.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_remote_offer_and_answer_produces_a_genuine_answer_where_set_remote_description_silently_fails_to(
+) {
+    let (ta, sa, tb, sb) = connect_pair().await;
+    let b_fp_before = tb.local_fingerprint(&sb).unwrap();
+
+    // Mirror the historical bug's exact precondition: the answerer (`tb`) pre-emptively restarts
+    // its *own* side first — the pre-fix `answer_restart_offer` did this (both directly, and via
+    // `P2pSession::ice_restart`'s own unconditional call before the offerer/answerer role split) —
+    // which commits a fresh local offer and puts the real `RTCPeerConnection` in
+    // `have-local-offer` signaling state.
+    tb.ice_restart(&sb).await.unwrap();
+    let b_own_restart_offer = tb.local_description(&sb).unwrap();
+
+    // The peer (`ta`) independently restarts too and produces its own genuine offer — this is
+    // what `tb` must actually answer.
+    ta.ice_restart(&sa).await.unwrap();
+    let a_genuine_offer = ta.local_description(&sa).unwrap();
+
+    // -- The historical bug, reproduced directly -----------------------------------------------
+    // `tb.committed_local_sdp` is `Some` (from `tb`'s own restart above), so the pre-fix code path
+    // (`set_remote_description`) infers "this must be an answer" and applies `a_genuine_offer`
+    // labeled as `RTCSdpType::Answer`. This *succeeds* — `have-local-offer` + `SetRemote(Answer)`
+    // is a legal JSEP transition regardless of what the SDP actually contains.
+    tb.set_remote_description(&sb, a_genuine_offer.clone())
+        .await
+        .expect(
+            "set_remote_description accepts the mislabeled genuine offer without erroring — this \
+             accidental 'success' (not a crash) is exactly the confirmed defect",
+        );
+
+    // Proof the "success" above is hollow: no real answer was ever generated. `create_answer`/
+    // `set_local_description` never ran, so `local_description()` is untouched.
+    assert_eq!(
+        tb.local_description(&sb).unwrap().0,
+        b_own_restart_offer.0,
+        "set_remote_description must not have produced a real answer here — local_description() \
+         changing would mean create_answer somehow ran despite this being the 'must be an answer' \
+         branch, which is not the historical bug this reproduces"
+    );
+
+    // -- The fix -------------------------------------------------------------------------------
+    // `tb`'s real signaling state returned to `stable` after the bogus transition above (a valid
+    // `have-local-offer` -> `stable` move), so re-processing the *exact same* genuine offer via
+    // `set_remote_offer_and_answer` starts from a clean, valid `stable` state and drives a real
+    // offer/answer round trip regardless of `committed_local_sdp` already being `Some`.
+    tb.set_remote_offer_and_answer(&sb, a_genuine_offer.clone())
+        .await
+        .expect("set_remote_offer_and_answer must genuinely answer the peer's offer");
+
+    let b_genuine_answer = tb.local_description(&sb).unwrap();
+    assert_ne!(
+        b_genuine_answer.0, b_own_restart_offer.0,
+        "set_remote_offer_and_answer did not produce a new local description — looks like it \
+         short-circuited instead of genuinely calling create_answer"
+    );
+    assert_ne!(
+        b_genuine_answer.0, a_genuine_offer.0,
+        "the produced answer must not simply be a copy of the peer's own offer"
+    );
+    let b_genuine_answer_text = std::str::from_utf8(&b_genuine_answer.0).unwrap();
+    let a_offer_text = std::str::from_utf8(&a_genuine_offer.0).unwrap();
+    assert_ne!(
+        sdp_attr(b_genuine_answer_text, "a=ice-ufrag:"),
+        sdp_attr(a_offer_text, "a=ice-ufrag:"),
+        "the genuine answer must carry tb's own ICE credentials, not the peer's"
+    );
+
+    // The DTLS certificate — and thus the fingerprint — must still never rotate (task 10.19's own
+    // invariant), even across this repaired sequence.
+    assert_eq!(
+        tb.local_fingerprint(&sb).unwrap(),
+        b_fp_before,
+        "DTLS fingerprint must never rotate across an ICE restart, even after this repaired path"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn buffered_amount_rises_under_backpressure_and_drains_as_peer_receives() {
     // (10.2) Send faster than the peer drains — the peer never calls `recv()` during the send

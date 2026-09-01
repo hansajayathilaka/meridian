@@ -413,8 +413,29 @@ async fn ice_restart_preserves_session_and_ratchet_over_webrtc() {
     )
     .await;
 
-    asess.ice_restart().await.unwrap();
-    bsess.ice_restart().await.unwrap();
+    // (task 10.22) `ice_restart` now needs a real, symmetric signaling round trip — a fresh
+    // restart-scoped relay pair, run concurrently (the lexicographically-larger-key side waits
+    // briefly for the other's offer, so a sequential await/await here would deadlock the first
+    // call). This is the first test to exercise a *second* incoming SDP after the original
+    // handshake over the real backend: an earlier version of the answerer's path reused
+    // `WebRtcTransport::set_remote_description`, which infers offer-vs-answer from
+    // `committed_local_sdp` alone — correct only for the one-shot original handshake, and
+    // structurally broken here (see `Transport::set_remote_offer_and_answer`'s own doc comment in
+    // `apps/transport/src/lib.rs` for the full defect and its fix). `answer_restart_offer`
+    // (`apps/core/src/session.rs`) now calls `set_remote_offer_and_answer` instead, which this test
+    // exercises on whichever side ends up as the answerer.
+    let (mut restart_relay_a, mut restart_relay_b) = MemRelay::pair(alice.ik(), bob.ik());
+    let (ares, bres) = tokio::join!(
+        asess.ice_restart(
+            &mut restart_relay_a,
+            &alice.store,
+            &ahandle,
+            &mut alice.chat
+        ),
+        bsess.ice_restart(&mut restart_relay_b, &bob.store, &bhandle, &mut bob.chat),
+    );
+    ares.expect("alice ice_restart over real webrtc");
+    bres.expect("bob ice_restart over real webrtc");
 
     asess
         .send_chat(&alice.store, &ahandle, &mut alice.chat, "after restart")

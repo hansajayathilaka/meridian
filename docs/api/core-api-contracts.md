@@ -16,6 +16,12 @@ pub trait Transport: Send + Sync {
     async fn add_transceiver(&self, s: &SessionHandle, kind: MediaKind) -> Result<TrackId>;
     fn local_description(&self, s: &SessionHandle) -> Result<Sdp>;
     async fn set_remote_description(&self, s: &SessionHandle, sdp: Sdp) -> Result<()>;
+    // (task 10.22, ADR 0025) Unconditionally treats `sdp` as a genuine remote offer and produces a
+    // genuine local answer, regardless of local commit state — unlike `set_remote_description`,
+    // whose offer-vs-answer inference from local commit state is only valid for the one-shot
+    // original dial/answer handshake. For callers (e.g. the ICE-restart answerer) that already know,
+    // from their own protocol-level role decision, that `sdp` is a genuine offer.
+    async fn set_remote_offer_and_answer(&self, s: &SessionHandle, sdp: Sdp) -> Result<()>;
     async fn add_ice_candidate(&self, s: &SessionHandle, c: IceCandidate) -> Result<()>;
     fn local_fingerprint(&self, s: &SessionHandle) -> Result<Fingerprint>; // asserted in the offer
     fn dtls_fingerprint(&self, s: &SessionHandle) -> Result<Fingerprint>; // negotiated; §4.6 binding
@@ -61,6 +67,17 @@ fn on_envelope(cb: impl Fn(DecryptedContent));               // verified + decry
 fn trust_state(peer: &PublicKey) -> TrustState;
 fn mark_verified(peer: &PublicKey) -> Result<()>;            // after safety-number compare
 // Key/device change surfaces here; UI MUST honor block-on-verified (D06, DOC verification-ux)
+
+// (task 10.22, ADR 0025) One symmetric, bounded, glare-safe restart: `relay` is a *freshly
+// constructed* SignalRelay used only for this one attempt (never held open for the session's
+// remaining lifetime — see ADR 0025); the identity-key tie-break (the same one dial/answer roles
+// use) decides which side offers vs. answers. Breaking change from the pre-10.22 no-op signature
+// `async fn ice_restart(&mut self) -> Result<()>` — no real caller depended on that broken
+// behavior (docs/tasks/phase-10/10.22-session-ice-restart-signaling.md).
+async fn ice_restart(
+    sess: &mut Session, relay: &mut dyn SignalRelay, store: &dyn SecretStore,
+    handle: &KeyHandle, chat: &mut ChatState,
+) -> Result<()>;
 ```
 
 ## Stream registry — the extension point (T04, D12)

@@ -362,7 +362,13 @@ async fn run_sender(rundir: &Path, input: &Path, split: usize) -> Result<(), Str
 
     wait_for_file(&rundir.join("cut_restored"), "the veth restore marker").await?;
     println!("[drive:sender] link restored per the harness — calling ice_restart()…");
-    sess.ice_restart()
+    // (task 10.22) `ice_restart` now needs a real, symmetric signaling round trip — reusing the
+    // same `relay` this side dialed with is the minimal, reasonable choice here (ADR 0025's
+    // "reconnect transiently" pattern doesn't require a *fresh* relay, only that the connection not
+    // be held open for the session's entire remaining lifetime "just in case"; this driver's
+    // file-based `FileRelay` costs nothing to keep around between the dial and this one restart
+    // attempt). Wiring a genuinely fresh reconnect here is 10.23's job, not this task's.
+    sess.ice_restart(&mut relay, &store, &handle, &mut chat)
         .await
         .map_err(|e| format!("ice_restart: {e}"))?;
     println!("[drive:sender] ice_restart() returned Ok — waiting for bob's resume bitmap…");
@@ -531,7 +537,9 @@ async fn run_receiver(rundir: &Path, output: &Path, split: usize) -> Result<(), 
     // and we don't want to block this side's own ability to notice the marker).
     wait_for_file(&rundir.join("cut_restored"), "the veth restore marker").await?;
     println!("[drive:receiver] link restored per the harness — calling ice_restart()…");
-    sess.ice_restart()
+    // (task 10.22) See the sender's own matching comment: reusing the already-in-scope `relay` is
+    // the minimal, reasonable update for this test-only driver's new signature.
+    sess.ice_restart(&mut relay, &store, &handle, &mut chat)
         .await
         .map_err(|e| format!("ice_restart: {e}"))?;
 

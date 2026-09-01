@@ -524,6 +524,37 @@ impl WebRtcTransport {
         Ok(())
     }
 
+    /// Apply `text` as a genuine remote **offer** and produce a genuine local **answer** —
+    /// `set_remote_description`, `create_answer`, `set_local_description`, then cache the answer as
+    /// `committed_local_sdp` (discarding any stale `pending_offer`) and `text` itself as
+    /// `remote_sdp`. Shared, unconditional body for both [`Transport::set_remote_description`]'s
+    /// "nothing committed yet" branch (the original handshake's answerer path, where this is
+    /// reached *because* `committed_local_sdp` was still empty) and
+    /// [`Transport::set_remote_offer_and_answer`] (any later point in the session where the caller
+    /// already knows, from its own protocol-level role decision, that `text` is a genuine offer —
+    /// e.g. task 10.22's ICE-restart answerer, where `committed_local_sdp` is already `Some` from
+    /// earlier in the session's life and so could never itself be used to infer that this is an
+    /// offer). See `set_remote_offer_and_answer`'s own doc comment (`apps/transport/src/lib.rs`)
+    /// for the full rationale for why these two call sites need a shared, commit-state-independent
+    /// primitive rather than each re-deriving it.
+    async fn apply_remote_offer_and_answer(&self, sess: &Arc<Session>, text: String) -> Result<()> {
+        let desc = RTCSessionDescription::offer(text.clone())
+            .map_err(|_| TransportError::BadRemoteDescription)?;
+        sess.pc
+            .set_remote_description(desc)
+            .await
+            .map_err(backend_err)?;
+        let answer = sess.pc.create_answer(None).await.map_err(backend_err)?;
+        sess.pc
+            .set_local_description(answer.clone())
+            .await
+            .map_err(backend_err)?;
+        *sess.committed_local_sdp.lock().unwrap() = Some(answer.sdp);
+        *sess.pending_offer.lock().unwrap() = None;
+        *sess.remote_sdp.lock().unwrap() = Some(text);
+        Ok(())
+    }
+
     /// The actual gather-and-collect body of [`Transport::local_candidates`], factored out so the
     /// whole thing (commit + wait) can be wrapped in one outer [`GATHER_TIMEOUT`] by the caller.
     async fn gather_local_candidates(&self, sess: &Arc<Session>) -> Result<Vec<IceCandidate>> {
@@ -768,32 +799,33 @@ impl Transport for WebRtcTransport {
 
         let already_committed = sess.committed_local_sdp.lock().unwrap().is_some();
         if already_committed {
-            // We already committed our own offer (dialer path) — this must be the peer's answer.
+            // We already committed our own not-yet-answered offer — this must be the peer's
+            // answer. Valid whenever the committed local description is genuinely this side's own
+            // outstanding offer: the dialer at the original handshake, or either side immediately
+            // after its own `ice_restart()` call awaiting the peer's matching answer — regardless
+            // of how many times the session has restarted. NOT valid when the committed state is
+            // instead stale/unrelated and `sdp` is a fresh, peer-initiated offer (the ICE-restart
+            // *answerer*'s case) — see this trait method's own doc comment (`apps/transport/src/lib.rs`)
+            // and `set_remote_offer_and_answer` for the unconditional alternative such callers use
+            // instead.
             let desc = RTCSessionDescription::answer(text.clone())
                 .map_err(|_| TransportError::BadRemoteDescription)?;
             sess.pc
                 .set_remote_description(desc)
                 .await
                 .map_err(backend_err)?;
+            *sess.remote_sdp.lock().unwrap() = Some(text);
         } else {
-            // Nothing committed yet — this is the peer's offer. Apply it, answer it, commit the
-            // answer as our local description (answerer path).
-            let desc = RTCSessionDescription::offer(text.clone())
-                .map_err(|_| TransportError::BadRemoteDescription)?;
-            sess.pc
-                .set_remote_description(desc)
-                .await
-                .map_err(backend_err)?;
-            let answer = sess.pc.create_answer(None).await.map_err(backend_err)?;
-            sess.pc
-                .set_local_description(answer.clone())
-                .await
-                .map_err(backend_err)?;
-            *sess.committed_local_sdp.lock().unwrap() = Some(answer.sdp);
-            *sess.pending_offer.lock().unwrap() = None;
+            // Nothing committed yet — this is the peer's offer (answerer path).
+            self.apply_remote_offer_and_answer(&sess, text).await?;
         }
-        *sess.remote_sdp.lock().unwrap() = Some(text);
         Ok(())
+    }
+
+    async fn set_remote_offer_and_answer(&self, s: &SessionHandle, sdp: Sdp) -> Result<()> {
+        let sess = self.get_session(s)?;
+        let text = String::from_utf8(sdp.0).map_err(|_| TransportError::BadRemoteDescription)?;
+        self.apply_remote_offer_and_answer(&sess, text).await
     }
 
     async fn add_ice_candidate(&self, s: &SessionHandle, c: IceCandidate) -> Result<()> {
