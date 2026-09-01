@@ -65,7 +65,8 @@ reviews (not new findings, but re-examined for severity/ownership in this pass) 
 - The `RESTART_GLARE_WINDOW` mutual-timeout race and the post-restart DTLS/SCTP readiness race (both
   found by the `ice_restart` gap-closure wave, tasks 10.22/10.23 — non-blocking, non-security).
 
-Findings, on-the-fly decisions, and coverage gaps: [review-report.md](./review-report.md).
+Findings, on-the-fly decisions, and coverage gaps: `review-report.md` (sweep in progress — this link
+becomes live once that file lands in this same PR).
 
 ## Tasks (todo)
 <!-- Filled by /plan-review-phase. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
