@@ -562,6 +562,31 @@ evaporate:
   possible timing skew between the two independent calls; a caller hitting this can simply retry
   `ice_restart()`. No open task owns closing this narrower race — pick up via a future `/plan-phase`
   if it proves to matter in practice (e.g. via real-world restart telemetry).
+- **`ice_restart()` returning `Ok` does not guarantee the data path is actually ready to carry
+  traffic — a genuine post-restart readiness race, distinct from (and found only after) the offer/
+  answer signaling fix above.** Found live by task 10.23's own kill/resume re-run:
+  `tools/netns-kill-resume.sh run` (the real `mrd.file/1` scenario) now passes cleanly, 3/3, over a
+  real 15s veth cut — but `probe` (task 10.15's smaller chat-only companion, which sends a message
+  *immediately* after `ice_restart()` returns rather than polling for a bitmap first) fails
+  reproducibly, 5/5: both sides' `ice_restart()` calls return `Ok` (the full ADR 0025 signaling round
+  trip and layered fingerprint check genuinely succeed — confirmed, not the old no-op gap recurring),
+  but a chat message sent right after is never received, with no local error. Diagnosed live and
+  independently re-confirmed by this task's own test-engineer review: plain IP connectivity recovers
+  immediately post-restore (the network fabric itself is fine), real ICE-level traffic (~6–13
+  packets) genuinely flows in the exact window between `Ok` and the failed send (ruling out "nothing
+  happening at all"), and inserting a throwaway 3-second sleep before the send made `probe` pass
+  reliably (reproduced independently by two different people/passes) — strong evidence the race sits
+  at the DTLS/SCTP association layer, which must itself reconverge above ICE and has no observable
+  readiness signal today. `run` doesn't hit this because its sender happens to poll for a resume
+  bitmap first, incidentally buying enough wall-clock time. **Not a security issue** (no fingerprint/
+  auth check involved) and **not blocking Phase 10's exit gate** (task 10.24 re-runs the feature's own
+  acceptance demo, `run`, which already passes; `probe` was never itself an acceptance criterion) —
+  but a real reliability/observability gap: no open task owns adding a readiness signal (e.g. waiting
+  for the transport's own post-restart `Connected`-equivalent state, which `WebRtcTransport` doesn't
+  yet wire up for anything but the *original* connection per ADR 0025's own noted scope) before
+  `ice_restart()` returns, or before a caller sends immediately afterward. Pick up via a future
+  `/plan-phase`, alongside the already-tracked `RESTART_GLARE_WINDOW` and `on_reconnect`-hook
+  residuals this compounds with.
 > live in each task file's **Outcome** section (and the phase README) — not here. This block carries
 > only what is *currently actionable* plus obligations no open task owns.
 
@@ -966,7 +991,7 @@ ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md]
 - [x] **10.20** Wire types: `SignalContent::IceRestartOffer`/`Answer` — [file](./phase-10/10.20-ice-restart-wire-types.md)
 - [x] **10.21** Tolerant (mailbox-eligible) restart delivery (depends on 10.20) — [file](./phase-10/10.21-tolerant-restart-delivery.md)
 - [x] **10.22** `P2pSession::ice_restart` real signaling (depends on 10.19, 10.20, 10.21) — [file](./phase-10/10.22-session-ice-restart-signaling.md)
-- [ ] **10.23** CLI/demo wiring for the new `ice_restart` signature (depends on 10.22) — [file](./phase-10/10.23-cli-ice-restart-wiring.md)
+- [x] **10.23** CLI/demo wiring for the new `ice_restart` signature (depends on 10.22) — [file](./phase-10/10.23-cli-ice-restart-wiring.md). Fully executed; `run` (the feature-defining kill/resume scenario) now genuinely passes live — see [transcript](./phase-10/10.23-demo-transcript.md); the smaller `probe` companion still fails live, for a new, distinct readiness-race reason recorded there, not the old `ice_restart` no-op.
 - [ ] **10.24** Phase exit-gate re-run (depends on 10.19–10.23) — [file](./phase-10/10.24-phase-exit-gate-rerun.md)
 
 ## Legend / how to read

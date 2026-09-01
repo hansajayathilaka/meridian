@@ -157,7 +157,7 @@ Tests/Reviews):
 - [x] **10.20** Wire types: `SignalContent::IceRestartOffer`/`Answer` (independent) — [file](./10.20-ice-restart-wire-types.md)
 - [x] **10.21** Tolerant (mailbox-eligible) restart delivery (depends on 10.20) — [file](./10.21-tolerant-restart-delivery.md)
 - [x] **10.22** `P2pSession::ice_restart` real signaling — symmetric, glare-safe, layered fingerprint check (depends on 10.19, 10.20, 10.21) — [file](./10.22-session-ice-restart-signaling.md)
-- [ ] **10.23** CLI/demo wiring for the new signature (depends on 10.22) — [file](./10.23-cli-ice-restart-wiring.md)
+- [x] **10.23** CLI/demo wiring for the new signature (depends on 10.22) — [file](./10.23-cli-ice-restart-wiring.md)
 
 **Wave 10 — phase exit (re-run)**
 - [ ] **10.24** Phase exit-gate re-run (depends on 10.19–10.23) — [file](./10.24-phase-exit-gate-rerun.md)
