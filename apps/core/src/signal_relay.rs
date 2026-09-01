@@ -23,8 +23,19 @@
 //! T07, and even then only chat envelopes get it) — if the peer is not live on the rendezvous right
 //! now, dial/answer cannot proceed, so [`send`](RendezvousRelay::send) turns
 //! `route() == Ok(false)` into a hard [`SessionError::Relay`].
+//!
+//! ## `send_tolerant()` is the sibling, mailbox-eligible exception (task 10.21, ADR 0025)
+//! [`send_tolerant`](RendezvousRelay::send_tolerant) exists for signaling that, unlike the initial
+//! dial/answer, has an established session and trust relationship to fall back on — today, ICE
+//! restart (task 10.22). It calls straight through to
+//! [`SignalingClient::route_with_hint_detailed`] (already built for T07's mailbox,
+//! `RouteOutcome{delivered, queued}`) and only turns a genuine [`SignalError`] into an `Err`;
+//! `Ok(RouteOutcome{queued: true, ..})` — the peer is offline but the envelope was durably queued —
+//! is treated exactly the same as `Ok(RouteOutcome{delivered: true, ..})`, per ADR 0025's decision
+//! that restart signaling must not require a standing relay connection. `send`/`map_route_result`
+//! above are untouched by this — they keep the hard-fail contract this module doc already explains.
 
-use meridian_signaling::{SignalError, SignalingClient};
+use meridian_signaling::{RouteOutcome, SignalError, SignalingClient};
 
 use crate::session::{SessionError, SignalRelay};
 
@@ -59,6 +70,18 @@ impl SignalRelay for RendezvousRelay<'_> {
         map_route_result(
             self.client
                 .route_with_hint(*to, self.hint.clone(), blob)
+                .await,
+        )
+    }
+
+    async fn send_tolerant(
+        &mut self,
+        to: &[u8; 32],
+        blob: Vec<u8>,
+    ) -> Result<RouteOutcome, SessionError> {
+        map_route_outcome_result(
+            self.client
+                .route_with_hint_detailed(*to, self.hint.clone(), blob)
                 .await,
         )
     }
@@ -100,6 +123,17 @@ fn map_route_result(result: Result<bool, SignalError>) -> Result<(), SessionErro
     }
 }
 
+/// The `route_with_hint_detailed()` outcome → `send_tolerant()` mapping (task 10.21, ADR 0025),
+/// extracted for the same reason as [`map_route_result`]: unit-testable without a live WebSocket.
+/// Unlike `map_route_result`, an `Ok` [`RouteOutcome`] passes straight through unchanged — whether
+/// `delivered` or `queued`, the mailbox-eligible path treats both as success (see the module docs).
+/// A [`SignalError`] still propagates via [`map_signal_error`], exactly as it does for `send`.
+fn map_route_outcome_result(
+    result: Result<RouteOutcome, SignalError>,
+) -> Result<RouteOutcome, SessionError> {
+    result.map_err(map_signal_error)
+}
+
 /// The `next_deliver()` outcome → `recv()` mapping, extracted for the same reason.
 fn map_deliver_result(
     result: Result<meridian_proto::Deliver, SignalError>,
@@ -134,6 +168,44 @@ mod tests {
     #[test]
     fn route_signal_error_maps_to_relay_error() {
         let err = map_route_result(Err(SignalError::ClosedEarly("frame"))).unwrap_err();
+        assert!(matches!(err, SessionError::Relay(_)));
+    }
+
+    // -- 10.21: `send_tolerant`'s mapping (ADR 0025) — the mailbox-eligible sibling of `send` above,
+    // proving both required outcomes "in isolation" (task file scope), the same way the hard-fail
+    // tests above prove `send`'s behavior without a live WebSocket. --------------------------------
+
+    #[test]
+    fn route_tolerant_delivered_live_is_ok() {
+        let outcome = map_route_outcome_result(Ok(RouteOutcome {
+            delivered: true,
+            queued: false,
+        }))
+        .unwrap();
+        assert!(outcome.delivered);
+        assert!(!outcome.queued);
+    }
+
+    #[test]
+    fn route_tolerant_queued_to_mailbox_is_ok_not_an_error() {
+        // Mirrors the exact `RouteOutcome` shape `apps/rendezvous/tests/rendezvous.rs`'s
+        // `route_to_offline_peer_with_mailbox_enabled_queues` (T07/ADR 0007) proves a real
+        // rendezvous produces for an offline-but-mailbox-enabled peer. ADR 0025's decision is that
+        // `send_tolerant` must treat this the same as a live delivery — never `send`'s hard error.
+        let outcome = map_route_outcome_result(Ok(RouteOutcome {
+            delivered: false,
+            queued: true,
+        }))
+        .unwrap();
+        assert!(!outcome.delivered);
+        assert!(outcome.queued);
+    }
+
+    #[test]
+    fn route_tolerant_signal_error_is_still_a_genuine_failure() {
+        // A real transport/protocol error (as opposed to "offline but queued") still propagates —
+        // `send_tolerant` only tolerates the mailbox-eligible outcome, not every failure mode.
+        let err = map_route_outcome_result(Err(SignalError::ClosedEarly("frame"))).unwrap_err();
         assert!(matches!(err, SessionError::Relay(_)));
     }
 

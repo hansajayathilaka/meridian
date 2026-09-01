@@ -1134,6 +1134,14 @@ impl SignalRelay for CountingRelay {
         self.sends += 1;
         self.inner.send(to, blob).await
     }
+    async fn send_tolerant(
+        &mut self,
+        to: &[u8; 32],
+        blob: Vec<u8>,
+    ) -> Result<meridian_core::signaling::RouteOutcome, SessionError> {
+        self.sends += 1;
+        self.inner.send_tolerant(to, blob).await
+    }
     async fn recv(&mut self) -> Result<([u8; 32], Vec<u8>), SessionError> {
         self.inner.recv().await
     }

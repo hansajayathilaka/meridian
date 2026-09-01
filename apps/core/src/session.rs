@@ -52,6 +52,7 @@ use meridian_transport::{
 };
 
 use crate::relay::{self, GatherClasses};
+use crate::signaling::RouteOutcome;
 
 use crate::chat::{ChatError, ChatState};
 use crate::streams::{CapabilityError, StreamId, StreamRegistry};
@@ -280,6 +281,23 @@ pub enum SessionError {
 pub trait SignalRelay: Send {
     /// Route an opaque, already-sealed envelope blob to `to`.
     async fn send(&mut self, to: &[u8; 32], blob: Vec<u8>) -> Result<(), SessionError>;
+    /// Route an opaque, already-sealed envelope blob to `to`, **tolerating** a currently-offline
+    /// peer (ADR 0025) — the sibling of [`send`](Self::send), added for ICE-restart signaling
+    /// (task 10.21/10.22), not a replacement for it. `send`'s hard-fail contract stays exactly as
+    /// it is for the original dial/answer handshake, where a queued-but-unread offer would already
+    /// be stale by the time it's read and there is no established session to fall back on. An ICE
+    /// restart has no such excuse: a live ratchet session and established trust already exist —
+    /// exactly [ADR 0007](../../docs/adr/0007-offline-mailbox.md)'s mailbox precondition — so
+    /// `Ok(RouteOutcome { queued: true, .. })` ("durably queued into the peer's offline mailbox,
+    /// will arrive on reconnect") is a normal, non-error outcome here, on equal footing with
+    /// `Ok(RouteOutcome { delivered: true, .. })` ("pushed to a live connection right now"). Only a
+    /// genuine failure (no live connection *and* no mailbox to fall back on, or a transport/signal
+    /// error) is an `Err`.
+    async fn send_tolerant(
+        &mut self,
+        to: &[u8; 32],
+        blob: Vec<u8>,
+    ) -> Result<RouteOutcome, SessionError>;
     /// Await the next delivered `(from, blob)`.
     async fn recv(&mut self) -> Result<([u8; 32], Vec<u8>), SessionError>;
 }
@@ -316,6 +334,25 @@ impl MemRelay {
 impl SignalRelay for MemRelay {
     async fn send(&mut self, _to: &[u8; 32], blob: Vec<u8>) -> Result<(), SessionError> {
         self.tx.send(blob).map_err(|_| SessionError::SignalingEnded)
+    }
+    /// `MemRelay` is a bare in-process channel pair with no mailbox concept at all — it can only
+    /// ever honestly report "delivered live" (the send succeeded) or "genuinely failed" (the
+    /// peer's other half was dropped, exactly [`send`](Self::send)'s own existing failure mode,
+    /// reused rather than inventing a distinct "offline" simulation this test double has no way to
+    /// back up). It never fabricates `queued: true` — see the module doc's own dropped-end-simulates-
+    /// the-relay-vanishing convention, which this mirrors.
+    async fn send_tolerant(
+        &mut self,
+        _to: &[u8; 32],
+        blob: Vec<u8>,
+    ) -> Result<RouteOutcome, SessionError> {
+        self.tx
+            .send(blob)
+            .map(|()| RouteOutcome {
+                delivered: true,
+                queued: false,
+            })
+            .map_err(|_| SessionError::SignalingEnded)
     }
     async fn recv(&mut self) -> Result<([u8; 32], Vec<u8>), SessionError> {
         match self.rx.recv().await {
@@ -1822,5 +1859,36 @@ mod tests {
         let candidates = vec!["candidate:host 1 127.0.0.1".to_string()];
         assert!(enforce_relay_only(IcePolicy::Direct, &candidates).is_ok());
         assert!(enforce_relay_only(IcePolicy::PreferRelay, &candidates).is_ok());
+    }
+
+    // -- 10.21: `SignalRelay::send_tolerant`, proven against `MemRelay` (the live-peer half of the
+    // task's two required outcomes; the offline/queued half is proven against `RendezvousRelay`'s
+    // own `map_route_outcome_result` in `signal_relay.rs`, since `MemRelay` has no mailbox concept
+    // to honestly simulate — see its own `send_tolerant` doc comment above). ------------------------
+
+    #[tokio::test]
+    async fn mem_relay_send_tolerant_delivers_live_to_a_connected_peer() {
+        let (mut a, mut b) = MemRelay::pair([1u8; 32], [2u8; 32]);
+        let outcome = a.send_tolerant(&[2u8; 32], vec![9, 9, 9]).await.unwrap();
+        assert!(
+            outcome.delivered,
+            "a connected MemRelay pair always delivers live"
+        );
+        assert!(!outcome.queued);
+
+        let (from, blob) = b.recv().await.unwrap();
+        assert_eq!(from, [1u8; 32]);
+        assert_eq!(blob, vec![9, 9, 9]);
+    }
+
+    #[tokio::test]
+    async fn mem_relay_send_tolerant_errors_when_the_peer_half_is_dropped() {
+        // Mirrors `send`'s own existing failure mode (module doc: "dropping one end simulates the
+        // rendezvous going away") — `MemRelay` has no mailbox to fall back on, so this is a genuine
+        // failure, never a fabricated `queued: true`.
+        let (mut a, b) = MemRelay::pair([1u8; 32], [2u8; 32]);
+        drop(b);
+        let err = a.send_tolerant(&[2u8; 32], vec![1]).await.unwrap_err();
+        assert!(matches!(err, SessionError::SignalingEnded));
     }
 }

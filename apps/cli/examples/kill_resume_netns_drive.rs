@@ -160,6 +160,22 @@ impl SignalRelay for FileRelay {
         Ok(())
     }
 
+    /// This driver's `FileRelay` has no mailbox concept (an append-only file pair, not a
+    /// rendezvous) — like `MemRelay` (`meridian_core::session`), the only honest outcomes are
+    /// "delivered" (the write succeeded) or a genuine I/O failure, never a fabricated
+    /// `queued: true`.
+    async fn send_tolerant(
+        &mut self,
+        to: &[u8; 32],
+        blob: Vec<u8>,
+    ) -> Result<meridian_core::signaling::RouteOutcome, SessionError> {
+        self.send(to, blob).await?;
+        Ok(meridian_core::signaling::RouteOutcome {
+            delivered: true,
+            queued: false,
+        })
+    }
+
     async fn recv(&mut self) -> Result<([u8; 32], Vec<u8>), SessionError> {
         loop {
             let mut f = OpenOptions::new()
