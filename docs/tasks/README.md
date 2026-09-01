@@ -331,6 +331,22 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   independently re-derived as an implementation-level bugfix within ADR 0025's existing scope, not a
   design change. **Verdict: blocked until F1 lands**, then green for the next build phase (T10 or T14).
   Full report: [phase-11/review-report.md](./phase-11/review-report.md).
+- **NOW:** **Phase 11's findings are broken into 10 numbered fix-tasks** (11.1–11.10), planned by the
+  **planner** agent. F1 (blocking) → **11.1** (lands first: the `sid`-collision fix, architect-ratified
+  before or as part of its own task). **11.2** and **11.6** are soft-ordered after 11.1 (and, for 11.6,
+  after 11.2 too) — all three touch the same `apps/core/src/session.rs` `open_stream`/`ice_restart` area,
+  avoiding rebase churn though none is a functional dependency of another. **11.3** (F3+N1) has no
+  dependency; **11.4** soft-depends on it (same `run_responder`/`finalize_transfer` functions). **11.5**
+  has no dependency. **11.7** (conformance vectors) is sequenced before **11.8** (the proof-delivery
+  mechanism decision) so it locks in the four already-shipped, stable wire shapes now rather than waiting
+  on 11.8's own architect consult — if 11.8 extends the chunk wire shape, that's a follow-up vector
+  amendment flagged as 11.8's own residual, not a reason to block 11.7. **11.9** (devops-owned, docs-only,
+  mirrors the branch-protection `TODO: confirm` precedent) and **11.10** (new CI workflow for the
+  kill-resume rig) are each independent of everything else. N2–N4 stay informational/deferred, not
+  converted; N5 was already promoted straight to a tracker carry-forward (below), not a fix-task. Full
+  breakdown: [phase-11/README.md](./phase-11/README.md#tasks-todo).
+- **NEXT:** `/next-task` — no fix-task in this batch is blocked; task-picker should return 11.1 first per
+  the report's own priority (the phase's one blocking finding).
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -1032,6 +1048,29 @@ an earlier, independently-discovered SCTP defect) closed the phase — 24/24 don
 - [x] **10.22** `P2pSession::ice_restart` real signaling (depends on 10.19, 10.20, 10.21) — [file](./phase-10/10.22-session-ice-restart-signaling.md)
 - [x] **10.23** CLI/demo wiring for the new `ice_restart` signature (depends on 10.22) — [file](./phase-10/10.23-cli-ice-restart-wiring.md). Fully executed; `run` (the feature-defining kill/resume scenario) now genuinely passes live — see [transcript](./phase-10/10.23-demo-transcript.md); the smaller `probe` companion still fails live, for a new, distinct readiness-race reason recorded there, not the old `ice_restart` no-op.
 - [x] **10.24** Phase exit-gate re-run (depends on 10.19–10.23) — [file](./phase-10/10.24-phase-exit-gate-rerun.md). Verdict: GO — Phase 10's exit criteria are met, phase closed (24/24).
+
+### Phase 11 — Review of Phase 10 · **open — sweep complete, verdict recorded** · [details](./phase-11/README.md)
+Review phase. Sweeps everything built since the Phase-9 review: Phase 10 — File Transfer Stream (tasks
+10.1–10.24). No untracked out-of-band PRs of substance landed in this window (one trivial dependabot
+devcontainer-lockfile bump, PR #86, confirmed via `git log --merges`).
+[Report](./phase-11/review-report.md): 10 findings — **1 blocking** (F1), 9 should-fix (F2–F10), 5 nits
+(N1 folds into F3's fix-task, N2–N4 stay informational/deferred, N5 promoted straight to this tracker's
+carry-forward list). Zero on-the-fly decisions need `/adr` ratification — task 10.22's mid-phase
+`ice_restart` signaling fix was independently re-derived as an implementation-level bugfix within
+ADR 0025's existing scope. **Verdict: blocked until F1 lands**, then green for the next build phase (T10
+or T14). 10 fix-tasks (11.1–11.10) planned by the **planner** agent; landing order and dependencies:
+[phase-11/README.md](./phase-11/README.md#tasks-todo).
+
+- [ ] **11.1** Namespace `open_stream`'s `sid`/channel-label derivation to fix concurrent-open collisions (F1, blocking) — [file](./phase-11/11.1-fix-open-stream-sid-collision.md)
+- [ ] **11.2** Enforce relay-only on `ice_restart`'s freshly-gathered candidates (F2; soft-depends on 11.1) — [file](./phase-11/11.2-ice-restart-relay-only-enforcement.md)
+- [ ] **11.3** Bound/restructure `mrd.file/1`'s `pending_chunks` buffer and its O(n) rescan (F3 + N1) — [file](./phase-11/11.3-bound-pending-chunks-buffer.md)
+- [ ] **11.4** Real-CLI-path bit-flip rejection test (F4; soft-depends on 11.3) — [file](./phase-11/11.4-cli-bitflip-rejection-test.md)
+- [ ] **11.5** Resume boundary tests: 0 chunks received / all-but-last chunk (F5) — [file](./phase-11/11.5-resume-boundary-tests.md)
+- [ ] **11.6** Make `RESTART_GLARE_WINDOW` test-overridable; cover the timeout-fallback branch (F6; soft-depends on 11.1, 11.2) — [file](./phase-11/11.6-restart-glare-window-timeout-test.md)
+- [ ] **11.7** Conformance vectors for Phase 10's new wire surfaces (F7) — [file](./phase-11/11.7-file-transfer-conformance-vectors.md)
+- [ ] **11.8** Wire `FileReceiver`'s per-chunk verification into the real send path, or narrow the claim (F8) — [file](./phase-11/11.8-chunk-proof-delivery-mechanism.md)
+- [ ] **11.9** Confirm `soak-file-transfer.yml` ran clean post-10.18 on a real runner (F9, devops-owned, docs-only) — [file](./phase-11/11.9-soak-workflow-runner-confirmation.md)
+- [ ] **11.10** Add scheduled/`workflow_dispatch` CI for `netns-kill-resume.sh` (F10) — [file](./phase-11/11.10-netns-kill-resume-ci-workflow.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.

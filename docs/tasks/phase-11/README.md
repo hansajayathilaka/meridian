@@ -83,7 +83,53 @@ precedent for a phase-exit-blocking finding recorded rather than downgraded. Ful
 
 ## Tasks (todo)
 <!-- Filled by /plan-review-phase. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
-(pending `/plan-review-phase`)
+Planned by the **planner** agent from [review-report.md](./review-report.md)'s 1 blocking + 9 should-fix
+findings (10 fix-tasks, 11.1–11.10; N1 folds into 11.3's F3 fix; N2–N4 stay informational/deferred per
+the report's own disposition, not converted; N5 was already promoted straight to a tracker carry-forward,
+not a fix-task). Landing order below follows dependency analysis: 11.1 lands first (the phase's one
+blocking finding, F1's `sid`-collision fix, architect-ratified before or as part of its own task); 11.2
+and 11.6 are **soft**-ordered after 11.1 (and, for 11.6, after 11.2 too) — all three touch
+`apps/core/src/session.rs`'s `open_stream`/`ice_restart` area, so landing in this order avoids rebase
+churn even though none is a functional dependency of another. 11.3 (F3+N1, the `apps/streams/file.rs`
+buffer restructuring) has **no** dependency and is sequenced after the session.rs cluster only because
+it's a separate crate/area. 11.4 **soft**-depends on 11.3 — its new test lands in the same
+`run_responder`/`finalize_transfer` functions N1's fix touches. 11.5 (resume boundary tests) has **no**
+dependency on anything in this phase. 11.7 (conformance vectors) has **no** hard dependency but is
+deliberately sequenced before 11.8: it locks in the four already-shipped, stable wire shapes now, before
+11.8's own architect consult decides whether to extend the chunk wire shape further — if it does, that's
+a follow-up vector amendment flagged as 11.8's own residual, not a reason to block 11.7 today. 11.8 (F8,
+the phase's most architecturally significant should-fix) has **no** hard dependency on any other
+fix-task. 11.9 (docs-only devops confirmation, mirroring the existing branch-protection `TODO: confirm`
+precedent) and 11.10 (the new CI workflow for the kill-resume rig) are each independent of everything
+else and of each other.
+
+- [ ] **11.1** Namespace `open_stream`'s `sid`/channel-label derivation to fix concurrent-open collisions (F1, blocking) — [file](./11.1-fix-open-stream-sid-collision.md)
+- [ ] **11.2** Enforce relay-only on `ice_restart`'s freshly-gathered candidates (F2; soft-depends on 11.1) — [file](./11.2-ice-restart-relay-only-enforcement.md)
+- [ ] **11.3** Bound/restructure `mrd.file/1`'s `pending_chunks` buffer and its O(n) rescan (F3 + N1) — [file](./11.3-bound-pending-chunks-buffer.md)
+- [ ] **11.4** Real-CLI-path bit-flip rejection test (F4; soft-depends on 11.3) — [file](./11.4-cli-bitflip-rejection-test.md)
+- [ ] **11.5** Resume boundary tests: 0 chunks received / all-but-last chunk (F5) — [file](./11.5-resume-boundary-tests.md)
+- [ ] **11.6** Make `RESTART_GLARE_WINDOW` test-overridable; cover the timeout-fallback branch (F6; soft-depends on 11.1, 11.2) — [file](./11.6-restart-glare-window-timeout-test.md)
+- [ ] **11.7** Conformance vectors for Phase 10's new wire surfaces (F7) — [file](./11.7-file-transfer-conformance-vectors.md)
+- [ ] **11.8** Wire `FileReceiver`'s per-chunk verification into the real send path, or narrow the claim (F8) — [file](./11.8-chunk-proof-delivery-mechanism.md)
+- [ ] **11.9** Confirm `soak-file-transfer.yml` ran clean post-10.18 on a real runner (F9, devops-owned, docs-only) — [file](./11.9-soak-workflow-runner-confirmation.md)
+- [ ] **11.10** Add scheduled/`workflow_dispatch` CI for `netns-kill-resume.sh` (F10) — [file](./11.10-netns-kill-resume-ci-workflow.md)
+
+**N2, N3, N4** were deliberately **not** converted to fix-tasks — matching the review report's own
+disposition: N2 (`LoopbackTransport::ice_restart`'s "no-op" doc-comment overclaim) and N4 (no back-to-back
+resume-bitmap test) are low-priority, "pick up next time the file is touched / if capacity allows" items
+with no live defect behind them; N3 (the dead HKDF-export capability) needs no action at all — the report
+itself calls it a byproduct of a clean design, not a gap. **N5** (the `CtrlFrame::Close` cleanup gap) was
+**not** converted either — it was already promoted straight to a master-tracker carry-forward bullet by
+the report itself, since it's dormant/unreachable today (no code path in this phase ever sends `Close`
+for a file transfer); no fix-task would have anything live to test against.
 
 ## Exit criteria
-(pending `/plan-review-phase` and the fix-task run)
+All fix-tasks (11.1–11.10) `[x]`. Tree green workspace-wide (`cargo build --workspace`,
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` in both default and
+`--features webrtc` configs, `tools/check-docs.sh`, `tools/lint-server-no-core.sh`,
+`tools/lint-tui-no-cli.sh`). Findings closed per the report's verdict: every task's named reviewer(s)
+signing off PASS with zero blocking findings surviving any task's final review round. 11.9 may stay open
+longer than the rest since it depends on a human/devops observation an agent session cannot make
+directly — matching the existing branch-protection `TODO: confirm` precedent — and should not itself
+block the phase's other 9 tasks from closing. Docs synced as part of each task's own commit. Draft PR:
+[#93](https://github.com/hansajayathilaka/meridian/pull/93).
