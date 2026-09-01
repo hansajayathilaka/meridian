@@ -920,8 +920,8 @@ ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md]
 - [x] **10.16** Corrupted-chunk adversarial test (depends on 10.8) — [file](./phase-10/10.16-corrupted-chunk-adversarial-test.md)
 - [x] **10.18** Fix: real `WebRtcTransport` can't send a full 64 KiB `mrd.file/1` chunk (depends on 10.7) — [file](./phase-10/10.18-sctp-max-message-size-fix.md)
 - [x] **10.17** Phase exit (first attempt): acceptance demo + third-party implementability check + doc sync (depends on all above, including 10.18) — [file](./phase-10/10.17-phase-exit-demo.md). Fully executed; verdict is a blocking finding (`ice_restart` no-op), not a clean pass.
-- [ ] **10.19** Real `Transport::ice_restart` (webrtc-rs primitive) (depends on 10.18) — [file](./phase-10/10.19-real-transport-ice-restart.md)
-- [ ] **10.20** Wire types: `SignalContent::IceRestartOffer`/`Answer` — [file](./phase-10/10.20-ice-restart-wire-types.md)
+- [x] **10.19** Real `Transport::ice_restart` (webrtc-rs primitive) (depends on 10.18) — [file](./phase-10/10.19-real-transport-ice-restart.md)
+- [x] **10.20** Wire types: `SignalContent::IceRestartOffer`/`Answer` — [file](./phase-10/10.20-ice-restart-wire-types.md)
 - [ ] **10.21** Tolerant (mailbox-eligible) restart delivery (depends on 10.20) — [file](./phase-10/10.21-tolerant-restart-delivery.md)
 - [ ] **10.22** `P2pSession::ice_restart` real signaling (depends on 10.19, 10.20, 10.21) — [file](./phase-10/10.22-session-ice-restart-signaling.md)
 - [ ] **10.23** CLI/demo wiring for the new `ice_restart` signature (depends on 10.22) — [file](./phase-10/10.23-cli-ice-restart-wiring.md)
