@@ -4,7 +4,8 @@
 
 # Phase 10 — File Transfer Stream
 
-**Kind:** build · **Status:** planning · **Reviews phase(s):** n/a
+**Kind:** build · **Status:** **closed — 24/24 tasks done (10.1–10.24), exit gate passed on its
+second attempt (10.24).** · **Reviews phase(s):** n/a (pending a future `/start-review-phase`)
 
 ## Goal
 Ship **[T09 — File Transfer Stream](../../architecture/features/09-file-transfer.md)** (`mrd.file/1`):
@@ -160,7 +161,7 @@ Tests/Reviews):
 - [x] **10.23** CLI/demo wiring for the new signature (depends on 10.22) — [file](./10.23-cli-ice-restart-wiring.md)
 
 **Wave 10 — phase exit (re-run)**
-- [ ] **10.24** Phase exit-gate re-run (depends on 10.19–10.23) — [file](./10.24-phase-exit-gate-rerun.md)
+- [x] **10.24** Phase exit-gate re-run (depends on 10.19–10.23) — [file](./10.24-phase-exit-gate-rerun.md). Verdict: GO — Phase 10's exit criteria are met.
 
 ## Exit criteria
 All tasks `[x]`, tree green (`cargo build --workspace`, `cargo fmt --all -- --check`,
@@ -169,17 +170,49 @@ All tasks `[x]`, tree green (`cargo build --workspace`, `cargo fmt --all -- --ch
 end-to-end per the spec's "Working output" section, plus the reference third-party implementability
 check (task 10.17). Then `/start-review-phase`.
 
-**Status as of task 10.17 (2026-08-31): NOT met — held open by a real, live-reconfirmed finding, per
-Phase 4/7's own "don't lower the bar" precedent.** All 18 tasks are individually `[x]`; tree is green
-workspace-wide; docs are synced; the reference third-party `mrd.echo/1` implementability check
-**PASSED**. But the feature's own acceptance demo does not run end-to-end: `meridian send` over the
-real `WebRtcTransport` correctly completes a genuine multi-chunk transfer (confirming task 10.18's
-fix in the real CLI path), but the network-cut → ICE-restart → resume → verified-match sequence the
-spec's own demo script names does not complete, live-reconfirmed against a real netns/veth cut —
-`WebRtcTransport::ice_restart` does not restore connectivity, a known, pre-existing gap named in
-`apps/transport/src/webrtc_backend.rs`'s own module doc and first empirically confirmed by task
-10.15. Full record: [10.17's Outcome](./10.17-phase-exit-demo.md#outcome) and
-[demo transcript](./10.17-demo-transcript.md). **This phase does not proceed to
-`/start-review-phase` until a gap-closure task for that resumability gap lands and 10.17's exit gate
-is re-run clean** — see [docs/tasks/README.md](../README.md)'s "Live carry-forwards" and ▶ NOW/NEXT
-sections for the up-to-date pointer.
+**Met — Phase 10 closed.** All 24 tasks are `[x]` (10.1–10.18's original 18, plus the six-task
+`ice_restart` gap-closure arc 10.19–10.24). Tree is green workspace-wide (`cargo build --workspace
+[--features webrtc]`, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+[--features webrtc] -- -D warnings`, all clean in both configs); docs are synced
+(`docs/api/wire-protocol.md` and `docs/api/core-api-contracts.md` both confirmed complete and
+byte-accurate for the new `ice_restart` wire types/signature, `bash tools/check-docs.sh` clean); the
+reference third-party `mrd.echo/1` implementability check **PASSED** (task 10.17; reasoned, not
+re-run, at task 10.24 — nothing in `docs/api/stream-types-v1.md` or the stream-type-authoring skill
+changed since).
+
+**History — one gap-closure cycle, following the Phase 4/7 "don't lower the bar" precedent.** Task
+10.17's own exit-gate run (2026-08-31) found the feature's acceptance demo did not run end-to-end:
+`meridian send` over the real `WebRtcTransport` correctly completed a genuine multi-chunk transfer
+(confirming task 10.18's SCTP fix in the real CLI path), but the network-cut → ICE-restart → resume →
+verified-match sequence the spec's own demo script names did not complete, live-reconfirmed against a
+real netns/veth cut — `WebRtcTransport::ice_restart` did not restore connectivity, a known,
+pre-existing gap named in `apps/transport/src/webrtc_backend.rs`'s own module doc and first
+empirically confirmed by task 10.15. Full record: [10.17's Outcome](./10.17-phase-exit-demo.md#outcome)
+and [demo transcript](./10.17-demo-transcript.md). [ADR 0025](../../adr/0025-ice-restart-renegotiation.md)
+decided the fix mechanism (ICE-restart offers/answers ride the same tolerant, mailbox-eligible
+signaling path T07 already built, never a standing relay connection held open for a session's
+lifetime); tasks **10.19**–**10.23** implemented it (real `Transport::ice_restart`, the new
+`SignalContent::IceRestartOffer`/`Answer` wire types, tolerant restart delivery, `P2pSession::ice_restart`'s
+symmetric glare-safe signaling with a layered fingerprint check, and CLI/demo wiring) — 10.22's own
+review round found and fixed a real protocol-correctness bug along the way (the ICE-restart
+answerer's path silently mislabeling the peer's genuine offer as an answer to its own, fixed via a
+new commit-state-independent `Transport::set_remote_offer_and_answer`). Task **10.23**'s own live
+re-run first proved the fix for the real `mrd.file/1` kill/resume scenario (3/3 clean), while also
+surfacing one new, separately-scoped, non-blocking finding (a post-restart readiness race on the
+smaller `probe` companion script, distinct from the now-fixed no-op). Task **10.24** (this exit-gate
+re-run) independently re-confirmed both halves of the demo live on the final branch tip — the real
+multi-chunk transfer (5/5 clean) and the kill/resume scenario (2/2 further clean runs, on top of
+10.23's own 3/3) — re-confirmed doc-sync and the full tree-green matrix with zero regressions, and
+reasoned (rather than blindly re-ran) that the third-party check still holds. Full record:
+[10.24's Outcome](./10.24-phase-exit-gate-rerun.md#outcome) and
+[demo transcript](./10.24-demo-transcript.md).
+
+**Two residuals remain, both correctly non-blocking and explicitly tracked** (neither fixed nor
+re-litigated by 10.24, per that task's own scope): the `RESTART_GLARE_WINDOW` mutual-timeout race
+(ADR 0025's own accepted residual — both sides can end up simultaneously offering if their restart
+calls are offset by more than 5s) and the post-restart readiness race 10.23 found (`ice_restart()`
+returning `Ok` doesn't yet guarantee the DTLS/SCTP path has reconverged enough to carry traffic
+immediately). Both are recorded in [docs/tasks/README.md](../README.md)'s "Live carry-forwards" for
+a future `/plan-phase` to pick up if they prove to matter in practice.
+
+Phase 10 is now ready for a future `/start-review-phase`.
