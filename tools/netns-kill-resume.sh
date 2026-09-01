@@ -58,6 +58,18 @@
 # rather than take it on faith. If either driver reports the errors above, that is this rig correctly
 # doing its job, not a bug in the rig — do not "fix" this script to hide either failure.
 #
+# UPDATE (task 10.23): both gaps above are now fixed and no longer expected on a live run.
+#   - Gap 2 (SCTP max-message-size) was fixed by task 10.18
+#     (`apps/transport/src/webrtc_backend.rs`'s `SCTP_MAX_MESSAGE_SIZE`/`with_max_message_size_attr`).
+#   - Gap 1 (`ice_restart` real signaling) was fixed by tasks 10.19–10.22 per
+#     [ADR 0025](../docs/adr/0025-ice-restart-renegotiation.md); the driver/probe examples were
+#     updated in task 10.23 to call the new signature the way ADR 0025 requires (a fresh,
+#     transiently-reconnected `SignalRelay` for the restart round trip, not the dial-time relay held
+#     open). `run`/`probe` are now both expected to PASS end-to-end on this rig — see
+#     `docs/tasks/phase-10/10.23-demo-transcript.md` for a real, live re-run. A FAIL at this point is
+#     a genuine new regression, not a reproduction of either historical gap above — report it, don't
+#     assume it's "the same known issue."
+#
 # Usage:
 #   cargo build -p meridian-cli --example kill_resume_netns_drive --features webrtc
 #   cargo build -p meridian-cli --example netns_ice_restart_probe --features webrtc
@@ -112,7 +124,30 @@ EOF
 # (tools/netns-netem.sh's own gate) — probe it directly rather than assuming, per this task's own
 # instruction.
 need_veth_linkstate() {
-  local probe_a="kr-probe-a-$$" probe_b="kr-probe-b-$$" ns_a="kr-probe-nsa-$$" ns_b="kr-probe-nsb-$$"
+  # (task 10.23 fix) Interface names are capped at IFNAMSIZ (15 usable bytes) — the previous
+  # "kr-probe-a-$$"/"kr-probe-b-$$" prefixes are 11 chars on their own, so any 5-digit (or wider)
+  # shell PID pushed the full name past 15 and made `ip link add ... peer name ...` fail outright
+  # (confirmed live on this sandbox: `ip link add kr-probe-a-16738 ... peer name kr-probe-b-16738`
+  # → "wrong: not a valid ifname"). That failure was silently swallowed by this function's own `||
+  # true`/`ok=0` handling and reported as "netns/veth link up/down is not usable in this
+  # environment — skipping", which is wrong: the capability genuinely works, only the self-check's
+  # own probe names didn't fit. Task 10.17 first found this and worked around it out-of-line; fixed
+  # here for real by zero-padding the PID to 6 digits (NOT truncating via bash's `${pid: -6}` — that
+  # returns an *empty string*, not the whole value, for any PID under 6 digits, i.e. effectively
+  # every real invocation given Linux's default `pid_max` of 32768; a truncate-based first attempt
+  # at this fix silently collapsed every probe pair to the same constant name and was caught live,
+  # by 10.23's own review, reproducing an actual `/run/netns/kr-lsa-` collision between two
+  # concurrently-running instances — exactly the collision-safety property this fix exists to keep).
+  # Zero-padding preserves genuine per-PID differentiation for short PIDs ("kr-a-016738") without any
+  # truncation risk for long ones (Linux PIDs cap at 7 digits under `pid_max`, so "kr-a-4194304" is
+  # still only 12 bytes, safely under the 15-byte cap). Namespace names (`ns_a`/`ns_b`) are
+  # unaffected by `IFNAMSIZ` itself — `ip netns add` has no such constraint, only `ip link add` does
+  # — but share the same suffix for readability/pairing.
+  local pid="$$"
+  local pid_suffix
+  printf -v pid_suffix '%06d' "$pid"
+  local probe_a="kr-a-${pid_suffix}" probe_b="kr-b-${pid_suffix}"
+  local ns_a="kr-lsa-${pid_suffix}" ns_b="kr-lsb-${pid_suffix}"
   local ok=1
   trap 'ip netns del "'"$ns_a"'" 2>/dev/null || true; ip netns del "'"$ns_b"'" 2>/dev/null || true' RETURN
   if ip netns add "$ns_a" 2>/dev/null && ip netns add "$ns_b" 2>/dev/null \
@@ -241,10 +276,10 @@ run() {
 
   if [[ "$ok" -ne 1 ]]; then
     echo "[kill-resume] FAIL: at least one driver process did not complete successfully — see logs" \
-         "above. If the failure is the documented post-restore timeout, this is REPRODUCING a" \
-         "known, pre-existing gap in apps/transport/src/webrtc_backend.rs's ice_restart no-op" \
-         "(see this script's own header comment), not a defect introduced by this task; treat it" \
-         "as a finding to report, not silently paper over." >&2
+         "above. As of task 10.23 this scenario is expected to PASS (both the SCTP-max-message-size" \
+         "gap [task 10.18] and the ice_restart no-op gap [tasks 10.19-10.22, ADR 0025] are fixed);" \
+         "a failure here is a genuine, newly-observed defect, not a reproduction of either historical" \
+         "gap this script's own header comment records — report it, don't assume it away." >&2
     exit 1
   fi
 
@@ -283,11 +318,11 @@ run() {
 # A smaller, chat-only companion to `run` (see `apps/cli/examples/netns_ice_restart_probe.rs`'s own
 # module doc): sidesteps the CHUNK_SIZE/SCTP-max-message-size collision entirely (a chat message is a
 # few dozen bytes) to directly answer whether the P2P **substrate** itself — not file-transfer
-# chunking — recovers from a genuine veth cut once `ice_restart()` is called on both sides. On this
-# sandbox's own rig this reproducibly FAILS (times out post-restore) — a real, pre-existing gap in
-# `meridian-transport`'s current `ice_restart` (see that example's own module doc for the full
-# finding), independent of anything this task built. A FAIL here is this rig correctly reporting a
-# real defect, not a bug in the rig — do not "fix" this function to report PASS instead.
+# chunking — recovers from a genuine veth cut once `ice_restart()` is called on both sides.
+# Historically (task 10.15) this reproducibly FAILED (timed out post-restore) — a real, pre-existing
+# gap in `meridian-transport`'s then-current `ice_restart` no-op (see that example's own module doc
+# for the full finding). UPDATE (task 10.23): that gap is now fixed (tasks 10.19-10.22, ADR 0025) and
+# this is expected to PASS — see this script's own top-of-file "UPDATE (task 10.23)" note.
 probe() {
   need_root
   need_veth_linkstate
@@ -340,10 +375,11 @@ probe() {
   echo "[kill-resume:probe] --- b ---"; cat "$b_log"
 
   if [[ "$ok" -ne 1 ]]; then
-    echo "[kill-resume:probe] FAIL: the session did not survive the real network cut. If both logs" \
-         "show a clean post-restore timeout (not a crash), this is REPRODUCING the documented gap in" \
-         "apps/transport/src/webrtc_backend.rs's ice_restart no-op — see" \
-         "apps/cli/examples/netns_ice_restart_probe.rs's module doc. Report it, do not paper over it." >&2
+    echo "[kill-resume:probe] FAIL: the session did not survive the real network cut. As of task" \
+         "10.23 this is expected to PASS (the ice_restart no-op gap is fixed, tasks 10.19-10.22," \
+         "ADR 0025) — a failure here is a genuine, newly-observed defect, not a reproduction of the" \
+         "historical gap apps/cli/examples/netns_ice_restart_probe.rs's module doc records. Report" \
+         "it, do not paper over it." >&2
     exit 1
   fi
   echo "[kill-resume:probe] PASS: the session survived a real veth cut + ice_restart()."

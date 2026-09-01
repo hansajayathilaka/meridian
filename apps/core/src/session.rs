@@ -52,6 +52,7 @@ use meridian_transport::{
 };
 
 use crate::relay::{self, GatherClasses};
+use crate::signaling::RouteOutcome;
 
 use crate::chat::{ChatError, ChatState};
 use crate::streams::{CapabilityError, StreamId, StreamRegistry};
@@ -174,6 +175,53 @@ pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 /// makes itself; it cannot drain the answerer's OTKs through this wait.
 pub const OFFER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// (10.22, ADR 0025) How long the offering side of an ICE restart — the lexicographically-smaller
+/// identity key, the same tie-break [`apps/cli/src/chat.rs`](../../cli/src/chat.rs)'s dial/answer
+/// role convention already uses ("the lexicographically-smaller identity key initiates") — waits
+/// for the peer's `IceRestartAnswer` before giving up. Mirrors [`ANSWER_TIMEOUT`]'s own rationale
+/// for the *original* handshake almost exactly: the chain this bounds is one relay hop (offer) +
+/// the peer's own up-to-~20s candidate gather (`GATHER_TIMEOUT`, no trickle ICE) + one relay hop
+/// (answer) — the same order-of-magnitude cost, so the same 30s value applies rather than
+/// inventing an independently-tuned number with no data behind it. Kept as its own distinct
+/// constant (not a reuse of `ANSWER_TIMEOUT` itself) purely so the two call sites read
+/// independently and can be retuned on their own later if a restart's real-world latency profile
+/// ever proves different from a fresh dial's — e.g. because restart delivery can also fall back to
+/// the peer's offline mailbox (ADR 0025's own accepted "not instantaneous" cost), whereas the
+/// original handshake's `send` is hard-fail and never queues. On expiry this reuses
+/// [`SessionError::AnswerTimeout`] rather than a new variant: it's exactly the same "the peer never
+/// answered" condition `ANSWER_TIMEOUT` already names, just for a restart instead of the initial
+/// dial. Not a security boundary any more than `ANSWER_TIMEOUT` is: a caller can simply retry
+/// [`P2pSession::ice_restart`] again later; firing early never weakens anything, it only means
+/// this one attempt gave up a bit sooner than an unusually slow-but-honest peer needed.
+pub const RESTART_ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// (10.22, ADR 0025) How long the *other* side of a restart — the lexicographically-larger
+/// identity key — waits for an incoming `IceRestartOffer` before concluding the peer apparently
+/// hasn't (yet) attempted its own restart and falling through to send its own offer instead
+/// (mirroring [`RESTART_ANSWER_TIMEOUT`]'s own branch, per ADR 0025's decision text: "falling
+/// through to send its own only if nothing showed up"). Deliberately much shorter than
+/// `RESTART_ANSWER_TIMEOUT`: this window exists only to catch the scenario ADR 0025 actually
+/// motivates it with — both sides independently noticing the same broken shared candidate pair and
+/// deciding to restart at roughly the same real-world moment — so a genuinely concurrent peer's
+/// offer (sent at the very start of its own [`P2pSession::ice_restart`] call, with no gather-then-
+/// relay chain to wait through on *this* side's clock before it even starts sending) should
+/// already be in flight within a few seconds of this side's own call starting. Waiting the full
+/// answer-length bound here would only delay this side's own fallback offer for a peer that, in
+/// practice, isn't actually racing it at all. A tuning knob, not a security boundary, exactly like
+/// `RESTART_ANSWER_TIMEOUT`/`ANSWER_TIMEOUT`: firing early only costs one extra, harmless round of
+/// this side proactively offering instead of answering — never a weaker session either way.
+///
+/// **Known, accepted residual** (not fixed by this task; consistent with ADR 0025's own "adds a
+/// small amount of session-layer state/logic" Cons entry): if the smaller-key peer calls its own
+/// `ice_restart()` more than this window *after* the larger-key side already fell through and sent
+/// its own offer, both sides can end up simultaneously offering and discarding each other's offer
+/// while waiting for an answer that the other side's own tie-break logic will never send — a
+/// mutual timeout rather than a completed restart. ADR 0025's design (both sides "plausibly decide
+/// to restart around the same real-world moment") does not claim to resolve every possible timing
+/// skew between the two calls, only the common concurrent case; a caller hitting this residual can
+/// simply retry `ice_restart()`.
+pub const RESTART_GLARE_WINDOW: Duration = Duration::from_secs(5);
+
 /// Errors from the P2P substrate.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -193,6 +241,37 @@ pub enum SessionError {
     FingerprintMismatch {
         negotiated: String,
         asserted: String,
+    },
+    /// (10.22, ADR 0025) The **second**, distinct half of the ICE-restart layered fingerprint
+    /// check: even once the ordinary asserted-vs-negotiated cross-check ([`Self::FingerprintMismatch`],
+    /// §4.6, unweakened) has already passed for the restart offer/answer's own `dtls_fp` field, the
+    /// negotiated fingerprint no longer equals the value this session cached from the *original*
+    /// handshake ([`P2pSession::fingerprints`]). A real ICE restart never recreates the
+    /// `RTCPeerConnection` — task 10.19 confirmed against the real webrtc-rs backend that the DTLS
+    /// certificate (and thus the fingerprint) is byte-identical before and after a restart — so
+    /// this should be essentially **unreachable** in practice. This variant signals an
+    /// implementation defect (something rotated a cert unexpectedly across a restart that should
+    /// never touch it), never an ordinary handshake authentication failure — kept structurally
+    /// distinct from `FingerprintMismatch` for exactly that reason: an operator seeing this
+    /// variant should suspect a transport bug, not a substituted peer identity caught fresh at
+    /// handshake time (that's what `FingerprintMismatch` already means, unweakened, unchanged).
+    /// Fails closed exactly like `FingerprintMismatch`: the transport is torn down rather than
+    /// left running with a silently-accepted identity change.
+    #[error(
+        "ICE-restart fingerprint drift (local={local}): negotiated {negotiated} != cached {expected} — should be unreachable; torn down"
+    )]
+    RestartFingerprintDrift {
+        /// `true` if the drift was observed on our own cached `local_fp`; `false` if on the
+        /// negotiated *remote* fingerprint against the cached `remote_fp`. Only `false` is ever
+        /// actually produced by this task's own check — per ADR 0025's decision, the layered
+        /// check compares the negotiated *remote* value against `remote_fp` (re-verifying the
+        /// peer's identity binding), never our own `local_fp` (which this side's own transport
+        /// controls and never asks a peer to assert back to us). The field still exists, rather
+        /// than being hardcoded away, so a future defense-in-depth local-side check has somewhere
+        /// structurally honest to report through instead of overloading this variant's meaning.
+        local: bool,
+        expected: String,
+        negotiated: String,
     },
     /// A signaling envelope carried a payload we did not expect at this point in the handshake.
     #[error("unexpected signaling payload during {phase}")]
@@ -280,6 +359,23 @@ pub enum SessionError {
 pub trait SignalRelay: Send {
     /// Route an opaque, already-sealed envelope blob to `to`.
     async fn send(&mut self, to: &[u8; 32], blob: Vec<u8>) -> Result<(), SessionError>;
+    /// Route an opaque, already-sealed envelope blob to `to`, **tolerating** a currently-offline
+    /// peer (ADR 0025) — the sibling of [`send`](Self::send), added for ICE-restart signaling
+    /// (task 10.21/10.22), not a replacement for it. `send`'s hard-fail contract stays exactly as
+    /// it is for the original dial/answer handshake, where a queued-but-unread offer would already
+    /// be stale by the time it's read and there is no established session to fall back on. An ICE
+    /// restart has no such excuse: a live ratchet session and established trust already exist —
+    /// exactly [ADR 0007](../../docs/adr/0007-offline-mailbox.md)'s mailbox precondition — so
+    /// `Ok(RouteOutcome { queued: true, .. })` ("durably queued into the peer's offline mailbox,
+    /// will arrive on reconnect") is a normal, non-error outcome here, on equal footing with
+    /// `Ok(RouteOutcome { delivered: true, .. })` ("pushed to a live connection right now"). Only a
+    /// genuine failure (no live connection *and* no mailbox to fall back on, or a transport/signal
+    /// error) is an `Err`.
+    async fn send_tolerant(
+        &mut self,
+        to: &[u8; 32],
+        blob: Vec<u8>,
+    ) -> Result<RouteOutcome, SessionError>;
     /// Await the next delivered `(from, blob)`.
     async fn recv(&mut self) -> Result<([u8; 32], Vec<u8>), SessionError>;
 }
@@ -316,6 +412,25 @@ impl MemRelay {
 impl SignalRelay for MemRelay {
     async fn send(&mut self, _to: &[u8; 32], blob: Vec<u8>) -> Result<(), SessionError> {
         self.tx.send(blob).map_err(|_| SessionError::SignalingEnded)
+    }
+    /// `MemRelay` is a bare in-process channel pair with no mailbox concept at all — it can only
+    /// ever honestly report "delivered live" (the send succeeded) or "genuinely failed" (the
+    /// peer's other half was dropped, exactly [`send`](Self::send)'s own existing failure mode,
+    /// reused rather than inventing a distinct "offline" simulation this test double has no way to
+    /// back up). It never fabricates `queued: true` — see the module doc's own dropped-end-simulates-
+    /// the-relay-vanishing convention, which this mirrors.
+    async fn send_tolerant(
+        &mut self,
+        _to: &[u8; 32],
+        blob: Vec<u8>,
+    ) -> Result<RouteOutcome, SessionError> {
+        self.tx
+            .send(blob)
+            .map(|()| RouteOutcome {
+                delivered: true,
+                queued: false,
+            })
+            .map_err(|_| SessionError::SignalingEnded)
     }
     async fn recv(&mut self) -> Result<([u8; 32], Vec<u8>), SessionError> {
         match self.rx.recv().await {
@@ -738,10 +853,279 @@ impl<T: Transport> P2pSession<T> {
         Ok(self.transport.buffered_amount(&self.conn, &ch).await?)
     }
 
-    /// Restart ICE on a network change, keeping the session and ratchet alive (invariant 5). The
-    /// crypto/ratchet state ([`ChatState`]) is untouched; only the candidate pairs are renegotiated.
-    pub async fn ice_restart(&mut self) -> Result<(), SessionError> {
-        self.transport.ice_restart(&self.conn).await?;
+    /// Restart ICE on a network change, keeping the session and ratchet alive (invariant 5): one
+    /// symmetric, bounded, glare-safe method (task 10.22, [ADR 0025](../../../docs/adr/0025-ice-restart-renegotiation.md))
+    /// both sides call the same way, closing the gap tasks 10.15/10.17 live-reconfirmed (the old
+    /// no-op version of this method returned `Ok` without the peer ever learning a restart
+    /// happened at all, so the data channel never actually recovered from a real network cut).
+    ///
+    /// `relay` is a **freshly-constructed** [`SignalRelay`] used only for the bounded duration of
+    /// this one restart attempt, then dropped again — mirroring [`dial`]/[`answer`]'s own relay
+    /// lifetime, never a connection held open for the session's remaining lifetime (ADR 0025's
+    /// whole point: no new continuous-presence signal to the rendezvous operator). `store`/
+    /// `handle`/`chat` are needed only to seal/open the restart offer/answer envelopes on this
+    /// session's existing ratchet — the ratchet itself is never advanced or otherwise touched by
+    /// anything in this method (invariant 5, already true of the old no-op and preserved here).
+    ///
+    /// ## What happens
+    /// 1. **Glare-safe branch**, reusing the exact identity-key tie-break
+    ///    [`apps/cli/src/chat.rs`](../../cli/src/chat.rs) already documents for the dial/answer
+    ///    roles ("the lexicographically-smaller identity key initiates"): the smaller-key side
+    ///    restarts *our own* local ICE state via [`Transport::ice_restart`] (task 10.19's real
+    ///    primitive — fresh ufrag/pwd, fresh candidate gather, producing a fresh local offer; the
+    ///    DTLS certificate/fingerprint never changes across this, task 10.19 confirmed this against
+    ///    the real backend), then seals + [`SignalRelay::send_tolerant`]s (task 10.21 — `queued` to
+    ///    the peer's offline mailbox is a normal, non-error outcome here, unlike the original
+    ///    handshake's hard-fail `send`) that fresh offer, then waits — bounded by
+    ///    [`RESTART_ANSWER_TIMEOUT`] — for the peer's answer, discarding (and continuing to wait,
+    ///    within the remaining budget) any competing offer it sees from the peer meanwhile, since
+    ///    its own offer already won the tie-break. The larger-key side instead waits briefly
+    ///    (bounded by [`RESTART_GLARE_WINDOW`]) for an incoming offer first — deliberately
+    ///    restarting nothing of its own local ICE state while it waits, since a genuine JSEP
+    ///    answerer never does — and, if one arrives, genuinely answers it via
+    ///    [`Transport::set_remote_offer_and_answer`]'s real `create_answer` round trip (which itself
+    ///    produces fresh local ICE parameters on the answering side, real JSEP semantics for
+    ///    answering an ICE-restart offer — no explicit `Transport::ice_restart` call needed or
+    ///    correct on this side). It falls through to restarting its own local ICE state and sending
+    ///    its own offer (identical to the smaller-key branch) only if the window elapses with
+    ///    nothing — see that constant's own doc for the residual this can't fully resolve.
+    /// 2. **Layered fingerprint check**, on whichever side ends up processing the peer's SDP: the
+    ///    ordinary asserted-vs-negotiated cross-check ([`verify_fingerprint`], §4.6, unweakened —
+    ///    a mismatch here is the existing [`SessionError::FingerprintMismatch`]), **and** a new,
+    ///    distinct assertion that the negotiated value still equals this session's own cached
+    ///    `remote_fp` from the *original* handshake (a mismatch here is the new
+    ///    [`SessionError::RestartFingerprintDrift`], never conflated with the first check).
+    ///
+    /// On success, `self.local_fp`/`self.remote_fp` are left exactly as they were (the layered
+    /// check's second half is precisely the proof that they're still correct) and nothing about
+    /// the session's already-open data channels changes — only ICE/DTLS renegotiates.
+    ///
+    /// **Out of scope** (ADR 0025, and task 10.9's own carry-forward): this method does not decide
+    /// *when* to restart (a caller — today, an operator/test driver — still calls this explicitly
+    /// on its own signal) and does not itself trigger any `StreamType::on_reconnect`/resume-bitmap
+    /// behavior; a caller invokes those manually after this returns `Ok`, exactly as before.
+    pub async fn ice_restart(
+        &mut self,
+        relay: &mut dyn SignalRelay,
+        store: &dyn SecretStore,
+        handle: &KeyHandle,
+        chat: &mut ChatState,
+    ) -> Result<(), SessionError> {
+        if self.our_ik < self.peer_ik {
+            // The lexicographically-smaller identity key always offers (mirrors the dial/answer
+            // role tie-break `apps/cli/src/chat.rs` documents). Only the side that is actually
+            // about to *send* a fresh offer calls `Transport::ice_restart` on itself — see this
+            // method's own restructuring note below for why the answerer branch must not.
+            self.transport.ice_restart(&self.conn).await?;
+            self.restart_offer_and_await_answer(relay, store, handle, chat, RESTART_ANSWER_TIMEOUT)
+                .await
+        } else {
+            // Deliberately does **not** call `Transport::ice_restart` here, before we even know
+            // whether we'll end up answering the peer's genuine offer or falling through to send
+            // our own: doing so would leave the real `RTCPeerConnection` in `have-local-offer`
+            // signaling state (webrtc-rs's own JSEP state machine, not just this crate's
+            // `committed_local_sdp` bookkeeping) before the peer's genuine offer is ever
+            // processed — and `have-local-offer` only accepts a `SetRemote(Answer)` /
+            // `SetRemote(Pranswer)` transition next, never `SetRemote(Offer)` (confirmed by
+            // reading `webrtc-0.17.1`'s own `check_next_signaling_state`), so
+            // `set_remote_offer_and_answer`'s genuine offer application would fail outright with a
+            // real signaling-state error. Restarting our own local ICE state is only correct once
+            // we know we're the one sending a fresh offer (the fallback branch below).
+            match tokio::time::timeout(
+                RESTART_GLARE_WINDOW,
+                recv_restart_signal(relay, store, handle, &self.our_ik, &self.peer_ik, chat),
+            )
+            .await
+            {
+                Ok(Ok(RestartSignal::Offer { sdp, dtls_fp, ice })) => {
+                    self.answer_restart_offer(relay, store, handle, chat, sdp, dtls_fp, ice)
+                        .await
+                }
+                Ok(Ok(RestartSignal::Answer { .. })) => {
+                    // We never sent an offer of our own yet, so an answer arriving here is
+                    // out-of-phase — mirrors `recv_sdp`'s own catch-all for the original handshake.
+                    Err(SessionError::UnexpectedSignal {
+                        phase: "ice_restart",
+                    })
+                }
+                Ok(Err(e)) => Err(e),
+                Err(_elapsed) => {
+                    // Nothing arrived within the brief window — apparently the peer hasn't (yet)
+                    // attempted its own restart. Fall through and offer ourselves, exactly like
+                    // the smaller-key branch above (see `RESTART_GLARE_WINDOW`'s own doc for the
+                    // known residual this can leave unresolved if the peer's own call is merely
+                    // late rather than absent) — and, like that branch, restart our own local ICE
+                    // state first since we're now the one sending a fresh offer.
+                    self.transport.ice_restart(&self.conn).await?;
+                    self.restart_offer_and_await_answer(
+                        relay,
+                        store,
+                        handle,
+                        chat,
+                        RESTART_ANSWER_TIMEOUT,
+                    )
+                    .await
+                }
+            }
+        }
+    }
+
+    /// The offerer's half of the restart round trip (10.22): seal + tolerantly send a fresh
+    /// `IceRestartOffer` built from the transport's just-restarted local state (mirrors
+    /// `dial_established`'s own first-offer construction), then wait — bounded by `timeout`,
+    /// decreasing across retries so a discarded competing offer never resets the budget — for the
+    /// peer's `IceRestartAnswer`, discarding any incoming `IceRestartOffer` seen in that window
+    /// (glare: this side already knows, from the identity-key tie-break, that its own offer is the
+    /// one that should win).
+    async fn restart_offer_and_await_answer(
+        &mut self,
+        relay: &mut dyn SignalRelay,
+        store: &dyn SecretStore,
+        handle: &KeyHandle,
+        chat: &mut ChatState,
+        timeout: Duration,
+    ) -> Result<(), SessionError> {
+        let offer = self.transport.local_description(&self.conn)?;
+        let local_fp = self.transport.local_fingerprint(&self.conn)?;
+        let ice = candidate_strings(&self.transport, &self.conn).await?;
+        let offer_content = SignalContent::IceRestartOffer {
+            sdp: offer.0,
+            dtls_fp: local_fp.0.clone(),
+            ice,
+        };
+        let blob = chat.seal_bytes(
+            store,
+            handle,
+            &self.our_ik,
+            &self.peer_ik,
+            &offer_content.encode()?,
+        )?;
+        // (10.21, ADR 0025) `delivered` or `queued` are both success — only a genuine relay/signal
+        // failure is an `Err` here, unlike the original handshake's hard-fail `send`.
+        relay.send_tolerant(&self.peer_ik, blob).await?;
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(SessionError::AnswerTimeout(timeout));
+            }
+            let signal = match tokio::time::timeout(
+                remaining,
+                recv_restart_signal(relay, store, handle, &self.our_ik, &self.peer_ik, chat),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => return Err(SessionError::AnswerTimeout(timeout)),
+            };
+            match signal {
+                RestartSignal::Answer { sdp, dtls_fp, ice } => {
+                    return self.apply_restart_remote(sdp, dtls_fp, ice).await;
+                }
+                RestartSignal::Offer { .. } => {
+                    // Glare: our own offer already won the tie-break — ignore the peer's competing
+                    // offer and keep waiting for our own answer within the remaining budget.
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// The answerer's half of the restart round trip (10.22): given the peer's freshly-received
+    /// `IceRestartOffer`, genuinely answer it via
+    /// [`Transport::set_remote_offer_and_answer`]'s real `create_answer`/`set_local_description`
+    /// round trip, add its candidates, then seal + tolerantly send our own fresh
+    /// `IceRestartAnswer`, and finally the layered fingerprint check.
+    ///
+    /// Deliberately does **not** call [`Transport::ice_restart`] on itself first, unlike an earlier
+    /// version of this method: a genuine JSEP answerer never restarts its own ICE agent as a
+    /// distinct step — receiving a remote offer with `ice_restart: true` and genuinely answering it
+    /// via `create_answer` is what naturally produces fresh local ICE parameters on the answering
+    /// side (real JSEP semantics: answering an ICE-restart offer restarts the answerer's own ICE
+    /// agent for that transport as a side effect of the answer, not a prerequisite to it). Calling
+    /// `ice_restart` here first would pre-commit a conflicting local offer of our own *before* the
+    /// peer's genuine offer is ever processed — which is what made `set_remote_description`'s
+    /// commit-state-based offer/answer inference misclassify the peer's offer as an answer in the
+    /// version of this method that predates `set_remote_offer_and_answer` (see that trait method's
+    /// own doc comment in `apps/transport/src/lib.rs` for the full defect this replaced).
+    #[allow(clippy::too_many_arguments)]
+    async fn answer_restart_offer(
+        &mut self,
+        relay: &mut dyn SignalRelay,
+        store: &dyn SecretStore,
+        handle: &KeyHandle,
+        chat: &mut ChatState,
+        offer_sdp: Vec<u8>,
+        asserted_fp: String,
+        offer_ice: Vec<String>,
+    ) -> Result<(), SessionError> {
+        self.transport
+            .set_remote_offer_and_answer(&self.conn, Sdp(offer_sdp))
+            .await?;
+        for c in offer_ice {
+            self.transport
+                .add_ice_candidate(&self.conn, IceCandidate(c))
+                .await?;
+        }
+
+        let answer_sdp = self.transport.local_description(&self.conn)?;
+        let local_fp = self.transport.local_fingerprint(&self.conn)?;
+        let ice = candidate_strings(&self.transport, &self.conn).await?;
+        let answer_content = SignalContent::IceRestartAnswer {
+            sdp: answer_sdp.0,
+            dtls_fp: local_fp.0.clone(),
+            ice,
+        };
+        let blob = chat.seal_bytes(
+            store,
+            handle,
+            &self.our_ik,
+            &self.peer_ik,
+            &answer_content.encode()?,
+        )?;
+        relay.send_tolerant(&self.peer_ik, blob).await?;
+
+        self.verify_restart_fingerprint(&asserted_fp).await
+    }
+
+    /// The offerer's remaining half once the peer's `IceRestartAnswer` arrives: apply it, add its
+    /// candidates, then the layered fingerprint check — mirrors `dial_established`'s own
+    /// `set_remote_description`/`add_ice_candidate`/`verify_fingerprint` sequence for the original
+    /// answer.
+    async fn apply_restart_remote(
+        &mut self,
+        answer_sdp: Vec<u8>,
+        asserted_fp: String,
+        answer_ice: Vec<String>,
+    ) -> Result<(), SessionError> {
+        self.transport
+            .set_remote_description(&self.conn, Sdp(answer_sdp))
+            .await?;
+        for c in answer_ice {
+            self.transport
+                .add_ice_candidate(&self.conn, IceCandidate(c))
+                .await?;
+        }
+        self.verify_restart_fingerprint(&asserted_fp).await
+    }
+
+    /// The layered check itself (10.22, ADR 0025): first the ordinary asserted-vs-negotiated
+    /// cross-check (§4.6, unweakened, reused directly from [`verify_fingerprint`]) against the
+    /// restart offer/answer's own asserted `dtls_fp`, then the new, distinct assertion that the
+    /// negotiated value still equals this session's own cached `remote_fp` from the *original*
+    /// handshake — re-verifying the peer's identity binding rather than merely trusting task
+    /// 10.19's own finding that a real restart can't change it.
+    async fn verify_restart_fingerprint(&self, asserted: &str) -> Result<(), SessionError> {
+        let negotiated = verify_fingerprint(&self.transport, &self.conn, asserted).await?;
+        if negotiated != self.remote_fp {
+            let _ = self.transport.close(&self.conn).await;
+            return Err(SessionError::RestartFingerprintDrift {
+                local: false,
+                expected: self.remote_fp.0.clone(),
+                negotiated: negotiated.0,
+            });
+        }
         Ok(())
     }
 
@@ -1754,6 +2138,60 @@ async fn recv_sdp(
     }
 }
 
+/// (10.22) What an ICE restart's `relay.recv()` loop can see. `relay` is a fresh, restart-specific
+/// [`SignalRelay`] scoped to one bounded attempt (ADR 0025 — dropped again once it finishes), so
+/// the only things ever legitimately expected on it are the peer's own `IceRestartOffer`/
+/// `IceRestartAnswer`.
+enum RestartSignal {
+    Offer {
+        sdp: Vec<u8>,
+        dtls_fp: String,
+        ice: Vec<String>,
+    },
+    Answer {
+        sdp: Vec<u8>,
+        dtls_fp: String,
+        ice: Vec<String>,
+    },
+}
+
+/// Receive one signaling envelope from an ICE-restart-scoped relay and decode it as either an
+/// `IceRestartOffer` or `IceRestartAnswer` — the restart round trip's counterpart to [`recv_sdp`],
+/// except it recognizes *either* shape (the caller doesn't know in advance which one it'll see:
+/// the smaller-key side is waiting for an answer but may see a competing offer first; the
+/// larger-key side is waiting for an offer but has sent nothing yet, so an answer here would be
+/// out-of-phase). Mirrors `recv_sdp`'s own peer-filtering and pre-connection-trickle handling.
+async fn recv_restart_signal(
+    relay: &mut dyn SignalRelay,
+    store: &dyn SecretStore,
+    handle: &KeyHandle,
+    our_ik: &[u8; 32],
+    peer_ik: &[u8; 32],
+    chat: &mut ChatState,
+) -> Result<RestartSignal, SessionError> {
+    loop {
+        let (from, blob) = relay.recv().await?;
+        if &from != peer_ik {
+            continue; // not our peer; ignore
+        }
+        let plaintext = chat.open_bytes(store, handle, our_ik, peer_ik, &blob, false)?;
+        match SignalContent::decode(&plaintext)? {
+            SignalContent::IceRestartOffer { sdp, dtls_fp, ice } => {
+                return Ok(RestartSignal::Offer { sdp, dtls_fp, ice })
+            }
+            SignalContent::IceRestartAnswer { sdp, dtls_fp, ice } => {
+                return Ok(RestartSignal::Answer { sdp, dtls_fp, ice })
+            }
+            SignalContent::IceTrickle { .. } => continue, // pre-connection trickle, ignore for now
+            _ => {
+                return Err(SessionError::UnexpectedSignal {
+                    phase: "ice_restart",
+                })
+            }
+        }
+    }
+}
+
 /// The §4.6 cross-check: the transport's negotiated remote fingerprint MUST equal the fingerprint
 /// the peer asserted inside its ratchet-encrypted, AEAD-authenticated envelope. Mismatch ⇒ teardown,
 /// fail closed.
@@ -1822,5 +2260,36 @@ mod tests {
         let candidates = vec!["candidate:host 1 127.0.0.1".to_string()];
         assert!(enforce_relay_only(IcePolicy::Direct, &candidates).is_ok());
         assert!(enforce_relay_only(IcePolicy::PreferRelay, &candidates).is_ok());
+    }
+
+    // -- 10.21: `SignalRelay::send_tolerant`, proven against `MemRelay` (the live-peer half of the
+    // task's two required outcomes; the offline/queued half is proven against `RendezvousRelay`'s
+    // own `map_route_outcome_result` in `signal_relay.rs`, since `MemRelay` has no mailbox concept
+    // to honestly simulate — see its own `send_tolerant` doc comment above). ------------------------
+
+    #[tokio::test]
+    async fn mem_relay_send_tolerant_delivers_live_to_a_connected_peer() {
+        let (mut a, mut b) = MemRelay::pair([1u8; 32], [2u8; 32]);
+        let outcome = a.send_tolerant(&[2u8; 32], vec![9, 9, 9]).await.unwrap();
+        assert!(
+            outcome.delivered,
+            "a connected MemRelay pair always delivers live"
+        );
+        assert!(!outcome.queued);
+
+        let (from, blob) = b.recv().await.unwrap();
+        assert_eq!(from, [1u8; 32]);
+        assert_eq!(blob, vec![9, 9, 9]);
+    }
+
+    #[tokio::test]
+    async fn mem_relay_send_tolerant_errors_when_the_peer_half_is_dropped() {
+        // Mirrors `send`'s own existing failure mode (module doc: "dropping one end simulates the
+        // rendezvous going away") — `MemRelay` has no mailbox to fall back on, so this is a genuine
+        // failure, never a fabricated `queued: true`.
+        let (mut a, b) = MemRelay::pair([1u8; 32], [2u8; 32]);
+        drop(b);
+        let err = a.send_tolerant(&[2u8; 32], vec![1]).await.unwrap_err();
+        assert!(matches!(err, SessionError::SignalingEnded));
     }
 }

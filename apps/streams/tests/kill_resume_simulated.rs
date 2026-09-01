@@ -304,9 +304,27 @@ async fn kill_resume_harness_orchestration_matches_the_real_driver_exactly() {
     assert_eq!(received_before_cut.len(), SPLIT_CHUNKS);
 
     // --- Phase 2: the "cut" — real `ice_restart()` on both sides, exactly like the real driver
-    // calls once the harness script's `cut_restored` marker appears. ---
-    asess.ice_restart().await.expect("alice ice_restart");
-    bsess.ice_restart().await.expect("bob ice_restart");
+    // calls once the harness script's `cut_restored` marker appears. (task 10.22) The signature now
+    // needs a real, symmetric signaling round trip — a fresh restart-scoped relay pair, run
+    // concurrently (the lexicographically-larger-key side waits briefly for the other's offer, so
+    // a sequential await/await here would deadlock the first call). ---
+    let (mut restart_relay_a, mut restart_relay_b) = MemRelay::pair(alice.ik(), bob.ik());
+    let (ares, bres) = tokio::join!(
+        asess.ice_restart(
+            &mut restart_relay_a,
+            &alice.store,
+            &ahandle,
+            &mut alice.chat
+        ),
+        bsess.ice_restart(
+            &mut restart_relay_b,
+            &bob.store,
+            bob.account.handle(),
+            &mut bob.chat
+        ),
+    );
+    ares.expect("alice ice_restart");
+    bres.expect("bob ice_restart");
 
     // --- Phase 3: bob computes his resume bitmap the way the real driver does (from
     // `distinct_chunk_indices`, not `FileReceiver`) and sends it as a raw tagged frame — the exact

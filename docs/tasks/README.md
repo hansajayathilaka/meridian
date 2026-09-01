@@ -272,49 +272,63 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   gap-closure task for the `ice_restart` real-transport resumability gap (architect-review territory —
   a session-layer ctrl-channel ICE-renegotiation design, not a config change) lands and this exit gate
   is re-run clean, mirroring exactly how Phase 7's F1 held that phase's own closure open.
-- **NEXT:** open a gap-closure task (via a future `/plan-phase`/`/new-task`) for the `ice_restart`
-  real-transport resumability gap, then re-run task 10.17's exit gate. Phase 10 is not yet eligible for
-  `/start-review-phase` until that re-run passes cleanly (or the team makes an explicit, documented
-  decision to accept the current state and close anyway — not done here, per this task's own scope of
-  verify-and-report, not decide).
+- **NOW:** the gap-closure fix landed. [ADR 0025](../adr/0025-ice-restart-renegotiation.md)
+  (architect-reviewed) decided the mechanism: ICE-restart offers/answers ride the same tolerant,
+  mailbox-eligible signaling path T07 already built (never a standing relay connection held open for a
+  session's lifetime, preserving feature 04's "servers out of the data path" property), one symmetric
+  glare-safe `P2pSession::ice_restart` method reusing the existing dial/answer identity-key tie-break,
+  and a layered fingerprint check (the ordinary asserted-vs-negotiated cross-check plus a new assertion
+  against the session's own cached fingerprint). Tasks
+  [10.19](./phase-10/10.19-real-transport-ice-restart.md)–[10.23](./phase-10/10.23-cli-ice-restart-wiring.md)
+  (Wave 9.5 in `phase-10/README.md`) implemented it — 10.22's own review round found and fixed a real
+  protocol-correctness bug (the ICE-restart answerer's path silently mislabeling the peer's genuine
+  offer as an answer to its own) — and 10.23's own live re-run first proved the fix for the real
+  `mrd.file/1` kill/resume scenario (3/3 clean), while surfacing one new, separately-scoped,
+  non-blocking finding (a post-restart readiness race on the smaller `probe` companion script).
+- **NOW:** **Phase 10 (File Transfer Stream) is closed — 24/24 tasks done (10.1–10.24), exit gate
+  passed on its second attempt.** Task **10.24** (Wave 10, the exit-gate re-run) independently
+  re-confirmed the fix on the final branch tip: the real `meridian send` multi-chunk transfer over
+  real WebRTC (5/5 clean runs), and the network-cut + `ice_restart()` + resume kill/resume scenario
+  over real netns/veth (2/2 further clean runs, on top of 10.23's own 3/3) — the exact scenario task
+  10.17 originally found broken. The reference third-party `mrd.echo/1` implementability check was
+  reasoned (not blindly re-run) to still hold, since nothing in `docs/api/stream-types-v1.md` or the
+  stream-type-authoring skill changed since task 10.17's own already-passed run — confirmed via
+  `git log`. Doc-sync (`wire-protocol.md`'s `ice_restart_offer`/`ice_restart_answer`,
+  `core-api-contracts.md`'s new `ice_restart` signature) and the full tree-green matrix (build/fmt/
+  clippy in both configs, full nextest for every touched crate, `check-docs.sh`) are all clean with
+  zero regressions from what 10.19–10.23 already recorded. Both narrower residuals from this fix
+  (the `RESTART_GLARE_WINDOW` mutual-timeout race, and 10.23's own post-restart readiness-race
+  finding) remain correctly non-blocking and separately tracked below — neither was fixed or
+  re-litigated by 10.24, per that task's own scope. Full record:
+  [10.24's Outcome](./phase-10/10.24-phase-exit-gate-rerun.md#outcome) and
+  [demo transcript](./phase-10/10.24-demo-transcript.md); closure summary:
+  [phase-10/README.md](./phase-10/README.md#exit-criteria). Phase 10 is now ready for a future
+  `/start-review-phase`.
 
 
 ### Live carry-forwards (not owned by any open task)
-- **`WebRtcTransport::ice_restart` does not actually restore connectivity after a real network
-  change — it is a documented no-op over the real backend, only tested against `LoopbackTransport`'s
-  local-only contract until task 10.15 empirically exercised it for real.** This is not a new defect:
-  `apps/transport/src/webrtc_backend.rs`'s own module doc (lines 70–91) already named it "ICE restart
-  does not (yet) fulfill the resumability promise (known gap)," flagged for architect review as "a
-  not-yet-numbered successor to [task] 1.15," since closing it needs a ctrl-channel renegotiation
-  message to carry a restart offer to the peer — `P2pSession::ice_restart` has no session-layer
-  signaling path today, calling the backend on one side with no envelope round trip. Task 10.15's
-  `tools/netns-kill-resume.sh probe` confirmed this empirically for the first time: cutting a real
-  veth for 15s (past the backend's own 9s `ICE_FAILED_TIMEOUT`), restoring it, then calling
-  `ice_restart()` on both sides — the sender's send call returns `Ok(())` with no error, but the peer
-  never receives it even 25s later. **Compounding finding** (originally filed here as a narrower
-  "no `StreamType::on_reconnect` hook" gap by task 10.9's own review): even if a hook existed to
-  automatically fire `meridian_streams::send_resume_bitmap`/`watch_resume` after `ice_restart()`
-  returns, it would still fail over the real backend today, since `ice_restart()` itself doesn't
-  restore the connection — the missing hook and the no-op restart are two layers of the same
-  unresolved resumability promise, and closing either alone doesn't fix the demo script's own
-  "network cut → reconnect → resume" scenario over real WebRTC. Confirmed harmless over
-  `LoopbackTransport` (used by every `meridian-streams`/`meridian-cli` test in this phase), so nothing
-  built in Phase 10 is *wrong* — task 10.10's CLI and task 10.17's phase-exit demo should run their
-  resume/reconnect scenario over loopback (or document the real-transport gap explicitly if the demo
-  is run over real WebRTC) until this lands. No open task owns the fix (needs a real ctrl-channel
-  renegotiation design — architect-review territory, not a config change like 10.18's) — pick up via
-  a future `/plan-phase`.
-- **RE-CONFIRMED LIVE by task 10.17's phase-exit demo, for the actual `mrd.file/1` kill/resume
-  scenario (not just 10.15's chat-only `probe`)**: with task 10.18's SCTP fix landed, a real
-  multi-chunk transfer (24 chunks) now sends 15/24 chunks correctly before a genuine 15s veth cut;
-  after the cut is restored, `ice_restart()` returns `Ok` on both sides and the receiver correctly
-  computes and sends a resume bitmap (9/24 missing, the expected count) — but the sender never
-  receives it and the receiver never receives the resent chunks, exactly as this gap's own prior
-  description predicted. See [10.17's demo transcript](./phase-10/10.17-demo-transcript.md) (Part 2).
-  This means the feature spec's own literal acceptance-demo script (`meridian send` narrating
-  cut→ICE-restart→resume→verified-match in one live process) **does not pass** over the real
-  transport today — recorded honestly as a phase-exit-blocking finding per that task's own
-  instructions, not silently downgraded. Still no open task owns the fix.
+- **RESOLVED (Phase 10, tasks 10.19–10.24): `WebRtcTransport::ice_restart` now actually restores
+  connectivity after a real network change, confirmed live for the actual `mrd.file/1` kill/resume
+  scenario, independently, twice more.** Originally a documented no-op over the real backend
+  (`apps/transport/src/webrtc_backend.rs`'s own module doc), first empirically confirmed broken by
+  task 10.15 and live-reconfirmed by task 10.17's own phase-exit demo (a real 15s veth cut: both
+  sides' `ice_restart()` returned `Ok`, the receiver correctly computed a 9/24-missing resume bitmap,
+  but the sender never received it and no chunks were resent) — this held Phase 10's exit gate open.
+  [ADR 0025](../adr/0025-ice-restart-renegotiation.md) decided the fix mechanism (ICE-restart
+  offers/answers ride the same tolerant, mailbox-eligible signaling path T07 already built, never a
+  standing relay connection held open for a session's lifetime); tasks 10.19–10.22 implemented it
+  (real `Transport::ice_restart`, the new `SignalContent::IceRestartOffer`/`Answer` wire types,
+  tolerant restart delivery, `P2pSession::ice_restart`'s symmetric glare-safe signaling with a
+  layered fingerprint check — 10.22's own review round found and fixed a real protocol-correctness
+  bug along the way, the ICE-restart answerer's path silently mislabeling the peer's genuine offer as
+  an answer to its own). Task 10.23 first proved the fix live for the real `mrd.file/1` scenario
+  (`tools/netns-kill-resume.sh run`, 3/3 clean). Task 10.24 (the phase-exit-gate re-run) independently
+  re-confirmed it again, twice more (2/2 further clean runs, on the final branch tip), and confirmed
+  the rest of the exit gate (the real multi-chunk transfer, doc-sync, the third-party check, the full
+  tree-green matrix) all pass — **Phase 10's exit criteria are now met**, see
+  [phase-10/README.md](./phase-10/README.md#exit-criteria). Two narrower residuals from this same fix
+  remain, both correctly non-blocking and separately tracked below: the `RESTART_GLARE_WINDOW`
+  mutual-timeout race, and a post-restart readiness race found by 10.23's own re-run.
 - **NEW (found by task 10.17): `tools/netns-kill-resume.sh`'s own pre-flight self-check
   (`need_veth_linkstate`) has an environment-dependent false-negative bug**, independent of the
   `ice_restart` gap above. It names its probe veth/netns interfaces `kr-probe-a-$$`/
@@ -512,6 +526,73 @@ evaporate:
   was judged correct since none blocks anything else in this phase). No task currently owns this;
   pick up via a future `/plan-phase` doc-sync sweep (not urgent — none is security-critical prose,
   unlike the sites 6.7 already fixed).
+- **RESOLVED, no residual: task 10.22's `ice_restart` answerer-path offer/answer misclassification**
+  (found independently by a security review and a combined architect/code review of the uncommitted
+  10.22 diff, fixed in the same task before landing). The original implementation had the
+  answerer's own side call `Transport::ice_restart` on itself — once unconditionally at the top of
+  `P2pSession::ice_restart` before the offerer/answerer role split even happened, and a second time
+  redundantly inside `answer_restart_offer` — before ever processing the peer's genuine restart
+  offer. Two independent defects compounded: (a) `WebRtcTransport::set_remote_description`'s
+  offer-vs-answer inference (`committed_local_sdp.is_some()`) is valid only for the one-shot original
+  dial/answer handshake, so on a second incoming SDP it misclassified the peer's genuine offer as an
+  answer to our own (self-generated, never-sent) restart offer — "working" only because `webrtc-rs`
+  0.17.1's JSEP state machine validates the asserted `type` transition, not the SDP content itself,
+  for this narrow (DTLS-cert-unchanged, single-data-channel) case; (b) independently, and more
+  fundamentally, the pre-emptive self-restart also would have left the real `RTCPeerConnection` in
+  `have-local-offer` signaling state, which `webrtc-0.17.1`'s own `check_next_signaling_state` (read
+  directly) only ever accepts a `SetRemote(Answer)`/`SetRemote(Pranswer)` transition out of — so, had
+  only the redundant inner call been removed while the top-level unconditional call stayed, applying
+  the peer's genuine offer next would have failed outright with a real signaling-state error instead
+  of the original silent mislabeling; both call sites had to be corrected together, not just one.
+  Fixed by:
+  a new, commit-state-independent `Transport::set_remote_offer_and_answer` (implemented in both
+  `WebRtcTransport` and `LoopbackTransport`, `apps/transport/src/lib.rs`/`webrtc_backend.rs`/
+  `loopback.rs`) that always treats its argument as a genuine offer and always drives a real
+  `create_answer`/`set_local_description` round trip; and restructuring
+  `P2pSession::ice_restart`/`answer_restart_offer` (`apps/core/src/session.rs`) so `Transport::ice_restart`
+  is called **only** on a side that is actually about to send its own fresh offer (the
+  lexicographically-smaller side immediately, or the larger side's own post-glare-window fallback),
+  never on the side that ends up answering the peer's genuine offer — matching real JSEP semantics,
+  where answering an ICE-restart offer via `create_answer` itself produces fresh local ICE parameters
+  on the answering side, with no separate self-restart call needed or correct. The layered fingerprint
+  check (`verify_restart_fingerprint`) needed no changes and was reconfirmed still passing unweakened.
+  **No residual on the offer/answer-inference concern itself** — the fix is structural (a new,
+  unconditional trait method), not a narrower patch of the same heuristic. A separate, pre-existing,
+  already-in-code-documented residual is *not* resolved by this fix and remains accepted as-is (see
+  `RESTART_GLARE_WINDOW`'s own doc comment, `apps/core/src/session.rs`): if the lexicographically-
+  smaller-key peer calls its own `ice_restart()` more than `RESTART_GLARE_WINDOW` (5s) after the
+  larger-key side has already timed out waiting and fallen through to sending its own offer, both
+  sides can end up simultaneously offering and discarding each other's offer while waiting for an
+  answer neither side's tie-break logic will ever send — a mutual timeout rather than a completed
+  restart. ADR 0025's design only claims to resolve the common concurrent-restart case, not every
+  possible timing skew between the two independent calls; a caller hitting this can simply retry
+  `ice_restart()`. No open task owns closing this narrower race — pick up via a future `/plan-phase`
+  if it proves to matter in practice (e.g. via real-world restart telemetry).
+- **`ice_restart()` returning `Ok` does not guarantee the data path is actually ready to carry
+  traffic — a genuine post-restart readiness race, distinct from (and found only after) the offer/
+  answer signaling fix above.** Found live by task 10.23's own kill/resume re-run:
+  `tools/netns-kill-resume.sh run` (the real `mrd.file/1` scenario) now passes cleanly, 3/3, over a
+  real 15s veth cut — but `probe` (task 10.15's smaller chat-only companion, which sends a message
+  *immediately* after `ice_restart()` returns rather than polling for a bitmap first) fails
+  reproducibly, 5/5: both sides' `ice_restart()` calls return `Ok` (the full ADR 0025 signaling round
+  trip and layered fingerprint check genuinely succeed — confirmed, not the old no-op gap recurring),
+  but a chat message sent right after is never received, with no local error. Diagnosed live and
+  independently re-confirmed by this task's own test-engineer review: plain IP connectivity recovers
+  immediately post-restore (the network fabric itself is fine), real ICE-level traffic (~6–13
+  packets) genuinely flows in the exact window between `Ok` and the failed send (ruling out "nothing
+  happening at all"), and inserting a throwaway 3-second sleep before the send made `probe` pass
+  reliably (reproduced independently by two different people/passes) — strong evidence the race sits
+  at the DTLS/SCTP association layer, which must itself reconverge above ICE and has no observable
+  readiness signal today. `run` doesn't hit this because its sender happens to poll for a resume
+  bitmap first, incidentally buying enough wall-clock time. **Not a security issue** (no fingerprint/
+  auth check involved) and **not blocking Phase 10's exit gate** (task 10.24 re-runs the feature's own
+  acceptance demo, `run`, which already passes; `probe` was never itself an acceptance criterion) —
+  but a real reliability/observability gap: no open task owns adding a readiness signal (e.g. waiting
+  for the transport's own post-restart `Connected`-equivalent state, which `WebRtcTransport` doesn't
+  yet wire up for anything but the *original* connection per ADR 0025's own noted scope) before
+  `ice_restart()` returns, or before a caller sends immediately afterward. Pick up via a future
+  `/plan-phase`, alongside the already-tracked `RESTART_GLARE_WINDOW` and `on_reconnect`-hook
+  residuals this compounds with.
 > live in each task file's **Outcome** section (and the phase README) — not here. This block carries
 > only what is *currently actionable* plus obligations no open task owns.
 
@@ -876,7 +957,7 @@ agent; landing order and dependencies: [phase-9/README.md](./phase-9/README.md#t
 - [x] **9.9** Add `Mailbox::validate` config check (N1) — [file](./phase-9/9.9-mailbox-config-validate.md)
 - [x] **9.10** Nit sweep: mailbox-drain proptest, `purge_loop` coverage, double-ack no-op test (N3, N4, N5; soft-depends on 9.1, 9.3) — [file](./phase-9/9.10-phase-9-nit-sweep.md)
 
-### Phase 10 — File Transfer Stream · **in progress — 17 tasks planned, 0/17 done** · [details](./phase-10/README.md)
+### Phase 10 — File Transfer Stream · **closed — 24/24 done** · [details](./phase-10/README.md)
 Build phase. **[T09 — File Transfer Stream](../architecture/features/09-file-transfer.md)** alone:
 `mrd.file/1` as a stream-type extension (manifest-on-ctrl, 64 KiB AEAD-chunked, backpressure,
 resume-via-bitmap, incremental subtree verification, TUI inline preview/progress). Dep T04 done since
@@ -892,7 +973,10 @@ diffs to any core crate; (2) per-stream keys need a new `DoubleRatchet` HKDF-exp
 (`apps/crypto`) — already-accepted design per `stream-types-v1.md`/the crypto-protocols skill, no new
 ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md](./phase-10/README.md#architect-consult-substratewire-shape-decisions-settled-before-task-breakdown).
 17 tasks (10.1–10.17) across 9 dependency waves, planned by the **planner** agent:
-[phase-10/README.md](./phase-10/README.md#tasks-todo).
+[phase-10/README.md](./phase-10/README.md#tasks-todo). Task 10.17's own exit-gate attempt found a
+real, live-reconfirmed blocking finding (`WebRtcTransport::ice_restart`'s no-op — see
+[ADR 0025](../adr/0025-ice-restart-renegotiation.md)); tasks 10.18–10.24 (7 more, fixing that gap and
+an earlier, independently-discovered SCTP defect) closed the phase — 24/24 done.
 
 - [x] **10.1** Ratchet HKDF-export for per-stream keys — [file](./phase-10/10.1-ratchet-hkdf-export.md)
 - [x] **10.2** `Transport::buffered_amount` backpressure primitive — [file](./phase-10/10.2-transport-buffered-amount.md)
@@ -911,7 +995,13 @@ ADR, but mandatory security-reviewer sign-off. Full record: [phase-10/README.md]
 - [x] **10.15** Kill/resume test automation (depends on 10.9, 10.10, 10.13) — [file](./phase-10/10.15-kill-resume-automation.md)
 - [x] **10.16** Corrupted-chunk adversarial test (depends on 10.8) — [file](./phase-10/10.16-corrupted-chunk-adversarial-test.md)
 - [x] **10.18** Fix: real `WebRtcTransport` can't send a full 64 KiB `mrd.file/1` chunk (depends on 10.7) — [file](./phase-10/10.18-sctp-max-message-size-fix.md)
-- [x] **10.17** Phase exit: acceptance demo + third-party implementability check + doc sync (depends on all above, including 10.18) — [file](./phase-10/10.17-phase-exit-demo.md)
+- [x] **10.17** Phase exit (first attempt): acceptance demo + third-party implementability check + doc sync (depends on all above, including 10.18) — [file](./phase-10/10.17-phase-exit-demo.md). Fully executed; verdict is a blocking finding (`ice_restart` no-op), not a clean pass.
+- [x] **10.19** Real `Transport::ice_restart` (webrtc-rs primitive) (depends on 10.18) — [file](./phase-10/10.19-real-transport-ice-restart.md)
+- [x] **10.20** Wire types: `SignalContent::IceRestartOffer`/`Answer` — [file](./phase-10/10.20-ice-restart-wire-types.md)
+- [x] **10.21** Tolerant (mailbox-eligible) restart delivery (depends on 10.20) — [file](./phase-10/10.21-tolerant-restart-delivery.md)
+- [x] **10.22** `P2pSession::ice_restart` real signaling (depends on 10.19, 10.20, 10.21) — [file](./phase-10/10.22-session-ice-restart-signaling.md)
+- [x] **10.23** CLI/demo wiring for the new `ice_restart` signature (depends on 10.22) — [file](./phase-10/10.23-cli-ice-restart-wiring.md). Fully executed; `run` (the feature-defining kill/resume scenario) now genuinely passes live — see [transcript](./phase-10/10.23-demo-transcript.md); the smaller `probe` companion still fails live, for a new, distinct readiness-race reason recorded there, not the old `ice_restart` no-op.
+- [x] **10.24** Phase exit-gate re-run (depends on 10.19–10.23) — [file](./phase-10/10.24-phase-exit-gate-rerun.md). Verdict: GO — Phase 10's exit criteria are met, phase closed (24/24).
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.

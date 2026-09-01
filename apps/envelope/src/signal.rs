@@ -43,6 +43,30 @@ pub enum SignalContent {
         dtls_fp: String,
         ice: Vec<String>,
     },
+    /// An unsolicited ICE-restart offer riding this same session-substrate signaling tier
+    /// ([ADR 0025](../../../docs/adr/0025-ice-restart-renegotiation.md)) — same shape as
+    /// [`SdpOffer`](SignalContent::SdpOffer), but carries a fresh SDP offer/candidate set for an
+    /// *already-established* session whose P2P path has degraded, not the initial session
+    /// establishment. Delivery is tolerant (mailbox-eligible), never hard-fail, since a live ratchet
+    /// session already exists to fall back on.
+    IceRestartOffer {
+        #[serde(with = "meridian_proto::bytes::bytes_vec")]
+        sdp: Vec<u8>,
+        dtls_fp: String,
+        ice: Vec<String>,
+    },
+    /// The response to an [`IceRestartOffer`](SignalContent::IceRestartOffer), same shape as
+    /// [`SdpAnswer`](SignalContent::SdpAnswer) ([ADR 0025](../../../docs/adr/0025-ice-restart-renegotiation.md)).
+    /// A real ICE restart never recreates the `RTCPeerConnection`, so `dtls_fp` here is expected to
+    /// still match the session's already-cached fingerprint — checked as a *second*, additional
+    /// assertion layered on top of the ordinary asserted-vs-negotiated cross-check (§4.6), not a
+    /// replacement for it.
+    IceRestartAnswer {
+        #[serde(with = "meridian_proto::bytes::bytes_vec")]
+        sdp: Vec<u8>,
+        dtls_fp: String,
+        ice: Vec<String>,
+    },
     /// Trickled ICE candidates discovered after the offer/answer.
     IceTrickle { candidates: Vec<String> },
     /// A ratchet-sealed `mrd.ctrl/1` frame (channel 0). Carried in-band on the ctrl data channel

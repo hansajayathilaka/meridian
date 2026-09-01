@@ -354,6 +354,18 @@ impl Transport for LoopbackTransport {
         })
     }
 
+    async fn set_remote_offer_and_answer(&self, s: &SessionHandle, sdp: Sdp) -> Result<()> {
+        // Unlike the real webrtc-rs backend, this loopback fabric has no JSEP offer/answer role
+        // state machine at all — `set_remote_description` above never infers offer-vs-answer from
+        // any `committed_local_sdp`-style local commit state; it always just parses the peer's SDP
+        // and records `peer`/`remote_fp` directly, which is already exactly what a genuine-offer
+        // caller needs. So this is a plain delegation, not a distinct code path: nothing here can
+        // exhibit the real backend's role-inference bug in the first place, but callers (e.g. the
+        // ICE-restart answerer path in `apps/core/src/session.rs`) still call this method by name
+        // so the same call site works unmodified across both backends.
+        self.set_remote_description(s, sdp).await
+    }
+
     async fn add_ice_candidate(&self, s: &SessionHandle, _c: IceCandidate) -> Result<()> {
         // Candidates only refine the path in a real backend; on the loopback the link is already up
         // once descriptions are exchanged. Just validate the handle.

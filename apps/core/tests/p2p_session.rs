@@ -672,8 +672,24 @@ async fn ice_restart_preserves_session_and_ratchet() {
     )
     .await;
 
-    asess.ice_restart().await.unwrap();
-    bsess.ice_restart().await.unwrap();
+    // (task 10.22) `ice_restart` now needs a real, symmetric signaling round trip — a fresh
+    // restart-scoped relay pair, per ADR 0025 ("used only for the bounded duration of one restart
+    // attempt, then dropped again"), and both sides genuinely have to run it concurrently: whoever
+    // is on the lexicographically-larger-key side waits (briefly) for the other's offer, so a
+    // sequential `asess.ice_restart(..).await; bsess.ice_restart(..).await;` would deadlock the
+    // first call waiting on a peer that hasn't even started yet.
+    let (mut restart_relay_a, mut restart_relay_b) = MemRelay::pair(alice.ik(), bob.ik());
+    let (ares, bres) = tokio::join!(
+        asess.ice_restart(
+            &mut restart_relay_a,
+            &alice.store,
+            &ahandle,
+            &mut alice.chat
+        ),
+        bsess.ice_restart(&mut restart_relay_b, &bob.store, &bhandle, &mut bob.chat),
+    );
+    ares.expect("alice ice_restart");
+    bres.expect("bob ice_restart");
 
     asess
         .send_chat(&alice.store, &ahandle, &mut alice.chat, "after restart")
@@ -689,6 +705,361 @@ async fn ice_restart_preserves_session_and_ratchet() {
         }
         other => panic!("post-restart message lost: {other:?}"),
     }
+}
+
+/// (task 10.22, deliverable a) Both sides call [`P2pSession::ice_restart`] **concurrently** — the
+/// glare case ADR 0025 names as more likely for a restart than for the one-shot initial dial. The
+/// identity-key tie-break must resolve this deterministically (the same, coherent SDP exchange
+/// completes) regardless of `tokio::join!`'s own scheduling order between the two futures, which
+/// this test does not (and cannot) control — that's the actual point: correctness here comes from
+/// the code's own tie-break, not from any accidental ordering.
+#[tokio::test]
+async fn ice_restart_glare_resolves_deterministically_and_both_sides_return_ok() {
+    let mut alice = Peer::new("glare.a");
+    let mut bob = Peer::new("glare.b");
+    establish_ratchet(&mut alice, &mut bob);
+
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(LoopbackTransport::new(fabric.clone()));
+    let tb = Arc::new(LoopbackTransport::new(fabric.clone()));
+
+    let (ra, rb) = connect(
+        ta,
+        tb,
+        &mut alice,
+        &mut bob,
+        Arc::new(StreamRegistry::with_builtins()),
+        Arc::new(StreamRegistry::with_builtins()),
+    )
+    .await;
+    let mut asess = ra.unwrap();
+    let mut bsess = rb.unwrap();
+
+    // Fingerprints agree before the restart (§4.6 already passed once).
+    let (a_local_before, a_remote_before) = asess.fingerprints();
+    let (b_local_before, b_remote_before) = bsess.fingerprints();
+    assert_eq!(a_local_before, b_remote_before);
+    assert_eq!(b_local_before, a_remote_before);
+
+    let ahandle = alice.handle();
+    let bhandle = bob.handle();
+    let (mut restart_relay_a, mut restart_relay_b) = MemRelay::pair(alice.ik(), bob.ik());
+    let (ares, bres) = tokio::join!(
+        asess.ice_restart(
+            &mut restart_relay_a,
+            &alice.store,
+            &ahandle,
+            &mut alice.chat
+        ),
+        bsess.ice_restart(&mut restart_relay_b, &bob.store, &bhandle, &mut bob.chat),
+    );
+    ares.expect("alice's concurrent ice_restart must resolve to Ok, not deadlock or race");
+    bres.expect("bob's concurrent ice_restart must resolve to Ok, not deadlock or race");
+
+    // One coherent, non-conflicting SDP exchange happened — not two independent, split-brained
+    // negotiations — proven the same way the original handshake's own coherence is proven
+    // elsewhere in this file: the bound fingerprints still cross-check after the restart.
+    let (a_local_after, a_remote_after) = asess.fingerprints();
+    let (b_local_after, b_remote_after) = bsess.fingerprints();
+    assert_eq!(a_local_after, b_remote_after);
+    assert_eq!(b_local_after, a_remote_after);
+
+    // The restart is genuinely two-way live, not merely "returned Ok": a message flows each way
+    // afterward, over the same session (no re-handshake).
+    asess
+        .send_chat(&alice.store, &ahandle, &mut alice.chat, "still alive: a->b")
+        .await
+        .unwrap();
+    accept_first_p2p_message(
+        &mut bsess,
+        &bob.store,
+        &bhandle,
+        &mut bob.chat,
+        &alice.ik(),
+        "still alive: a->b",
+    )
+    .await;
+    bsess
+        .send_chat(&bob.store, &bhandle, &mut bob.chat, "still alive: b->a")
+        .await
+        .unwrap();
+    match asess
+        .pump(&alice.store, &ahandle, &mut alice.chat)
+        .await
+        .unwrap()
+    {
+        Some(SessionEvent::Chat(ChatContent::Text { body, .. })) => {
+            assert_eq!(body, "still alive: b->a");
+        }
+        other => panic!("alice expected chat after glare-resolved restart, got {other:?}"),
+    }
+}
+
+/// (task 10.22) The smaller-key side's own "discard a competing offer, keep waiting for my
+/// answer within the remaining budget" branch, isolated deterministically: a bogus
+/// `IceRestartOffer` is pre-queued into Alice's restart-relay inbox *before* either side's
+/// `ice_restart()` call starts, so it is guaranteed (FIFO `MemRelay`) to be the first thing Alice's
+/// own wait-for-answer loop sees — she must discard it and keep waiting, then still pick up Bob's
+/// genuine answer that arrives right behind it. Alice's identity key is generated smaller than
+/// Bob's (retried until true — the tie-break is on live key bytes, not something this test can
+/// otherwise pin) so this exercises the *offerer's* discard branch specifically (mirrors the
+/// smaller-key side of `ice_restart_glare_resolves_deterministically_and_both_sides_return_ok`).
+#[tokio::test]
+async fn ice_restart_smaller_key_discards_a_spurious_incoming_offer_while_awaiting_its_answer() {
+    let (mut alice, mut bob) = smaller_and_larger_key_peers("discard.a", "discard.b");
+    establish_ratchet(&mut alice, &mut bob);
+    assert!(alice.ik() < bob.ik(), "alice must hold the smaller key");
+
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(LoopbackTransport::new(fabric.clone()));
+    let tb = Arc::new(LoopbackTransport::new(fabric.clone()));
+
+    let (ra, rb) = connect(
+        ta,
+        tb,
+        &mut alice,
+        &mut bob,
+        Arc::new(StreamRegistry::with_builtins()),
+        Arc::new(StreamRegistry::with_builtins()),
+    )
+    .await;
+    let mut asess = ra.unwrap();
+    let mut bsess = rb.unwrap();
+
+    let ahandle = alice.handle();
+    let bhandle = bob.handle();
+
+    let (mut restart_relay_a, mut restart_relay_b) = MemRelay::pair(alice.ik(), bob.ik());
+
+    // Pre-seed a syntactically-valid-enough (but entirely bogus) `IceRestartOffer` into Alice's
+    // inbox, sealed on Bob's real ratchet so it decrypts fine — Alice's discard branch fires on the
+    // envelope's *type* alone, never touching the bogus SDP/fingerprint fields inside.
+    let bogus_offer = SignalContent::IceRestartOffer {
+        sdp: b"v=loopback\ntoken=999999\nfp=sha-256 LOOPBACK:bogus\ngen=0\n".to_vec(),
+        dtls_fp: "sha-256 LOOPBACK:bogus".to_string(),
+        ice: vec!["candidate:host 1 10.0.0.1".to_string()],
+    };
+    let bogus_blob = bob
+        .chat
+        .seal_bytes(
+            &bob.store,
+            &bhandle,
+            &bob.ik(),
+            &alice.ik(),
+            &bogus_offer.encode().expect("encode bogus offer"),
+        )
+        .expect("seal bogus offer on bob's real ratchet");
+    restart_relay_b
+        .send(&alice.ik(), bogus_blob)
+        .await
+        .expect("pre-seed alice's inbox with the bogus offer");
+
+    let (ares, bres) = tokio::join!(
+        asess.ice_restart(
+            &mut restart_relay_a,
+            &alice.store,
+            &ahandle,
+            &mut alice.chat
+        ),
+        bsess.ice_restart(&mut restart_relay_b, &bob.store, &bhandle, &mut bob.chat),
+    );
+    ares.expect("alice must discard the spurious offer and still complete via bob's real answer");
+    bres.expect("bob's ice_restart must complete normally");
+
+    // The session is still genuinely alive on both ends after discarding the spurious offer.
+    asess
+        .send_chat(&alice.store, &ahandle, &mut alice.chat, "post-discard")
+        .await
+        .unwrap();
+    accept_first_p2p_message(
+        &mut bsess,
+        &bob.store,
+        &bhandle,
+        &mut bob.chat,
+        &alice.ik(),
+        "post-discard",
+    )
+    .await;
+}
+
+/// (task 10.22, deliverable c) A restart offer whose asserted `dtls_fp` field does not match what
+/// the transport actually negotiates from the SDP it carries is rejected exactly like the original
+/// handshake's own fingerprint check — the *ordinary*, unweakened §4.6 cross-check
+/// ([`SessionError::FingerprintMismatch`]), not the new layered check. Constructed the same way
+/// `p2p_session.rs`'s own `relay_only_answer_aborts_before_any_signaling_send_on_a_leaked_host_candidate`
+/// crafts a fake envelope by hand: `LoopbackTransport::set_remote_description` negotiates whatever
+/// fingerprint is embedded in the SDP text itself (`fp=...`), independent of the envelope's own
+/// separate `dtls_fp` field — deliberately making the two disagree here is what proves the check
+/// actually reads the transport's own negotiated value rather than merely trusting the assertion.
+#[tokio::test]
+async fn ice_restart_rejects_a_corrupted_dtls_fp_in_the_restart_offer() {
+    let (mut alice, mut bob) = smaller_and_larger_key_peers("corrupt.a", "corrupt.b");
+    establish_ratchet(&mut alice, &mut bob);
+    assert!(bob.ik() > alice.ik(), "bob must hold the larger key");
+
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(LoopbackTransport::new(fabric.clone()));
+    let tb = Arc::new(LoopbackTransport::new(fabric.clone()));
+
+    let (ra, rb) = connect(
+        ta,
+        tb,
+        &mut alice,
+        &mut bob,
+        Arc::new(StreamRegistry::with_builtins()),
+        Arc::new(StreamRegistry::with_builtins()),
+    )
+    .await;
+    let asess = ra.unwrap();
+    let mut bsess = rb.unwrap();
+    drop(asess); // alice's live session is never driven in this test; bob processes a hand-crafted offer.
+
+    let bhandle = bob.handle();
+
+    // A syntactically valid SDP whose *embedded* fingerprint (what the transport will actually
+    // negotiate) differs from the envelope's own asserted `dtls_fp` field — the deliberate
+    // corruption/substitution this test targets.
+    let corrupted_offer = SignalContent::IceRestartOffer {
+        sdp: b"v=loopback\ntoken=42\nfp=sha-256 LOOPBACK:REAL-NEGOTIATED\ngen=0\n".to_vec(),
+        dtls_fp: "sha-256 LOOPBACK:SUBSTITUTED-WRONG".to_string(),
+        ice: vec!["candidate:host 1 10.0.0.2".to_string()],
+    };
+    let blob = alice
+        .chat
+        .seal_bytes(
+            &alice.store,
+            &alice.handle(),
+            &alice.ik(),
+            &bob.ik(),
+            &corrupted_offer.encode().expect("encode corrupted offer"),
+        )
+        .expect("seal corrupted offer on alice's real ratchet");
+    // Deliver directly into bob's own inbound queue (bob is the larger key, so his `ice_restart`
+    // waits for an incoming offer first — exactly what it will see here). `feeder` plays alice's
+    // side of a fresh restart-scoped relay pair, used only to inject this one hand-crafted message.
+    let (mut feeder, mut restart_relay_b) = MemRelay::pair(alice.ik(), bob.ik());
+    feeder
+        .send(&bob.ik(), blob)
+        .await
+        .expect("deliver the corrupted offer to bob's inbox");
+
+    let result = bsess
+        .ice_restart(&mut restart_relay_b, &bob.store, &bhandle, &mut bob.chat)
+        .await;
+    match result {
+        Err(SessionError::FingerprintMismatch { .. }) => {}
+        Err(e) => panic!("expected FingerprintMismatch, got a different error: {e}"),
+        Ok(()) => panic!("a corrupted restart-offer fingerprint must never be accepted"),
+    }
+}
+
+/// (task 10.22, deliverable d) The **layered** check's own new arm: the ordinary asserted-vs-
+/// negotiated cross-check passes (the envelope's `dtls_fp` matches exactly what
+/// `LoopbackTransport` negotiates from the SDP it carries), but the negotiated value no longer
+/// equals the session's own cached `remote_fp` from the *original* handshake — simulating exactly
+/// the "something rotated the peer's cert unexpectedly" scenario `RestartFingerprintDrift`'s own
+/// doc comment describes. `LoopbackTransport::set_remote_description` trusts whatever fingerprint
+/// is embedded in the peer's SDP verbatim (no independent negotiation of its own to fake), so
+/// asserting a *different* fingerprint than the one cached at the original handshake — while still
+/// keeping the envelope's own `dtls_fp` field consistent with that new SDP — is a faithful stand-in
+/// for "the DTLS identity actually presented during the restart no longer matches the one bound at
+/// handshake time", without needing a real webrtc-rs backend to (mis)implement a real cert
+/// rotation bug.
+#[tokio::test]
+async fn ice_restart_layered_check_flags_fingerprint_drift_against_the_cached_value() {
+    let (mut alice, mut bob) = smaller_and_larger_key_peers("drift.a", "drift.b");
+    establish_ratchet(&mut alice, &mut bob);
+    assert!(bob.ik() > alice.ik(), "bob must hold the larger key");
+
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(LoopbackTransport::new(fabric.clone()));
+    let tb = Arc::new(LoopbackTransport::new(fabric.clone()));
+
+    let (ra, rb) = connect(
+        ta,
+        tb,
+        &mut alice,
+        &mut bob,
+        Arc::new(StreamRegistry::with_builtins()),
+        Arc::new(StreamRegistry::with_builtins()),
+    )
+    .await;
+    let asess = ra.unwrap();
+    let mut bsess = rb.unwrap();
+    // `bsess`'s own cached `remote_fp` is *alice's* fingerprint (from the original handshake) —
+    // this test drifts exactly that cached value, so bob's `ice_restart`'s layered check is what
+    // must catch it.
+    let (_bob_local_before, cached_alice_fp) = bsess.fingerprints();
+    let cached_alice_fp = cached_alice_fp.clone();
+    drop(asess); // alice's live session is never driven in this test; bob processes a hand-crafted offer.
+
+    let bhandle = bob.handle();
+
+    // A "restart offer from alice" whose asserted `dtls_fp` matches its own embedded SDP exactly
+    // (the ordinary check passes) but is a *different* value than what bob's session originally
+    // cached for alice at handshake time (the layered check's own new arm must catch this).
+    let drifted_fp = "sha-256 LOOPBACK:DRIFTED-CERT".to_string();
+    assert_ne!(
+        drifted_fp, cached_alice_fp.0,
+        "the drifted fingerprint must genuinely differ from the cached one for this test to prove anything"
+    );
+    let drifted_offer = SignalContent::IceRestartOffer {
+        sdp: format!("v=loopback\ntoken=7\nfp={drifted_fp}\ngen=0\n").into_bytes(),
+        dtls_fp: drifted_fp.clone(),
+        ice: vec!["candidate:host 1 10.0.0.3".to_string()],
+    };
+    let blob = alice
+        .chat
+        .seal_bytes(
+            &alice.store,
+            &alice.handle(),
+            &alice.ik(),
+            &bob.ik(),
+            &drifted_offer.encode().expect("encode drifted offer"),
+        )
+        .expect("seal drifted offer on alice's real ratchet");
+    let (mut feeder_a, mut restart_relay_b) = MemRelay::pair(alice.ik(), bob.ik());
+    feeder_a
+        .send(&bob.ik(), blob)
+        .await
+        .expect("deliver the drifted offer to bob's inbox");
+
+    let result = bsess
+        .ice_restart(&mut restart_relay_b, &bob.store, &bhandle, &mut bob.chat)
+        .await;
+    match result {
+        Err(SessionError::RestartFingerprintDrift {
+            local,
+            expected,
+            negotiated,
+        }) => {
+            assert!(
+                !local,
+                "the drift is on the remote (alice's) side, not ours"
+            );
+            assert_eq!(expected, cached_alice_fp.0);
+            assert_eq!(negotiated, drifted_fp);
+        }
+        Err(e) => panic!("expected RestartFingerprintDrift, got a different error: {e}"),
+        Ok(()) => panic!(
+            "a negotiated fingerprint that silently drifted from the cached value must never pass"
+        ),
+    }
+}
+
+/// Generates `(smaller, larger)` peers where `smaller.ik() < larger.ik()` — the identity-key
+/// tie-break `P2pSession::ice_restart` uses is on live, randomly-generated key bytes, so this
+/// retries generation until the desired ordering holds (a coin flip each time; bounded so a broken
+/// generator fails loudly instead of spinning forever).
+fn smaller_and_larger_key_peers(smaller_hint: &str, larger_hint: &str) -> (Peer, Peer) {
+    for _ in 0..64 {
+        let a = Peer::new(smaller_hint);
+        let b = Peer::new(larger_hint);
+        if a.ik() < b.ik() {
+            return (a, b);
+        }
+    }
+    panic!("failed to generate a smaller/larger identity-key pair after 64 attempts");
 }
 
 #[tokio::test]
@@ -1083,6 +1454,13 @@ impl Transport for LeakyTransport {
     async fn set_remote_description(&self, s: &SessionHandle, sdp: Sdp) -> TransportResult<()> {
         self.0.set_remote_description(s, sdp).await
     }
+    async fn set_remote_offer_and_answer(
+        &self,
+        s: &SessionHandle,
+        sdp: Sdp,
+    ) -> TransportResult<()> {
+        self.0.set_remote_offer_and_answer(s, sdp).await
+    }
     async fn add_ice_candidate(&self, s: &SessionHandle, c: IceCandidate) -> TransportResult<()> {
         self.0.add_ice_candidate(s, c).await
     }
@@ -1133,6 +1511,14 @@ impl SignalRelay for CountingRelay {
     async fn send(&mut self, to: &[u8; 32], blob: Vec<u8>) -> Result<(), SessionError> {
         self.sends += 1;
         self.inner.send(to, blob).await
+    }
+    async fn send_tolerant(
+        &mut self,
+        to: &[u8; 32],
+        blob: Vec<u8>,
+    ) -> Result<meridian_core::signaling::RouteOutcome, SessionError> {
+        self.sends += 1;
+        self.inner.send_tolerant(to, blob).await
     }
     async fn recv(&mut self) -> Result<([u8; 32], Vec<u8>), SessionError> {
         self.inner.recv().await

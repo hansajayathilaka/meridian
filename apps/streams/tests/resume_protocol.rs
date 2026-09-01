@@ -326,9 +326,27 @@ async fn resume_after_ice_restart_completes_the_transfer_resending_zero_already_
     // `P2pSession::ice_restart` (mirrors `apps/core/tests/p2p_session.rs`'s own
     // `ice_restart_preserves_session_and_ratchet`). Ratchet + stream-level state (the open
     // `mrd.file/1` data channel, `alice_file`'s resume watcher, `receiver`'s own bookkeeping) all
-    // survive untouched — this is exactly invariant 5. ---
-    asess.ice_restart().await.expect("alice ice_restart");
-    bsess.ice_restart().await.expect("bob ice_restart");
+    // survive untouched — this is exactly invariant 5. (task 10.22) The signature now needs a real,
+    // symmetric signaling round trip — a fresh restart-scoped relay pair, run concurrently (the
+    // lexicographically-larger-key side waits briefly for the other's offer, so a sequential
+    // await/await here would deadlock the first call). ---
+    let (mut restart_relay_a, mut restart_relay_b) = MemRelay::pair(alice.ik(), bob.ik());
+    let (ares, bres) = tokio::join!(
+        asess.ice_restart(
+            &mut restart_relay_a,
+            &alice.store,
+            alice.account.handle(),
+            &mut alice.chat
+        ),
+        bsess.ice_restart(
+            &mut restart_relay_b,
+            &bob.store,
+            bob.account.handle(),
+            &mut bob.chat
+        ),
+    );
+    ares.expect("alice ice_restart");
+    bres.expect("bob ice_restart");
 
     // "Once the stream is live again": bob sends the current resume bitmap over the same,
     // still-open `mrd.file/1` channel.
@@ -480,9 +498,25 @@ async fn resume_after_ice_restart_resends_exactly_a_scattered_non_contiguous_mis
     assert_eq!(receiver.received_offsets().len(), delivered_indices.len());
     assert!(!receiver.is_complete());
 
-    // --- Phase 2: drop + redial, exactly as the prefix/suffix test does. ---
-    asess.ice_restart().await.expect("alice ice_restart");
-    bsess.ice_restart().await.expect("bob ice_restart");
+    // --- Phase 2: drop + redial, exactly as the prefix/suffix test does (task 10.22: real,
+    // symmetric signaling round trip over a fresh restart-scoped relay pair, run concurrently). ---
+    let (mut restart_relay_a, mut restart_relay_b) = MemRelay::pair(alice.ik(), bob.ik());
+    let (ares, bres) = tokio::join!(
+        asess.ice_restart(
+            &mut restart_relay_a,
+            &alice.store,
+            alice.account.handle(),
+            &mut alice.chat
+        ),
+        bsess.ice_restart(
+            &mut restart_relay_b,
+            &bob.store,
+            bob.account.handle(),
+            &mut bob.chat
+        ),
+    );
+    ares.expect("alice ice_restart");
+    bres.expect("bob ice_restart");
 
     send_resume_bitmap(&mut bsess, &mut bob.chat, sid, &receiver)
         .await
