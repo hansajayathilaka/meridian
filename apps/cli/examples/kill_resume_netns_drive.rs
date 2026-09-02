@@ -238,27 +238,20 @@ fn leaf_count_for_size(size: u64) -> usize {
     }
 }
 
-/// Mirrors `apps/cli/src/send.rs::distinct_chunk_indices` exactly: the set of distinct chunk indices
-/// actually arrived so far, from raw arrival-order `pending_chunks` — this driver's receiver side
-/// deliberately reuses `send.rs`'s own real-production bookkeeping approach (not `FileReceiver`'s
-/// per-chunk-proof API, whose wire delivery mechanism is a separate, upstream `TODO: confirm` this
-/// task does not solve — see `apps/streams/src/receiver.rs`'s module doc) rather than inventing a
-/// third convention.
-fn distinct_chunk_indices(pending_chunks: &[Vec<u8>]) -> std::collections::BTreeSet<u64> {
-    pending_chunks
-        .iter()
-        .filter_map(|raw| ChunkFrame::decode(raw).ok())
-        .map(|frame| frame.i)
-        .collect()
-}
-
 /// Whole-file reassembly + BLAKE3 verification, mirroring `send.rs::finalize_transfer`'s real
 /// production approach (per-chunk AEAD open, whole-file merkle check) minus the on-disk sanity cap
-/// (this driver's test files are always small).
-fn finalize(manifest: &FileManifest, k_f: &[u8; 32], pending_chunks: &[Vec<u8>]) -> Vec<u8> {
+/// (this driver's test files are always small). (task 11.3: `pending_chunks` is now itself keyed by
+/// chunk index — the `distinct_chunk_indices` rescan helper this file used to mirror from
+/// `send.rs`/`kill_resume_simulated.rs` is gone there too, replaced by reading the map's own key set
+/// directly; every call site below does the same.)
+fn finalize(
+    manifest: &FileManifest,
+    k_f: &[u8; 32],
+    pending_chunks: &std::collections::BTreeMap<u64, Vec<u8>>,
+) -> Vec<u8> {
     let leaf_count = leaf_count_for_size(manifest.size);
     let mut buf = vec![0u8; manifest.size as usize];
-    for raw in pending_chunks {
+    for raw in pending_chunks.values() {
         let frame = ChunkFrame::decode(raw).expect("valid chunk frame");
         if frame.i as usize >= leaf_count {
             continue;
@@ -563,7 +556,7 @@ async fn run_receiver(rundir: &Path, output: &Path, split: usize) -> Result<(), 
             Ok(_) => {
                 if let Some(sid) = sid {
                     let transfer = file_stream.transfer(sid).expect("tracked transfer");
-                    if distinct_chunk_indices(&transfer.pending_chunks).len() >= split {
+                    if transfer.pending_chunks.len() >= split {
                         break;
                     }
                 }
@@ -602,9 +595,9 @@ async fn run_receiver(rundir: &Path, output: &Path, split: usize) -> Result<(), 
     // of `send_resume_bitmap`, built from this driver's own real-production-style bookkeeping rather
     // than `FileReceiver`, per this module's doc).
     let leaf_count = leaf_count_for_size(manifest.size);
-    let received = {
+    let received: std::collections::BTreeSet<u64> = {
         let transfer = file_stream.transfer(sid).expect("tracked transfer");
-        distinct_chunk_indices(&transfer.pending_chunks)
+        transfer.pending_chunks.keys().copied().collect()
     };
     let resume = ResumeRequest::from_received(&received, leaf_count);
     let resume_body = resume.encode().map_err(|e| e.to_string())?;
@@ -626,7 +619,7 @@ async fn run_receiver(rundir: &Path, output: &Path, split: usize) -> Result<(), 
     tokio::time::timeout(POST_RESTORE_TIMEOUT, async {
         loop {
             let transfer = file_stream.transfer(sid).expect("tracked transfer");
-            if distinct_chunk_indices(&transfer.pending_chunks).len() >= leaf_count {
+            if transfer.pending_chunks.len() >= leaf_count {
                 return Ok::<(), String>(());
             }
             match sess.pump(&store, &handle, &mut chat).await {

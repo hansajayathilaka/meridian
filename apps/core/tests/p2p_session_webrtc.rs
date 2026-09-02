@@ -452,3 +452,172 @@ async fn ice_restart_preserves_session_and_ratchet_over_webrtc() {
         other => panic!("post-restart message lost: {other:?}"),
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_bidirectional_open_stream_never_collides_on_sid_over_webrtc() {
+    // Phase 11 review F1 regression, over the real backend: `p2p_session.rs`'s
+    // `concurrent_bidirectional_open_stream_never_collides_on_sid` proves the fix deterministically
+    // over `LoopbackTransport`; this proves the same race can't bind two `RTCDataChannel`s to the
+    // same negotiated SCTP stream id (`webrtc_backend::stream_id_for_label` derives that id purely
+    // from the channel *label*, which embeds `sid` — see `apps/core/src/session.rs`'s
+    // `stream_channel_label`). Before the fix, both peers' independently-incrementing `next_sid`
+    // counters would derive the identical `sid` here, so Alice's own locally-opened channel and the
+    // channel she opens to accept Bob's `Open` would carry the *literal same* label — either a hard
+    // `add_data_channel` failure (the backend's own `negotiated_ids` collision guard,
+    // `apps/transport/src/webrtc_backend.rs`) or, if that guard didn't catch it, two logically
+    // distinct streams cross-wired onto one SCTP stream.
+    use std::sync::Mutex;
+
+    struct Recorder {
+        received: Mutex<Vec<(meridian_core::streams::StreamId, Vec<u8>)>>,
+    }
+    impl Recorder {
+        fn new() -> Self {
+            Self {
+                received: Mutex::new(Vec::new()),
+            }
+        }
+        fn frames(&self) -> Vec<(meridian_core::streams::StreamId, Vec<u8>)> {
+            self.received.lock().unwrap().clone()
+        }
+    }
+    impl StreamType for Recorder {
+        fn name(&self) -> &'static str {
+            "mrd.echo/1"
+        }
+        fn version(&self) -> u16 {
+            1
+        }
+        fn channel_cfg(&self) -> ChannelCfg {
+            ChannelCfg::reliable_ordered("mrd.echo/1")
+        }
+        fn direction(&self) -> meridian_core::envelope::Direction {
+            meridian_core::envelope::Direction::Bidir
+        }
+        fn on_frame(&self, sid: meridian_core::streams::StreamId, frame: &[u8]) {
+            self.received.lock().unwrap().push((sid, frame.to_vec()));
+        }
+    }
+
+    let mut alice = Peer::new("f1.a");
+    let mut bob = Peer::new("f1.b");
+    establish_ratchet(&mut alice, &mut bob);
+
+    let ta = Arc::new(WebRtcTransport::new());
+    let tb = Arc::new(WebRtcTransport::new());
+
+    let alice_rec = Arc::new(Recorder::new());
+    let bob_rec = Arc::new(Recorder::new());
+    let mut reg_a = StreamRegistry::with_builtins();
+    register_stream_type(&mut reg_a, alice_rec.clone());
+    let mut reg_b = StreamRegistry::with_builtins();
+    register_stream_type(&mut reg_b, bob_rec.clone());
+
+    let (ra, rb) = connect(
+        ta,
+        tb,
+        &mut alice,
+        &mut bob,
+        Arc::new(reg_a),
+        Arc::new(reg_b),
+    )
+    .await;
+    let mut asess = ra.expect("dial established over real webrtc");
+    let mut bsess = rb.expect("answer established over real webrtc");
+
+    let ahandle = alice.handle();
+    let bhandle = bob.handle();
+
+    // The race: both sides open the same stream type without waiting on each other.
+    let (sid_a, sid_b) = {
+        let a = asess.open_stream(
+            &alice.store,
+            &ahandle,
+            &mut alice.chat,
+            "mrd.echo/1",
+            vec![],
+        );
+        let b = bsess.open_stream(&bob.store, &bhandle, &mut bob.chat, "mrd.echo/1", vec![]);
+        let (a, b) = tokio::join!(a, b);
+        (a.unwrap(), b.unwrap())
+    };
+
+    assert_ne!(
+        sid_a, sid_b,
+        "two independently, concurrently allocated sids for the same stream type must never collide"
+    );
+    assert_ne!(
+        sid_a % 2,
+        sid_b % 2,
+        "the two sides must allocate sids from disjoint (even/odd) domains"
+    );
+
+    // Drain both `Open`/`Accept` round trips. Real SCTP delivery ordering across two different data
+    // channels (ctrl carries both `Open`s and `Accept`s here) isn't guaranteed to interleave exactly
+    // like the deterministic loopback test, so each side just pumps until it has seen both of its
+    // expected `StreamOpened` events (its own accepted-by-peer sid, and the peer's opened-onto-us
+    // sid), tolerating either arrival order.
+    async fn drain_two_stream_opens<T: meridian_core::transport::Transport>(
+        sess: &mut P2pSession<T>,
+        store: &MemorySecretStore,
+        handle: &KeyHandle,
+        chat: &mut ChatState,
+        expect: [u64; 2],
+    ) {
+        let mut remaining: Vec<u64> = expect.to_vec();
+        while !remaining.is_empty() {
+            match sess.pump(store, handle, chat).await.unwrap() {
+                Some(SessionEvent::StreamOpened(got, ty)) => {
+                    assert_eq!(ty, "mrd.echo/1");
+                    let pos = remaining
+                        .iter()
+                        .position(|s| *s == got)
+                        .unwrap_or_else(|| panic!("unexpected StreamOpened sid {got}"));
+                    remaining.remove(pos);
+                }
+                other => panic!("expected StreamOpened, got {other:?}"),
+            }
+        }
+    }
+    tokio::join!(
+        drain_two_stream_opens(
+            &mut asess,
+            &alice.store,
+            &ahandle,
+            &mut alice.chat,
+            [sid_a, sid_b]
+        ),
+        drain_two_stream_opens(
+            &mut bsess,
+            &bob.store,
+            &bhandle,
+            &mut bob.chat,
+            [sid_a, sid_b]
+        ),
+    );
+
+    // No cross-talk over the real SCTP association: Alice's own stream (sid_a) must reach Bob
+    // tagged sid_a, Bob's own stream (sid_b) must reach Alice tagged sid_b — never mixed and never
+    // an `add_data_channel`/backend error, which is what a negotiated-stream-id collision between
+    // two distinct `RTCDataChannel`s would have produced.
+    asess
+        .send_stream_frame(&mut alice.chat, sid_a, b"alice's stream")
+        .await
+        .unwrap();
+    bsess
+        .send_stream_frame(&mut bob.chat, sid_b, b"bob's stream")
+        .await
+        .unwrap();
+
+    match bsess.pump(&bob.store, &bhandle, &mut bob.chat).await {
+        Ok(None) => {}
+        other => panic!("bob expected a silently-dispatched stream frame, got {other:?}"),
+    }
+    match asess.pump(&alice.store, &ahandle, &mut alice.chat).await {
+        Ok(None) => {}
+        other => panic!("alice expected a silently-dispatched stream frame, got {other:?}"),
+    }
+
+    assert_eq!(bob_rec.frames(), vec![(sid_a, b"alice's stream".to_vec())]);
+    assert_eq!(alice_rec.frames(), vec![(sid_b, b"bob's stream".to_vec())]);
+}
