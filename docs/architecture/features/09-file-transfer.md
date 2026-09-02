@@ -9,7 +9,7 @@
 Resumable, integrity-verified P2P file/image transfer implemented purely as a stream type against the T04 registry — no changes to core session code allowed. That constraint is the point: this task *validates* that "ultimate sharing platform" is an architectural property.
 
 ## Scope
-In: manifest on ctrl (name, size, BLAKE3 merkle root, per-file key sealed under the ratchet); 64 KiB chunks, AEAD per chunk (nonce = index), reliable-unordered channel; backpressure via bufferedAmount watermarks; resume via missing-range bitmap after redial; incremental subtree verification; recipient accept/reject policy hook (auto-accept images < N MB configurable); inline image preview in TUI (sixel/kitty where available) and progress UI; multi-file batches.
+In: manifest on ctrl (name, size, BLAKE3 merkle root, per-file key sealed under the ratchet); 64 KiB chunks, AEAD per chunk (nonce = index), reliable-unordered channel; backpressure via bufferedAmount watermarks; resume via missing-range bitmap after redial; incremental subtree verification (design goal — a mechanism is chosen but not yet wired into the real send path, see the Acceptance criteria below and [11.8's decision record](../../tasks/phase-11/11.8-chunk-proof-delivery-mechanism.md#risks--notes)); recipient accept/reject policy hook (auto-accept images < N MB configurable); inline image preview in TUI (sixel/kitty where available) and progress UI; multi-file batches.
 Out: reshare/dedup of identical ciphertext to other peers (design allows it, §7.2 — record as follow-up), mailbox'd attachments (offline file delivery is out of scope by design: files require a live session; small images may fall back to inline chat payloads ≤ 64 KiB).
 
 ## Deliverables
@@ -30,7 +30,7 @@ $ sha256sum on both ends → identical
 ```
 
 ## Acceptance criteria
-Byte-perfect delivery under the loss profile; resume never re-sends >2% already-delivered data; corrupted chunk (injected) is detected by AEAD/merkle and re-requested, never written; a *reference third-party check*: an engineer not on the task implements a toy `mrd.echo/1` stream from `stream-types-v1.md` in <1 day — if they can't, the contract doc fails acceptance.
+Byte-perfect delivery under the loss profile; resume never re-sends >2% already-delivered data; corrupted chunk (injected) is detected by AEAD, never written — AEAD authentication is genuinely per-chunk in the shipped `meridian send` path, but merkle-root verification there is whole-file only (checked once, after every chunk has arrived), so a corrupted-but-authenticated chunk fails the *entire* transfer today rather than being individually re-requested; per-chunk merkle detection + re-request is a real, tracked gap (review finding F8, [11.8's decision record](../../tasks/phase-11/11.8-chunk-proof-delivery-mechanism.md#risks--notes)) with a chosen mechanism (a flat leaf-hash list exchanged once via a new in-stream frame tag) not yet wired into the real send path; a *reference third-party check*: an engineer not on the task implements a toy `mrd.echo/1` stream from `stream-types-v1.md` in <1 day — if they can't, the contract doc fails acceptance.
 
 ## Risks / notes
 Throughput ceiling risk from SCTP-over-DTLS (§5.1): the soak report feeds the Phase-4 QUIC decision (ADR-6). Ship the numbers, don't hide them.
