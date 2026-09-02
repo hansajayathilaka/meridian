@@ -238,12 +238,19 @@ fn sample_file(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }
 
-/// Feeds every buffered raw `pending_chunks` entry (bare `ChunkFrame` bytes, post-tag-stripping —
-/// `FileStream::on_frame`'s own contract) into `receiver`, using `tree` to produce each chunk's own
-/// merkle proof (the test harness's own stand-in for however a real proof-delivery mechanism
-/// eventually reaches the receiver — `TODO: confirm`, `crate::receiver`'s own module doc).
-fn feed_into_receiver(receiver: &mut FileReceiver, pending: &[Vec<u8>], tree: &MerkleTree) {
-    for raw in pending {
+/// Feeds every buffered `pending_chunks` entry (bare `ChunkFrame` bytes, post-tag-stripping —
+/// `FileStream::on_frame`'s own contract; task 11.3: now keyed by each frame's own chunk index
+/// rather than arrival order, so callers pass whichever subset of values they want fed, e.g.
+/// `.values()` for everything or `.range(lo..)` for just a newly-arrived tail) into `receiver`,
+/// using `tree` to produce each chunk's own merkle proof (the test harness's own stand-in for
+/// however a real proof-delivery mechanism eventually reaches the receiver — `TODO: confirm`,
+/// `crate::receiver`'s own module doc).
+fn feed_into_receiver<'a>(
+    receiver: &mut FileReceiver,
+    frames: impl IntoIterator<Item = &'a Vec<u8>>,
+    tree: &MerkleTree,
+) {
+    for raw in frames {
         let frame = ChunkFrame::decode(raw).expect("valid chunk frame");
         let proof = tree.proof(frame.i as usize).expect("index in range");
         receiver
@@ -311,7 +318,7 @@ async fn resume_after_ice_restart_completes_the_transfer_resending_zero_already_
     let mut receiver = FileReceiver::new(manifest, k_f);
     {
         let transfer = bob_file.transfer(sid).expect("bob tracks the transfer");
-        feed_into_receiver(&mut receiver, &transfer.pending_chunks, &tree);
+        feed_into_receiver(&mut receiver, transfer.pending_chunks.values(), &tree);
     }
     assert_eq!(receiver.received_offsets().len(), DELIVERED as usize);
     assert!(!receiver.is_complete());
@@ -386,9 +393,10 @@ async fn resume_after_ice_restart_completes_the_transfer_resending_zero_already_
     drain_frames(&mut bsess, &mut bob, resent_indices.len()).await;
     {
         let transfer = bob_file.transfer(sid).expect("bob tracks the transfer");
-        // `pending_chunks` only ever grows (task 10.6's own contract) — feed just the newly-arrived
-        // tail rather than re-feeding what phase 1 already verified.
-        let new_frames = &transfer.pending_chunks[DELIVERED as usize..];
+        // (task 11.3) `pending_chunks` is now keyed by each chunk's own index and only ever grows —
+        // feed just the newly-arrived indices (>= DELIVERED) rather than re-feeding what phase 1
+        // already verified.
+        let new_frames = transfer.pending_chunks.range(DELIVERED..).map(|(_, v)| v);
         feed_into_receiver(&mut receiver, new_frames, &tree);
     }
 
@@ -493,7 +501,7 @@ async fn resume_after_ice_restart_resends_exactly_a_scattered_non_contiguous_mis
     let mut receiver = FileReceiver::new(manifest, k_f);
     {
         let transfer = bob_file.transfer(sid).expect("bob tracks the transfer");
-        feed_into_receiver(&mut receiver, &transfer.pending_chunks, &tree);
+        feed_into_receiver(&mut receiver, transfer.pending_chunks.values(), &tree);
     }
     assert_eq!(receiver.received_offsets().len(), delivered_indices.len());
     assert!(!receiver.is_complete());
@@ -558,9 +566,14 @@ async fn resume_after_ice_restart_resends_exactly_a_scattered_non_contiguous_mis
     drain_frames(&mut bsess, &mut bob, resent_indices.len()).await;
     {
         let transfer = bob_file.transfer(sid).expect("bob tracks the transfer");
-        // `pending_chunks` only ever grows (task 10.6's own contract): the first
-        // `delivered_indices.len()` entries are phase 1's; feed just the newly-arrived tail.
-        let new_frames = &transfer.pending_chunks[delivered_indices.len()..];
+        // (task 11.3) `pending_chunks` is now keyed by each chunk's own index and only ever grows —
+        // phase 1 delivered everything except `MISSING`, so feed just those newly-arrived indices
+        // rather than re-feeding what phase 1 already verified.
+        let new_frames = transfer
+            .pending_chunks
+            .iter()
+            .filter(|(i, _)| MISSING.contains(i))
+            .map(|(_, v)| v);
         feed_into_receiver(&mut receiver, new_frames, &tree);
     }
 
@@ -586,5 +599,331 @@ async fn resume_after_ice_restart_resends_exactly_a_scattered_non_contiguous_mis
         resent_already_delivered_bytes, 0,
         "resume must never resend a single byte of an already-delivered chunk, even against a \
          scattered missing set"
+    );
+}
+
+/// Same real end-to-end pipeline as the two tests above, but exercising the boundary the task 11.5
+/// review finding (F5) flagged as untested: the receiver has received **nothing** before the drop, so
+/// resume must force a full resend of every chunk in the file (`DELIVERED = 0`) rather than merely a
+/// suffix/prefix/scattered subset. This is the degenerate case of `ResumeRequest::from_received`'s own
+/// "nothing received" path (already unit-tested in isolation as
+/// `resume.rs::nothing_received_marks_every_index_missing_across_a_byte_boundary`), but — like the
+/// scattered-set test above — the full send/resume pipeline had never driven that all-missing bitmap
+/// through a real `send_missing_chunks` call, which could hide a bug where an empty "already received"
+/// set is treated as "nothing to do" rather than "everything is missing".
+#[tokio::test]
+async fn resume_at_zero_chunks_received_resends_the_whole_file() {
+    let mut alice = Peer::new("resume.zero.a");
+    let mut bob = Peer::new("resume.zero.b");
+    establish_ratchet(&mut alice, &mut bob);
+
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(LoopbackTransport::new(fabric.clone()));
+    let tb = Arc::new(LoopbackTransport::new(fabric.clone()));
+    let (reg_a, reg_b, alice_file, bob_file) = file_registries();
+    let (mut asess, mut bsess) = connect(ta, tb, &mut alice, &mut bob, reg_a, reg_b).await;
+    clear_first_contact(&mut asess, &mut alice, &mut bsess, &mut bob).await;
+
+    // Same 12-full-chunks + one-short-final-chunk = 13 total chunk layout as the prefix/suffix and
+    // scattered tests above, for an identical, already-validated chunk count.
+    let data = sample_file(12 * CHUNK_SIZE + 999);
+    let tree = MerkleTree::from_bytes(&data);
+    let leaf_count = tree.leaf_count();
+    assert_eq!(leaf_count, 13);
+
+    let (sid, k_f, manifest) = open_file_transfer(
+        &mut asess,
+        &mut alice,
+        &mut bsess,
+        &mut bob,
+        "movie.bin",
+        &data,
+    )
+    .await;
+
+    let mut resume_rx = alice_file.watch_resume(sid);
+
+    // --- Phase 1: the drop happens before Alice sends a single chunk — DELIVERED = 0. Nothing is
+    // sent, nothing is drained, and Bob's receiver starts from a completely empty bookkeeping state.
+    const DELIVERED: u64 = 0;
+    let chunks: Vec<&[u8]> = data.chunks(CHUNK_SIZE).collect();
+    assert_eq!(chunks.len() as u64, leaf_count as u64);
+
+    let mut receiver = FileReceiver::new(manifest, k_f);
+    assert_eq!(receiver.received_offsets().len(), DELIVERED as usize);
+    assert!(!receiver.is_complete());
+
+    let delivered_indices: HashSet<u64> = (0..DELIVERED).collect();
+
+    // --- Phase 2: drop + redial, exactly as the tests above (real `ice_restart`, real symmetric
+    // signaling round trip). ---
+    let (mut restart_relay_a, mut restart_relay_b) = MemRelay::pair(alice.ik(), bob.ik());
+    let (ares, bres) = tokio::join!(
+        asess.ice_restart(
+            &mut restart_relay_a,
+            &alice.store,
+            alice.account.handle(),
+            &mut alice.chat
+        ),
+        bsess.ice_restart(
+            &mut restart_relay_b,
+            &bob.store,
+            bob.account.handle(),
+            &mut bob.chat
+        ),
+    );
+    ares.expect("alice ice_restart");
+    bres.expect("bob ice_restart");
+
+    send_resume_bitmap(&mut bsess, &mut bob.chat, sid, &receiver)
+        .await
+        .expect("bob sends the resume bitmap");
+
+    match asess
+        .pump(&alice.store, alice.account.handle(), &mut alice.chat)
+        .await
+    {
+        Ok(None) => {}
+        other => panic!("alice expected the resume frame to dispatch silently, got {other:?}"),
+    }
+    let resume = resume_rx
+        .try_recv()
+        .expect("alice's resume watcher must have received the bitmap");
+    assert_eq!(
+        resume.missing_indices(leaf_count),
+        (0..leaf_count as u64).collect::<Vec<_>>(),
+        "with nothing received, the bitmap must mark every chunk index missing"
+    );
+
+    // --- Phase 3: resume — with nothing previously delivered, this must resend the *entire* file. ---
+    let cfg = meridian_streams::sender::SenderConfig::default();
+    let resent_indices =
+        send_missing_chunks(&mut asess, &mut alice.chat, sid, &k_f, &data, &resume, &cfg)
+            .await
+            .expect("send_missing_chunks must succeed");
+    assert_eq!(
+        resent_indices,
+        (0..leaf_count as u64).collect::<Vec<_>>(),
+        "resume from zero chunks received must resend every chunk, in order"
+    );
+
+    drain_frames(&mut bsess, &mut bob, resent_indices.len()).await;
+    {
+        let transfer = bob_file.transfer(sid).expect("bob tracks the transfer");
+        feed_into_receiver(&mut receiver, transfer.pending_chunks.values(), &tree);
+    }
+
+    assert!(
+        receiver.is_complete(),
+        "the transfer must be complete after resume"
+    );
+    assert_eq!(
+        receiver.reassemble().unwrap(),
+        data,
+        "the reassembled file must match the source exactly"
+    );
+
+    // --- The acceptance criterion, measured precisely, same as the tests above: bytes resent that
+    // duplicate an already-delivered chunk index, as a fraction of bytes already delivered before the
+    // drop. With zero bytes delivered before the drop, this is vacuously zero — the meaningful check
+    // here is the stronger one just above: every chunk (and *only* every chunk, not more) was resent,
+    // covering the file exactly once. ---
+    let resent_already_delivered_bytes: u64 = resent_indices
+        .iter()
+        .filter(|i| delivered_indices.contains(i))
+        .map(|&i| chunks[i as usize].len() as u64)
+        .sum();
+    assert_eq!(
+        resent_already_delivered_bytes, 0,
+        "resume must never resend a single byte of an already-delivered chunk"
+    );
+    let resent_bytes: u64 = resent_indices
+        .iter()
+        .map(|&i| chunks[i as usize].len() as u64)
+        .sum();
+    assert_eq!(
+        resent_bytes,
+        data.len() as u64,
+        "resume from zero chunks received must resend exactly the file's bytes, once each — no \
+         wasted bytes beyond what a full transfer already requires"
+    );
+}
+
+/// Same real end-to-end pipeline as the tests above, but exercising the other boundary task 11.5's
+/// review finding (F5) flagged: the receiver has received **every chunk except the last**, so resume
+/// must recover exactly one chunk — and that chunk is the file's short final chunk (`999` bytes here,
+/// versus a full [`CHUNK_SIZE`] for every other chunk in this harness's fixture; see the module doc's
+/// "12 full chunks + one short final chunk = 13" layout). A resend path that assumed every chunk is
+/// exactly `CHUNK_SIZE` (e.g. slicing `data` by `index * CHUNK_SIZE..(index + 1) * CHUNK_SIZE` instead
+/// of using `data.chunks(CHUNK_SIZE)`) would panic or silently corrupt precisely this last chunk; the
+/// prefix/suffix test above happens to also resend the last chunk as part of a larger missing range,
+/// but never in isolation, which could hide an off-by-one that only manifests when the *only* missing
+/// index is the final, short one.
+#[tokio::test]
+async fn resume_at_all_but_the_last_chunk_recovers_the_short_final_chunk() {
+    let mut alice = Peer::new("resume.lastchunk.a");
+    let mut bob = Peer::new("resume.lastchunk.b");
+    establish_ratchet(&mut alice, &mut bob);
+
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(LoopbackTransport::new(fabric.clone()));
+    let tb = Arc::new(LoopbackTransport::new(fabric.clone()));
+    let (reg_a, reg_b, alice_file, bob_file) = file_registries();
+    let (mut asess, mut bsess) = connect(ta, tb, &mut alice, &mut bob, reg_a, reg_b).await;
+    clear_first_contact(&mut asess, &mut alice, &mut bsess, &mut bob).await;
+
+    // 12 full CHUNK_SIZE chunks + one short (999-byte) final chunk = 13 chunks total — same fixture
+    // as the tests above, chosen specifically so the last chunk (index 12) is shorter than
+    // `CHUNK_SIZE`.
+    let data = sample_file(12 * CHUNK_SIZE + 999);
+    let tree = MerkleTree::from_bytes(&data);
+    let leaf_count = tree.leaf_count();
+    assert_eq!(leaf_count, 13);
+
+    let (sid, k_f, manifest) = open_file_transfer(
+        &mut asess,
+        &mut alice,
+        &mut bsess,
+        &mut bob,
+        "movie.bin",
+        &data,
+    )
+    .await;
+
+    let mut resume_rx = alice_file.watch_resume(sid);
+
+    // --- Phase 1: deliver every chunk except the last: indices 0..12 arrive, index 12 (the short
+    // final chunk) never gets a first attempt. ---
+    let last_index = leaf_count as u64 - 1;
+    let chunks: Vec<&[u8]> = data.chunks(CHUNK_SIZE).collect();
+    assert_eq!(chunks.len() as u64, leaf_count as u64);
+    assert!(
+        chunks[last_index as usize].len() < CHUNK_SIZE,
+        "the fixture's last chunk must be shorter than CHUNK_SIZE for this boundary test to mean \
+         anything"
+    );
+
+    let mut first_attempt_bytes_by_index: Vec<(u64, usize)> = Vec::new();
+    for i in 0..last_index {
+        send_chunk_frame(
+            &mut asess,
+            &mut alice.chat,
+            sid,
+            &k_f,
+            i,
+            chunks[i as usize],
+        )
+        .await
+        .expect("phase 1 send must succeed");
+        first_attempt_bytes_by_index.push((i, chunks[i as usize].len()));
+    }
+    drain_frames(&mut bsess, &mut bob, last_index as usize).await;
+
+    let mut receiver = FileReceiver::new(manifest, k_f);
+    {
+        let transfer = bob_file.transfer(sid).expect("bob tracks the transfer");
+        feed_into_receiver(&mut receiver, transfer.pending_chunks.values(), &tree);
+    }
+    assert_eq!(receiver.received_offsets().len(), last_index as usize);
+    assert!(!receiver.is_complete());
+
+    let already_delivered_bytes: u64 = first_attempt_bytes_by_index
+        .iter()
+        .map(|(_, len)| *len as u64)
+        .sum();
+    let delivered_indices: HashSet<u64> = (0..last_index).collect();
+
+    // --- Phase 2: drop + redial, exactly as the tests above. ---
+    let (mut restart_relay_a, mut restart_relay_b) = MemRelay::pair(alice.ik(), bob.ik());
+    let (ares, bres) = tokio::join!(
+        asess.ice_restart(
+            &mut restart_relay_a,
+            &alice.store,
+            alice.account.handle(),
+            &mut alice.chat
+        ),
+        bsess.ice_restart(
+            &mut restart_relay_b,
+            &bob.store,
+            bob.account.handle(),
+            &mut bob.chat
+        ),
+    );
+    ares.expect("alice ice_restart");
+    bres.expect("bob ice_restart");
+
+    send_resume_bitmap(&mut bsess, &mut bob.chat, sid, &receiver)
+        .await
+        .expect("bob sends the resume bitmap");
+
+    match asess
+        .pump(&alice.store, alice.account.handle(), &mut alice.chat)
+        .await
+    {
+        Ok(None) => {}
+        other => panic!("alice expected the resume frame to dispatch silently, got {other:?}"),
+    }
+    let resume = resume_rx
+        .try_recv()
+        .expect("alice's resume watcher must have received the bitmap");
+    assert_eq!(
+        resume.missing_indices(leaf_count),
+        vec![last_index],
+        "the bitmap must mark exactly the final, short chunk missing — nothing else"
+    );
+
+    // --- Phase 3: resume — alice resends exactly the one missing (short) chunk. ---
+    let cfg = meridian_streams::sender::SenderConfig::default();
+    let resent_indices =
+        send_missing_chunks(&mut asess, &mut alice.chat, sid, &k_f, &data, &resume, &cfg)
+            .await
+            .expect("send_missing_chunks must succeed");
+    assert_eq!(
+        resent_indices,
+        vec![last_index],
+        "resume must resend exactly the missing final chunk, nothing already delivered"
+    );
+
+    drain_frames(&mut bsess, &mut bob, resent_indices.len()).await;
+    {
+        let transfer = bob_file.transfer(sid).expect("bob tracks the transfer");
+        // (task 11.3) `pending_chunks` is keyed by chunk index and only ever grows — feed just the
+        // newly-arrived tail (the final index) rather than re-feeding what phase 1 already verified.
+        let new_frames = transfer.pending_chunks.range(last_index..).map(|(_, v)| v);
+        feed_into_receiver(&mut receiver, new_frames, &tree);
+    }
+
+    assert!(
+        receiver.is_complete(),
+        "the transfer must be complete after resume"
+    );
+    assert_eq!(
+        receiver.reassemble().unwrap(),
+        data,
+        "the reassembled file must match the source exactly, including the short final chunk"
+    );
+
+    // --- The acceptance criterion, measured precisely, same as the tests above. ---
+    let resent_already_delivered_bytes: u64 = resent_indices
+        .iter()
+        .filter(|i| delivered_indices.contains(i))
+        .map(|&i| chunks[i as usize].len() as u64)
+        .sum();
+    let ratio = resent_already_delivered_bytes as f64 / already_delivered_bytes as f64;
+
+    assert_eq!(
+        resent_already_delivered_bytes, 0,
+        "resume must never resend a single byte of an already-delivered chunk"
+    );
+    assert!(
+        ratio <= 0.02,
+        "resume must re-send no more than 2% of already-delivered data; measured {:.4}% \
+         ({resent_already_delivered_bytes} of {already_delivered_bytes} already-delivered bytes)",
+        ratio * 100.0
+    );
+    assert_eq!(
+        chunks[resent_indices[0] as usize].len(),
+        999,
+        "the single resent chunk must be the short, 999-byte final chunk, not a full CHUNK_SIZE one"
     );
 }

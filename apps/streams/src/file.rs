@@ -14,7 +14,7 @@
 //! (10.9), and the CLI/TUI surfaces (10.10/10.11) are separate, independently-testable tasks built
 //! on top of the shell defined here.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -27,7 +27,9 @@ use meridian_core::streams::{OpenDecision, PolicyCtx, StreamId, StreamType};
 use meridian_core::transport::ChannelCfg;
 use meridian_proto::CodecError;
 
+use crate::chunk::ChunkFrame;
 use crate::manifest::FileManifest;
+use crate::merkle::CHUNK_SIZE;
 use crate::resume::{ResumeRequest, FRAME_TAG_CHUNK, FRAME_TAG_RESUME};
 
 /// Registry name for this stream type, including its version suffix — see
@@ -148,13 +150,49 @@ fn is_probably_image(name: &str) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct TransferState {
     /// The manifest captured at accept time. Always `Some` for an entry this module itself created
-    /// (`FileStream::accept`, the only writer) — `on_frame` never creates an entry, only appends to
+    /// (`FileStream::accept`, the only writer) — `on_frame` never creates an entry, only inserts into
     /// one that already exists.
     pub manifest: Option<FileManifest>,
-    /// Raw inbound stream frames, in arrival order — **not** file order, since `channel_cfg` is
-    /// reliable + unordered; each frame's own `i` (decoded from its `{i, data}` CBOR body, task
-    /// 10.8) is what determines its place in the file.
-    pub pending_chunks: Vec<Vec<u8>>,
+    /// Raw inbound chunk frames, keyed by each frame's own claimed chunk index `i` (decoded from its
+    /// `{i, data}` CBOR body) — **not** arrival order, since `channel_cfg` is reliable + unordered.
+    /// Mirrors `crate::receiver::FileReceiver`'s own `chunks: BTreeMap<u64, Vec<u8>>` convention for
+    /// the identical reason: a duplicate/retransmitted delivery of an index already buffered must
+    /// not grow this structure (review finding F3/N1 — an unbounded `Vec` here let a flooding or
+    /// retransmitting peer grow memory without bound, and forced an O(n) rescan just to find which
+    /// indices had arrived). [`FileStream::on_frame`] is the only writer, and this is always a keyed
+    /// **insert** (last-arrival-wins), never a keyed *ignore*: a duplicate index for a chunk already
+    /// buffered replaces the existing entry rather than appending a second one — bounding this
+    /// structure to at most one entry per index either way, but only "replace" also lets task
+    /// 10.9/10.16's real resume protocol supersede a previously-buffered *corrupted* delivery with a
+    /// later, genuine resend for the same index (`corrupted_chunk_adversarial.rs`'s own acceptance
+    /// test exercises exactly this and would silently break under a first-wins/ignore policy, since
+    /// nothing else ever removes or replaces a buffered entry before this restructuring existed).
+    ///
+    /// **Resolved `TODO: confirm` (task 11.3's own open question):** once a transfer is accepted,
+    /// its manifest's `size` is already known, so `on_frame` also rejects an index that is obviously
+    /// out of range for that size (via [`leaf_count_for_size`]) *before* ever inserting it — not just
+    /// relying on the fact that a validated in-range index is inherently bounded by the leaf count.
+    /// This closes F3's DoS concern directly at the point of insertion (mirroring
+    /// `FileReceiver::receive_frame`'s own `OutOfRange` check, which today only ever runs later, at
+    /// `finalize_transfer`/reassembly time) rather than leaving a window where an arbitrary `u64`
+    /// index can still be buffered until that later check runs. This is a small, natural guard added
+    /// as part of this restructuring — not a new validation subsystem — and it does not change what a
+    /// *legitimate* transfer needs: every real index is always `< leaf_count`.
+    pub pending_chunks: BTreeMap<u64, Vec<u8>>,
+}
+
+/// Number of [`CHUNK_SIZE`] leaves a file of `size` bytes was split into, matching
+/// [`crate::merkle::MerkleTree`]'s own empty-file convention (a zero-byte file is exactly one
+/// virtual leaf, never zero leaves). Mirrors `crate::receiver`'s own private helper of the same name
+/// and shape exactly — kept as its own copy here (rather than exported and shared) since this module
+/// must not depend on `receiver.rs`'s internals, and the computation is a one-line mirror of the
+/// manifest's own `size` field, not receiver-engine logic.
+fn leaf_count_for_size(size: u64) -> usize {
+    if size == 0 {
+        1
+    } else {
+        size.div_ceil(CHUNK_SIZE as u64) as usize
+    }
 }
 
 /// The `mrd.file/1` [`StreamType`]: registry name/version, channel config, and the recipient policy
@@ -243,7 +281,7 @@ impl FileStream {
                 sid,
                 TransferState {
                     manifest: Some(manifest),
-                    pending_chunks: Vec::new(),
+                    pending_chunks: BTreeMap::new(),
                 },
             );
         }
@@ -361,12 +399,19 @@ impl StreamType for FileStream {
     /// decode/verify/write is task 10.8's receiver engine) plus, as of task 10.9, the resume-frame
     /// dispatch. Every inbound `mrd.file/1` in-stream frame now carries a one-byte discriminator
     /// (`crate::resume`'s module doc, "Wire framing") ahead of its actual body:
-    /// - [`FRAME_TAG_CHUNK`]: the body (with the tag byte stripped) is buffered exactly as before —
-    ///   `pending_chunks` still holds bare `ChunkFrame`-encoded bytes, byte-for-byte identical to
-    ///   what task 10.7/10.8 already produce/consume, only for a stream this side accepted (e.g. the
-    ///   sender's own side, which never calls `on_open` for a stream it itself opened, is silently
-    ///   dropped, matching the trait's documented default rather than growing unbounded state for a
-    ///   transfer with no captured manifest).
+    /// - [`FRAME_TAG_CHUNK`]: the body (with the tag byte stripped) is decoded as a [`ChunkFrame`]
+    ///   only far enough to read its own claimed index `i` — the *value* inserted into
+    ///   `pending_chunks` is still the bare, untouched `ChunkFrame`-encoded body bytes, byte-for-byte
+    ///   identical to what task 10.7/10.8 already produce/consume. Buffered only for a stream this
+    ///   side accepted (e.g. the sender's own side, which never calls `on_open` for a stream it
+    ///   itself opened, is silently dropped, matching the trait's documented default rather than
+    ///   growing unbounded state for a transfer with no captured manifest); a body that fails to
+    ///   decode as a `ChunkFrame`, or whose claimed index `i` is out of range for the accepted
+    ///   manifest's own size (task 11.3, review finding F3), is likewise dropped without buffering
+    ///   anything. `pending_chunks` is keyed by `i` and bounded to one entry per index (task 11.3,
+    ///   review finding N1) — a duplicate/retransmitted index for a chunk already buffered *replaces*
+    ///   the existing entry rather than appending a second one: see
+    ///   [`TransferState::pending_chunks`]'s own doc for why replace, not ignore.
     /// - [`FRAME_TAG_RESUME`]: decoded as a [`ResumeRequest`] and forwarded to whichever
     ///   [`watch_resume`](Self::watch_resume) caller registered a watcher for this `sid` (the
     ///   sender's own side); dropped silently if nobody is watching (e.g. it arrived at the
@@ -382,7 +427,27 @@ impl StreamType for FileStream {
             FRAME_TAG_CHUNK => {
                 if let Ok(mut transfers) = self.transfers.lock() {
                     if let Some(state) = transfers.get_mut(&sid) {
-                        state.pending_chunks.push(body.to_vec());
+                        if let Some(manifest) = state.manifest.as_ref() {
+                            if let Ok(chunk) = ChunkFrame::decode(body) {
+                                let leaf_count = leaf_count_for_size(manifest.size);
+                                if (chunk.i as usize) < leaf_count {
+                                    // Keyed insert, last-arrival-wins (a plain `BTreeMap::insert`,
+                                    // not `entry().or_insert()`) — see `TransferState::pending_chunks`'
+                                    // own doc for why: a duplicate index can legitimately arrive
+                                    // because task 10.9/10.16's resume protocol resends exactly this
+                                    // index after a previous delivery for it failed downstream
+                                    // verification (e.g. a corrupted chunk), and that later, genuine
+                                    // resend must be able to supersede the earlier bad bytes. Either
+                                    // policy (overwrite or first-wins/ignore) equally satisfies F3's
+                                    // memory bound — this buffer never exceeds one entry per index
+                                    // either way — so there is no bounding reason to prefer
+                                    // first-wins, and only overwrite keeps resume's own
+                                    // corrupted-chunk-recovery acceptance test
+                                    // (`corrupted_chunk_adversarial.rs`, task 10.16) working.
+                                    state.pending_chunks.insert(chunk.i, body.to_vec());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -568,40 +633,57 @@ mod tests {
     }
 
     /// (task 10.9) Prepends the chunk-frame discriminator byte — every real in-stream `mrd.file/1`
-    /// frame now carries one (`crate::resume`'s module doc, "Wire framing") — so these tests can
-    /// still feed `on_frame` arbitrary placeholder "chunk" bytes without needing a real
-    /// `ChunkFrame`-encoded body.
+    /// frame now carries one (`crate::resume`'s module doc, "Wire framing").
     fn tagged_chunk(body: &[u8]) -> Vec<u8> {
         crate::resume::tag_frame(FRAME_TAG_CHUNK, body.to_vec())
+    }
+
+    /// (task 11.3) Builds a real, decodable `ChunkFrame`-encoded body for index `i` — as of task
+    /// 11.3, `on_frame` decodes each chunk frame's own `i` (to key `pending_chunks` and to check it
+    /// against the accepted manifest's leaf count), so tests can no longer feed arbitrary
+    /// placeholder bytes the way the pre-11.3 arrival-order `Vec` allowed.
+    fn chunk_frame_bytes(i: u64, data: &[u8]) -> Vec<u8> {
+        crate::chunk::ChunkFrame {
+            i,
+            data: data.to_vec(),
+        }
+        .encode()
+        .unwrap()
     }
 
     #[test]
     fn on_frame_buffers_only_for_a_stream_this_side_accepted() {
         let fs = FileStream::new(MAX);
         // No prior `on_open`/accept for sid 5: frames must be dropped, not buffered anywhere.
-        fs.on_frame(5, &tagged_chunk(b"stray chunk frame"));
+        fs.on_frame(
+            5,
+            &tagged_chunk(&chunk_frame_bytes(0, b"stray chunk frame")),
+        );
         assert!(fs.transfer(5).is_none());
 
-        let m = manifest("cat.png", 1);
+        // Large enough that indices 0 and 1 are both in range.
+        let m = manifest("cat.png", CHUNK_SIZE as u64 * 2);
         assert_eq!(
             fs.on_open(5, &m.encode().unwrap(), &ctx(false)),
             OpenDecision::Accept
         );
-        fs.on_frame(5, &tagged_chunk(b"chunk-a"));
-        fs.on_frame(5, &tagged_chunk(b"chunk-b"));
+        let frame_a = chunk_frame_bytes(0, b"chunk-a");
+        let frame_b = chunk_frame_bytes(1, b"chunk-b");
+        fs.on_frame(5, &tagged_chunk(&frame_a));
+        fs.on_frame(5, &tagged_chunk(&frame_b));
         let recorded = fs.transfer(5).unwrap();
-        assert_eq!(
-            recorded.pending_chunks,
-            vec![b"chunk-a".to_vec(), b"chunk-b".to_vec()]
-        );
+        let expected: BTreeMap<u64, Vec<u8>> = BTreeMap::from([(0, frame_a), (1, frame_b)]);
+        assert_eq!(recorded.pending_chunks, expected);
     }
 
     #[test]
     fn on_frame_strips_the_tag_byte_leaving_pending_chunks_byte_for_byte_identical() {
         // Regression pin for the wire-framing change itself: `pending_chunks` must hold exactly the
-        // pre-10.9 `ChunkFrame`-encoded bytes (task 10.7/10.8's own shape), never the tag byte.
+        // pre-10.9 `ChunkFrame`-encoded bytes (task 10.7/10.8's own shape), never the tag byte —
+        // keyed (task 11.3) by the frame's own index rather than arrival position.
         let fs = FileStream::new(MAX);
-        let m = manifest("cat.png", 1);
+        // Large enough that index 3 is in range (4 leaves).
+        let m = manifest("cat.png", CHUNK_SIZE as u64 * 4);
         fs.on_open(1, &m.encode().unwrap(), &ctx(false));
         let real_chunk_frame = crate::chunk::ChunkFrame {
             i: 3,
@@ -611,11 +693,70 @@ mod tests {
         .unwrap();
         fs.on_frame(1, &tagged_chunk(&real_chunk_frame));
         let recorded = fs.transfer(1).unwrap();
-        assert_eq!(recorded.pending_chunks, vec![real_chunk_frame.clone()]);
+        assert_eq!(recorded.pending_chunks.len(), 1);
+        assert_eq!(recorded.pending_chunks.get(&3), Some(&real_chunk_frame));
         // And it must still decode as a normal `ChunkFrame`, exactly as `sender_engine.rs`'s tests
         // rely on.
-        let decoded = crate::chunk::ChunkFrame::decode(&recorded.pending_chunks[0]).unwrap();
+        let decoded = crate::chunk::ChunkFrame::decode(&recorded.pending_chunks[&3]).unwrap();
         assert_eq!(decoded.i, 3);
+    }
+
+    /// (task 11.3, review finding N1) A duplicate/retransmitted chunk frame for an index already
+    /// buffered must never grow `pending_chunks` past one entry per index — bounding growth is F3's
+    /// own concern, and it holds regardless of *which* copy the single remaining entry ends up
+    /// holding. See `TransferState::pending_chunks`'s own doc for why the copy that wins is
+    /// specifically the *latest* arrival (not the first): a legitimate resume resend for a
+    /// previously-corrupted index must be able to supersede the earlier bad bytes
+    /// (`corrupted_chunk_adversarial.rs`, task 10.16).
+    #[test]
+    fn on_frame_ignores_a_duplicate_chunk_index_rather_than_growing_the_buffer() {
+        let fs = FileStream::new(MAX);
+        let m = manifest("cat.png", CHUNK_SIZE as u64 * 2);
+        fs.on_open(4, &m.encode().unwrap(), &ctx(false));
+
+        let first = chunk_frame_bytes(0, &[0x01; 8]);
+        let retransmit = chunk_frame_bytes(0, &[0x02; 8]); // same index, different payload
+        fs.on_frame(4, &tagged_chunk(&first));
+        fs.on_frame(4, &tagged_chunk(&retransmit));
+        // A third, fourth, ... duplicate must not grow it either.
+        fs.on_frame(4, &tagged_chunk(&retransmit));
+
+        let recorded = fs.transfer(4).unwrap();
+        assert_eq!(
+            recorded.pending_chunks.len(),
+            1,
+            "a duplicate/retransmitted index must never grow the buffer"
+        );
+        assert_eq!(
+            recorded.pending_chunks.get(&0),
+            Some(&retransmit),
+            "the latest arrival for an index must win, so a genuine resume resend can supersede a \
+             previously-buffered corrupted delivery for the same index"
+        );
+    }
+
+    /// (task 11.3's own resolved `TODO: confirm`) An obviously out-of-range chunk index — beyond the
+    /// accepted manifest's own leaf count — must be rejected at `on_frame` time, not merely left for
+    /// a later `finalize_transfer`-style check, closing F3's DoS concern directly rather than
+    /// allowing unbounded-index insertion until then.
+    #[test]
+    fn on_frame_drops_an_out_of_range_chunk_index_without_buffering_it() {
+        let fs = FileStream::new(MAX);
+        // A single-leaf file (tiny size): only index 0 is in range.
+        let m = manifest("cat.png", 10);
+        fs.on_open(6, &m.encode().unwrap(), &ctx(false));
+
+        let hostile = chunk_frame_bytes(999, b"out of range");
+        fs.on_frame(6, &tagged_chunk(&hostile));
+        assert!(
+            fs.transfer(6).unwrap().pending_chunks.is_empty(),
+            "an out-of-range index must never be buffered"
+        );
+
+        // The real, in-range index still buffers normally afterward.
+        let real = chunk_frame_bytes(0, b"real chunk");
+        fs.on_frame(6, &tagged_chunk(&real));
+        assert_eq!(fs.transfer(6).unwrap().pending_chunks.len(), 1);
     }
 
     #[test]
