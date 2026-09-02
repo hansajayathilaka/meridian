@@ -79,6 +79,26 @@ fn stream_channel_label(ty: &str, sid: StreamId) -> String {
     format!("{ty}#{sid}")
 }
 
+/// (11.1, F1) The `next_sid` seed for a freshly constructed session — architect-ratified fix for the
+/// concurrent-`open_stream` collision (Phase 11 review finding F1): partition the `u64` sid space by
+/// the *same* identity-key lexicographic tie-break already used twice elsewhere in this file (the
+/// dial/answer role convention, and ICE-restart glare per ADR 0025 — see `ice_restart`'s own `our_ik
+/// < peer_ik` check) rather than inventing a new one. The lexicographically-smaller-key side seeds
+/// `0` and (since [`P2pSession::open_stream`] increments by 2, not 1) allocates only even sids `2, 4,
+/// 6, …`; the larger-key side seeds `1` and allocates only odd sids `3, 5, 7, …`. Both domains start
+/// cleanly above the fixed [`CTRL_SID`]`= 0`/[`CHAT_SID`]`= 1`, so the two sides can never
+/// independently derive the same `sid` — and thus never the same [`stream_channel_label`] — for two
+/// logically distinct streams opened concurrently. `our_ik`/`peer_ik` are fixed, mutually
+/// authenticated pre-session values (not attacker-influenced per call), so neither side can grief the
+/// other into starvation by choosing its own parity class.
+fn initial_next_sid(our_ik: &[u8; 32], peer_ik: &[u8; 32]) -> u64 {
+    if our_ik < peer_ik {
+        0
+    } else {
+        1
+    }
+}
+
 /// (task 10.4) The `info` parameter to `meridian_crypto::Session::encrypt_and_export`/
 /// `decrypt_and_export` (task 10.1) for a generic stream frame. `docs/api/stream-types-v1.md`
 /// already specifies the target shape as accepted design — `HKDF(ratchet_export, info =
@@ -91,13 +111,30 @@ fn stream_channel_label(ty: &str, sid: StreamId) -> String {
 /// the ASCII domain tag, then the type name's UTF-8 bytes, then the stream id as 8 big-endian bytes
 /// (both peers already know `(ty, sid)` for any stream they have open — see
 /// [`stream_channel_label`] — so this needs no extra negotiation of its own).
-fn stream_export_info(ty: &str, sid: StreamId) -> Vec<u8> {
-    let mut info = Vec::with_capacity(b"mrd/stream/".len() + ty.len() + 8);
-    info.extend_from_slice(b"mrd/stream/");
+///
+/// (11.7, review finding F7) `pub(crate)`, not private, so it can be re-exported — unchanged —
+/// through [`crate::test_support`] for `xtask`'s conformance-vector generator and this crate's own
+/// `stream_export_info` re-derivation test (`test-vectors/session-substrate-v1.json`) to call the
+/// real byte layout directly, rather than a parallel reimplementation that could silently drift
+/// from it. Not part of the crate's application-facing API (see `test_support`'s own doc comment).
+/// `stream_export_info` itself stays `pub(crate)` rather than `pub`: since [`session`](self) is a
+/// genuinely public module (unlike `meridian_crypto::primitives`, which is private), marking this
+/// function plain `pub` would leak it into the crate's real public surface as
+/// `meridian_core::session::stream_export_info`. [`crate::test_support`] instead wraps it behind a
+/// thin forwarding function, which is what actually needs the visibility bump, not this item.
+pub(crate) fn stream_export_info(ty: &str, sid: StreamId) -> Vec<u8> {
+    let mut info = Vec::with_capacity(STREAM_EXPORT_INFO_TAG.len() + ty.len() + 8);
+    info.extend_from_slice(STREAM_EXPORT_INFO_TAG);
     info.extend_from_slice(ty.as_bytes());
     info.extend_from_slice(&sid.to_be_bytes());
     info
 }
+
+/// (11.7, review finding F7) The ASCII domain tag `stream_export_info` prefixes onto every derived
+/// `info` byte string — named so a conformance test can genuinely mutate it and re-run the *real*
+/// function (mirroring `meridian_crypto::x3dh`'s `X3DH_INFO` divergent-label test), rather than a
+/// test independently reimplementing the concatenation with a different literal.
+pub(crate) const STREAM_EXPORT_INFO_TAG: &[u8] = b"mrd/stream/";
 
 /// (1.33) How long [`dial_established`] will wait for the peer's answer before giving up. Bounds
 /// the *dialer's* wait specifically — the responder's wait for the offer is unchanged (it already
@@ -774,7 +811,12 @@ impl<T: Transport> P2pSession<T> {
                 code: "unsupported".to_string(),
                 reason: format!("no local stream type {ty}"),
             })?;
-        self.next_sid += 1;
+        // (11.1, F1) `next_sid` is seeded per-side at construction (see `dial_established`/
+        // `answer_established`) so the two sides allocate from disjoint parity classes — smaller
+        // identity key even, larger odd — and incremented by 2 here rather than 1, so two peers
+        // concurrently opening the same stream type can never derive the same `sid` (and thus never
+        // the same `stream_channel_label`). See those seed sites' comments for the full rationale.
+        self.next_sid += 2;
         let sid = self.next_sid;
         let cfg = st.channel_cfg();
         // (task 10.4) Remembered so this side's own `handle_ctrl` `Accept` arm can later derive the
@@ -911,6 +953,26 @@ impl<T: Transport> P2pSession<T> {
         handle: &KeyHandle,
         chat: &mut ChatState,
     ) -> Result<(), SessionError> {
+        self.ice_restart_with_glare_window(relay, store, handle, chat, RESTART_GLARE_WINDOW)
+            .await
+    }
+
+    /// (11.6, review finding F6) Same as [`Self::ice_restart`] — byte-for-byte identical logic —
+    /// with the larger-key side's glare-wait window taken as a parameter instead of hardcoding
+    /// [`RESTART_GLARE_WINDOW`]. `ice_restart` itself just forwards to this with that real
+    /// constant, so production behavior/the frozen `core-api-contracts.md` `ice_restart` signature
+    /// are both completely unchanged; this sibling exists purely so a test can shrink the window
+    /// and force the timeout-then-fallback branch deterministically, without either burning the
+    /// real ~5s wait on every run or weakening the production constant to do it. Not itself part
+    /// of the frozen core API surface — an internal test seam only.
+    pub async fn ice_restart_with_glare_window(
+        &mut self,
+        relay: &mut dyn SignalRelay,
+        store: &dyn SecretStore,
+        handle: &KeyHandle,
+        chat: &mut ChatState,
+        glare_window: Duration,
+    ) -> Result<(), SessionError> {
         if self.our_ik < self.peer_ik {
             // The lexicographically-smaller identity key always offers (mirrors the dial/answer
             // role tie-break `apps/cli/src/chat.rs` documents). Only the side that is actually
@@ -932,7 +994,7 @@ impl<T: Transport> P2pSession<T> {
             // real signaling-state error. Restarting our own local ICE state is only correct once
             // we know we're the one sending a fresh offer (the fallback branch below).
             match tokio::time::timeout(
-                RESTART_GLARE_WINDOW,
+                glare_window,
                 recv_restart_signal(relay, store, handle, &self.our_ik, &self.peer_ik, chat),
             )
             .await
@@ -988,6 +1050,10 @@ impl<T: Transport> P2pSession<T> {
         let offer = self.transport.local_description(&self.conn)?;
         let local_fp = self.transport.local_fingerprint(&self.conn)?;
         let ice = candidate_strings(&self.transport, &self.conn).await?;
+        // F20 (11.2): same fail-closed check as the original handshake — abort here, before the
+        // restart offer is sealed and sent, if relay-only actually gathered anything but relay
+        // candidates on this fresh post-restart gather.
+        enforce_relay_only(self.policy, &ice)?;
         let offer_content = SignalContent::IceRestartOffer {
             sdp: offer.0,
             dtls_fp: local_fp.0.clone(),
@@ -1072,6 +1138,10 @@ impl<T: Transport> P2pSession<T> {
         let answer_sdp = self.transport.local_description(&self.conn)?;
         let local_fp = self.transport.local_fingerprint(&self.conn)?;
         let ice = candidate_strings(&self.transport, &self.conn).await?;
+        // F20 (11.2): same fail-closed check as the original handshake — abort here, before the
+        // restart answer is sealed and sent, if relay-only actually gathered anything but relay
+        // candidates on this fresh post-restart gather.
+        enforce_relay_only(self.policy, &ice)?;
         let answer_content = SignalContent::IceRestartAnswer {
             sdp: answer_sdp.0,
             dtls_fp: local_fp.0.clone(),
@@ -1736,7 +1806,7 @@ async fn dial_established<T: Transport>(
         registry,
         peer_caps: Vec::new(),
         open_streams: BTreeSet::from([CTRL_SID]),
-        next_sid: CHAT_SID,
+        next_sid: initial_next_sid(&our_ik, &peer_ik),
         local_fp,
         remote_fp,
         keepalive_t: 0,
@@ -1981,7 +2051,7 @@ async fn answer_established<T: Transport>(
         registry,
         peer_caps: Vec::new(),
         open_streams: BTreeSet::from([CTRL_SID]),
-        next_sid: CHAT_SID,
+        next_sid: initial_next_sid(&our_ik, &peer_ik),
         local_fp,
         remote_fp,
         keepalive_t: 0,
