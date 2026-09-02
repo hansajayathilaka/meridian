@@ -1,0 +1,118 @@
+# Scheduled + workflow_dispatch runner for tools/netns-kill-resume.sh (task 11.10, review finding
+# F10). Mirrors netns-netem-smoke.yml/soak-file-transfer.yml's structure (task 10.13/10.14's own
+# precedent): schedule + workflow_dispatch, not the blocking push/PR gate — this needs root/
+# NET_ADMIN for its netns/veth topology, the same posture as those two siblings.
+#
+# Deliberately omitted from CI until now (task 10.15's own call): the rig was expected to reproduce
+# two known, pre-existing gaps (the real WebRtcTransport's SCTP max-message-size limit, and
+# ice_restart's real-backend no-op) rather than exercise anything meaningful. Both gaps are now fixed
+# (task 10.18's SCTP fix, tasks 10.19-10.22's ADR-0025 ice_restart renegotiation) — the rationale for
+# omitting scheduled coverage of the `run` scenario no longer holds, per Phase 11's review (F10).
+# `tools/netns-kill-resume.sh` itself needs no change here: task 10.23 already fixed the probe/
+# self-check PID false-negative this workflow would otherwise have inherited.
+#
+# Runs both `run` (the full mrd.file/1 kill/resume scenario — 3/3 clean on task 10.23's rig, 2/2
+# further clean on 10.24's phase-exit re-run) and `probe` (the smaller chat-only ice_restart
+# substrate check). These are NOT expected to have the same outcome: `probe` is a KNOWN, reproducible,
+# still-open FAIL (4/4 runs, a post-restart DTLS/SCTP readiness race distinct from — and found only
+# after fixing — the two historical gaps above; see docs/tasks/phase-10/10.23-demo-transcript.md and
+# the carry-forward in docs/tasks/README.md/phase-11/README.md). `probe`'s step below is deliberately
+# `continue-on-error: true` for exactly this reason — mirroring soak-file-transfer.yml's own
+# "EXPECTED TO BE RED" convention for a known, separately-tracked defect — so its known failure can
+# never mask a real regression in `run`, the scenario this workflow actually exists to protect.
+#
+# On a runner without root or without basic netns/veth link-state support, the script's own
+# need_root()/need_veth_linkstate() gates skip (exit 0) with a clear message rather than failing —
+# see the fail-loudly preflight below for why ubuntu-latest specifically should never hit that skip
+# path silently.
+name: netns-kill-resume
+
+on:
+  schedule:
+    # Offset from capacity-check.yml (Monday 06:00 UTC), p2p-wire-proof.yml (07:00),
+    # netns-netem-smoke.yml (08:00) and soak-file-transfer.yml (09:00) so the scheduled,
+    # longer-running/privileged jobs don't contend for the same runner-queue moment. TODO: confirm
+    # desired cadence — weekly chosen as a reasonable default matching the existing four; no cadence
+    # is specified anywhere in docs/operations/, the same open question those four already carry for
+    # their own schedules (no on-call rotation yet to action a red run,
+    # docs/operations/runbook.md's own open item).
+    - cron: "0 10 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  netns-kill-resume:
+    name: kill/resume + ice_restart substrate check (tools/netns-kill-resume.sh)
+    runs-on: ubuntu-latest
+    # run's own internal wait budget alone (pre-cut burst poll + 15s cut + up-to-180s/30s driver
+    # waits) is ~4.5 minutes worst case, plus probe's own (~2.8 minutes worst case) — call it ~7.5
+    # minutes of script-internal budget before counting checkout, preflight, or either
+    # `cargo build ... --features webrtc` (the first is a cold, webrtc-rs-dependent build; neither
+    # this workflow nor its siblings cache the cargo registry). 20 minutes mirrors
+    # soak-file-transfer.yml's own build-to-runtime headroom ratio for a comparably
+    # webrtc-feature-heavy build, rather than the tighter 15 minutes a naive read of just the two
+    # 15s network cuts would suggest.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Without this, a runner that ever lost basic netns/veth link-state support would make the
+      # script's own need_veth_linkstate() gracefully skip (exit 0) — by design for a genuinely
+      # capability-less sandbox, see that function's comment — but here, on ubuntu-latest, that
+      # graceful skip would turn a real regression into a permanently-green no-op instead of a red
+      # run: netns/veth is basic kernel functionality expected present well beyond this repo, so its
+      # absence here would itself be news worth failing loudly on, not swallowing. Mirrors
+      # netns-netem-smoke.yml's own modprobe preflight, adapted to the capability this specific rig
+      # actually depends on (netns/veth link-state, not netem — this rig injects no loss/RTT). Also
+      # toggles link state (up/down/up), not just object creation, matching exactly what
+      # need_veth_linkstate() itself checks (tools/netns-kill-resume.sh) — object creation alone
+      # could pass on a runner that can create netns/veth but not toggle their state, the narrower
+      # failure mode this preflight exists to catch.
+      - name: Fail loudly if netns/veth link-state is unexpectedly unavailable on this runner
+        run: |
+          if ! sudo ip netns add kr-ci-preflight 2>/tmp/netns-preflight.err; then
+            echo "::error::netns support unexpectedly unavailable on ubuntu-latest — was believed present; investigate before trusting this job's green runs."
+            cat /tmp/netns-preflight.err
+            exit 1
+          fi
+          if ! sudo ip link add kr-ci-pfa netns kr-ci-preflight type veth peer name kr-ci-pfb netns kr-ci-preflight 2>/tmp/veth-preflight.err; then
+            echo "::error::veth support unexpectedly unavailable on ubuntu-latest — was believed present; investigate before trusting this job's green runs."
+            cat /tmp/veth-preflight.err
+            sudo ip netns del kr-ci-preflight
+            exit 1
+          fi
+          if ! sudo ip netns exec kr-ci-preflight ip link set kr-ci-pfa up 2>/tmp/linkstate-preflight.err \
+             || ! sudo ip netns exec kr-ci-preflight ip link set kr-ci-pfa down 2>>/tmp/linkstate-preflight.err \
+             || ! sudo ip netns exec kr-ci-preflight ip link set kr-ci-pfa up 2>>/tmp/linkstate-preflight.err; then
+            echo "::error::veth link-state toggling (up/down/up) unexpectedly unavailable on ubuntu-latest — was believed present; investigate before trusting this job's green runs."
+            cat /tmp/linkstate-preflight.err
+            sudo ip netns del kr-ci-preflight
+            exit 1
+          fi
+          sudo ip netns del kr-ci-preflight
+
+      - name: Build the netns kill/resume driver examples (--features webrtc)
+        run: |
+          cargo build -p meridian-cli --example kill_resume_netns_drive --features webrtc
+          cargo build -p meridian-cli --example netns_ice_restart_probe --features webrtc
+
+      - name: Full mrd.file/1 kill/resume scenario (tools/netns-kill-resume.sh run)
+        run: sudo bash tools/netns-kill-resume.sh run
+
+      # EXPECTED TO BE RED: `probe` reproduces a known, still-open, non-blocking defect — a
+      # post-restart DTLS/SCTP readiness race distinct from (and found only after fixing) the two
+      # historical gaps this workflow's header talks about (confirmed 4/4 by task 10.23, not re-run
+      # or fixed by 10.24 — see docs/tasks/phase-10/10.23-demo-transcript.md and the carry-forward in
+      # docs/tasks/README.md/phase-11/README.md). `continue-on-error: true` so this known failure can
+      # never mask a real regression in `run` above, the scenario this workflow actually exists to
+      # protect — mirrors soak-file-transfer.yml's own "EXPECTED TO BE RED" convention. Flip this
+      # back to a hard failure once the readiness race is picked up and fixed by its own future task.
+      - name: chat-only ice_restart substrate check (tools/netns-kill-resume.sh probe)
+        continue-on-error: true
+        run: sudo bash tools/netns-kill-resume.sh probe
+
+      - name: Force cleanup (in case a failed step left a topology up)
+        if: always()
+        run: sudo bash tools/netns-kill-resume.sh down || true
