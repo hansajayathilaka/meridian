@@ -371,11 +371,27 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   deliverable) before it can start, and **11.9** is self-declared unable to be completed by an agent
   session alone (needs a human/devops runner observation) — neither was cleanly unblocked for this run.
   Draft PR carrying all seven commits: [#94](https://github.com/hansajayathilaka/meridian/pull/94).
-- **NEXT:** `/next-task` — **11.8** needs an architect pre-check on the proof-delivery design fork before
-  implementation can start (not cleanly unblocked without it); **11.9** stays blocked pending a human/
-  devops runner observation it explicitly says an agent session cannot supply; **11.10** (new CI workflow
-  for the kill-resume rig) has no dependency on either and is the next cleanly unblocked fix-task if a
-  future run wants to skip ahead rather than wait on 11.8's consult.
+- **NOW:** **8/10 Phase 11 fix-tasks done** (11.1–11.7, 11.10), one `/next-task all` batch (a single task
+  this run — task-picker confirmed against the actual task files that 11.8 and 11.9 remain excluded for
+  the same reasons already on record). **11.10** shipped `.github/workflows/netns-kill-resume.yml`
+  (scheduled Monday 10:00 UTC, offset from the four existing scheduled jobs, + `workflow_dispatch`),
+  mirroring `netns-netem-smoke.yml`/`soak-file-transfer.yml`'s structure with a `netns`/`veth`-specific
+  fail-loudly preflight (this rig needs no netem). Two review rounds found real, fixed issues: devops
+  found `timeout-minutes: 15` too tight against the script's own worst-case wait budget plus two uncached
+  `--features webrtc` builds (widened to 20); code-reviewer found a genuine blocking issue — running
+  `probe` as a hard step would make the job permanently red, since `probe` reproduces a known, still-open,
+  non-blocking post-restart DTLS/SCTP readiness race (task 10.23: 4/4 fail, not fixed by 10.24) distinct
+  from the two historical gaps this workflow exists to confirm are fixed — fixed with
+  `continue-on-error: true` on `probe` plus a documenting comment (mirroring `soak-file-transfer.yml`'s
+  own "EXPECTED TO BE RED" convention), and also sharpened the preflight to toggle veth link state
+  (up/down/up), not just object creation, matching what `need_veth_linkstate()` itself checks. Zero
+  findings survived the final pass. Tree unaffected (`tools/netns-kill-resume.sh` itself received no
+  changes; docs-only + new-workflow-only diff).
+- **NEXT:** `/next-task` — **11.8** still needs an architect pre-check on the proof-delivery design fork
+  before implementation can start (not cleanly unblocked without it); **11.9** stays blocked pending a
+  human/devops runner observation it explicitly says an agent session cannot supply. Both remain the only
+  two open Phase 11 fix-tasks; per the phase's own exit criteria, 11.9 may stay open longer than the rest
+  without itself blocking the phase's other tasks from being considered closed.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -408,9 +424,10 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   by direct code reading that task 10.23 already zero-pads the PID to 6 fixed digits
   (`tools/netns-kill-resume.sh`), closing the overflow. This tracker previously kept carrying the
   original finding forward past its actual fix — corrected here per
-  [phase-11/review-report.md](./phase-11/review-report.md)'s "Coverage / test gaps" section. (A related,
-  still-open gap remains: no CI workflow runs this rig at all, now that the SCTP-fix rationale for
-  omitting one no longer holds — tracked as fix-task 11.10, F10.)
+  [phase-11/review-report.md](./phase-11/review-report.md)'s "Coverage / test gaps" section. **RESOLVED
+  further (Phase 11, task 11.10): the related, still-open gap this bullet also carried — no CI workflow
+  ran this rig at all — is closed.** `.github/workflows/netns-kill-resume.yml` now runs it on a
+  schedule + `workflow_dispatch`, per fix-task 11.10 (F10).
 - **NEW (found by task 10.17's third-party `mrd.echo/1` implementability check): `.claude/skills/
   stream-type-authoring/SKILL.md` step 3 is stale relative to the authoritative
   `docs/api/stream-types-v1.md`.** The skill still says to "derive per-stream keys via HKDF-export
@@ -440,7 +457,7 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
 - **`apps/tui`'s extension registry has no public seam for a feature module to register into a *live*
   session, and `chat.rs`'s transcript renderer never consults the shared registry at all** (found by
   task 10.11's own review). Confirmed: `apps/tui/src/app.rs`'s `register_builtin_commands` is a
-  private free function called only once, from `App::new_with_config` — nothing outside `app.rs` can
+  private free function called only once, from `App::new_with_config`. — nothing outside `app.rs` can
   add a `PaletteCommand`/`MessageRenderer` into a running app's `SurfaceRegistry`. Compounding this,
   `apps/tui/src/screens/chat.rs::transcript_registry` builds a fresh, hardcoded
   `MessageRendererRegistry` containing only `ChatMessageRenderer` on every render call — it never reads
@@ -657,9 +674,12 @@ evaporate:
   but a real reliability/observability gap: no open task owns adding a readiness signal (e.g. waiting
   for the transport's own post-restart `Connected`-equivalent state, which `WebRtcTransport` doesn't
   yet wire up for anything but the *original* connection per ADR 0025's own noted scope) before
-  `ice_restart()` returns, or before a caller sends immediately afterward. Pick up via a future
-  `/plan-phase`, alongside the already-tracked `RESTART_GLARE_WINDOW` and `on_reconnect`-hook
-  residuals this compounds with.
+  `ice_restart()` returns, or before a caller sends immediately afterward. **Now scheduled/monitored
+  in CI, not just documented:** task 11.10 wires `probe` into
+  `.github/workflows/netns-kill-resume.yml` (with `continue-on-error: true`, since this race is
+  expected to keep failing until fixed) so a future fix's actual effect on `probe` is visible, rather
+  than only re-discoverable by an ad hoc local run. Pick up via a future `/plan-phase`, alongside the
+  already-tracked `RESTART_GLARE_WINDOW` and `on_reconnect`-hook residuals this compounds with.
 - **NEW (found by task 10.4's own review, surfaced to this tracker by Phase 11's sweep, N5):
   `CtrlFrame::Close`'s handler doesn't clean up the per-stream bookkeeping it created.**
   `apps/core/src/session.rs`'s `handle_ctrl` `Close` arm only removes the `open_streams` entry, leaving
@@ -1078,7 +1098,7 @@ an earlier, independently-discovered SCTP defect) closed the phase — 24/24 don
 - [x] **10.23** CLI/demo wiring for the new `ice_restart` signature (depends on 10.22) — [file](./phase-10/10.23-cli-ice-restart-wiring.md). Fully executed; `run` (the feature-defining kill/resume scenario) now genuinely passes live — see [transcript](./phase-10/10.23-demo-transcript.md); the smaller `probe` companion still fails live, for a new, distinct readiness-race reason recorded there, not the old `ice_restart` no-op.
 - [x] **10.24** Phase exit-gate re-run (depends on 10.19–10.23) — [file](./phase-10/10.24-phase-exit-gate-rerun.md). Verdict: GO — Phase 10's exit criteria are met, phase closed (24/24).
 
-### Phase 11 — Review of Phase 10 · **open — sweep complete, verdict recorded** · [details](./phase-11/README.md)
+### Phase 11 — Review of Phase 10 · **open — 8/10 fix-tasks done** · [details](./phase-11/README.md)
 Review phase. Sweeps everything built since the Phase-9 review: Phase 10 — File Transfer Stream (tasks
 10.1–10.24). No untracked out-of-band PRs of substance landed in this window (one trivial dependabot
 devcontainer-lockfile bump, PR #86, confirmed via `git log --merges`).
@@ -1099,7 +1119,7 @@ or T14). 10 fix-tasks (11.1–11.10) planned by the **planner** agent; landing o
 - [x] **11.7** Conformance vectors for Phase 10's new wire surfaces (F7) — [file](./phase-11/11.7-file-transfer-conformance-vectors.md)
 - [ ] **11.8** Wire `FileReceiver`'s per-chunk verification into the real send path, or narrow the claim (F8) — [file](./phase-11/11.8-chunk-proof-delivery-mechanism.md)
 - [ ] **11.9** Confirm `soak-file-transfer.yml` ran clean post-10.18 on a real runner (F9, devops-owned, docs-only) — [file](./phase-11/11.9-soak-workflow-runner-confirmation.md)
-- [ ] **11.10** Add scheduled/`workflow_dispatch` CI for `netns-kill-resume.sh` (F10) — [file](./phase-11/11.10-netns-kill-resume-ci-workflow.md)
+- [x] **11.10** Add scheduled/`workflow_dispatch` CI for `netns-kill-resume.sh` (F10) — [file](./phase-11/11.10-netns-kill-resume-ci-workflow.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
