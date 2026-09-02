@@ -349,11 +349,11 @@ async fn corrupted_chunk_is_rejected_never_written_and_recovered_via_resume() {
 
     // Chunk 0: genuinely good, must be accepted.
     {
-        let frame = ChunkFrame::decode(&transfer.pending_chunks[0]).expect("valid chunk frame");
+        let frame = ChunkFrame::decode(&transfer.pending_chunks[&0]).expect("valid chunk frame");
         assert_eq!(frame.i, 0);
         let proof = tree.proof(0).expect("index in range");
         let accepted = receiver
-            .receive_frame(&transfer.pending_chunks[0], &proof)
+            .receive_frame(&transfer.pending_chunks[&0], &proof)
             .expect("chunk 0 must pass AEAD + merkle verification");
         assert_eq!(accepted, 0);
     }
@@ -363,14 +363,14 @@ async fn corrupted_chunk_is_rejected_never_written_and_recovered_via_resume() {
     // not a generic decode failure. ---
     {
         let frame =
-            ChunkFrame::decode(&transfer.pending_chunks[1]).expect("still a well-formed frame");
+            ChunkFrame::decode(&transfer.pending_chunks[&1]).expect("still a well-formed frame");
         assert_eq!(
             frame.i, TARGET,
             "the corrupted frame still claims the right index — only its ciphertext is wrong"
         );
         let proof = tree.proof(TARGET as usize).expect("index in range");
         let err = receiver
-            .receive_frame(&transfer.pending_chunks[1], &proof)
+            .receive_frame(&transfer.pending_chunks[&1], &proof)
             .expect_err("a bit-flipped chunk must be rejected, never silently accepted");
         assert!(
             matches!(err, ReceiveError::Crypto { i } if i == TARGET),
@@ -402,11 +402,11 @@ async fn corrupted_chunk_is_rejected_never_written_and_recovered_via_resume() {
 
     // Chunk 2: also genuinely good, must be accepted independently of chunk 1's fate.
     {
-        let frame = ChunkFrame::decode(&transfer.pending_chunks[2]).expect("valid chunk frame");
+        let frame = ChunkFrame::decode(&transfer.pending_chunks[&2]).expect("valid chunk frame");
         assert_eq!(frame.i, 2);
         let proof = tree.proof(2).expect("index in range");
         let accepted = receiver
-            .receive_frame(&transfer.pending_chunks[2], &proof)
+            .receive_frame(&transfer.pending_chunks[&2], &proof)
             .expect("chunk 2 must pass AEAD + merkle verification");
         assert_eq!(accepted, 2);
     }
@@ -460,8 +460,13 @@ async fn corrupted_chunk_is_rejected_never_written_and_recovered_via_resume() {
 
     drain_frames(&mut bsess, &mut bob, resent_indices.len()).await;
     let transfer_after_resume = bob_file.transfer(sid).expect("bob tracks the transfer");
-    assert_eq!(transfer_after_resume.pending_chunks.len(), 4);
-    let resent_frame_bytes = &transfer_after_resume.pending_chunks[3];
+    // (task 11.3) `pending_chunks` is now keyed by chunk index and bounded to one entry per index —
+    // the genuine resend for `TARGET` *replaces* the earlier corrupted entry at the same key rather
+    // than appending a fourth entry (see `TransferState::pending_chunks`'s own doc: this is exactly
+    // the scenario — a resume resend superseding a previously-corrupted delivery — that requires
+    // last-arrival-wins rather than first-wins/ignore semantics).
+    assert_eq!(transfer_after_resume.pending_chunks.len(), 3);
+    let resent_frame_bytes = &transfer_after_resume.pending_chunks[&TARGET];
     let resent_frame = ChunkFrame::decode(resent_frame_bytes).expect("valid chunk frame");
     assert_eq!(resent_frame.i, TARGET);
     let proof = tree.proof(TARGET as usize).expect("index in range");

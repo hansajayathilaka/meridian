@@ -47,7 +47,7 @@
 //! per chunk.
 
 #[cfg(any(test, feature = "webrtc"))]
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(any(test, feature = "webrtc"))]
 use std::io::Write as _;
 #[cfg(any(test, feature = "webrtc"))]
@@ -633,11 +633,10 @@ async fn run_responder<T: Transport>(
                         continue;
                     };
                     // BLOCKING #1: completion is judged by the number of *distinct* chunk indices
-                    // actually received, never by `pending_chunks.len()` (a raw arrival-order frame
-                    // count). `mrd.file/1` is reliable-unordered, so a duplicate/retransmitted
-                    // delivery of a chunk already received is expected and must not be double-counted
-                    // — otherwise this could fire (and fail) while a genuinely distinct chunk index
-                    // is still missing.
+                    // actually received, never by a raw arrival-order frame count. `mrd.file/1` is
+                    // reliable-unordered, so a duplicate/retransmitted delivery of a chunk already
+                    // received is expected and must not be double-counted — otherwise this could fire
+                    // (and fail) while a genuinely distinct chunk index is still missing.
                     //
                     // Verification-review fix: cardinality alone (`distinct.len() >= leaf_count`) is
                     // not sufficient — it says nothing about *which* indices are present. A peer
@@ -650,9 +649,19 @@ async fn run_responder<T: Transport>(
                     // though the real final chunk arrives moments later. Require *membership* of
                     // every required index instead: only every real index `0..leaf_count` having
                     // actually arrived may trigger finalization.
-                    let distinct = distinct_chunk_indices(&transfer.pending_chunks);
+                    //
+                    // Task 11.3: `pending_chunks` (`meridian_streams::file::TransferState`) is now
+                    // itself keyed by chunk index and bounded to one entry per index (a
+                    // duplicate/retransmitted frame overwrites rather than appends, and an
+                    // out-of-range index is rejected before ever being buffered at all) — so its own
+                    // key set already *is* the distinct-indices bookkeeping this used to compute by
+                    // rescanning every raw frame on every pump event; `distinct_chunk_indices` is
+                    // gone, replaced by a direct `contains_key` membership check below. The
+                    // out-of-range scenario described above can no longer even reach `pending_chunks`
+                    // through `FileStream::on_frame`'s real buffering path — `finalize_transfer`'s own
+                    // out-of-range check (below) remains only as defense in depth.
                     let leaf_count = leaf_count_for_size(manifest.size) as u64;
-                    if (0..leaf_count).all(|i| distinct.contains(&i)) {
+                    if (0..leaf_count).all(|i| transfer.pending_chunks.contains_key(&i)) {
                         match finalize_transfer(manifest, k_f, &transfer.pending_chunks, out_dir) {
                             Ok(path) => {
                                 print_received_line(manifest, json);
@@ -710,21 +719,6 @@ async fn run_responder<T: Transport>(
     })
 }
 
-/// Distinct chunk indices actually received so far for one transfer, decoded from each raw
-/// arrival-order frame's own `i` field — see BLOCKING #1. A frame that fails to decode contributes no
-/// index here (it is not silently treated as "received"); if a transfer is later attempted to
-/// finalize anyway, [`finalize_transfer`] will surface that same decode failure itself. Mirrors
-/// `apps/streams/src/receiver.rs::FileReceiver::received_offsets`'s identical intent for the identical
-/// wire shape.
-#[cfg(any(test, feature = "webrtc"))]
-fn distinct_chunk_indices(pending_chunks: &[Vec<u8>]) -> BTreeSet<u64> {
-    pending_chunks
-        .iter()
-        .filter_map(|raw| ChunkFrame::decode(raw).ok())
-        .map(|frame| frame.i)
-        .collect()
-}
-
 /// Sanity cap on `manifest.size` before eagerly allocating an in-memory whole-file reassembly buffer
 /// (should-fix #6). `manifest.size` is sender-controlled and otherwise completely unbounded, so a
 /// hostile or buggy peer could claim an absurd (e.g. multi-terabyte) size purely to force a large
@@ -740,15 +734,16 @@ fn distinct_chunk_indices(pending_chunks: &[Vec<u8>]) -> BTreeSet<u64> {
 #[cfg(any(test, feature = "webrtc"))]
 const MAX_TRANSFER_SIZE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Reassembles a completed transfer's raw, arrival-order `pending_chunks` (each already AEAD-opened
-/// here) into the declared file size, verifies the whole-file merkle root, and — only on a match —
-/// writes it under `out_dir`. See the module doc's "Receiver-side integrity check" section for why
-/// this checks the whole file rather than calling `FileReceiver::receive_frame` per chunk.
+/// Reassembles a completed transfer's `pending_chunks` (task 11.3: keyed by chunk index, each value
+/// already AEAD-opened here) into the declared file size, verifies the whole-file merkle root, and —
+/// only on a match — writes it under `out_dir`. See the module doc's "Receiver-side integrity check"
+/// section for why this checks the whole file rather than calling `FileReceiver::receive_frame` per
+/// chunk.
 #[cfg(any(test, feature = "webrtc"))]
 fn finalize_transfer(
     manifest: &FileManifest,
     k_f: &[u8; 32],
-    pending_chunks: &[Vec<u8>],
+    pending_chunks: &BTreeMap<u64, Vec<u8>>,
     out_dir: &Path,
 ) -> Result<PathBuf, String> {
     if manifest.size > MAX_TRANSFER_SIZE_BYTES {
@@ -760,7 +755,7 @@ fn finalize_transfer(
     }
     let leaf_count = leaf_count_for_size(manifest.size);
     let mut buf = vec![0u8; manifest.size as usize];
-    for raw in pending_chunks {
+    for raw in pending_chunks.values() {
         let frame = ChunkFrame::decode(raw).map_err(|e| format!("malformed chunk frame: {e}"))?;
         // BLOCKING #2: reject an out-of-range chunk index *before* AEAD-opening it or doing any
         // offset arithmetic on it. `k_f` authenticates only (key, index) — not that the index is
@@ -775,11 +770,11 @@ fn finalize_transfer(
         // Verification-review fix: this used to be fatal for the *whole* transfer (`return Err`),
         // but the caller (`run_responder`'s completion check, above) now only ever calls this
         // function once every real index `0..leaf_count` genuinely has at least one valid-looking
-        // frame among `pending_chunks` (see the membership fix there) — `pending_chunks` can still
-        // legitimately contain *extra* frames mixed in among those required ones: duplicates,
-        // retransmits, or a stray/hostile out-of-range index. None of those are load-bearing for
-        // this transfer's success, so skip (not fail) an out-of-range frame here and keep
-        // reassembling the indices that actually matter. A frame that *is* in-range but fails to
+        // frame among `pending_chunks` (see the membership fix there). As of task 11.3,
+        // `FileStream::on_frame` itself already rejects an out-of-range index before ever buffering
+        // it, so this branch is defense in depth rather than the primary defense — kept in case
+        // `pending_chunks` is ever constructed by a caller other than `on_frame` (e.g. directly, as
+        // this module's own unit tests below still do). A frame that *is* in-range but fails to
         // authenticate, or an overrun offset, remains a real, reportable failure below.
         if frame.i as usize >= leaf_count {
             continue;
@@ -1310,6 +1305,23 @@ mod tests {
         meridian_streams::resume::tag_frame(meridian_streams::FRAME_TAG_CHUNK, frame)
     }
 
+    /// Companion to [`tagged_chunk_frame`] (task 11.4, review finding F4): builds a real, sealed
+    /// `mrd.file/1` chunk frame the exact same way — real [`meridian_streams::seal_chunk`], real
+    /// [`ChunkFrame::encode`], real `tag_frame` — but flips one ciphertext byte *after* all of that
+    /// real sealing/framing, mirroring
+    /// `apps/streams/tests/corrupted_chunk_adversarial.rs::corrupted_chunk_wire_bytes`'s own
+    /// real-sealing-then-flip technique and injection point (see that file's module doc for why this,
+    /// not a `Transport`-level proxy, is the correct layer: the frame still crosses a real
+    /// ratchet-seal/open via [`P2pSession::send_stream_frame`]/`pump`, so only `open_chunk`'s own
+    /// chunk-level AEAD check — not the outer ratchet AEAD — is what can catch it).
+    fn corrupted_tagged_chunk_frame(k_f: &[u8; 32], i: u64, plaintext: &[u8]) -> Vec<u8> {
+        let mut sealed = meridian_streams::seal_chunk(k_f, i, plaintext);
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0x01;
+        let frame = ChunkFrame { i, data: sealed }.encode().unwrap();
+        meridian_streams::resume::tag_frame(meridian_streams::FRAME_TAG_CHUNK, frame)
+    }
+
     /// BLOCKING #1 regression test: a duplicate/retransmitted chunk frame must never inflate the
     /// responder's completion check (previously `pending_chunks.len()`, a raw arrival-order frame
     /// count) past the file's real `leaf_count` while a genuinely distinct chunk index is still
@@ -1689,22 +1701,156 @@ mod tests {
         );
     }
 
-    #[test]
-    fn distinct_chunk_indices_collapses_duplicate_frames_to_one_index() {
-        let key = [0x11u8; 32];
-        let frame_bytes = tagged_chunk_frame(&key, 4, b"payload");
-        // Strip the tag byte back off — `distinct_chunk_indices` operates on `pending_chunks`'
-        // already-untagged shape (`FileStream::on_frame`'s own contract).
-        let (_, body) = frame_bytes.split_first().unwrap();
-        let pending = vec![body.to_vec(), body.to_vec(), body.to_vec()];
-        let distinct = distinct_chunk_indices(&pending);
-        assert_eq!(
-            distinct.len(),
-            1,
-            "three copies of the same index must collapse to one"
+    /// Task 11.4 (review finding F4): proves the real `meridian send` CLI receive path
+    /// (`run_responder`/`finalize_transfer`) rejects a bit-flipped chunk end to end, closing the gap
+    /// between this module's own doc claim ("Receiver-side integrity check", above) and what was
+    /// actually tested at this shipped layer — `apps/streams/tests/corrupted_chunk_adversarial.rs`
+    /// already covers this at `meridian-streams`'s own, lower layer, but nothing previously drove it
+    /// through this crate's real `run_responder`/`finalize_transfer` wiring.
+    ///
+    /// Injection technique/point: [`corrupted_tagged_chunk_frame`] reproduces the real sender-side
+    /// sealing (`seal_chunk` + `ChunkFrame::encode` + `tag_frame`) byte-for-byte and flips exactly one
+    /// ciphertext byte *after* that real sealing — the same technique and layer
+    /// `corrupted_chunk_adversarial.rs` uses, and deliberately not a `Transport`-level proxy (which
+    /// would only ever see the outer ratchet ciphertext and fail the *ratchet's* AEAD instead,
+    /// exercising an already-well-tested layer rather than this one). The corrupted frame is handed to
+    /// the same real `P2pSession::send_stream_frame` every good chunk uses, so it still crosses a real
+    /// ratchet-seal, a real `LoopbackTransport` hop, and a real ratchet-open at the responder's
+    /// `pump()` — only `open_chunk`'s own chunk-level AEAD check is left to catch it.
+    #[tokio::test]
+    async fn a_bit_flipped_chunk_is_rejected_and_the_file_is_never_written() {
+        let mut alice = Peer::new("send.bitflip.alice");
+        let mut bob = Peer::new("send.bitflip.bob");
+        establish_ratchet(&mut alice, &mut bob);
+
+        let alice_file = Arc::new(FileStream::with_ask_user(0, |_, _| true));
+        let bob_file = Arc::new(FileStream::with_ask_user(0, |_, _| true));
+        let (mut asess, mut bsess) =
+            connect(&mut alice, &mut bob, alice_file, bob_file.clone()).await;
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let data = sample(500); // a single chunk: one corrupted frame alone drives completion
+        let tree = MerkleTree::from_bytes(&data);
+        let root = tree.root();
+        let (alice_ik, bob_ik) = (alice.ik(), bob.ik());
+
+        let alice_task = async {
+            asess
+                .send_chat(&alice.store, alice.account.handle(), &mut alice.chat, HELLO)
+                .await
+                .expect("hello");
+
+            let (params, k_f) = FileStream::build_open_params(
+                &mut alice.chat,
+                &alice.store,
+                alice.account.handle(),
+                &alice_ik,
+                &bob_ik,
+                FileMeta {
+                    name: "bitflip.bin".to_string(),
+                    size: data.len() as u64,
+                    root,
+                },
+            )
+            .expect("build open params");
+            let sid = asess
+                .open_stream(
+                    &alice.store,
+                    alice.account.handle(),
+                    &mut alice.chat,
+                    meridian_streams::file::NAME,
+                    params,
+                )
+                .await
+                .expect("open stream");
+
+            loop {
+                match asess
+                    .pump(&alice.store, alice.account.handle(), &mut alice.chat)
+                    .await
+                {
+                    Ok(Some(SessionEvent::StreamOpened(got, _))) if got == sid => break,
+                    Ok(_) => {}
+                    Err(e) => panic!("unexpected error waiting for accept: {e}"),
+                }
+            }
+
+            // The bit flip itself — see this test's own doc comment for why this is the correct
+            // injection point.
+            asess
+                .send_stream_frame(
+                    &mut alice.chat,
+                    sid,
+                    &corrupted_tagged_chunk_frame(&k_f, 0, &data),
+                )
+                .await
+                .expect(
+                    "handing the corrupted frame to the real ratchet-seal/transport path must succeed",
+                );
+            (sid, k_f)
+        };
+
+        let (alice_out, recv_result) = tokio::join!(
+            alice_task,
+            run_responder(
+                &mut bsess,
+                &bob.store,
+                bob.account.handle(),
+                &mut bob.chat,
+                bob_ik,
+                alice_ik,
+                &bob_file,
+                out_dir.path(),
+                1,
+                false,
+            ),
         );
-        assert!(distinct.contains(&4));
+        let (sid, k_f) = alice_out;
+
+        // The real CLI receive path, end to end: the transfer must fail, never hang, and never be
+        // reported as received.
+        let err = recv_result.expect_err(
+            "a bit-flipped chunk must be rejected, never silently accepted as a valid file",
+        );
+        assert!(
+            err.contains("failed verification"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            std::fs::read_dir(out_dir.path()).unwrap().next().is_none(),
+            "a bit-flipped chunk must never result in a file being written to disk"
+        );
+
+        // Pin the *specific* branch: the real, wire-buffered frame `finalize_transfer` saw must fail
+        // via `open_chunk`'s own chunk-level AEAD check (the `open_chunk(...).map_err(...)` branch),
+        // not the whole-file merkle-mismatch branch (already covered by
+        // `a_transfer_that_can_never_verify_settles_as_a_clean_failure_instead_of_hanging`, above).
+        // `run_responder`'s own returned error wraps both branches identically (asserted on above),
+        // so this checks `finalize_transfer`'s return value directly, against the real bytes bob's
+        // side actually buffered off the wire (not a bench-built stand-in).
+        let manifest = FileManifest {
+            name: "bitflip.bin".to_string(),
+            size: data.len() as u64,
+            root,
+            key: vec![0xAA; 32], // unused by `finalize_transfer`
+        };
+        let transfer = bob_file
+            .transfer(sid)
+            .expect("bob must have buffered the (corrupted) chunk frame");
+        let err = finalize_transfer(&manifest, &k_f, &transfer.pending_chunks, out_dir.path())
+            .expect_err("the bit-flipped frame must fail to authenticate, never verify");
+        assert!(
+            err.contains("failed to authenticate"),
+            "must fail via open_chunk's chunk-level AEAD check specifically: {err}"
+        );
     }
+
+    // (task 11.3) `distinct_chunk_indices` is gone — `pending_chunks`
+    // (`meridian_streams::file::TransferState`) is now itself keyed by chunk index, so three
+    // duplicate/retransmitted deliveries of the same index collapsing to one entry is exercised
+    // directly at the source in `apps/streams/src/file.rs`'s own
+    // `on_frame_ignores_a_duplicate_chunk_index_rather_than_growing_the_buffer` test, rather than via
+    // a rescan helper here.
 
     /// BLOCKING #2 regression test: an out-of-range chunk index must never reach the unchecked
     /// `frame.i as usize * CHUNK_SIZE` offset multiply that used to panic (debug builds) or
@@ -1740,8 +1886,12 @@ mod tests {
 
         let out_dir = tempfile::tempdir().unwrap();
         // Must return `Err` (leaf 0's real data never arrived, so the merkle check must fail), not
-        // panic — the surrounding test harness itself is the panic detector.
-        let err = finalize_transfer(&manifest, &key, &[body.to_vec()], out_dir.path()).expect_err(
+        // panic — the surrounding test harness itself is the panic detector. Built directly as a
+        // `BTreeMap` (task 11.3) rather than via `FileStream::on_frame` — this exercises
+        // `finalize_transfer`'s own defense-in-depth out-of-range check directly, independent of
+        // `on_frame`'s own (now primary) guard against ever buffering an out-of-range index at all.
+        let pending = BTreeMap::from([(hostile_i, body.to_vec())]);
+        let err = finalize_transfer(&manifest, &key, &pending, out_dir.path()).expect_err(
             "skipping the only (out-of-range) frame must leave leaf 0 unfilled, \
                          failing the merkle check rather than silently succeeding",
         );
@@ -1777,13 +1927,12 @@ mod tests {
         let (_, stray_body) = stray.split_first().unwrap();
 
         let out_dir = tempfile::tempdir().unwrap();
-        let path = finalize_transfer(
-            &manifest,
-            &key,
-            &[real_body.to_vec(), stray_body.to_vec()],
-            out_dir.path(),
-        )
-        .expect("the stray out-of-range frame must be ignored, not fail the transfer");
+        // Built directly as a `BTreeMap` (task 11.3) with two distinct keys — `on_frame`'s own real
+        // buffering path would never let the out-of-range key 999 in, so this exercises
+        // `finalize_transfer`'s defense-in-depth check directly, same rationale as the test above.
+        let pending = BTreeMap::from([(0u64, real_body.to_vec()), (999u64, stray_body.to_vec())]);
+        let path = finalize_transfer(&manifest, &key, &pending, out_dir.path())
+            .expect("the stray out-of-range frame must be ignored, not fail the transfer");
         assert_eq!(std::fs::read(&path).unwrap(), data);
     }
 

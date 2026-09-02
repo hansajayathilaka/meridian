@@ -345,8 +345,37 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   kill-resume rig) are each independent of everything else. N2–N4 stay informational/deferred, not
   converted; N5 was already promoted straight to a tracker carry-forward (below), not a fix-task. Full
   breakdown: [phase-11/README.md](./phase-11/README.md#tasks-todo).
-- **NEXT:** `/next-task` — no fix-task in this batch is blocked; task-picker should return 11.1 first per
-  the report's own priority (the phase's one blocking finding).
+- **NOW:** **7/10 Phase 11 fix-tasks done** (11.1–11.7), one `/next-task all` batch, one commit per task,
+  reviewed and green throughout. **11.1** (F1, blocking) closed the `sid`-collision: architect-ratified
+  scheme partitions the sid space by the existing identity-key tie-break (smaller key → even sids, larger
+  → odd), implementation-level, no wire change. **11.2** (F2) added the missing `enforce_relay_only` check
+  to `ice_restart`'s two candidate-gather call sites, closing a defense-in-depth gap against the relay-only
+  anonymity invariant. **11.3** (F3+N1) restructured `mrd.file/1`'s `pending_chunks` from an unbounded
+  `Vec` to an index-keyed, out-of-range-rejecting `BTreeMap`; review accepted a deliberate deviation from
+  the task's literal "insert-or-ignore" wording to overwrite semantics, needed so a legitimate resend can
+  supersede an earlier corrupted chunk during resume recovery. **11.4** (F4) proved the real `meridian
+  send` CLI receive path genuinely rejects a bit-flipped chunk end to end (no production defect found).
+  **11.5** (F5) added the two missing full-pipeline resume boundary tests (zero chunks received; all-but-
+  the-last short final chunk). **11.6** (F6) made `RESTART_GLARE_WINDOW` test-overridable via a new `pub`
+  sibling method (the only mechanism that actually works from the separate integration-test crate) and
+  pinned the previously-untested larger-key timeout-then-self-offer fallback branch as a genuine
+  regression test. **11.7** (F7) locked Phase 10's new wire surfaces into two new xtask-generated
+  conformance-vector files, split by owning crate per a folded-in architect consult; two non-blocking
+  review findings (a mis-stated E0364 causal comment, a meta-test that reimplemented its constant instead
+  of mutating the real one) were fixed in the same commit rather than carried forward. Every task's named
+  reviewer(s) signed off PASS with zero blocking findings surviving any task's final review round; the one
+  deliberate scope deviation (11.3) was reviewed and accepted, not silently taken. Tree green throughout
+  (touched-crate `cargo test`/`fmt`/`clippy`, full-workspace clippy and `tools/check-docs.sh` after 11.7).
+  Task-picker's batch stopped here by design: **11.8** needs its own architect consult on a genuine design
+  fork (whether to wire a real per-chunk proof-delivery mechanism or narrow the feature's claimed
+  deliverable) before it can start, and **11.9** is self-declared unable to be completed by an agent
+  session alone (needs a human/devops runner observation) — neither was cleanly unblocked for this run.
+  Draft PR carrying all seven commits: [#94](https://github.com/hansajayathilaka/meridian/pull/94).
+- **NEXT:** `/next-task` — **11.8** needs an architect pre-check on the proof-delivery design fork before
+  implementation can start (not cleanly unblocked without it); **11.9** stays blocked pending a human/
+  devops runner observation it explicitly says an agent session cannot supply; **11.10** (new CI workflow
+  for the kill-resume rig) has no dependency on either and is the next cleanly unblocked fix-task if a
+  future run wants to skip ahead rather than wait on 11.8's consult.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -1061,13 +1090,13 @@ ADR 0025's existing scope. **Verdict: blocked until F1 lands**, then green for t
 or T14). 10 fix-tasks (11.1–11.10) planned by the **planner** agent; landing order and dependencies:
 [phase-11/README.md](./phase-11/README.md#tasks-todo).
 
-- [ ] **11.1** Namespace `open_stream`'s `sid`/channel-label derivation to fix concurrent-open collisions (F1, blocking) — [file](./phase-11/11.1-fix-open-stream-sid-collision.md)
-- [ ] **11.2** Enforce relay-only on `ice_restart`'s freshly-gathered candidates (F2; soft-depends on 11.1) — [file](./phase-11/11.2-ice-restart-relay-only-enforcement.md)
-- [ ] **11.3** Bound/restructure `mrd.file/1`'s `pending_chunks` buffer and its O(n) rescan (F3 + N1) — [file](./phase-11/11.3-bound-pending-chunks-buffer.md)
-- [ ] **11.4** Real-CLI-path bit-flip rejection test (F4; soft-depends on 11.3) — [file](./phase-11/11.4-cli-bitflip-rejection-test.md)
-- [ ] **11.5** Resume boundary tests: 0 chunks received / all-but-last chunk (F5) — [file](./phase-11/11.5-resume-boundary-tests.md)
-- [ ] **11.6** Make `RESTART_GLARE_WINDOW` test-overridable; cover the timeout-fallback branch (F6; soft-depends on 11.1, 11.2) — [file](./phase-11/11.6-restart-glare-window-timeout-test.md)
-- [ ] **11.7** Conformance vectors for Phase 10's new wire surfaces (F7) — [file](./phase-11/11.7-file-transfer-conformance-vectors.md)
+- [x] **11.1** Namespace `open_stream`'s `sid`/channel-label derivation to fix concurrent-open collisions (F1, blocking) — [file](./phase-11/11.1-fix-open-stream-sid-collision.md)
+- [x] **11.2** Enforce relay-only on `ice_restart`'s freshly-gathered candidates (F2; soft-depends on 11.1) — [file](./phase-11/11.2-ice-restart-relay-only-enforcement.md)
+- [x] **11.3** Bound/restructure `mrd.file/1`'s `pending_chunks` buffer and its O(n) rescan (F3 + N1) — [file](./phase-11/11.3-bound-pending-chunks-buffer.md)
+- [x] **11.4** Real-CLI-path bit-flip rejection test (F4; soft-depends on 11.3) — [file](./phase-11/11.4-cli-bitflip-rejection-test.md)
+- [x] **11.5** Resume boundary tests: 0 chunks received / all-but-last chunk (F5) — [file](./phase-11/11.5-resume-boundary-tests.md)
+- [x] **11.6** Make `RESTART_GLARE_WINDOW` test-overridable; cover the timeout-fallback branch (F6; soft-depends on 11.1, 11.2) — [file](./phase-11/11.6-restart-glare-window-timeout-test.md)
+- [x] **11.7** Conformance vectors for Phase 10's new wire surfaces (F7) — [file](./phase-11/11.7-file-transfer-conformance-vectors.md)
 - [ ] **11.8** Wire `FileReceiver`'s per-chunk verification into the real send path, or narrow the claim (F8) — [file](./phase-11/11.8-chunk-proof-delivery-mechanism.md)
 - [ ] **11.9** Confirm `soak-file-transfer.yml` ran clean post-10.18 on a real runner (F9, devops-owned, docs-only) — [file](./phase-11/11.9-soak-workflow-runner-confirmation.md)
 - [ ] **11.10** Add scheduled/`workflow_dispatch` CI for `netns-kill-resume.sh` (F10) — [file](./phase-11/11.10-netns-kill-resume-ci-workflow.md)

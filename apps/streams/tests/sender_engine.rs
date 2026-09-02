@@ -242,14 +242,18 @@ async fn drain_frames<T: Transport>(sess: &mut P2pSession<T>, peer: &mut Peer, n
     }
 }
 
-/// Reassembles a file from a `FileStream`'s raw `pending_chunks` (arrival order, **not** file
-/// order — `on_frame` just appends) by decoding each `{i, data}` [`ChunkFrame`] and opening it
+/// Reassembles a file from a `FileStream`'s `pending_chunks` (task 11.3: keyed by each frame's own
+/// chunk index, **not** arrival order) by decoding each `{i, data}` [`ChunkFrame`] and opening it
 /// under `k_f`, placing plaintext at offset `i * CHUNK_SIZE`. Mirrors what a real receiver engine
 /// (task 10.8) does, without depending on it, so this test can assert reassembly correctness on its
-/// own regardless of the arrival order the raw frames happen to be in.
-fn reassemble(pending: &[Vec<u8>], k_f: &[u8; 32], total_len: usize) -> Vec<u8> {
+/// own regardless of the order the raw frames happen to have arrived in.
+fn reassemble(
+    pending: &std::collections::BTreeMap<u64, Vec<u8>>,
+    k_f: &[u8; 32],
+    total_len: usize,
+) -> Vec<u8> {
     let mut out = vec![0u8; total_len];
-    for raw in pending {
+    for raw in pending.values() {
         let frame = ChunkFrame::decode(raw).expect("valid chunk frame");
         let plaintext = open_chunk(k_f, frame.i, &frame.data).expect("chunk opens under k_f");
         let start = frame.i as usize * CHUNK_SIZE;
@@ -463,12 +467,18 @@ async fn send_chunk_frame_does_not_assume_call_order_reflects_file_order() {
     let transfer = bob_file.transfer(sid).expect("transfer tracked");
     assert_eq!(transfer.pending_chunks.len(), 3);
 
-    // Bob's own arrival order mirrors the scrambled call order (loopback is FIFO) — proving the
-    // *frames themselves*, not some out-of-band ordering, are what let reassembly succeed below.
-    let first_arrived = ChunkFrame::decode(&transfer.pending_chunks[0]).expect("valid chunk frame");
+    // (task 11.3) `pending_chunks` is now keyed by each frame's own claimed chunk index rather than
+    // arrival order, so there is no separate "arrival order" left to observe via decode-and-compare
+    // (any entry decoded from key `k` trivially has `.i == k` by construction — `on_frame` inserts
+    // under the frame's own claimed index). What's still worth asserting explicitly: the scrambled
+    // call order above didn't cause any index to be dropped, merged, or misplaced — the key set is
+    // exactly {0, 1, 2} regardless of the send order.
+    let indices: std::collections::BTreeSet<u64> =
+        transfer.pending_chunks.keys().copied().collect();
     assert_eq!(
-        first_arrived.i, 2,
-        "arrival order must reflect the scrambled call order, not file order"
+        indices,
+        [0u64, 1, 2].into_iter().collect(),
+        "all three scrambled-order indices must be present, keyed by their own claimed `i`"
     );
 
     let reassembled = reassemble(&transfer.pending_chunks, &k_f, data.len());

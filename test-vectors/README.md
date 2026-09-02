@@ -9,8 +9,23 @@ Wire-critical crate bumps must pass these before merge.
 - `ratchet-v1.json` — Double Ratchet chain-key/message-key transcript + header round trip.
 - `envelope-v1.json` — `MessageEnvelope` deterministic-CBOR encoding.
 - `safety-numbers-v1.json` — safety-number/fingerprint.
+- `federation-v1.json` — s2s `FedFrame` body wire-encoding vectors (T06 cross-org federation).
+- `c2s-v1.json` — c2s `Fetch.hint`/`RouteBody.to_hint`/mailbox/federation-error-code wire-encoding
+  vectors.
+- `file-transfer-v1.json` — `mrd.file/1`: `FileManifest` CBOR encoding, BLAKE3 merkle
+  leaf/internal-node construction + `ChunkFrame` CBOR encoding, and the resume-bitmap byte layout
+  (task 11.7, review finding F7).
+- `session-substrate-v1.json` — the per-stream HKDF-export `info` byte layout
+  (`stream_export_info`) and `SignalContent::IceRestartOffer`/`IceRestartAnswer` CBOR encoding
+  (task 11.7, review finding F7).
 
 CI enforces these two ways: `git diff --exit-code test-vectors/` after regenerating (drift = a wire
 change that must be reviewed), and `cargo test -p meridian-crypto --test conformance`, which
 re-derives the crypto vectors via the crate's real code and asserts byte equality — the actual gate
-against a spec-divergent KDF label or silent derivation drift.
+against a spec-divergent KDF label or silent derivation drift. `apps/proto/tests/conformance.rs` and
+`apps/core/tests/stream_export_info_conformance.rs` hold `c2s-v1.json` and
+`session-substrate-v1.json`'s `stream_export_info` section to that same independent-re-derivation
+bar; the rest (including `file-transfer-v1.json` and `session-substrate-v1.json`'s
+`SignalContent::IceRestartOffer`/`Answer` section) rely on the `git diff --exit-code`
+regenerate-and-diff self-consistency check alone, matching the accepted `federation-v1.json`
+precedent (see `test-vectors/CLAUDE.md`).

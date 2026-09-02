@@ -80,3 +80,34 @@ pub mod directory;
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
+
+/// **Test/vector-generation support only** — exposes [`session::stream_export_info`] (otherwise
+/// `pub(crate)`) so `xtask`'s `vectors` subcommand and this crate's own re-derivation test can build
+/// byte-pinned conformance fixtures (`test-vectors/session-substrate-v1.json`, task 11.7, review
+/// finding F7) from the crate's *real* byte layout instead of a parallel reimplementation that could
+/// itself drift from it. Mirrors [`meridian_crypto::test_support`]'s existing pattern in spirit;
+/// implemented as thin wrapper functions (not a bare `pub use`) because a plain re-export of a
+/// `pub(crate)` item is rejected by rustc (E0364) as widening its visibility beyond what its
+/// defining module allows, regardless of whether that module is itself public or private — marking
+/// `stream_export_info` plain `pub` instead would satisfy `pub use`, but since `session` (unlike
+/// `meridian-crypto`'s private `primitives` module) is itself a genuinely public module, that would
+/// leak it into the crate's real public surface as `session::stream_export_info`. Wrapping it in
+/// functions defined here, which have crate-wide access to call it, sidesteps both problems without
+/// widening `session`'s own public API. This is deliberately **not** part of the application-facing
+/// API (see `core-api-contracts.md`) — nothing in `apps/` outside `xtask`/tests should ever call it.
+#[doc(hidden)]
+pub mod test_support {
+    /// See the module doc comment. Forwards to [`crate::session::stream_export_info`] unchanged.
+    pub fn stream_export_info(ty: &str, sid: crate::streams::StreamId) -> Vec<u8> {
+        crate::session::stream_export_info(ty, sid)
+    }
+
+    /// The real domain tag [`stream_export_info`] prefixes onto every derived `info` byte string —
+    /// exposed so a conformance test can mutate a copy of the *real* constant and reconstruct the
+    /// byte layout from it (mirroring `meridian_crypto::x3dh`'s divergent-`X3DH_INFO`-label test)
+    /// rather than independently reimplementing the tag as a hardcoded literal that could itself
+    /// silently drift from the real one.
+    pub fn stream_export_info_tag() -> &'static [u8] {
+        crate::session::STREAM_EXPORT_INFO_TAG
+    }
+}
