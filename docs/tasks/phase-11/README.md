@@ -112,7 +112,7 @@ else and of each other.
 - [x] **11.7** Conformance vectors for Phase 10's new wire surfaces (F7) — [file](./11.7-file-transfer-conformance-vectors.md)
 - [ ] **11.8** Wire `FileReceiver`'s per-chunk verification into the real send path, or narrow the claim (F8) — [file](./11.8-chunk-proof-delivery-mechanism.md)
 - [ ] **11.9** Confirm `soak-file-transfer.yml` ran clean post-10.18 on a real runner (F9, devops-owned, docs-only) — [file](./11.9-soak-workflow-runner-confirmation.md)
-- [ ] **11.10** Add scheduled/`workflow_dispatch` CI for `netns-kill-resume.sh` (F10) — [file](./11.10-netns-kill-resume-ci-workflow.md)
+- [x] **11.10** Add scheduled/`workflow_dispatch` CI for `netns-kill-resume.sh` (F10) — [file](./11.10-netns-kill-resume-ci-workflow.md)
 
 **N2, N3, N4** were deliberately **not** converted to fix-tasks — matching the review report's own
 disposition: N2 (`LoopbackTransport::ice_restart`'s "no-op" doc-comment overclaim) and N4 (no back-to-back
