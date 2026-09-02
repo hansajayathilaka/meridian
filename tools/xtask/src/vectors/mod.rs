@@ -7,9 +7,11 @@
 mod c2s;
 mod envelope;
 mod federation;
+mod file_transfer;
 mod identity;
 mod ratchet;
 mod safety_numbers;
+mod session_substrate;
 mod x3dh;
 
 use std::path::{Path, PathBuf};
@@ -43,5 +45,7 @@ pub fn generate() -> Result<(), String> {
     safety_numbers::generate_safety_numbers()?;
     federation::generate_federation()?;
     c2s::generate_c2s()?;
+    file_transfer::generate_file_transfer()?;
+    session_substrate::generate_session_substrate()?;
     Ok(())
 }

@@ -13,6 +13,10 @@ meridian-store = { path = "../../apps/store" }
 meridian-crypto = { path = "../../apps/crypto" }
 meridian-proto = { path = "../../apps/proto" }
 meridian-envelope = { path = "../../apps/envelope" }
+# 11.7: file-transfer-v1.json (FileManifest/ChunkFrame/merkle/resume bitmap) + session-substrate-v1.json
+# (stream_export_info via meridian-core's test_support, IceRestartOffer/Answer).
+meridian-streams = { path = "../../apps/streams" }
+meridian-core = { path = "../../apps/core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }

@@ -1,0 +1,174 @@
+{
+  "version": 1,
+  "note": "mrd.file/1 conformance vectors (task 11.7, review finding F7): FileManifest CBOR encoding, BLAKE3 merkle leaf/internal-node construction + ChunkFrame CBOR encoding, and the resume-bitmap byte layout. Deterministic (fixed byte patterns, no RNG/wall-clock). Regenerate with `cargo run -p xtask -- vectors`. Every value comes from meridian-streams's real MerkleTree/seal_chunk/FileManifest/ChunkFrame/ResumeRequest code. Spec: docs/api/stream-types-v1.md, docs/api/wire-protocol.md §6, apps/streams/src/{manifest,chunk,merkle,resume}.rs. Locks in what Phase 10 already shipped — see docs/tasks/phase-11/11.7-file-transfer-conformance-vectors.md.",
+  "manifest": [
+    {
+      "name": "empty-file",
+      "note": "Zero-chunk (empty file) convention (merkle.rs module doc): a single virtual leaf whose hash is BLAKE3(0x00) (the leaf domain-separation byte still applies) — root computed by the real MerkleTree::from_bytes(&[]), not reproduced by hand.",
+      "name_field": "empty.bin",
+      "size": 0,
+      "root_hex": "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213",
+      "key_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "encoded_hex": "a4646e616d6569656d7074792e62696e6473697a650064726f6f7458202d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213636b65795820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "canonical",
+      "note": "A typical non-empty manifest — `root` is the real merkle root of this same file's `power-of-two-4-leaves` chunk_and_merkle vector above (74 bytes across 4 chunks), tying the two sections together rather than using an unrelated hand-picked root.",
+      "name_field": "vacation.mp4",
+      "size": 74,
+      "root_hex": "dba7b613e0145910a7251c3f197944a3fefa3650bd44339c820a683925def91e",
+      "key_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "encoded_hex": "a4646e616d656c7661636174696f6e2e6d70346473697a65184a64726f6f745820dba7b613e0145910a7251c3f197944a3fefa3650bd44339c820a683925def91e636b65795820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "chunk_and_merkle": [
+    {
+      "name": "power-of-two-4-leaves",
+      "note": "A clean 4-leaf (power-of-two) tree: every level pairs cleanly, so the pinned proof (for leaf 1) is Sibling/Sibling only — no ProofStep::Promoted.",
+      "chunk_hex": [
+        "0000000000000000000000000000000000",
+        "010101010101010101010101010101010101",
+        "02020202020202020202020202020202020202",
+        "0303030303030303030303030303030303030303"
+      ],
+      "leaf_count": 4,
+      "root_hex": "dba7b613e0145910a7251c3f197944a3fefa3650bd44339c820a683925def91e",
+      "proof_leaf_index": 1,
+      "proof_steps": [
+        {
+          "hash_hex": "d67e8c4527ae1acc41fa4c915f87dfaafd6cfe3497835943d3760706d3a2c899",
+          "kind": "sibling",
+          "side": "left"
+        },
+        {
+          "hash_hex": "c56453c3588e1a3c487730297db663fe767d25917c4b9fde1bc5b4edbfd48c4e",
+          "kind": "sibling",
+          "side": "right"
+        }
+      ],
+      "chunk_frame": {
+        "k_f_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+        "i": 1,
+        "plaintext_hex": "010101010101010101010101010101010101",
+        "sealed_data_hex": "ca7dae144916b2038084e13a970dcd3e1121a762346df49bebced47481ac6ebe1b02",
+        "encoded_hex": "a261690164646174615822ca7dae144916b2038084e13a970dcd3e1121a762346df49bebced47481ac6ebe1b02"
+      }
+    },
+    {
+      "name": "odd-leaf-count-promoted",
+      "note": "A 3-leaf tree: level0 = [a,b,c] -> level1 = [hash(a,b), c] -> root = hash(hash(a,b), c). The pinned proof (for leaf 2, the odd node out) is Promoted then Sibling(Left) — this is the exact odd-node-promotion construction a prior domain-separation-bug regression test (apps/streams/src/merkle.rs) already covers functionally; this vector byte-pins it.",
+      "chunk_hex": [
+        "0000000000000000000000000000000000",
+        "010101010101010101010101010101010101",
+        "02020202020202020202020202020202020202"
+      ],
+      "leaf_count": 3,
+      "root_hex": "75e9ae175ab181160f8357e9e0fed9532e4ee468dfc7cd9026662bcff63ff871",
+      "proof_leaf_index": 2,
+      "proof_steps": [
+        {
+          "kind": "promoted"
+        },
+        {
+          "hash_hex": "8912495fed76baa663bb3e468af247514f9e44180ff3b43cb1208b493d9c76ed",
+          "kind": "sibling",
+          "side": "left"
+        }
+      ],
+      "chunk_frame": {
+        "k_f_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+        "i": 2,
+        "plaintext_hex": "02020202020202020202020202020202020202",
+        "sealed_data_hex": "de06a971af2511958834906de09eaff47a672537c2dccd8ee0ea11a07d8dc0af473976",
+        "encoded_hex": "a261690264646174615823de06a971af2511958834906de09eaff47a672537c2dccd8ee0ea11a07d8dc0af473976"
+      }
+    },
+    {
+      "name": "short-final-chunk",
+      "note": "4 leaves, the last (index 3) far shorter than the others and not a power-of-two length (7 bytes) — the real-world 'file length not a multiple of the chunk size' case. Leaf count is even (no Promoted step here; that's the separate odd-leaf-count case above) — this vector isolates the short-final-chunk leaf-hash byte layout specifically.",
+      "chunk_hex": [
+        "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+        "a3a3a3a3a3a3a3"
+      ],
+      "leaf_count": 4,
+      "root_hex": "f36e2fd780b01332cb7cdcb8badacedc21a36ab1731ccaa04dac4d65261a2eaf",
+      "proof_leaf_index": 3,
+      "proof_steps": [
+        {
+          "hash_hex": "46743d67592ff8fc19daf091ed64b750826c81c673d174f7401f6aa96028da7c",
+          "kind": "sibling",
+          "side": "left"
+        },
+        {
+          "hash_hex": "bc4e16090922edd27c1faf97a8ec14fcb10d6ea7f6f2befb1e7caf4c98d75cd4",
+          "kind": "sibling",
+          "side": "left"
+        }
+      ],
+      "chunk_frame": {
+        "k_f_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+        "i": 3,
+        "plaintext_hex": "a3a3a3a3a3a3a3",
+        "sealed_data_hex": "36b7a453f71c789f0f52f6c552dcad01d645375c6ee0fe",
+        "encoded_hex": "a261690364646174615736b7a453f71c789f0f52f6c552dcad01d645375c6ee0fe"
+      }
+    }
+  ],
+  "resume_bitmap": [
+    {
+      "name": "all-missing",
+      "leaf_count": 8,
+      "received": [],
+      "bitmap_hex": "ff",
+      "missing_indices": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "encoded_hex": "a1666269746d617041ff"
+    },
+    {
+      "name": "all-present",
+      "leaf_count": 8,
+      "received": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "bitmap_hex": "00",
+      "missing_indices": [],
+      "encoded_hex": "a1666269746d61704100"
+    },
+    {
+      "name": "mixed-crossing-byte-boundary",
+      "leaf_count": 9,
+      "received": [
+        0,
+        1,
+        3
+      ],
+      "bitmap_hex": "f401",
+      "missing_indices": [
+        2,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "encoded_hex": "a1666269746d617042f401"
+    }
+  ]
+}

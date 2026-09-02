@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "note": "Session-substrate conformance vectors (task 11.7, review finding F7): the per-stream HKDF-export `info` byte layout (stream_export_info, task 10.4) and SignalContent::IceRestartOffer/IceRestartAnswer CBOR encoding (task 10.22, ADR 0025). Deterministic (fixed byte patterns, no RNG/wall-clock). Regenerate with `cargo run -p xtask -- vectors`. `stream_export_info` additionally gets a dedicated re-derivation test (apps/core/tests/stream_export_info_conformance.rs), not just this generator's own self-consistency — see this module's doc comment. Spec: docs/api/stream-types-v1.md, docs/adr/0025-ice-restart-renegotiation.md, apps/core/src/session.rs, apps/envelope/src/signal.rs.",
+  "stream_export_info": [
+    {
+      "name": "canonical",
+      "ty": "mrd.file/1",
+      "sid": 7,
+      "info_hex": "6d72642f73747265616d2f6d72642e66696c652f310000000000000007"
+    },
+    {
+      "name": "sid-zero",
+      "ty": "mrd.file/1",
+      "sid": 0,
+      "info_hex": "6d72642f73747265616d2f6d72642e66696c652f310000000000000000"
+    },
+    {
+      "name": "sid-max",
+      "ty": "mrd.file/1",
+      "sid": 18446744073709551615,
+      "info_hex": "6d72642f73747265616d2f6d72642e66696c652f31ffffffffffffffff"
+    }
+  ],
+  "signal_content": [
+    {
+      "name": "ice-restart-offer-canonical",
+      "variant": "IceRestartOffer",
+      "fields": {
+        "dtls_fp": "sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
+        "ice": [
+          "candidate:1 1 UDP 2130706431 203.0.113.10 54400 typ host",
+          "candidate:2 1 UDP 1694498815 203.0.113.10 54401 typ srflx raddr 10.0.0.5 rport 54401"
+        ],
+        "sdp_hex": "763d300d0a6f3d2d203436203220494e20495034203132372e302e302e310d0a2e2e2e"
+      },
+      "encoded_hex": "a16f496365526573746172744f66666572a3637364705823763d300d0a6f3d2d203436203220494e20495034203132372e302e302e310d0a2e2e2e6764746c735f667078377368612d3235362041413a42423a43433a44443a45453a46463a30303a31313a32323a33333a34343a35353a36363a37373a38383a39396369636582783863616e6469646174653a312031205544502032313330373036343331203230332e302e3131332e31302035343430302074797020686f7374785463616e6469646174653a322031205544502031363934343938383135203230332e302e3131332e313020353434303120747970207372666c782072616464722031302e302e302e352072706f7274203534343031"
+    },
+    {
+      "name": "ice-restart-offer-empty-ice",
+      "variant": "IceRestartOffer",
+      "fields": {
+        "dtls_fp": "sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
+        "ice": [],
+        "sdp_hex": "763d300d0a6f3d2d203437203220494e20495034203132372e302e302e310d0a2e2e2e"
+      },
+      "encoded_hex": "a16f496365526573746172744f66666572a3637364705823763d300d0a6f3d2d203437203220494e20495034203132372e302e302e310d0a2e2e2e6764746c735f667078377368612d3235362041413a42423a43433a44443a45453a46463a30303a31313a32323a33333a34343a35353a36363a37373a38383a39396369636580"
+    },
+    {
+      "name": "ice-restart-answer-canonical",
+      "variant": "IceRestartAnswer",
+      "fields": {
+        "dtls_fp": "sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
+        "ice": [
+          "candidate:1 1 UDP 2130706431 203.0.113.20 54500 typ host"
+        ],
+        "sdp_hex": "763d300d0a6f3d2d203436203320494e20495034203132372e302e302e310d0a2e2e2e"
+      },
+      "encoded_hex": "a17049636552657374617274416e73776572a3637364705823763d300d0a6f3d2d203436203320494e20495034203132372e302e302e310d0a2e2e2e6764746c735f667078377368612d3235362041413a42423a43433a44443a45453a46463a30303a31313a32323a33333a34343a35353a36363a37373a38383a39396369636581783863616e6469646174653a312031205544502032313330373036343331203230332e302e3131332e32302035343530302074797020686f7374"
+    },
+    {
+      "name": "ice-restart-answer-empty-ice",
+      "variant": "IceRestartAnswer",
+      "fields": {
+        "dtls_fp": "sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
+        "ice": [],
+        "sdp_hex": "763d300d0a6f3d2d203437203320494e20495034203132372e302e302e310d0a2e2e2e"
+      },
+      "encoded_hex": "a17049636552657374617274416e73776572a3637364705823763d300d0a6f3d2d203437203320494e20495034203132372e302e302e310d0a2e2e2e6764746c735f667078377368612d3235362041413a42423a43433a44443a45453a46463a30303a31313a32323a33333a34343a35353a36363a37373a38383a39396369636580"
+    }
+  ]
+}
