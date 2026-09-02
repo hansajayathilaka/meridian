@@ -795,6 +795,185 @@ async fn ice_restart_glare_resolves_deterministically_and_both_sides_return_ok()
     }
 }
 
+/// (11.6, review finding F6) The larger-key side's own **glare-window-timeout, then self-offering
+/// fallback** branch — the one truly untested corner of `ice_restart`'s glare handling before this
+/// task: if nothing arrives within [`meridian_core::session::RESTART_GLARE_WINDOW`], the
+/// larger-key side falls through to restarting its own local ICE state and sending its own offer
+/// instead of answering. Driven here via `P2pSession::ice_restart_with_glare_window`'s injectable
+/// window (11.6) so the test can force that timeout in milliseconds rather than either burning the
+/// real ~5s wait every run or weakening the production constant to make it fast —
+/// `#[tokio::test(start_paused = true)]` (the same technique 1.33/2.17's own timeout tests already
+/// use) makes the shrunk window and the deliberately-late answer below race deterministically on
+/// tokio's virtual clock regardless of real scheduling, rather than via a flaky real-wall-clock
+/// margin.
+///
+/// Alice (smaller key) never calls her own `ice_restart` in this test at all — modeling the case
+/// ADR 0025's fallback branch actually exists for: only Bob's side detected the need to restart
+/// within this window, so nothing from Alice was ever going to arrive. Alice's own smaller-key
+/// branch, once invoked, only ever *offers* — it never checks for or answers an incoming offer;
+/// that path is structurally reachable only from the larger-key branch's own window-wait — so
+/// having her independently call `ice_restart` here too would trigger the *different*,
+/// already-documented residual (`RESTART_GLARE_WINDOW`'s own doc comment: both sides simultaneously
+/// offering and discarding each other, ending in a mutual timeout) rather than the fallback branch
+/// this test exists to pin — out of scope here, and neither the tie-break itself nor
+/// `RESTART_ANSWER_TIMEOUT` are touched. Instead, Bob's own genuine fallback offer is answered by a
+/// hand-crafted (but otherwise entirely genuine — same real ratchet, same real cached fingerprint)
+/// `IceRestartAnswer` sent only *after* his window has already elapsed, mirroring how
+/// `ice_restart_rejects_a_corrupted_dtls_fp_in_the_restart_offer`/
+/// `ice_restart_layered_check_flags_fingerprint_drift_against_the_cached_value` already hand-craft
+/// one half of the exchange elsewhere in this file — the only difference being this one is valid,
+/// not corrupted, so it proves the *success* path converges rather than a rejection.
+#[tokio::test(start_paused = true)]
+async fn ice_restart_larger_key_falls_back_to_self_offer_after_the_glare_window_elapses() {
+    let (mut alice, mut bob) = smaller_and_larger_key_peers("fallback.a", "fallback.b");
+    establish_ratchet(&mut alice, &mut bob);
+    assert!(bob.ik() > alice.ik(), "bob must hold the larger key");
+
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(LoopbackTransport::new(fabric.clone()));
+    let tb = Arc::new(LoopbackTransport::new(fabric.clone()));
+
+    let (ra, rb) = connect(
+        ta,
+        tb,
+        &mut alice,
+        &mut bob,
+        Arc::new(StreamRegistry::with_builtins()),
+        Arc::new(StreamRegistry::with_builtins()),
+    )
+    .await;
+    let mut asess = ra.unwrap();
+    let mut bsess = rb.unwrap();
+
+    let ahandle = alice.handle();
+    let bhandle = bob.handle();
+
+    // Get past the first-contact gate before the restart this test actually exercises, exactly like
+    // every other ice_restart test in this file.
+    asess
+        .send_chat(&alice.store, &ahandle, &mut alice.chat, "before fallback")
+        .await
+        .unwrap();
+    accept_first_p2p_message(
+        &mut bsess,
+        &bob.store,
+        &bhandle,
+        &mut bob.chat,
+        &alice.ik(),
+        "before fallback",
+    )
+    .await;
+
+    // Bob's own cached remote fp for alice — unchanged across a restart (task 10.19: the DTLS cert
+    // never rotates across one), so it is exactly the value a genuine answer would (re)assert. Its
+    // LoopbackTransport-specific encoding (`fingerprint_for`, `"sha-256 LOOPBACK:{token:016x}"`)
+    // also carries alice's own routing token, needed below so the hand-crafted answer addresses the
+    // same real peer session a genuine one would, rather than silently breaking bob's routing to
+    // her.
+    let (_bob_local, cached_alice_fp) = bsess.fingerprints();
+    let cached_alice_fp = cached_alice_fp.clone();
+    let alice_token_hex = cached_alice_fp
+        .0
+        .strip_prefix("sha-256 LOOPBACK:")
+        .expect("a LoopbackTransport fingerprint always carries this prefix");
+    let alice_token = u64::from_str_radix(alice_token_hex, 16)
+        .expect("a LoopbackTransport fingerprint's suffix is always hex");
+
+    let shrunk_glare_window = std::time::Duration::from_millis(50);
+    // Comfortably past the shrunk window (and comfortably under `RESTART_ANSWER_TIMEOUT`) — under
+    // `start_paused = true` this races bob's window on tokio's virtual clock, not real wall time, so
+    // the wide margin costs nothing and just makes the ordering unambiguous.
+    let late_answer_delay = std::time::Duration::from_millis(500);
+
+    let (alice_ik, bob_ik) = (alice.ik(), bob.ik());
+    let (mut restart_relay_a, mut restart_relay_b) = MemRelay::pair(alice_ik, bob_ik);
+    let bob_fut = bsess.ice_restart_with_glare_window(
+        &mut restart_relay_b,
+        &bob.store,
+        &bhandle,
+        &mut bob.chat,
+        shrunk_glare_window,
+    );
+    let feeder_fut = async {
+        tokio::time::sleep(late_answer_delay).await;
+        let genuine_looking_answer = SignalContent::IceRestartAnswer {
+            sdp: format!(
+                "v=loopback\ntoken={alice_token}\nfp={}\ngen=0\n",
+                cached_alice_fp.0
+            )
+            .into_bytes(),
+            dtls_fp: cached_alice_fp.0.clone(),
+            ice: vec!["candidate:host 1 10.0.0.9".to_string()],
+        };
+        let blob = alice
+            .chat
+            .seal_bytes(
+                &alice.store,
+                &ahandle,
+                &alice_ik,
+                &bob_ik,
+                &genuine_looking_answer
+                    .encode()
+                    .expect("encode the late answer"),
+            )
+            .expect("seal the late answer on alice's real ratchet");
+        restart_relay_a
+            .send(&bob_ik, blob)
+            .await
+            .expect("deliver the late answer to bob's inbox");
+    };
+
+    let (bres, _) = tokio::join!(bob_fut, feeder_fut);
+    bres.expect(
+        "bob's glare window must elapse, fall back to self-offering, and still converge once the \
+         (deliberately late) answer arrives",
+    );
+
+    // Genuinely converged, not merely "returned Ok": bob's cached fingerprint for alice (the
+    // layered check's own comparison target, task 10.22 deliverable d) is exactly what it was
+    // before the fallback, and a message flows each way afterward on the very same session/ratchet
+    // established before this restart — no re-handshake, no new session.
+    let (_bob_local_after, alice_fp_after) = bsess.fingerprints();
+    assert_eq!(
+        alice_fp_after, &cached_alice_fp,
+        "bob's cached fingerprint for alice must be exactly what it was before the fallback"
+    );
+
+    bsess
+        .send_chat(&bob.store, &bhandle, &mut bob.chat, "after fallback: b->a")
+        .await
+        .unwrap();
+    match asess
+        .pump(&alice.store, &ahandle, &mut alice.chat)
+        .await
+        .unwrap()
+    {
+        Some(SessionEvent::Chat(ChatContent::Text { body, .. })) => {
+            assert_eq!(body, "after fallback: b->a");
+        }
+        other => panic!("alice expected chat after the fallback-resolved restart, got {other:?}"),
+    }
+    asess
+        .send_chat(
+            &alice.store,
+            &ahandle,
+            &mut alice.chat,
+            "after fallback: a->b",
+        )
+        .await
+        .unwrap();
+    match bsess
+        .pump(&bob.store, &bhandle, &mut bob.chat)
+        .await
+        .unwrap()
+    {
+        Some(SessionEvent::Chat(ChatContent::Text { body, .. })) => {
+            assert_eq!(body, "after fallback: a->b");
+        }
+        other => panic!("bob expected chat after the fallback-resolved restart, got {other:?}"),
+    }
+}
+
 /// (task 10.22) The smaller-key side's own "discard a competing offer, keep waiting for my
 /// answer within the remaining budget" branch, isolated deterministically: a bogus
 /// `IceRestartOffer` is pre-queued into Alice's restart-relay inbox *before* either side's
@@ -1655,6 +1834,303 @@ async fn relay_only_answer_aborts_before_any_signaling_send_on_a_leaked_host_can
     );
 }
 
+// -- 11.2 (F2): `ice_restart`'s own freshly-gathered candidates must be relay-only-enforced too ---
+//
+// The two tests above prove `enforce_relay_only` aborts the *original* dial/answer handshake before
+// any leaked candidate reaches the signaling relay. `ice_restart`'s own two call sites
+// (`restart_offer_and_await_answer`, `answer_restart_offer`) gather fresh candidates on every
+// restart, and need the identical fail-closed guarantee against *that* gather — proven here the same
+// way, but with a transport double that must behave honestly for the *initial* handshake (otherwise
+// relay-only can never even establish the session these tests restart) and only misbehaves starting
+// from its *next* gather, i.e. exactly the post-restart one under test.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Wraps an honest [`LoopbackTransport`] but only starts leaking an extra host candidate once its
+/// shared `leak` flag is flipped — `LeakyTransport` above always leaks, which would also fail the
+/// *initial* relay-only handshake before `ice_restart` is ever reached; this double stays honest
+/// through that handshake and is flipped to leak immediately before the restart under test.
+#[derive(Clone)]
+struct RestartLeakyTransport(LoopbackTransport, Arc<AtomicBool>);
+
+#[async_trait::async_trait]
+impl Transport for RestartLeakyTransport {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+    async fn new_session(&self, cfg: IceConfig) -> TransportResult<SessionHandle> {
+        self.0.new_session(cfg).await
+    }
+    async fn add_data_channel(
+        &self,
+        s: &SessionHandle,
+        cfg: ChannelCfg,
+    ) -> TransportResult<ChannelId> {
+        self.0.add_data_channel(s, cfg).await
+    }
+    async fn add_transceiver(
+        &self,
+        s: &SessionHandle,
+        kind: MediaKind,
+    ) -> TransportResult<TrackId> {
+        self.0.add_transceiver(s, kind).await
+    }
+    fn local_description(&self, s: &SessionHandle) -> TransportResult<Sdp> {
+        self.0.local_description(s)
+    }
+    async fn set_remote_description(&self, s: &SessionHandle, sdp: Sdp) -> TransportResult<()> {
+        self.0.set_remote_description(s, sdp).await
+    }
+    async fn set_remote_offer_and_answer(
+        &self,
+        s: &SessionHandle,
+        sdp: Sdp,
+    ) -> TransportResult<()> {
+        self.0.set_remote_offer_and_answer(s, sdp).await
+    }
+    async fn add_ice_candidate(&self, s: &SessionHandle, c: IceCandidate) -> TransportResult<()> {
+        self.0.add_ice_candidate(s, c).await
+    }
+    async fn local_candidates(&self, s: &SessionHandle) -> TransportResult<Vec<IceCandidate>> {
+        let mut cands = self.0.local_candidates(s).await?;
+        if self.1.load(Ordering::SeqCst) {
+            // The deliberate, toggled leak: a host candidate appended on top of whatever the
+            // honest inner transport actually gathered.
+            cands.push(IceCandidate(
+                "candidate:host 999 10.0.0.99 leaked-on-restart-by-test-double".to_string(),
+            ));
+        }
+        Ok(cands)
+    }
+    fn local_fingerprint(&self, s: &SessionHandle) -> TransportResult<Fingerprint> {
+        self.0.local_fingerprint(s)
+    }
+    fn dtls_fingerprint(&self, s: &SessionHandle) -> TransportResult<Fingerprint> {
+        self.0.dtls_fingerprint(s)
+    }
+    async fn ice_restart(&self, s: &SessionHandle) -> TransportResult<()> {
+        self.0.ice_restart(s).await
+    }
+    async fn send(&self, s: &SessionHandle, ch: &ChannelId, data: &[u8]) -> TransportResult<()> {
+        self.0.send(s, ch, data).await
+    }
+    async fn recv(&self, s: &SessionHandle) -> TransportResult<Option<(ChannelId, Vec<u8>)>> {
+        self.0.recv(s).await
+    }
+    async fn buffered_amount(&self, s: &SessionHandle, ch: &ChannelId) -> TransportResult<u64> {
+        self.0.buffered_amount(s, ch).await
+    }
+    async fn selected_path(&self, s: &SessionHandle) -> TransportResult<Path> {
+        self.0.selected_path(s).await
+    }
+    async fn close(&self, s: &SessionHandle) -> TransportResult<()> {
+        self.0.close(s).await
+    }
+}
+
+/// Exercises `restart_offer_and_await_answer`'s call site: the smaller-key (offering) side's own
+/// fresh post-restart gather leaks a host candidate, and `ice_restart` must abort with
+/// `RelayOnlyViolation` before the restart offer ever reaches the signaling relay — mirroring
+/// `relay_only_dial_aborts_before_any_signaling_send_on_a_leaked_host_candidate` but for the restart
+/// path instead of the initial dial.
+#[tokio::test]
+async fn ice_restart_offer_side_aborts_before_any_signaling_send_on_a_leaked_host_candidate() {
+    let (mut alice, mut bob) = smaller_and_larger_key_peers("restart-leak.a", "restart-leak.b");
+    establish_ratchet(&mut alice, &mut bob);
+    assert!(alice.ik() < bob.ik(), "alice must hold the smaller key");
+
+    let fabric = LoopbackFabric::new();
+    let leak_flag = Arc::new(AtomicBool::new(false));
+    let ta = Arc::new(RestartLeakyTransport(
+        LoopbackTransport::new(fabric.clone()),
+        leak_flag.clone(),
+    ));
+    let tb = Arc::new(RestartLeakyTransport(
+        LoopbackTransport::new(fabric.clone()),
+        Arc::new(AtomicBool::new(false)),
+    ));
+
+    let ice_servers = demo_ice_servers();
+    let cfg_a = relay::ice_config(IcePolicy::RelayOnly, ice_servers.clone(), Vec::new());
+    let cfg_b = relay::ice_config(IcePolicy::RelayOnly, ice_servers, Vec::new());
+
+    let (mut relay_a, mut relay_b) = MemRelay::pair(alice.ik(), bob.ik());
+    let (alice_ik, bob_ik) = (alice.ik(), bob.ik());
+    let (ahandle, bhandle) = (alice.handle(), bob.handle());
+    let (ra, rb) = {
+        let achat = &mut alice.chat;
+        let bchat = &mut bob.chat;
+        tokio::join!(
+            dial_with_config(
+                ta,
+                &alice.store,
+                &ahandle,
+                alice_ik,
+                bob_ik,
+                achat,
+                &mut relay_a,
+                Arc::new(StreamRegistry::with_builtins()),
+                cfg_a,
+            ),
+            answer_with_config(
+                tb,
+                &bob.store,
+                &bhandle,
+                bob_ik,
+                alice_ik,
+                bchat,
+                &mut relay_b,
+                Arc::new(StreamRegistry::with_builtins()),
+                cfg_b,
+            ),
+        )
+    };
+    let mut asess =
+        ra.expect("relay-only dial should succeed: honest gather before the flag is flipped");
+    let _bsess = rb.expect("relay-only answer should succeed");
+
+    // Flip the flag now: alice's *next* candidate gather (the restart's own) leaks.
+    leak_flag.store(true, Ordering::SeqCst);
+
+    let (restart_relay_a, _restart_relay_b) = MemRelay::pair(alice.ik(), bob.ik());
+    let mut counting = CountingRelay {
+        inner: restart_relay_a,
+        sends: 0,
+    };
+    let result = asess
+        .ice_restart(&mut counting, &alice.store, &ahandle, &mut alice.chat)
+        .await;
+
+    match result {
+        Err(SessionError::RelayOnlyViolation { .. }) => {}
+        Err(e) => panic!("expected RelayOnlyViolation, got a different error: {e}"),
+        Ok(()) => panic!("a leaked candidate on the post-restart gather must never be accepted"),
+    }
+    assert_eq!(
+        counting.sends, 0,
+        "the restart offer must never reach the signaling relay once a leaked post-restart \
+         candidate is observed"
+    );
+}
+
+/// Exercises `answer_restart_offer`'s call site: the larger-key (answering) side genuinely answers
+/// alice's real restart offer, but its own fresh post-restart gather leaks a host candidate, and
+/// `ice_restart` must abort with `RelayOnlyViolation` before the restart answer ever reaches the
+/// signaling relay — mirroring
+/// `relay_only_answer_aborts_before_any_signaling_send_on_a_leaked_host_candidate` but for the
+/// restart path. The restart offer is crafted and delivered directly into bob's inbox (as
+/// `ice_restart_rejects_a_corrupted_dtls_fp_in_the_restart_offer` and
+/// `ice_restart_layered_check_flags_fingerprint_drift_against_the_cached_value` already do) rather
+/// than driven through a live, concurrent `asess.ice_restart(..)`, since bob's abort here must never
+/// send anything for alice to receive anyway; its asserted fingerprint deliberately matches what
+/// bob's session already cached for alice at the original handshake, so the *only* thing this test
+/// proves is the relay-only enforcement, not incidentally a fingerprint check.
+#[tokio::test]
+async fn ice_restart_answer_side_aborts_before_any_signaling_send_on_a_leaked_host_candidate() {
+    let (mut alice, mut bob) =
+        smaller_and_larger_key_peers("restart-leak-ans.a", "restart-leak-ans.b");
+    establish_ratchet(&mut alice, &mut bob);
+    assert!(bob.ik() > alice.ik(), "bob must hold the larger key");
+
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(RestartLeakyTransport(
+        LoopbackTransport::new(fabric.clone()),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    let leak_flag = Arc::new(AtomicBool::new(false));
+    let tb = Arc::new(RestartLeakyTransport(
+        LoopbackTransport::new(fabric.clone()),
+        leak_flag.clone(),
+    ));
+
+    let ice_servers = demo_ice_servers();
+    let cfg_a = relay::ice_config(IcePolicy::RelayOnly, ice_servers.clone(), Vec::new());
+    let cfg_b = relay::ice_config(IcePolicy::RelayOnly, ice_servers, Vec::new());
+
+    let (mut relay_a, mut relay_b) = MemRelay::pair(alice.ik(), bob.ik());
+    let (alice_ik, bob_ik) = (alice.ik(), bob.ik());
+    let (ahandle, bhandle) = (alice.handle(), bob.handle());
+    let (ra, rb) = {
+        let achat = &mut alice.chat;
+        let bchat = &mut bob.chat;
+        tokio::join!(
+            dial_with_config(
+                ta,
+                &alice.store,
+                &ahandle,
+                alice_ik,
+                bob_ik,
+                achat,
+                &mut relay_a,
+                Arc::new(StreamRegistry::with_builtins()),
+                cfg_a,
+            ),
+            answer_with_config(
+                tb,
+                &bob.store,
+                &bhandle,
+                bob_ik,
+                alice_ik,
+                bchat,
+                &mut relay_b,
+                Arc::new(StreamRegistry::with_builtins()),
+                cfg_b,
+            ),
+        )
+    };
+    let asess =
+        ra.expect("relay-only dial should succeed: honest gather before the flag is flipped");
+    let bsess =
+        rb.expect("relay-only answer should succeed: honest gather before the flag is flipped");
+    let (_bob_local_before, cached_alice_fp) = bsess.fingerprints();
+    let cached_alice_fp = cached_alice_fp.clone();
+    let mut bsess = bsess;
+    drop(asess); // alice's live session is never driven further in this test; bob processes a hand-crafted offer.
+
+    // Flip the flag now: bob's *next* candidate gather (the restart's own answer) leaks.
+    leak_flag.store(true, Ordering::SeqCst);
+
+    let restart_offer = SignalContent::IceRestartOffer {
+        sdp: format!("v=loopback\ntoken=11\nfp={}\ngen=0\n", cached_alice_fp.0).into_bytes(),
+        dtls_fp: cached_alice_fp.0.clone(),
+        ice: vec!["candidate:relay 1 turn.example.org".to_string()],
+    };
+    let blob = alice
+        .chat
+        .seal_bytes(
+            &alice.store,
+            &alice.handle(),
+            &alice_ik,
+            &bob_ik,
+            &restart_offer.encode().expect("encode restart offer"),
+        )
+        .expect("seal restart offer on alice's real ratchet");
+    let (mut feeder_a, restart_relay_b) = MemRelay::pair(alice.ik(), bob.ik());
+    feeder_a
+        .send(&bob_ik, blob)
+        .await
+        .expect("deliver the restart offer to bob's inbox");
+
+    let mut counting = CountingRelay {
+        inner: restart_relay_b,
+        sends: 0,
+    };
+    let result = bsess
+        .ice_restart(&mut counting, &bob.store, &bhandle, &mut bob.chat)
+        .await;
+
+    match result {
+        Err(SessionError::RelayOnlyViolation { .. }) => {}
+        Err(e) => panic!("expected RelayOnlyViolation, got a different error: {e}"),
+        Ok(()) => panic!("a leaked candidate on the post-restart gather must never be accepted"),
+    }
+    assert_eq!(
+        counting.sends, 0,
+        "the restart answer must never reach the signaling relay once a leaked post-restart \
+         candidate is observed"
+    );
+}
+
 // -- task 10.4: generic multi-stream substrate ----------------------------------------------------
 
 /// (task 10.4) End-to-end proof of the generalized substrate over `LoopbackTransport`, driving a
@@ -1856,4 +2332,182 @@ async fn send_stream_frame_on_an_unknown_stream_is_rejected() {
         Err(SessionError::UnknownStream(999)) => {}
         other => panic!("expected UnknownStream, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn concurrent_bidirectional_open_stream_never_collides_on_sid() {
+    // Phase 11 review F1 regression: before the fix, `next_sid` was a purely local per-side
+    // counter seeded at `CHAT_SID` on *both* sides, so two peers concurrently opening the same
+    // registered stream type independently derived the identical next `sid` — and thus the
+    // identical `stream_channel_label` — for two logically distinct streams. Reproduced here by
+    // having both Alice and Bob call `open_stream` for the same type *before* either has
+    // processed the other's `Open` frame (the actual race), then proving: (a) the two `sid`s
+    // differ (and land in the disjoint even/odd domains the fix partitions them into), (b) both
+    // `Open`/`Accept` round trips complete cleanly on both sides, and (c) frames sent on each
+    // side's own stream are demultiplexed to the correct `sid` on the peer with zero cross-talk —
+    // the actual corruption a collided sid/channel-label would cause.
+    use std::sync::Mutex;
+
+    struct Recorder {
+        received: Mutex<Vec<(meridian_core::streams::StreamId, Vec<u8>)>>,
+    }
+    impl Recorder {
+        fn new() -> Self {
+            Self {
+                received: Mutex::new(Vec::new()),
+            }
+        }
+        fn frames(&self) -> Vec<(meridian_core::streams::StreamId, Vec<u8>)> {
+            self.received.lock().unwrap().clone()
+        }
+    }
+    impl StreamType for Recorder {
+        fn name(&self) -> &'static str {
+            "mrd.echo/1"
+        }
+        fn version(&self) -> u16 {
+            1
+        }
+        fn channel_cfg(&self) -> ChannelCfg {
+            ChannelCfg::reliable_ordered("mrd.echo/1")
+        }
+        fn direction(&self) -> meridian_core::envelope::Direction {
+            meridian_core::envelope::Direction::Bidir
+        }
+        fn on_frame(&self, sid: meridian_core::streams::StreamId, frame: &[u8]) {
+            self.received.lock().unwrap().push((sid, frame.to_vec()));
+        }
+    }
+
+    let mut alice = Peer::new("f1.a");
+    let mut bob = Peer::new("f1.b");
+    establish_ratchet(&mut alice, &mut bob);
+
+    let fabric = LoopbackFabric::new();
+    let ta = Arc::new(LoopbackTransport::new(fabric.clone()));
+    let tb = Arc::new(LoopbackTransport::new(fabric.clone()));
+
+    let alice_rec = Arc::new(Recorder::new());
+    let bob_rec = Arc::new(Recorder::new());
+    let mut reg_a = StreamRegistry::with_builtins();
+    register_stream_type(&mut reg_a, alice_rec.clone());
+    let mut reg_b = StreamRegistry::with_builtins();
+    register_stream_type(&mut reg_b, bob_rec.clone());
+
+    let (ra, rb) = connect(
+        ta,
+        tb,
+        &mut alice,
+        &mut bob,
+        Arc::new(reg_a),
+        Arc::new(reg_b),
+    )
+    .await;
+    let mut asess = ra.expect("established");
+    let mut bsess = rb.expect("established");
+
+    let ahandle = alice.handle();
+    let bhandle = bob.handle();
+
+    // The race: both sides open the same stream type before either has seen the other's `Open`.
+    let sid_a = asess
+        .open_stream(
+            &alice.store,
+            &ahandle,
+            &mut alice.chat,
+            "mrd.echo/1",
+            vec![],
+        )
+        .await
+        .unwrap();
+    let sid_b = bsess
+        .open_stream(&bob.store, &bhandle, &mut bob.chat, "mrd.echo/1", vec![])
+        .await
+        .unwrap();
+
+    assert_ne!(
+        sid_a, sid_b,
+        "two independently, concurrently allocated sids for the same stream type must never collide"
+    );
+    assert_ne!(
+        sid_a % 2,
+        sid_b % 2,
+        "the two sides must allocate sids from disjoint (even/odd) domains"
+    );
+
+    // Bob processes Alice's `Open(sid_a)` first (it was already in flight before Bob's own
+    // `open_stream` call above), accepts it, and emits `StreamOpened(sid_a)` locally.
+    match bsess
+        .pump(&bob.store, &bhandle, &mut bob.chat)
+        .await
+        .unwrap()
+    {
+        Some(SessionEvent::StreamOpened(got, ty)) => {
+            assert_eq!(got, sid_a);
+            assert_eq!(ty, "mrd.echo/1");
+        }
+        other => panic!("bob expected StreamOpened(sid_a), got {other:?}"),
+    }
+    // Alice's queue has Bob's `Open(sid_b)` ahead of Bob's `Accept(sid_a)` (sent just above) —
+    // she processes Bob's `Open` first, accepts it, and emits `StreamOpened(sid_b)` locally.
+    match asess
+        .pump(&alice.store, &ahandle, &mut alice.chat)
+        .await
+        .unwrap()
+    {
+        Some(SessionEvent::StreamOpened(got, ty)) => {
+            assert_eq!(got, sid_b);
+            assert_eq!(ty, "mrd.echo/1");
+        }
+        other => panic!("alice expected StreamOpened(sid_b), got {other:?}"),
+    }
+    // Alice now sees Bob's `Accept(sid_a)` — her own open, confirmed.
+    match asess
+        .pump(&alice.store, &ahandle, &mut alice.chat)
+        .await
+        .unwrap()
+    {
+        Some(SessionEvent::StreamOpened(got, ty)) => {
+            assert_eq!(got, sid_a);
+            assert_eq!(ty, "mrd.echo/1");
+        }
+        other => panic!("alice expected StreamOpened(sid_a) (her own accept), got {other:?}"),
+    }
+    // Bob sees Alice's `Accept(sid_b)` — his own open, confirmed.
+    match bsess
+        .pump(&bob.store, &bhandle, &mut bob.chat)
+        .await
+        .unwrap()
+    {
+        Some(SessionEvent::StreamOpened(got, ty)) => {
+            assert_eq!(got, sid_b);
+            assert_eq!(ty, "mrd.echo/1");
+        }
+        other => panic!("bob expected StreamOpened(sid_b) (his own accept), got {other:?}"),
+    }
+
+    // No cross-talk: a frame sent on Alice's own stream (sid_a) must reach Bob tagged sid_a, and
+    // one sent on Bob's own stream (sid_b) must reach Alice tagged sid_b — never mixed. This is
+    // exactly the corruption a collided sid/channel-label would have produced (two logically
+    // distinct streams bound to the same wire channel).
+    asess
+        .send_stream_frame(&mut alice.chat, sid_a, b"alice's stream")
+        .await
+        .unwrap();
+    bsess
+        .send_stream_frame(&mut bob.chat, sid_b, b"bob's stream")
+        .await
+        .unwrap();
+
+    match bsess.pump(&bob.store, &bhandle, &mut bob.chat).await {
+        Ok(None) => {}
+        other => panic!("bob expected a silently-dispatched stream frame, got {other:?}"),
+    }
+    match asess.pump(&alice.store, &ahandle, &mut alice.chat).await {
+        Ok(None) => {}
+        other => panic!("alice expected a silently-dispatched stream frame, got {other:?}"),
+    }
+
+    assert_eq!(bob_rec.frames(), vec![(sid_a, b"alice's stream".to_vec())]);
+    assert_eq!(alice_rec.frames(), vec![(sid_b, b"bob's stream".to_vec())]);
 }
