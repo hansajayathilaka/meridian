@@ -103,13 +103,13 @@ fix-task. 11.9 (docs-only devops confirmation, mirroring the existing branch-pro
 precedent) and 11.10 (the new CI workflow for the kill-resume rig) are each independent of everything
 else and of each other.
 
-- [ ] **11.1** Namespace `open_stream`'s `sid`/channel-label derivation to fix concurrent-open collisions (F1, blocking) — [file](./11.1-fix-open-stream-sid-collision.md)
-- [ ] **11.2** Enforce relay-only on `ice_restart`'s freshly-gathered candidates (F2; soft-depends on 11.1) — [file](./11.2-ice-restart-relay-only-enforcement.md)
-- [ ] **11.3** Bound/restructure `mrd.file/1`'s `pending_chunks` buffer and its O(n) rescan (F3 + N1) — [file](./11.3-bound-pending-chunks-buffer.md)
-- [ ] **11.4** Real-CLI-path bit-flip rejection test (F4; soft-depends on 11.3) — [file](./11.4-cli-bitflip-rejection-test.md)
-- [ ] **11.5** Resume boundary tests: 0 chunks received / all-but-last chunk (F5) — [file](./11.5-resume-boundary-tests.md)
-- [ ] **11.6** Make `RESTART_GLARE_WINDOW` test-overridable; cover the timeout-fallback branch (F6; soft-depends on 11.1, 11.2) — [file](./11.6-restart-glare-window-timeout-test.md)
-- [ ] **11.7** Conformance vectors for Phase 10's new wire surfaces (F7) — [file](./11.7-file-transfer-conformance-vectors.md)
+- [x] **11.1** Namespace `open_stream`'s `sid`/channel-label derivation to fix concurrent-open collisions (F1, blocking) — [file](./11.1-fix-open-stream-sid-collision.md)
+- [x] **11.2** Enforce relay-only on `ice_restart`'s freshly-gathered candidates (F2; soft-depends on 11.1) — [file](./11.2-ice-restart-relay-only-enforcement.md)
+- [x] **11.3** Bound/restructure `mrd.file/1`'s `pending_chunks` buffer and its O(n) rescan (F3 + N1) — [file](./11.3-bound-pending-chunks-buffer.md)
+- [x] **11.4** Real-CLI-path bit-flip rejection test (F4; soft-depends on 11.3) — [file](./11.4-cli-bitflip-rejection-test.md)
+- [x] **11.5** Resume boundary tests: 0 chunks received / all-but-last chunk (F5) — [file](./11.5-resume-boundary-tests.md)
+- [x] **11.6** Make `RESTART_GLARE_WINDOW` test-overridable; cover the timeout-fallback branch (F6; soft-depends on 11.1, 11.2) — [file](./11.6-restart-glare-window-timeout-test.md)
+- [x] **11.7** Conformance vectors for Phase 10's new wire surfaces (F7) — [file](./11.7-file-transfer-conformance-vectors.md)
 - [ ] **11.8** Wire `FileReceiver`'s per-chunk verification into the real send path, or narrow the claim (F8) — [file](./11.8-chunk-proof-delivery-mechanism.md)
 - [ ] **11.9** Confirm `soak-file-transfer.yml` ran clean post-10.18 on a real runner (F9, devops-owned, docs-only) — [file](./11.9-soak-workflow-runner-confirmation.md)
 - [ ] **11.10** Add scheduled/`workflow_dispatch` CI for `netns-kill-resume.sh` (F10) — [file](./11.10-netns-kill-resume-ci-workflow.md)
