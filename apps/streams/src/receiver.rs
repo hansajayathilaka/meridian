@@ -22,12 +22,21 @@
 //! data: bstr}` and nothing more — no merkle proof field. This module decodes inbound frames via
 //! [`crate::chunk::ChunkFrame`] (the canonical type for this exact shape, shared with the sender
 //! engine, task 10.7, so both sides build/parse against one definition rather than two independently
-//! hand-rolled CBOR shapes). How the merkle proof for each chunk actually reaches the receiver over
-//! the wire is `TODO: confirm` — not pinned by any design doc as of this task — so
-//! [`FileReceiver::receive_frame`] takes the proof as a caller-supplied argument rather than assuming
-//! it rides inside the same frame; whoever wires this engine to a live transport (a later task)
-//! decides where that proof comes from (e.g. a proof-per-chunk extension to the wire shape, or a
-//! full proof set exchanged once via `mrd.ctrl/1`).
+//! hand-rolled CBOR shapes). [`FileReceiver::receive_frame`] takes a [`MerkleProof`] as a
+//! caller-supplied argument rather than assuming one rides inside the same frame — but **no caller
+//! in this tree supplies one today**: this type is tested only in isolation
+//! ([`FileReceiver`]'s own unit tests below), and the real `meridian send` CLI path
+//! (`apps/cli/src/send.rs::run_responder`/`finalize_transfer`) does not call it at all, instead
+//! buffering every chunk and doing one whole-file merkle-root recomputation once the transfer
+//! completes (review finding F8; task 11.8's decision record,
+//! `docs/tasks/phase-11/11.8-chunk-proof-delivery-mechanism.md#risks--notes`). An architect consult
+//! (task 11.8) decided the eventual mechanism — a flat leaf-hash list, sent once per transfer via a
+//! new in-stream frame tag (`FRAME_TAG_LEAF_HASHES`, mirroring how the resume bitmap already
+//! multiplexes onto this same channel, `crate::resume`), verified once against the manifest's root,
+//! after which each chunk needs only a cheap `leaf_hash(plaintext) == received_list[i]` comparison —
+//! not a per-call [`MerkleProof`]. Wiring that in is a real, tracked follow-up (unowned carry-forward
+//! for a future build phase, not a small fix) that will change this function's signature; until then
+//! this engine remains a tested-in-isolation component with no live caller.
 //!
 //! ## Scope
 //! In-memory reassembly only (`BTreeMap<u64, Vec<u8>>` keyed by chunk index) — sufficient for this
