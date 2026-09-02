@@ -1936,6 +1936,77 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), data);
     }
 
+    /// Task 11.8 (review finding F8) decision-record regression test: proves the real CLI path's
+    /// merkle detection today is whole-file-only, not per-chunk. Chunks 0 and 2 are genuine and
+    /// individually correct; chunk 1 is sealed correctly under its own claimed index (`i = 1`) — so
+    /// `open_chunk`'s AEAD check authenticates it fine — but its plaintext is actually chunk 2's
+    /// bytes, not chunk 1's real content: a real-world analog of a chunk silently swapped or
+    /// re-sealed from a different offset under a leaked `k_f`, exactly the class of corruption the
+    /// merkle layer (not AEAD) exists to catch. The feature spec (`docs/architecture/features/
+    /// 09-file-transfer.md`) claims a corrupted chunk is "detected by AEAD/merkle and
+    /// re-requested" — AEAD detection genuinely is per-chunk, but this test shows merkle detection,
+    /// and thus any notion of per-chunk re-request, is not: the two genuinely-correct chunks are
+    /// discarded right along with the corrupted one, and the whole transfer fails as one unit.
+    #[test]
+    fn a_merkle_corrupted_chunk_fails_the_whole_transfer_not_just_itself() {
+        let key = [0x5Cu8; 32];
+        let data = sample(2 * CHUNK_SIZE + 1234); // exactly 3 chunks: 0, 1 full-size, 2 short
+        let tree = MerkleTree::from_bytes(&data);
+        let manifest = FileManifest {
+            name: "swap.bin".to_string(),
+            size: data.len() as u64,
+            root: tree.root(),
+            key: vec![0xAA; 32],
+        };
+
+        let chunk_plaintext = |i: usize| -> &[u8] {
+            let start = i * CHUNK_SIZE;
+            let end = (start + CHUNK_SIZE).min(data.len());
+            &data[start..end]
+        };
+
+        let mut pending = BTreeMap::new();
+        for i in [0usize, 2] {
+            let sealed = meridian_streams::seal_chunk(&key, i as u64, chunk_plaintext(i));
+            pending.insert(
+                i as u64,
+                ChunkFrame {
+                    i: i as u64,
+                    data: sealed,
+                }
+                .encode()
+                .unwrap(),
+            );
+        }
+        // Wrong plaintext (chunk 2's bytes), sealed correctly under index 1's own key/nonce — so
+        // `open_chunk(&key, 1, ..)` authenticates without complaint.
+        let swapped = meridian_streams::seal_chunk(&key, 1, chunk_plaintext(2));
+        pending.insert(
+            1,
+            ChunkFrame {
+                i: 1,
+                data: swapped,
+            }
+            .encode()
+            .unwrap(),
+        );
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let err = finalize_transfer(&manifest, &key, &pending, out_dir.path())
+            .expect_err("a merkle-corrupted chunk must fail the whole transfer");
+        assert!(
+            err.contains("merkle root mismatch"),
+            "expected a merkle-layer failure (AEAD authenticated every chunk, including the \
+             swapped one): {err}"
+        );
+        assert!(
+            std::fs::read_dir(out_dir.path()).unwrap().next().is_none(),
+            "nothing must be written — including chunks 0 and 2, which were individually correct \
+             — proving today's real path has no per-chunk isolation or re-request, only \
+             whole-transfer failure"
+        );
+    }
+
     /// Should-fix #3 regression test: a pre-planted dangling symlink at the candidate path must not
     /// be treated as "free" (the old `Path::exists()` check follows symlinks and reports `false` for
     /// a dangling one) — `create_unique_file` must detect it via `create_new`'s own atomic check and
