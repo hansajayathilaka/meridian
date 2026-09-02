@@ -8,21 +8,21 @@
 //! ice_restart+resume+2%-bound coverage, using [`meridian_streams::FileReceiver`]'s per-chunk-proof
 //! bookkeeping). This test instead exercises the *specific* bookkeeping shape the real-netns driver
 //! actually uses — reused from `apps/cli/src/send.rs`'s own real-production convention (distinct
-//! chunk indices tracked from raw `pending_chunks`, whole-file BLAKE3 verification at the end, no
-//! per-chunk merkle proof) — since that is the path this task's own driver binary drives over the
-//! real rig, not `FileReceiver`'s. It also adds the two checks the demo script's own acceptance
-//! wording calls for that 10.9's test doesn't: a literal `sha256` comparison (`sha256sum on both
-//! ends → identical`) alongside the BLAKE3 root check, and the re-send ratio computed the exact way
-//! the real harness's shell script parses it from the driver's own JSON summary line
-//! (`resent_already_delivered_bytes / sent_before_cut_bytes`).
+//! chunk indices read straight off index-keyed `pending_chunks`'s own key set, task 11.3;
+//! whole-file BLAKE3 verification at the end, no per-chunk merkle proof) — since that is the path
+//! this task's own driver binary drives over the real rig, not `FileReceiver`'s. It also adds the
+//! two checks the demo script's own acceptance wording calls for that 10.9's test doesn't: a literal
+//! `sha256` comparison (`sha256sum on both ends → identical`) alongside the BLAKE3 root check, and
+//! the re-send ratio computed the exact way the real harness's shell script parses it from the
+//! driver's own JSON summary line (`resent_already_delivered_bytes / sent_before_cut_bytes`).
 //!
 //! Sequence (mirrors `kill_resume_netns_drive.rs`'s own phases, minus the marker-file/veth-cut
 //! synchronization, which needs a real rig):
 //! 1. Real two-party `P2pSession<LoopbackTransport>`, real ratchet, real `mrd.file/1` open.
 //! 2. Alice sends a prefix of chunks; Bob's `FileStream` buffers them (`pending_chunks`).
 //! 3. Both sides call the real `P2pSession::ice_restart` (task 4's substrate).
-//! 4. Bob computes his own resume bitmap from `distinct_chunk_indices(pending_chunks)` (not
-//!    `FileReceiver`) and sends it as a raw `FRAME_TAG_RESUME` frame directly via
+//! 4. Bob computes his own resume bitmap from `pending_chunks.keys()` (not `FileReceiver`) and
+//!    sends it as a raw `FRAME_TAG_RESUME` frame directly via
 //!    `send_stream_frame` — the exact wire bytes `send_resume_bitmap` would produce, built by hand
 //!    the way the real driver does it.
 //! 5. Alice's `watch_resume` receiver picks it up; she resends only the missing chunks.
@@ -162,22 +162,18 @@ fn sample_file(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }
 
-/// Mirrors `apps/cli/src/send.rs::distinct_chunk_indices` / `kill_resume_netns_drive.rs`'s identical
-/// helper exactly — the real driver's own bookkeeping shape, not `FileReceiver`'s.
-fn distinct_chunk_indices(pending_chunks: &[Vec<u8>]) -> std::collections::BTreeSet<u64> {
-    pending_chunks
-        .iter()
-        .filter_map(|raw| ChunkFrame::decode(raw).ok())
-        .map(|frame| frame.i)
-        .collect()
-}
-
 /// Mirrors `kill_resume_netns_drive.rs::finalize` / `send.rs::finalize_transfer` exactly: whole-file
-/// AEAD-open + BLAKE3 check, no per-chunk merkle proof.
-fn finalize(manifest: &FileManifest, k_f: &[u8; 32], pending_chunks: &[Vec<u8>]) -> Vec<u8> {
+/// AEAD-open + BLAKE3 check, no per-chunk merkle proof. (task 11.3: `pending_chunks` is now keyed by
+/// each chunk's own index — `distinct_chunk_indices` is gone, its job replaced by reading the map's
+/// own key set directly, mirroring `send.rs`'s identical simplification.)
+fn finalize(
+    manifest: &FileManifest,
+    k_f: &[u8; 32],
+    pending_chunks: &std::collections::BTreeMap<u64, Vec<u8>>,
+) -> Vec<u8> {
     let leaf_count = manifest.size.div_ceil(CHUNK_SIZE as u64).max(1) as usize;
     let mut buf = vec![0u8; manifest.size as usize];
-    for raw in pending_chunks {
+    for raw in pending_chunks.values() {
         let frame = ChunkFrame::decode(raw).expect("valid chunk frame");
         if frame.i as usize >= leaf_count {
             continue;
@@ -297,9 +293,11 @@ async fn kill_resume_harness_orchestration_matches_the_real_driver_exactly() {
             other => panic!("expected a silently-dispatched chunk frame, got {other:?}"),
         }
     }
-    let received_before_cut = {
+    let received_before_cut: std::collections::BTreeSet<u64> = {
         let transfer = bob_file.transfer(sid).expect("bob tracks the transfer");
-        distinct_chunk_indices(&transfer.pending_chunks)
+        // (task 11.3) `pending_chunks` is now itself keyed by chunk index, so its key set *is* the
+        // distinct-indices bookkeeping `distinct_chunk_indices` used to compute by rescanning.
+        transfer.pending_chunks.keys().copied().collect()
     };
     assert_eq!(received_before_cut.len(), SPLIT_CHUNKS);
 
