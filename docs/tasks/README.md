@@ -412,11 +412,47 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   `tools/check-docs.sh`). Full decision record:
   [11.8's Risks/notes](./phase-11/11.8-chunk-proof-delivery-mechanism.md#architect-decision-record-this-tasks-own-required-first-step)
   and [Outcome](./phase-11/11.8-chunk-proof-delivery-mechanism.md#outcome).
-- **NEXT:** `/next-task` — **11.9** is the only remaining Phase 11 fix-task, blocked pending a
-  human/devops runner observation it explicitly says an agent session cannot supply. Per the phase's own
-  exit criteria, 11.9 may stay open indefinitely without itself blocking Phase 11's other 9 tasks from
-  being considered closed — a future `/pick-next-phase` for the next build phase (T10 or T14, both
-  unblocked) does not need to wait on it.
+- **NOW:** **11.9** is the only remaining Phase 11 fix-task, blocked pending a human/devops runner
+  observation it explicitly says an agent session cannot supply. Per the phase's own exit criteria, 11.9
+  may stay open indefinitely without itself blocking Phase 11's other 9 tasks from being considered closed
+  — Phase 11 counts as review-swept for the purpose of opening the next build phase.
+- **NOW:** **Phase 12 (Browser & Desktop Clients) opened — scope is T11 alone.** The unblocked set at
+  this point is **{T10, T11, T14, T16}** — T09's closure (Phase 10) newly unblocked T11 (deps T04–T09)
+  and T16 (deps T09); T05/T06 already unblocked T10; T06/T07 already unblocked T14. T11 is chosen on
+  priority tier (T10/T11 = P2, outranking T14's P3 and T16's P4) and the same "sole gate on downstream
+  features" critical-path test Phase 2 used to pick T06 over T08/T09 and Phase 10 used to pick T09 over
+  T10/T14: **T11 is the sole remaining gate on T13 and T15**, and jointly gates T12 alongside T10, while
+  T10 alone gates only T12 (jointly with T11) and T14/T16 both gate nothing downstream. Track D
+  (`17→11→12→15`) also confirms T11 as the next item in sequence now that T17 is closed. Not bundled
+  with T10 (only an optional "if-ready" invite in T11's own dependency line, moot since T10 hasn't
+  shipped), T14, or T16 (no code-path overlap) — mirroring Phase 10's own non-bundling of T09. T10, T14,
+  and T16 all remain valid, unblocked choices for a later build phase. Full dependency-check rationale:
+  [phase-12/README.md](./phase-12/README.md).
+- **NOW:** **Phase 12 planned — 20 tasks (12.1–12.20) across 9 dependency waves.** An architect consult
+  ran first (Phase-8/Phase-10-style) and settled three genuine design gaps before task breakdown: (1)
+  desktop needs no new `SecretStore`/`Transport` — `OsSecretStore`/`WebRtcTransport` are directly
+  reusable from Tauri's in-process Rust backend, so the desktop track is integration-only; (2)
+  `meridian-core` does **not** compile to `wasm32-unknown-unknown` today (three independent blockers:
+  `meridian-signaling`'s unconditional `tokio-tungstenite` dependency, direct `tokio::time` use in
+  `apps/core/src/session.rs`, and an unconfigured `getrandom` wasm backend) — a dedicated
+  substrate-completion arc (12.1, 12.4) must land first, mirroring Phase 10's task 10.4 precedent
+  exactly, no new ADR needed; (3) two new ADRs were warranted and written:
+  [ADR 0026](../adr/0026-browser-client-local-store.md) (a new `WebCryptoSecretStore` backed by
+  non-extractable WebCrypto `CryptoKey`s, plus IndexedDB records sealed via the existing, unmodified
+  `meridian_crypto::at_rest::seal` under a derived key — porting ADR 0021's terminal-client sealing
+  intent to a substrate with no filesystem) and [ADR 0027](../adr/0027-desktop-signed-updates.md)
+  (Tauri's own updater-plugin signing scheme satisfies the "rejects an unsigned/tampered update"
+  acceptance criterion; OS-trusted Authenticode signing stays deferred, same trigger as ADR 0022/0023).
+  T11 needs no Definition-of-Done gate 9 task — new client *platforms* for content already surfaced in
+  the TUI (Phase 4/10), not a new protocol capability. The planner then broke T11 into: the wasm32
+  substrate arc (12.1, 12.4), foundational scaffolds (12.2 `shared-ui`+adapter interface, 12.3
+  `apps/desktop` Tauri crate, 12.5 `WebCryptoSecretStore`, 12.10 `meridian-wasm` crate), shared screens
+  (12.6–12.9), the real browser pieces (12.11 `Transport` shim, 12.12 IndexedDB store, 12.13 the wasm
+  adapter), both app shells (12.14, 12.15), the signed-updater pipeline (12.16), cross-cutting
+  verification (12.17 interop matrix, 12.18 conformance-vector cross-check), docs (12.19), and the
+  phase-exit demo (12.20). Full breakdown: [phase-12/README.md](./phase-12/README.md#tasks-todo).
+- **NEXT:** `/next-task` — Wave 1 (12.1, 12.2, 12.3) has no intra-phase dependencies and can start
+  immediately.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -1164,6 +1200,62 @@ or T14). 10 fix-tasks (11.1–11.10) planned by the **planner** agent; landing o
 - [x] **11.8** Wire `FileReceiver`'s per-chunk verification into the real send path, or narrow the claim (F8) — [file](./phase-11/11.8-chunk-proof-delivery-mechanism.md)
 - [ ] **11.9** Confirm `soak-file-transfer.yml` ran clean post-10.18 on a real runner (F9, devops-owned, docs-only) — [file](./phase-11/11.9-soak-workflow-runner-confirmation.md)
 - [x] **11.10** Add scheduled/`workflow_dispatch` CI for `netns-kill-resume.sh` (F10) — [file](./phase-11/11.10-netns-kill-resume-ci-workflow.md)
+
+### Phase 12 — Browser & Desktop Clients · **open — 0/20 tasks done** · [details](./phase-12/README.md)
+Build phase. **[T11 — Browser & Desktop Clients](../architecture/features/11-browser-desktop-clients.md)**
+alone: `meridian-core` → wasm32, a browser `Transport` shim over `RTCPeerConnection`, an IndexedDB-backed
+encrypted store, browser UI (chat/contacts/verification/file-transfer/message-requests), a Tauri desktop
+shell reusing T04's native `Transport` + DPAPI `SecretStore`, a signed updater, and a
+{CLI, browser, desktop}² interop matrix in CI. Deps T04–T09 all done (T04 Phase 0, T05/T06 Phase 2, T08
+Phase 4, T07 Phase 8, T09 Phase 10). Chosen over T10/T14/T16 (all also unblocked) on priority tier (P2 vs
+T14's P3/T16's P4) and the critical-path test — T11 is the sole gate on T13/T15 and jointly gates T12.
+Full pick rationale: [phase-12/README.md](./phase-12/README.md#dependency-check). An architect consult
+before task breakdown settled: desktop needs no new `SecretStore`/`Transport` (reuse only); a
+substrate-completion arc must land before real browser work (`meridian-core` isn't wasm32-buildable
+today); and two new ADRs ([0026](../adr/0026-browser-client-local-store.md) browser store,
+[0027](../adr/0027-desktop-signed-updates.md) desktop updater signing). No Definition-of-Done gate 9 task
+— new client platforms, not a new protocol capability. Full record:
+[phase-12/README.md](./phase-12/README.md#architect-consult-substratestoresigning-decisions-settled-before-task-breakdown).
+20 tasks (12.1–12.20) across 9 dependency waves, planned by the **planner** agent:
+[phase-12/README.md](./phase-12/README.md#tasks-todo).
+
+**Wave 1 — independent**
+- [ ] **12.1** `wasm32` substrate: toolchain + `getrandom` backend + timer seam — [file](./phase-12/12.1-wasm32-substrate-toolchain-getrandom-timer.md)
+- [ ] **12.2** `shared-ui` package + `MeridianClientAdapter` TS interface — [file](./phase-12/12.2-shared-ui-client-adapter-interface.md)
+- [ ] **12.3** `apps/desktop` Tauri crate scaffold (Rust side) — [file](./phase-12/12.3-desktop-tauri-crate-scaffold.md)
+
+**Wave 2 — depends on Wave 1**
+- [ ] **12.4** `meridian-signaling` WebSocket transport seam (depends on 12.1) — [file](./phase-12/12.4-signaling-ws-transport-seam.md)
+- [ ] **12.5** `WebCryptoSecretStore` in `apps/store`, wasm32-gated (depends on 12.1) — [file](./phase-12/12.5-webcrypto-secret-store.md)
+- [ ] **12.6** Desktop TS adapter (depends on 12.2, 12.3) — [file](./phase-12/12.6-desktop-ts-adapter.md)
+- [ ] **12.7** Core messaging screens: chat + contacts + message-requests (depends on 12.2) — [file](./phase-12/12.7-core-messaging-screens.md)
+- [ ] **12.8** Verification screen: QR camera-scan safety-number compare (depends on 12.2, 12.7) — [file](./phase-12/12.8-verification-screen.md)
+- [ ] **12.9** File transfer screen (depends on 12.2, 12.7) — [file](./phase-12/12.9-file-transfer-screen.md)
+
+**Wave 3 — depends on Wave 2**
+- [ ] **12.10** `meridian-wasm` crate scaffold + smoke build + bundle-size report (depends on 12.4) — [file](./phase-12/12.10-meridian-wasm-crate-scaffold.md)
+
+**Wave 4 — depends on Wave 3**
+- [ ] **12.11** Browser `Transport` shim (depends on 12.10) — [file](./phase-12/12.11-browser-transport-shim.md)
+- [ ] **12.12** Browser IndexedDB sealed store, `apps/wasm` (depends on 12.10, 12.5) — [file](./phase-12/12.12-browser-indexeddb-sealed-store.md)
+
+**Wave 5 — depends on Wave 4**
+- [ ] **12.13** Browser wasm adapter (depends on 12.2, 12.11, 12.12) — [file](./phase-12/12.13-browser-wasm-adapter.md)
+
+**Wave 6 — app shells**
+- [ ] **12.14** `apps/web` app shell (depends on 12.13, 12.7, 12.8, 12.9) — [file](./phase-12/12.14-web-app-shell.md)
+- [ ] **12.15** `apps/desktop` app shell (depends on 12.6, 12.7, 12.8, 12.9) — [file](./phase-12/12.15-desktop-app-shell.md)
+
+**Wave 7**
+- [ ] **12.16** Desktop signed release + updater pipeline, ADR 0027 (depends on 12.15, 12.3) — [file](./phase-12/12.16-desktop-signed-updater-pipeline.md)
+
+**Wave 8 — cross-cutting verification**
+- [ ] **12.17** {CLI, browser, desktop}² interop matrix CI job (depends on 12.14, 12.15) — [file](./phase-12/12.17-interop-matrix-ci.md)
+- [ ] **12.18** T01/T08 conformance-vector byte-identity check across CLI/browser/desktop (depends on 12.13, 12.15) — [file](./phase-12/12.18-cross-client-conformance-vectors.md)
+
+**Wave 9 — docs + phase exit**
+- [ ] **12.19** `web-deployment-guide.md` (depends on 12.14) — [file](./phase-12/12.19-web-deployment-guide.md)
+- [ ] **12.20** Phase exit: acceptance demo + doc sync (depends on 12.16, 12.17, 12.18, 12.19) — [file](./phase-12/12.20-phase-exit-acceptance-demo.md)
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
