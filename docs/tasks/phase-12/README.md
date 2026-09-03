@@ -4,7 +4,7 @@
 
 # Phase 12 — Browser & Desktop Clients
 
-**Kind:** build · **Status:** planning · **Reviews phase(s):** n/a (pending a future `/start-review-phase`)
+**Kind:** build · **Status:** open — 0/20 tasks done · **Reviews phase(s):** n/a (pending a future `/start-review-phase`)
 
 ## Goal
 Ship **[T11 — Browser & Desktop Clients](../../architecture/features/11-browser-desktop-clients.md)**:
@@ -77,9 +77,100 @@ T14. T11 is chosen over the other three:
 
 **T10, T14, and T16 all remain valid, unblocked choices for a later build phase.**
 
+## Architect consult: substrate/store/signing decisions settled before task breakdown
+
+An architect consult ran before task breakdown (Phase-8/Phase-10-style), because T11 raises genuine
+design questions no existing ADR fully settles:
+
+1. **Desktop needs no new `SecretStore` or `Transport` implementation.** `apps/store::OsSecretStore`
+   is already cross-platform (`keyring-core`, with `windows-native-keyring-store`/
+   `apple-native-keyring-store`/`zbus-secret-service-keyring-store` already resolved in `Cargo.lock`) and
+   `apps/transport::WebRtcTransport` is already native, tokio-based, with no CLI-specific coupling —
+   both are directly reusable from a Tauri Rust backend (in-process, full OS access, per ADR 0010) as-is.
+   Desktop's work is Tauri *integration*: a new `apps/desktop` crate wiring these in, plus the shared
+   Svelte UI (ADR 0012), plus Tauri command/event plumbing. No task in this phase implements a new
+   desktop-side `SecretStore`/`Transport`.
+2. **Browser client-local store** needed a new ADR — ADR 0021 is explicitly scoped to the terminal
+   client's filesystem/`at_rest::seal` substrate, which doesn't transfer to a browser sandbox (no
+   filesystem). [ADR 0026](../../adr/0026-browser-client-local-store.md) decides: a new
+   `WebCryptoSecretStore` backed by non-extractable WebCrypto `CryptoKey`s (the first `SecretStore` impl
+   that can honestly report `nonextractable() == true`), plus IndexedDB records sealed with the
+   existing, unmodified `meridian_crypto::at_rest::seal`/`open` under a derived key — same
+   schema-versioning/fail-closed discipline as ADR 0021, ported to IndexedDB records instead of files.
+3. **`meridian-core` does not compile to `wasm32-unknown-unknown` today**, confirmed by dependency-graph
+   audit (three independent blockers: `meridian-signaling`'s unconditional `tokio-tungstenite`
+   dependency has no wasm32 story; `apps/core/src/session.rs` and `meridian-transport`'s default build
+   call `tokio::time` directly; `meridian-store`'s `getrandom 0.3` needs its `wasm_js` backend opt-in
+   configured, and `wasm32-unknown-unknown` isn't yet in `rust-toolchain.toml`). This mirrors Phase 10's
+   task 10.4 precedent exactly: a dedicated substrate-completion arc (tasks 12.1 and 12.4 below) must
+   land — zero browser-UI-specific logic — before the real browser `Transport` shim / `meridian-wasm`
+   crate work starts. No new ADR needed; this implements already-accepted design (`stack.md`'s "one
+   core, five targets"), the same no-ADR call 10.4 made.
+4. **Desktop signed release + updater** needed a new ADR — ADR 0022/0023 deliberately deferred code
+   signing project-wide ("no tagged release, no known external consumer yet"), but T11's acceptance
+   criterion ("desktop updater rejects an unsigned/tampered update") is an auto-apply path, a materially
+   different risk than a passive checksum-verified download, crossing that deferral's own reopening
+   trigger for this one channel. [ADR 0027](../../adr/0027-desktop-signed-updates.md) decides: Tauri's
+   own built-in updater-plugin signing scheme (minisign-style, CI-held private key) satisfies the
+   criterion; OS-trusted Authenticode/notarization signing stays deferred, same trigger as 0022/0023.
+5. **No TUI surface task.** T11 ships new client *platforms* (browser, desktop) for content types
+   (chat, file, verification) that already have TUI surfaces from Phases 4/10 — no new stream type or
+   protocol-level user-visible capability is introduced for the TUI to lag behind, so Definition of Done
+   gate 9 does not apply to this phase. Recorded here explicitly per the CLAUDE.md convention for a
+   feature with no TUI surface.
+
+Two scoping calls the planner made that aren't spelled out in any doc (flagged, not silently taken):
+the signaling WebSocket transport seam (12.4) is its own task, separate from the toolchain/`getrandom`/
+timer task (12.1) — the former is a new internal trait/seam inside one crate, the latter is cross-cutting
+build configuration touching several leaf crates, and bundling them would violate "one focused change
+per task"; and the new `WebCryptoSecretStore` trait impl lives in `apps/store` (mirrors `os.rs`/`file.rs`/
+`mem.rs`) while the IndexedDB record-sealing/schema module (ADR 0026 conditions 2–5) lives in the new
+`apps/wasm` crate, because `meridian-crypto` (needed for sealing) already depends on `meridian-store`
+(`stack.md`'s acyclic graph) — putting the sealing code inside `apps/store` alongside the trait impl
+would create a cycle. ADR 0026 itself leaves this split open, so this isn't re-litigating the ADR.
+
+Full breakdown: [Tasks (todo)](#tasks-todo) below.
+
 ## Tasks (todo)
 <!-- Filled by /plan-phase. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
-- [ ] **12.1** <title> — [file](./12.1-<slug>.md)
+
+**Wave 1 — independent**
+- [ ] **12.1** `wasm32` substrate: toolchain + `getrandom` backend + timer seam — [file](./12.1-wasm32-substrate-toolchain-getrandom-timer.md)
+- [ ] **12.2** `shared-ui` package + `MeridianClientAdapter` TS interface — [file](./12.2-shared-ui-client-adapter-interface.md)
+- [ ] **12.3** `apps/desktop` Tauri crate scaffold (Rust side) — [file](./12.3-desktop-tauri-crate-scaffold.md)
+
+**Wave 2 — depends on Wave 1**
+- [ ] **12.4** `meridian-signaling` WebSocket transport seam (depends on 12.1) — [file](./12.4-signaling-ws-transport-seam.md)
+- [ ] **12.5** `WebCryptoSecretStore` in `apps/store`, wasm32-gated (depends on 12.1) — [file](./12.5-webcrypto-secret-store.md)
+- [ ] **12.6** Desktop TS adapter (depends on 12.2, 12.3) — [file](./12.6-desktop-ts-adapter.md)
+- [ ] **12.7** Core messaging screens: chat + contacts + message-requests (depends on 12.2) — [file](./12.7-core-messaging-screens.md)
+- [ ] **12.8** Verification screen: QR camera-scan safety-number compare (depends on 12.2, 12.7) — [file](./12.8-verification-screen.md)
+- [ ] **12.9** File transfer screen (depends on 12.2, 12.7) — [file](./12.9-file-transfer-screen.md)
+
+**Wave 3 — depends on Wave 2**
+- [ ] **12.10** `meridian-wasm` crate scaffold + smoke build + bundle-size report (depends on 12.4) — [file](./12.10-meridian-wasm-crate-scaffold.md)
+
+**Wave 4 — depends on Wave 3**
+- [ ] **12.11** Browser `Transport` shim (depends on 12.10) — [file](./12.11-browser-transport-shim.md)
+- [ ] **12.12** Browser IndexedDB sealed store, `apps/wasm` (depends on 12.10, 12.5) — [file](./12.12-browser-indexeddb-sealed-store.md)
+
+**Wave 5 — depends on Wave 4**
+- [ ] **12.13** Browser wasm adapter (depends on 12.2, 12.11, 12.12) — [file](./12.13-browser-wasm-adapter.md)
+
+**Wave 6 — app shells**
+- [ ] **12.14** `apps/web` app shell (depends on 12.13, 12.7, 12.8, 12.9) — [file](./12.14-web-app-shell.md)
+- [ ] **12.15** `apps/desktop` app shell (depends on 12.6, 12.7, 12.8, 12.9) — [file](./12.15-desktop-app-shell.md)
+
+**Wave 7**
+- [ ] **12.16** Desktop signed release + updater pipeline, ADR 0027 (depends on 12.15, 12.3) — [file](./12.16-desktop-signed-updater-pipeline.md)
+
+**Wave 8 — cross-cutting verification**
+- [ ] **12.17** {CLI, browser, desktop}² interop matrix CI job (depends on 12.14, 12.15) — [file](./12.17-interop-matrix-ci.md)
+- [ ] **12.18** T01/T08 conformance-vector byte-identity check across CLI/browser/desktop (depends on 12.13, 12.15) — [file](./12.18-cross-client-conformance-vectors.md)
+
+**Wave 9 — docs + phase exit**
+- [ ] **12.19** `web-deployment-guide.md` (depends on 12.14) — [file](./12.19-web-deployment-guide.md)
+- [ ] **12.20** Phase exit: acceptance demo + doc sync (depends on 12.16, 12.17, 12.18, 12.19) — [file](./12.20-phase-exit-acceptance-demo.md)
 
 ## Exit criteria
 Phase 12 is done when every task is `[x]`, the tree is green (`cargo build --workspace`,
