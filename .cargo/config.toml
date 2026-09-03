@@ -1,0 +1,9 @@
+# Workspace-wide cargo configuration. See docs/architecture/stack.md §4 ("one core, five targets").
+#
+# wasm32-unknown-unknown (task 12.1, T11 browser substrate): getrandom 0.3 has no default backend
+# for this target — opting into its `wasm_js` Cargo feature (apps/store/Cargo.toml) additionally
+# requires this `--cfg getrandom_backend="wasm_js"` rustflag at compile time, per
+# https://docs.rs/getrandom/#webassembly-support. Applies to every crate built for this target, not
+# just meridian-store, because rustflags are per-target, not per-crate.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", 'getrandom_backend="wasm_js"']
