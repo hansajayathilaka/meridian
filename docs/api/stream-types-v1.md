@@ -278,16 +278,35 @@ tag: u8 ‖ body: bytes
   frame and MUST be dropped silently — never panic on a malformed frame from an already-accepted
   stream.
 
-**Known gap — how a chunk's merkle proof reaches the receiver is not yet pinned.** The wire chunk body
-above is exactly `{i, data}` — no proof field. The reference receiver implementation's own per-chunk
-verification step requires a `MerkleProof` for `i` as a value the caller must already have on hand, and
-explicitly defers *how* it gets there to whoever wires the engine to a live transport — nothing in this
-tree does that today. Two candidate directions are already on record, neither chosen: a proof-per-chunk
-extension to the wire shape above, or a full proof set (or the flat leaf-hash list a proof set can be
-rebuilt from) exchanged once via `mrd.ctrl/1` or the manifest. `TODO: confirm` — a from-scratch
-`mrd.file/1` implementation needs to pick one of these (or something else) itself until a future
-revision of this section pins it. A toy `mrd.echo/1` implementation is unaffected, since it has no
-merkle layer at all.
+**Known gap — the chosen mechanism for how a chunk's merkle proof reaches the receiver is decided but
+not yet wired into the real send path.** The wire chunk body above is exactly `{i, data}` — no proof
+field. The reference receiver implementation's own per-chunk verification step (`FileReceiver::
+receive_frame`) requires a `MerkleProof` for `i` as a value the caller must already have on hand, and
+nothing in this tree supplies one today — the real `meridian send` CLI path (`apps/cli/src/send.rs`)
+does not call `FileReceiver` at all; instead it buffers every chunk (each already individually
+AEAD-authenticated via `open_chunk`) and, once the whole file has arrived, does a single whole-file
+merkle-root recomputation against the manifest's `root`. A corrupted-but-authenticated chunk therefore
+fails the *entire* transfer today, not just that chunk (review finding F8,
+[11.8's decision record](../tasks/phase-11/11.8-chunk-proof-delivery-mechanism.md#risks--notes)).
+
+Of the two candidate directions previously on record here, an architect consult (task 11.8) **decided
+against both as literally written**: a per-chunk proof extension to `ChunkFrame`'s wire shape would
+amend an already conformance-vector-pinned shape and is wire-inefficient (redundant shared internal-node
+hashes summed across every chunk); folding a proof set/leaf-hash list into `mrd.ctrl/1` or the
+`FileManifest` would either also amend a pinned shape or repeat the exact `CtrlFrame`-core-crate-leakage
+mistake task 10.9's own review already rejected once for the resume bitmap (see "Resume, in-stream"
+below, and `wire-protocol.md` §5's own correction). The **chosen mechanism** instead reuses the same additive, in-stream frame-tag
+multiplexing task 10.9 already shipped for the resume bitmap: a new frame kind (`FRAME_TAG_LEAF_HASHES`)
+carrying a flat, paginated list of the file's leaf hashes, sent once per transfer before any chunk
+frame, verified once against `manifest.root`, after which each chunk needs only a cheap
+`leaf_hash(plaintext) == received_list[i]` comparison — no per-chunk proof machinery, and the existing
+resume-bitmap mechanism becomes the actual re-request path once this lands. This is additive (touches
+neither `ChunkFrame`'s nor `FileManifest`'s pinned CBOR, no `CtrlFrame`/core-crate change) so it needed
+no ADR. **Not yet implemented** — the real wiring (pagination under the SCTP max-message-size ceiling, a
+new `MerkleTree::from_leaf_hashes` constructor, and a `FileReceiver::receive_frame` API change to consume
+an installed leaf-hash list instead of a per-call proof) is tracked as an unowned carry-forward for a
+future build phase, not a small fix; see the master tracker's carry-forward list. A toy `mrd.echo/1`
+implementation is unaffected, since it has no merkle layer at all.
 
 ### Resume, in-stream (not a `mrd.ctrl/1` frame)
 

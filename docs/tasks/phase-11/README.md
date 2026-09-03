@@ -3,7 +3,8 @@
 
 # Phase 11 — Review of Phase 10
 
-**Kind:** review · **Status:** sweep complete, verdict recorded — blocked until F1 lands ·
+**Kind:** review · **Status:** open — 9/10 fix-tasks done, only 11.9 remains (blocked on a human/devops
+runner observation, per its own documented precedent — see Exit criteria below) ·
 **Reviews phase(s):** Phase 10 (File Transfer Stream, tasks 10.1–10.24)
 
 ## Goal
@@ -110,9 +111,9 @@ else and of each other.
 - [x] **11.5** Resume boundary tests: 0 chunks received / all-but-last chunk (F5) — [file](./11.5-resume-boundary-tests.md)
 - [x] **11.6** Make `RESTART_GLARE_WINDOW` test-overridable; cover the timeout-fallback branch (F6; soft-depends on 11.1, 11.2) — [file](./11.6-restart-glare-window-timeout-test.md)
 - [x] **11.7** Conformance vectors for Phase 10's new wire surfaces (F7) — [file](./11.7-file-transfer-conformance-vectors.md)
-- [ ] **11.8** Wire `FileReceiver`'s per-chunk verification into the real send path, or narrow the claim (F8) — [file](./11.8-chunk-proof-delivery-mechanism.md)
+- [x] **11.8** Wire `FileReceiver`'s per-chunk verification into the real send path, or narrow the claim (F8) — [file](./11.8-chunk-proof-delivery-mechanism.md)
 - [ ] **11.9** Confirm `soak-file-transfer.yml` ran clean post-10.18 on a real runner (F9, devops-owned, docs-only) — [file](./11.9-soak-workflow-runner-confirmation.md)
-- [ ] **11.10** Add scheduled/`workflow_dispatch` CI for `netns-kill-resume.sh` (F10) — [file](./11.10-netns-kill-resume-ci-workflow.md)
+- [x] **11.10** Add scheduled/`workflow_dispatch` CI for `netns-kill-resume.sh` (F10) — [file](./11.10-netns-kill-resume-ci-workflow.md)
 
 **N2, N3, N4** were deliberately **not** converted to fix-tasks — matching the review report's own
 disposition: N2 (`LoopbackTransport::ice_restart`'s "no-op" doc-comment overclaim) and N4 (no back-to-back

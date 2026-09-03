@@ -15,6 +15,11 @@ jobs:
   lint:
     name: Lint + invariants
     runs-on: ubuntu-latest
+    # Measured ~1.3min; 10min gives real headroom for runner variance without masking a genuine
+    # hang for hours unattended (see the test-webrtc job below for why an explicit bound matters —
+    # every job in this file omitted timeout-minutes until a runaway test-webrtc run hit GitHub's
+    # own 360-minute platform default and had to be force-cancelled).
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -57,6 +62,7 @@ jobs:
     name: "Test: build + unit/integration + coverage (~10.5min)"
     needs: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -104,6 +110,7 @@ jobs:
     name: "Test: tamper-hook feature gate (~1.5min)"
     needs: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -175,6 +182,15 @@ jobs:
     name: "Test: real webrtc-rs transport backend (~7min)"
     needs: lint
     runs-on: ubuntu-latest
+    # This job has genuinely hung to GitHub's own 360-minute platform default before (no
+    # timeout-minutes was set here at all) and had to be force-cancelled — real WebRTC/ICE/SCTP
+    # tests over a real transport, and `Transport::recv()` has no bounded timeout anywhere in its
+    # own call chain (a known, tracked carry-forward — see docs/tasks/README.md's "Live
+    # carry-forwards"), so a stalled association can block a test forever with nothing here to
+    # catch it. 45min is generous over the ~7min normal case — a prior legitimate stall under heavy
+    # concurrent CI load was observed to resolve within ~31min (task 10.18's own review) — while
+    # still bounding a genuine hang to a single CI cycle instead of six hours.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -188,6 +204,7 @@ jobs:
     name: "Test: build-shape check + adversarial/cross-org harnesses + conformance (~3min)"
     needs: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -232,6 +249,7 @@ jobs:
     name: "Test: NAT matrix + relay policy (~3.5min)"
     needs: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -252,6 +270,7 @@ jobs:
     name: Build (release)
     needs: [test-core, test-tamper-hook, test-webrtc, test-harnesses, test-nat-matrix]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -268,6 +287,7 @@ jobs:
     # gate must not become a second path that can leak the publish credential.
     needs: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -305,6 +325,7 @@ jobs:
   supply-chain:
     name: License / advisory gate
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -317,6 +338,7 @@ jobs:
   docs:
     name: Docs (mermaid + links)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
