@@ -32,6 +32,8 @@ are the stack/repo decisions (extracted from [stack](../architecture/stack.md) �
 | [0023](./0023-cli-tui-binary-distribution.md) | Rolling `cli-latest` GitHub Release with Linux + Windows `x86_64` **`meridian` CLI/TUI** executables, own dependency-graph trigger (Accepted); signing deferred, same trigger as 0019's residual | executable-pipeline task, corrected scope |
 | [0024](./0024-mailbox-drain-from-attestation.md) | Mailbox-drained `Deliver.from`: no server-side sender persistence (no contact graph), a fixed `[0u8;32]` placeholder instead; client-side `SenderMismatch` is relaxed for `mailbox_id.is_some()` (Accepted; scope-corrects 0016 R4 for the mailbox-drain case) | Phase-8 planning, task 8.7 |
 | [0025](./0025-ice-restart-renegotiation.md) | ICE-restart renegotiation rides the mailbox (tolerant `SignalContent::IceRestartOffer`/`Answer`, no standing relay connection), one symmetric glare-safe method, layered fingerprint check (**Accepted**) | Phase-10 exit-gate finding, task 10.17 |
+| [0026](./0026-browser-client-local-store.md) | Browser `SecretStore` via non-extractable WebCrypto `CryptoKey`s; IndexedDB records sealed with `meridian_crypto::at_rest` under a derived key, same fail-closed/versioning discipline as ADR 0021 (Accepted) | Phase-12 planning, architect consult |
+| [0027](./0027-desktop-signed-updates.md) | Desktop updater signed via Tauri's built-in updater-plugin scheme (minisign-style, CI-held key); OS-trusted Authenticode signing stays deferred, same trigger as 0022/0023 (Accepted) | Phase-12 planning, architect consult |
 
 **Previously-open decisions, now resolved at handoff:** [0011 ratchet library](./0011-ratchet-library.md)
 X3DH layer → hand-wired over RustCrypto primitives (unchanged); Double Ratchet mechanism → composed
