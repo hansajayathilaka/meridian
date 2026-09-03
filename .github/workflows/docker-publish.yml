@@ -28,6 +28,9 @@ jobs:
   publish:
     name: Build & push meridian-rendezvous image
     runs-on: ubuntu-latest
+    # Mirrors ci.yml's docker-build gate (~4min for the same Dockerfile) plus a registry push;
+    # generous headroom without masking a genuine hang for hours unattended.
+    timeout-minutes: 20
     permissions:
       contents: read
       # Lets the built-in GITHUB_TOKEN push to ghcr.io — no DOCKERHUB_* secrets needed.

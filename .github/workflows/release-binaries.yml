@@ -39,6 +39,10 @@ jobs:
             target: x86_64-pc-windows-msvc
             asset_os: windows
     runs-on: ${{ matrix.os }}
+    # Windows release builds (ring's nasm assembly + MSVC linker) run meaningfully slower than
+    # Linux; generous headroom for both legs of the matrix without masking a genuine hang for
+    # hours unattended (no timeout-minutes was set on any job in this file before).
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -110,6 +114,7 @@ jobs:
     name: Publish rolling GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
