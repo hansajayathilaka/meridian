@@ -412,11 +412,25 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   `tools/check-docs.sh`). Full decision record:
   [11.8's Risks/notes](./phase-11/11.8-chunk-proof-delivery-mechanism.md#architect-decision-record-this-tasks-own-required-first-step)
   and [Outcome](./phase-11/11.8-chunk-proof-delivery-mechanism.md#outcome).
-- **NEXT:** `/next-task` — **11.9** is the only remaining Phase 11 fix-task, blocked pending a
-  human/devops runner observation it explicitly says an agent session cannot supply. Per the phase's own
-  exit criteria, 11.9 may stay open indefinitely without itself blocking Phase 11's other 9 tasks from
-  being considered closed — a future `/pick-next-phase` for the next build phase (T10 or T14, both
-  unblocked) does not need to wait on it.
+- **NOW:** **11.9** is the only remaining Phase 11 fix-task, blocked pending a human/devops runner
+  observation it explicitly says an agent session cannot supply. Per the phase's own exit criteria, 11.9
+  may stay open indefinitely without itself blocking Phase 11's other 9 tasks from being considered closed
+  — Phase 11 counts as review-swept for the purpose of opening the next build phase.
+- **NOW:** **Phase 12 (Browser & Desktop Clients) opened — scope is T11 alone.** The unblocked set at
+  this point is **{T10, T11, T14, T16}** — T09's closure (Phase 10) newly unblocked T11 (deps T04–T09)
+  and T16 (deps T09); T05/T06 already unblocked T10; T06/T07 already unblocked T14. T11 is chosen on
+  priority tier (T10/T11 = P2, outranking T14's P3 and T16's P4) and the same "sole gate on downstream
+  features" critical-path test Phase 2 used to pick T06 over T08/T09 and Phase 10 used to pick T09 over
+  T10/T14: **T11 is the sole remaining gate on T13 and T15**, and jointly gates T12 alongside T10, while
+  T10 alone gates only T12 (jointly with T11) and T14/T16 both gate nothing downstream. Track D
+  (`17→11→12→15`) also confirms T11 as the next item in sequence now that T17 is closed. Not bundled
+  with T10 (only an optional "if-ready" invite in T11's own dependency line, moot since T10 hasn't
+  shipped), T14, or T16 (no code-path overlap) — mirroring Phase 10's own non-bundling of T09. T10, T14,
+  and T16 all remain valid, unblocked choices for a later build phase. Full dependency-check rationale:
+  [phase-12/README.md](./phase-12/README.md).
+- **NEXT:** `/plan-phase` — break T11 down into tasks (WASM core build, browser `Transport` shim,
+  IndexedDB store, browser UI screens, Tauri shell, signed updater, and the
+  {CLI, browser, desktop}² interop matrix).
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -1164,6 +1178,16 @@ or T14). 10 fix-tasks (11.1–11.10) planned by the **planner** agent; landing o
 - [x] **11.8** Wire `FileReceiver`'s per-chunk verification into the real send path, or narrow the claim (F8) — [file](./phase-11/11.8-chunk-proof-delivery-mechanism.md)
 - [ ] **11.9** Confirm `soak-file-transfer.yml` ran clean post-10.18 on a real runner (F9, devops-owned, docs-only) — [file](./phase-11/11.9-soak-workflow-runner-confirmation.md)
 - [x] **11.10** Add scheduled/`workflow_dispatch` CI for `netns-kill-resume.sh` (F10) — [file](./phase-11/11.10-netns-kill-resume-ci-workflow.md)
+
+### Phase 12 — Browser & Desktop Clients · **planning** · [details](./phase-12/README.md)
+Build phase. **[T11 — Browser & Desktop Clients](../architecture/features/11-browser-desktop-clients.md)**
+alone: `meridian-core` → wasm32, a browser `Transport` shim over `RTCPeerConnection`, an IndexedDB-backed
+encrypted store, browser UI (chat/contacts/verification/file-transfer/message-requests), a Tauri desktop
+shell reusing T04's native `Transport` + DPAPI `SecretStore`, a signed updater, and a
+{CLI, browser, desktop}² interop matrix in CI. Deps T04–T09 all done (T04 Phase 0, T05/T06 Phase 2, T08
+Phase 4, T07 Phase 8, T09 Phase 10). Chosen over T10/T14/T16 (all also unblocked) on priority tier (P2 vs
+T14's P3/T16's P4) and the critical-path test — T11 is the sole gate on T13/T15 and jointly gates T12.
+Full pick rationale: [phase-12/README.md](./phase-12/README.md#dependency-check).
 
 ## Legend / how to read
 - Each task line links to its own file with **Goal · Scope · Deliverables · Risks · Tests · Reviews · Status**.
