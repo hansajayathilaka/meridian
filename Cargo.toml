@@ -17,6 +17,7 @@ members = [
   "apps/desktop",
   "apps/rendezvous",
   "apps/admin",
+  "apps/wasm",
   "tools/xtask",
 ]
 
