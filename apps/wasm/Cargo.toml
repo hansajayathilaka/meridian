@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# Task 12.10: the wasm-bindgen cdylib `stack.md` §3's documented target layout calls for (`apps/wasm/` here —
+# Task 12.10: the wasm-bindgen cdylib `stack.md` §3's target layout calls for (`apps/wasm/` here —
 # the workspace uses `apps/*` where the doc's own tree diagram shows `crates/*`; same crate, real
 # path). This is a build-pipeline SCAFFOLD only: it wraps `meridian-core`'s identity facade
 # (`generate_account`/`sign`/`verify`) and `meridian-crypto`'s `safety_number` behind
@@ -82,12 +82,34 @@ web-sys = { version = "0.3", features = [
   "RtcStatsIceCandidatePairState",
   "RtcStatsIceCandidateType",
   "MessageEvent",
+  # Task 12.12: `src/store/indexeddb.rs`'s IndexedDB record-sealing/schema module (ADR 0026
+  # binding conditions 2-5).
+  "IdbFactory",
+  "IdbOpenDbRequest",
+  "IdbDatabase",
+  "IdbObjectStore",
+  "IdbTransaction",
+  "IdbTransactionMode",
+  "IdbRequest",
 ] }
+# Task 12.12: `at_rest::seal`/`open`-wraps each IndexedDB record under a versioned JSON envelope
+# (`Envelope { v, data }` in `src/store/indexeddb.rs`) — same `serde`/`serde_json` pair every other
+# JSON-document store in this tree (`meridian-core::account`, `apps/tui::store`) already uses.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# `IndexedDbError` (task 12.12) — same `thiserror` pin every other error enum in this tree uses.
+thiserror = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 # Task 12.11's own test (a same-tab two-`BrowserTransport` SDP offer/answer loopback) needs real
 # `RTCPeerConnection`/`RTCDataChannel` objects, which do not exist in Node — see
 # `tests/browser_transport.rs`'s own module doc for why this lives in a separate integration-test
 # binary (its own `wasm_bindgen_test_configure!(run_in_browser)`) rather than inside `src/lib.rs`'s
-# existing Node-run unit tests.
+# existing Node-run unit tests. Task 12.12's IndexedDB/WebCrypto tests need the same real-browser
+# treatment for the identical reason (no IndexedDB in Node).
 wasm-bindgen-test = "0.3"
+# Task 12.12's own tests: a uniquely-named IndexedDB database per test (`getrandom::fill`) plus a
+# readable tag for it (`hex::encode`) — same pattern `apps/store/src/webcrypto.rs`'s own tests use
+# for seed bytes.
+getrandom = { workspace = true, features = ["wasm_js"] }
+hex = { workspace = true }

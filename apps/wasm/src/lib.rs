@@ -49,6 +49,12 @@ use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 pub mod transport;
 
+/// The IndexedDB record-sealing/schema module (ADR 0026 binding conditions 2–5, task 12.12) — see
+/// `store::indexeddb`'s module doc. `wasm32`-gated: it wraps `web_sys::IdbFactory`/`IdbDatabase`,
+/// meaningless (and undeployable) on any other target.
+#[cfg(target_arch = "wasm32")]
+pub mod store;
+
 /// A generated account: the identity itself plus the (private, in-process) store backing it.
 ///
 /// Opaque to JS beyond the getters/methods below — the private key never leaves `store`.

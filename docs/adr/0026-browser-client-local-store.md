@@ -5,6 +5,11 @@
 
 # ADR 0026: Browser client-local store — WebCrypto non-extractable keys + IndexedDB sealing
 
+**Scope-corrected by [ADR 0028](./0028-async-secretstore-bridge.md):** Decision B's "zero trait changes"
+claim below is factually wrong — `SecretStore`'s sync trait cannot genuinely reach `crypto.subtle`'s
+Promise-only API — see ADR 0028 for the async bridge this actually requires. The backing choice itself
+(`WebCryptoSecretStore` via non-extractable `CryptoKey`s) is unaffected and remains binding.
+
 **Options — `SecretStore` backing for the account/device keys:** (A) derive a raw seed and hand it to
 a WASM-side `FileSecretStore`-style at-rest wrapper (mirrors the headless CLI); (B) **a new
 `WebCryptoSecretStore` impl backed by non-extractable `CryptoKey`s via `crypto.subtle`, imported once

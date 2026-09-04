@@ -4,7 +4,7 @@
 
 # Phase 12 — Browser & Desktop Clients
 
-**Kind:** build · **Status:** open — 11/20 tasks done · **Reviews phase(s):** n/a (pending a future `/start-review-phase`)
+**Kind:** build · **Status:** open — 12/20 tasks done · **Reviews phase(s):** n/a (pending a future `/start-review-phase`)
 
 ## Goal
 Ship **[T11 — Browser & Desktop Clients](../../architecture/features/11-browser-desktop-clients.md)**:
@@ -152,10 +152,10 @@ Full breakdown: [Tasks (todo)](#tasks-todo) below.
 
 **Wave 4 — depends on Wave 3**
 - [x] **12.11** Browser `Transport` shim (depends on 12.10) — [file](./12.11-browser-transport-shim.md)
-- [~] **12.12** Browser IndexedDB sealed store, `apps/wasm` (depends on 12.10, 12.5) — [file](./12.12-browser-indexeddb-sealed-store.md)
+- [x] **12.12** Browser IndexedDB sealed store, `apps/wasm` (depends on 12.10, 12.5) — [file](./12.12-browser-indexeddb-sealed-store.md)
 
 **Wave 5 — depends on Wave 4**
-- [ ] **12.13** Browser wasm adapter (depends on 12.2, 12.11, 12.12) — [file](./12.13-browser-wasm-adapter.md)
+- [~] **12.13** Browser wasm adapter (depends on 12.2, 12.11, 12.12) — [file](./12.13-browser-wasm-adapter.md)
 
 **Wave 6 — app shells**
 - [ ] **12.14** `apps/web` app shell (depends on 12.13, 12.7, 12.8, 12.9) — [file](./12.14-web-app-shell.md)

@@ -44,6 +44,19 @@ pub trait SecretStore: Send + Sync {           // OS keystore / enclave / wrappe
     // algorithm's determinism (task 1.7, review finding F7) — used e.g. to seal local state at rest.
     fn derive_key(&self, h: &KeyHandle, info: &[u8]) -> Result<[u8; 32]>;
 }
+
+// (ADR 0028) Additive, non-object-safe async twin of `SecretStore`, for targets where the platform
+// key-store API is only reachable via Futures (today: wasm32's crypto.subtle, Promise-only by spec).
+// Not part of the frozen SecretStore contract above — implemented only where a real async backend
+// exists (WebCryptoSecretStore); every other SecretStore impl (OsSecretStore/FileSecretStore/
+// MemorySecretStore) is unaffected and does not implement it. Same operation names/inputs/outputs as
+// SecretStore — an async view of the same surface, not a new capability.
+pub trait AsyncSecretStore {
+    async fn store(&self, label: &str, secret: &[u8]) -> Result<KeyHandle>;
+    async fn use_key(&self, h: &KeyHandle, op: SignOrDh, input: &[u8]) -> Result<Vec<u8>>;
+    fn nonextractable(&self) -> bool;
+    async fn derive_key(&self, h: &KeyHandle, info: &[u8]) -> Result<[u8; 32]>;
+}
 ```
 
 ## Identity (T01 — frozen wire behavior)
@@ -56,6 +69,14 @@ fn same_principal(a: &Identity, b: &Identity) -> bool;   // key-only, ignores hi
 fn sign(store: &dyn SecretStore, h: &KeyHandle, msg: &[u8]) -> Result<Signature>;
 fn verify(pk: &PublicKey, msg: &[u8], sig: &Signature) -> bool;
 fn safety_number(local: &PublicKey, remote: &PublicKey) -> SafetyNumber; // order-independent
+
+// (ADR 0028) Generic-bound async siblings, for callers holding an AsyncSecretStore (e.g. wasm32's
+// WebCryptoSecretStore) instead of a &dyn SecretStore. Reuse every non-store-touching line (hint
+// validation, seed generation, storage labeling, signature construction) from the sync versions above
+// verbatim — this is the single source of truth both platforms share; no orchestration logic is
+// duplicated per platform.
+async fn generate_account_async<S: AsyncSecretStore>(store: &S) -> Result<AccountId>;
+async fn sign_async<S: AsyncSecretStore>(store: &S, h: &KeyHandle, msg: &[u8]) -> Result<Signature>;
 ```
 
 ## Sessions & messaging (T03/T04)

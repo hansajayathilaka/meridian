@@ -34,6 +34,7 @@ are the stack/repo decisions (extracted from [stack](../architecture/stack.md) �
 | [0025](./0025-ice-restart-renegotiation.md) | ICE-restart renegotiation rides the mailbox (tolerant `SignalContent::IceRestartOffer`/`Answer`, no standing relay connection), one symmetric glare-safe method, layered fingerprint check (**Accepted**) | Phase-10 exit-gate finding, task 10.17 |
 | [0026](./0026-browser-client-local-store.md) | Browser `SecretStore` via non-extractable WebCrypto `CryptoKey`s; IndexedDB records sealed with `meridian_crypto::at_rest` under a derived key, same fail-closed/versioning discipline as ADR 0021 (Accepted) | Phase-12 planning, architect consult |
 | [0027](./0027-desktop-signed-updates.md) | Desktop updater signed via Tauri's built-in updater-plugin scheme (minisign-style, CI-held key); OS-trusted Authenticode signing stays deferred, same trigger as 0022/0023 (Accepted) | Phase-12 planning, architect consult |
+| [0028](./0028-async-secretstore-bridge.md) | New non-object-safe `AsyncSecretStore` companion trait + `meridian_identity::generate_account_async`/`sign_async`, bridging `SecretStore` to `crypto.subtle`'s Promise-only API on wasm32 (Accepted; scope-corrects 0026's "zero trait changes" claim) | Task 12.13 required pre-check, architect consult |
 
 **Previously-open decisions, now resolved at handoff:** [0011 ratchet library](./0011-ratchet-library.md)
 X3DH layer → hand-wired over RustCrypto primitives (unchanged); Double Ratchet mechanism → composed
