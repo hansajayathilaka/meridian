@@ -4,7 +4,7 @@
 
 # Phase 12 — Browser & Desktop Clients
 
-**Kind:** build · **Status:** open — 0/20 tasks done · **Reviews phase(s):** n/a (pending a future `/start-review-phase`)
+**Kind:** build · **Status:** open — 6/20 tasks done · **Reviews phase(s):** n/a (pending a future `/start-review-phase`)
 
 ## Goal
 Ship **[T11 — Browser & Desktop Clients](../../architecture/features/11-browser-desktop-clients.md)**:
@@ -135,15 +135,15 @@ Full breakdown: [Tasks (todo)](#tasks-todo) below.
 <!-- Filled by /plan-phase. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
 
 **Wave 1 — independent**
-- [ ] **12.1** `wasm32` substrate: toolchain + `getrandom` backend + timer seam — [file](./12.1-wasm32-substrate-toolchain-getrandom-timer.md)
-- [ ] **12.2** `shared-ui` package + `MeridianClientAdapter` TS interface — [file](./12.2-shared-ui-client-adapter-interface.md)
-- [ ] **12.3** `apps/desktop` Tauri crate scaffold (Rust side) — [file](./12.3-desktop-tauri-crate-scaffold.md)
+- [x] **12.1** `wasm32` substrate: toolchain + `getrandom` backend + timer seam — [file](./12.1-wasm32-substrate-toolchain-getrandom-timer.md)
+- [x] **12.2** `shared-ui` package + `MeridianClientAdapter` TS interface — [file](./12.2-shared-ui-client-adapter-interface.md)
+- [x] **12.3** `apps/desktop` Tauri crate scaffold (Rust side) — [file](./12.3-desktop-tauri-crate-scaffold.md)
 
 **Wave 2 — depends on Wave 1**
-- [ ] **12.4** `meridian-signaling` WebSocket transport seam (depends on 12.1) — [file](./12.4-signaling-ws-transport-seam.md)
-- [ ] **12.5** `WebCryptoSecretStore` in `apps/store`, wasm32-gated (depends on 12.1) — [file](./12.5-webcrypto-secret-store.md)
-- [ ] **12.6** Desktop TS adapter (depends on 12.2, 12.3) — [file](./12.6-desktop-ts-adapter.md)
-- [ ] **12.7** Core messaging screens: chat + contacts + message-requests (depends on 12.2) — [file](./12.7-core-messaging-screens.md)
+- [x] **12.4** `meridian-signaling` WebSocket transport seam (depends on 12.1) — [file](./12.4-signaling-ws-transport-seam.md)
+- [~] **12.5** `WebCryptoSecretStore` in `apps/store`, wasm32-gated (depends on 12.1) — [file](./12.5-webcrypto-secret-store.md)
+- [x] **12.6** Desktop TS adapter (depends on 12.2, 12.3) — [file](./12.6-desktop-ts-adapter.md)
+- [x] **12.7** Core messaging screens: chat + contacts + message-requests (depends on 12.2) — [file](./12.7-core-messaging-screens.md)
 - [ ] **12.8** Verification screen: QR camera-scan safety-number compare (depends on 12.2, 12.7) — [file](./12.8-verification-screen.md)
 - [ ] **12.9** File transfer screen (depends on 12.2, 12.7) — [file](./12.9-file-transfer-screen.md)
 
