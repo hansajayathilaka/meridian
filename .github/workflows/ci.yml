@@ -264,6 +264,47 @@ jobs:
       - name: wasm32 substrate check (mirrors `just check-wasm32`)
         run: cargo check -p meridian-store -p meridian-identity -p meridian-crypto -p meridian-proto -p meridian-envelope -p meridian-transport -p meridian-signaling -p meridian-core --target wasm32-unknown-unknown
 
+  wasm-build:
+    name: "Build: meridian-wasm (wasm-pack --release) + smoke test (task 12.10, ~2min)"
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      # Real codegen/linking through `wasm-pack`, not just `cargo check` (check-wasm32 above only
+      # type-checks the wasm32 substrate this crate builds on) — the actual pipeline this task
+      # exists to prove. Pinned to the same 0.15.0 this task's own verification used.
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: "v0.15.0"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: wasm-pack build --release (real codegen/linking, not just cargo check)
+        run: wasm-pack build apps/wasm --release --target web
+      # Informational only — the hard <4 MB gate is task 12.20's. Reports both raw and gzipped
+      # (the wire-transfer-relevant number for a browser fetch) sizes of the compiled artifact.
+      - name: Bundle size report (informational — 12.20 owns the enforced gate)
+        run: |
+          wasm_file=apps/wasm/pkg/meridian_wasm_bg.wasm
+          raw=$(stat -c%s "$wasm_file")
+          gz=$(gzip -c "$wasm_file" | wc -c)
+          echo "meridian_wasm_bg.wasm: ${raw} bytes raw, ${gz} bytes gzipped"
+          echo "### meridian-wasm bundle size (informational)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- raw: ${raw} bytes" >> "$GITHUB_STEP_SUMMARY"
+          echo "- gzipped: ${gz} bytes" >> "$GITHUB_STEP_SUMMARY"
+      # Smoke test (task 12.10): generate_account -> sign -> verify and safety_number round-tripped
+      # through the actual compiled .wasm artifact. `--node`, not a headless-browser harness: this
+      # test calls no browser-only API (no WebCrypto/IndexedDB, unlike 12.5/12.12's own tests), so
+      # Node is sufficient and avoids the Chromium/ChromeDriver version-matching fragility 12.5 hit
+      # (see apps/wasm/src/lib.rs's module doc for the full reasoning — 12.11/12.12/12.13 should
+      # reuse this choice unless their own test needs a real browser API).
+      - name: Smoke test (wasm-pack test --node)
+        run: wasm-pack test --node apps/wasm
+
   test-nat-matrix:
     name: "Test: NAT matrix + relay policy (~3.5min)"
     needs: lint
@@ -295,6 +336,7 @@ jobs:
         test-harnesses,
         test-nat-matrix,
         check-wasm32,
+        wasm-build,
       ]
     runs-on: ubuntu-latest
     timeout-minutes: 20
