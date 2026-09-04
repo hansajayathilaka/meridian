@@ -176,6 +176,13 @@ export interface StreamOpenResult {
 /**
  * One `mrd.file/1` (T09) transfer's summary, for a transfers pane
  * (mirrors `apps/tui/src/streams/file.rs::TransferState`, display-oriented subset).
+ *
+ * **`state: "complete"` reports transport-level completion only — never a claim of verified
+ * integrity.** `mrd.file/1`'s per-chunk merkle proof delivery is not fully wired into the real send
+ * path yet (Phase 11 fix-task 11.8's residual, inherited as-is by task 12.9 — see that task's own
+ * Scope→Out note). A screen rendering this state must say no more than what it is: "transfer
+ * complete" / "failed", never "verified" or "corruption-free" — that stronger claim isn't something
+ * any adapter today actually reports.
  */
 export interface FileTransferSummary {
   streamId: StreamHandle;
@@ -386,4 +393,33 @@ export interface MeridianClientAdapter {
 
   /** Lists in-progress/recent file transfers, for a transfers pane. */
   listTransfers(): Promise<FileTransferSummary[]>;
+
+  /**
+   * Accepts a pending incoming `mrd.file/1` transfer — the receive-side counterpart to
+   * {@link sendFile}, added by task 12.9 for the file-transfer screen's receive prompt.
+   *
+   * `FileTransferSummary.state === "offered"` is the *only* state this ever legitimately applies
+   * to: per `docs/api/stream-types-v1.md`'s "`on_open` policy" section (`apps/streams/src/file.rs`'s
+   * `decide_file_offer`, task 10.6), a first-contact offer is rejected outright and an
+   * image-under-threshold offer is auto-accepted, both before either ever reaches a UI — only the
+   * remaining `AskUser` verdict surfaces here as `"offered"`, for this screen's own accept/reject
+   * prompt to resolve. Rejects with `"unknown"` if `streamId` does not name a transfer currently
+   * `"offered"` (already decided, or never existed).
+   *
+   * **Known gap, inherited as-is (task 12.9 Scope→Out; not this interface's to fix):** today's real
+   * `mrd.file/1` policy hook (`FileStream::with_ask_user`, `apps/streams/src/file.rs`) is a
+   * *synchronous* closure consulted inside `on_open` itself — the CLI (`apps/cli/src/send.rs`)
+   * satisfies it with a real blocking terminal prompt, which a GUI event loop cannot do. Neither
+   * concrete adapter today (`apps/desktop/ui/src/adapter.ts`, task 12.6) has a live round trip that
+   * can produce a genuine `"offered"` transfer or honor a call to this method — see that adapter's
+   * own doc comment on this method for the full gap report. This screen and
+   * {@link FakeMeridianClientAdapter} are written correctly against the *intended* shape regardless,
+   * so the real round trip can be wired later (a core/event-plumbing change, not a UI change) without
+   * touching this screen again.
+   */
+  acceptTransfer(streamId: StreamHandle): Promise<void>;
+
+  /** Rejects a pending incoming transfer — the counterpart to {@link acceptTransfer}, with the same
+   * `"offered"`-only precondition and the same known gap. */
+  rejectTransfer(streamId: StreamHandle): Promise<void>;
 }
