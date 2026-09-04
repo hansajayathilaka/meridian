@@ -768,6 +768,21 @@ evaporate:
   capability-mismatch teardown path sends it). Non-blocking today, but real leaked bookkeeping the
   moment a future stream type (or a `mrd.file/1` extension) starts sending `Close` mid-session. No open
   task owns this — pick up via a future `/plan-phase` when a stream type first needs `Close`.
+- **NEW (found by task 12.11's own review): browser↔native `stream_id_for_label` modulus mismatch will
+  break cross-implementation data-channel negotiation.** `apps/wasm/src/transport.rs`'s
+  `stream_id_for_label` (task 12.11, `BrowserTransport`) uses modulus `1_000`, while
+  `apps/transport/src/webrtc_backend.rs`'s native equivalent (`WebRtcTransport`) uses modulus `65_534` —
+  for the same channel label (e.g. `"mrd.ctrl/1"`), the two pure functions compute different negotiated
+  SCTP stream ids almost always (~1/65 coincidence chance). A pre-negotiated data channel needs both
+  sides to agree on the numeric id, so a real browser↔native session (browser↔CLI, browser↔desktop) is
+  expected to fail to line up `mrd.ctrl/1` (and any other registered label) until this is reconciled.
+  Narrowing only the browser side was the correct, safe fix for task 12.11's own scope (same-tab
+  browser↔browser loopback, where both sides use the same modulus and the test passes) — real Chrome
+  rejects `RTCPeerConnection::createDataChannel` with `OperationError` for at least one id in the
+  65,534-wide range the native side uses, root cause not yet investigated. Fixing the native side is out
+  of task 12.11's own file scope (`apps/transport/src/webrtc_backend.rs`). Flagged in task 12.17's own
+  Risks/notes (the interop-matrix task most likely to hit this live) — pick up via a future `/plan-phase`
+  or as a fix-task spun off when 12.17's own run surfaces it, whichever comes first.
 > live in each task file's **Outcome** section (and the phase README) — not here. This block carries
 > only what is *currently actionable* plus obligations no open task owns.
 
