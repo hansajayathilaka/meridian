@@ -69,6 +69,21 @@ coverage-html:
     cargo llvm-cov --workspace --html
     @echo "report: target/llvm-cov/html/index.html"
 
+# wasm32 substrate check (task 12.1 + task 12.4, T11 browser substrate): every crate meridian-core
+# depends on, `meridian-core` itself, and `meridian-signaling`, all compiling clean for
+# wasm32-unknown-unknown. Task 12.1 landed the first six (store/identity/crypto/proto/envelope/
+# transport); task 12.4 closed the remaining two — meridian-signaling's `tokio-tungstenite`/
+# `rustls` had no wasm32 story at all (fixed by `apps/signaling/src/ws_transport.rs`'s
+# `WsConnection` seam, native unchanged / wasm32 → the browser's own `WebSocket`), and
+# meridian-core's own `tokio` dependency turned out to need the same per-target split task 12.1
+# already found necessary for `apps/transport/Cargo.toml` (a member's own `features = [...]` list
+# *unions* onto the workspace default rather than restricting it). Deliberately package-scoped, not
+# `--workspace --target wasm32-unknown-unknown`: no other workspace member (`meridian-cli`,
+# `meridian-tui`, `meridian-rendezvous`, `meridian-desktop`, …) is wasm32-buildable or meant to be —
+# only the shared-core dependency chain browser/desktop clients (T11) actually need.
+check-wasm32:
+    cargo check -p meridian-store -p meridian-identity -p meridian-crypto -p meridian-proto -p meridian-envelope -p meridian-transport -p meridian-signaling -p meridian-core --target wasm32-unknown-unknown
+
 # Codegen (UniFFI + wasm-bindgen) and conformance vectors.
 codegen:
     cargo run -p xtask -- codegen

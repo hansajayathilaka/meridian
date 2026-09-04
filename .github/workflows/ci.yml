@@ -245,6 +245,25 @@ jobs:
           }
           cargo test -p meridian-crypto --test conformance
 
+  check-wasm32:
+    name: "Check: wasm32 substrate (8 crates, task 12.1 + 12.4) (~1min)"
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      # meridian-store, meridian-identity, meridian-crypto, meridian-proto, meridian-envelope,
+      # meridian-transport (task 12.1), plus meridian-signaling and meridian-core themselves (task
+      # 12.4 — the WsConnection transport seam over meridian-signaling's tokio-tungstenite/rustls,
+      # plus meridian-core's own tokio-feature-union fix) must all compile for
+      # wasm32-unknown-unknown (T11 browser substrate). This is the full dependency chain a browser
+      # build of meridian-core needs; no other workspace member is wasm32-buildable or meant to be.
+      - name: wasm32 substrate check (mirrors `just check-wasm32`)
+        run: cargo check -p meridian-store -p meridian-identity -p meridian-crypto -p meridian-proto -p meridian-envelope -p meridian-transport -p meridian-signaling -p meridian-core --target wasm32-unknown-unknown
+
   test-nat-matrix:
     name: "Test: NAT matrix + relay policy (~3.5min)"
     needs: lint
@@ -268,7 +287,15 @@ jobs:
 
   build:
     name: Build (release)
-    needs: [test-core, test-tamper-hook, test-webrtc, test-harnesses, test-nat-matrix]
+    needs:
+      [
+        test-core,
+        test-tamper-hook,
+        test-webrtc,
+        test-harnesses,
+        test-nat-matrix,
+        check-wasm32,
+      ]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
