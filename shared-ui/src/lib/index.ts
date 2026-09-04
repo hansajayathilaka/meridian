@@ -29,6 +29,11 @@ export { default as CreateAccount } from "../screens/CreateAccount.svelte";
 export { default as Contacts } from "../screens/Contacts.svelte";
 export { default as Chat } from "../screens/Chat.svelte";
 export { default as MessageRequests } from "../screens/MessageRequests.svelte";
+export { default as Verification } from "../screens/Verification.svelte";
+export { default as FileTransfer } from "../screens/FileTransfer.svelte";
+
+export { MediaDevicesQrScanner } from "./qrScanner";
+export type { QrScanner, QrScanOutcome } from "./qrScanner";
 
 export { createAccountStore } from "../screens/stores/accountStore";
 export type { CreateAccountState, CreateAccountStore } from "../screens/stores/accountStore";
@@ -41,3 +46,15 @@ export type {
   MessageRequestsState,
   MessageRequestsStore,
 } from "../screens/stores/messageRequestsStore";
+export { createVerificationStore, compareSafetyNumbers } from "../screens/stores/verificationStore";
+export type {
+  VerificationState,
+  VerificationStore,
+  ScanComparison,
+} from "../screens/stores/verificationStore";
+export {
+  createFileTransferStore,
+  transferPercent,
+  transferStateLabel,
+} from "../screens/stores/fileTransferStore";
+export type { FileTransferState, FileTransferStore } from "../screens/stores/fileTransferStore";

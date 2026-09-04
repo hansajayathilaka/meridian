@@ -1,0 +1,93 @@
+[package]
+name = "meridian-wasm"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Task 12.10: the wasm-bindgen cdylib `stack.md` §3's documented target layout calls for (`apps/wasm/` here —
+# the workspace uses `apps/*` where the doc's own tree diagram shows `crates/*`; same crate, real
+# path). This is a build-pipeline SCAFFOLD only: it wraps `meridian-core`'s identity facade
+# (`generate_account`/`sign`/`verify`) and `meridian-crypto`'s `safety_number` behind
+# `#[wasm_bindgen]`, using `MemorySecretStore` internally (NOT the real browser `SecretStore` —
+# `WebCryptoSecretStore`/IndexedDB wiring is task 12.12) — proving `wasm-pack build --release`
+# actually links and codegens before the harder real pieces (browser `Transport`, 12.11; browser
+# store, 12.12) are wired in. See src/lib.rs's module doc for what's exported and why.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+meridian-core = { path = "../core" }
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+# `wasm-pack test --node` (this task's choice of headless runner — see src/lib.rs's module doc):
+# plain function calls through the wasm boundary, no browser-only APIs (WebCrypto/IndexedDB) needed
+# for this task's smoke test, so a Node-backed test runner is simpler and avoids the
+# Chromium/ChromeDriver version-matching fragility task 12.5 hit (recorded there as an environment
+# risk, reconfirmed here: this sandbox has a `chromedriver` binary but no matching Chrome/Chromium
+# browser binary at all).
+wasm-bindgen-test = "0.3"
+
+# wasm32-unknown-unknown only (task 12.11): `src/transport.rs`'s `BrowserTransport`, the browser
+# realization of the frozen `Transport` trait over the browser's native `RTCPeerConnection`/
+# `RTCDataChannel`, via `web-sys`/`js-sys` (D02 — "browser policy forbids any other WebRTC stack",
+# system-design.md §6). Mirrors `apps/store/Cargo.toml`'s / `apps/signaling/Cargo.toml`'s existing
+# wasm32-gated dependency shape for the same reason: these crates only make sense on this target.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# `#[async_trait::async_trait]` on `impl Transport for BrowserTransport` — the concrete Rust shape
+# `apps/transport/src/lib.rs`'s frozen trait definition is written in (its own `[dependencies]`
+# entry, unconditional there since `LoopbackTransport` also needs it on every target; scoped to
+# wasm32 here since `src/transport.rs` is this crate's only consumer and is itself wasm32-only).
+async-trait = { workspace = true }
+# Bridges `RTCPeerConnection`/`RTCDataChannel` Promise-returning methods (`createOffer`,
+# `setLocalDescription`, `addIceCandidate`, `getStats`, ...) to Rust `Future`s.
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+# The internal per-session inbound-frame queue (`Transport::recv`) and one-shot "gathering
+# done"/"channel open"/"connected" signals bridging `RTCPeerConnection`/`RTCDataChannel`'s
+# callback-based event model into plain `.await`able points — same technique
+# `apps/signaling/src/ws_transport.rs`'s `WasmWsConnection` already established for the sibling
+# browser-only transport seam (task 12.4).
+futures-channel = "0.3"
+# `futures_util::lock::Mutex` — an async-aware (never-panicking, FIFO-queuing) mutex around the
+# per-session inbound-frame receiver, matching `WebRtcTransport::recv`'s own `tokio::sync::Mutex`
+# guarantee that two overlapping `recv()` callers serialize instead of one panicking on a double
+# `RefCell` borrow (there is no `tokio::sync::Mutex` story on this target — see
+# `apps/core/Cargo.toml`'s wasm32 tokio entry, `sync`-feature only, no `time`/`rt`).
+futures-util = { workspace = true }
+# `tokio::time`-shaped `timeout` for this target (`apps/core/src/session.rs`'s `time_compat` module
+# already established this exact pin/reasoning for the sibling wasm32 substrate — reused here
+# unchanged rather than re-litigated).
+wasmtimer = "0.2"
+web-sys = { version = "0.3", features = [
+  "RtcPeerConnection",
+  "RtcConfiguration",
+  "RtcIceServer",
+  "RtcIceTransportPolicy",
+  "RtcSessionDescriptionInit",
+  "RtcSdpType",
+  "RtcIceCandidateInit",
+  "RtcIceCandidate",
+  "RtcPeerConnectionIceEvent",
+  "RtcDataChannel",
+  "RtcDataChannelInit",
+  "RtcDataChannelType",
+  "RtcOfferOptions",
+  "RtcPeerConnectionState",
+  "RtcStatsReport",
+  "RtcIceCandidatePairStats",
+  "RtcIceCandidateStats",
+  "RtcStatsType",
+  "RtcStatsIceCandidatePairState",
+  "RtcStatsIceCandidateType",
+  "MessageEvent",
+] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+# Task 12.11's own test (a same-tab two-`BrowserTransport` SDP offer/answer loopback) needs real
+# `RTCPeerConnection`/`RTCDataChannel` objects, which do not exist in Node — see
+# `tests/browser_transport.rs`'s own module doc for why this lives in a separate integration-test
+# binary (its own `wasm_bindgen_test_configure!(run_in_browser)`) rather than inside `src/lib.rs`'s
+# existing Node-run unit tests.
+wasm-bindgen-test = "0.3"
