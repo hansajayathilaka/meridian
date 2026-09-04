@@ -404,6 +404,30 @@ export class FakeMeridianClientAdapter implements MeridianClientAdapter {
     return [...this.transfers];
   }
 
+  async acceptTransfer(streamId: StreamHandle): Promise<void> {
+    const transfer = this.requireOfferedTransfer(streamId);
+    transfer.state = "in_progress";
+  }
+
+  async rejectTransfer(streamId: StreamHandle): Promise<void> {
+    const transfer = this.requireOfferedTransfer(streamId);
+    transfer.state = "rejected";
+  }
+
+  private requireOfferedTransfer(streamId: StreamHandle): FileTransferSummary {
+    const transfer = this.transfers.find((t) => t.streamId === streamId);
+    if (!transfer) {
+      throw new MeridianAdapterError("unknown", `no transfer with id ${streamId}`);
+    }
+    if (transfer.state !== "offered") {
+      throw new MeridianAdapterError(
+        "unknown",
+        `transfer ${streamId} is not awaiting an accept/reject decision (state: ${transfer.state})`,
+      );
+    }
+    return transfer;
+  }
+
   // ---------------------------------------------------------------------
   // Test-only helpers — NOT part of MeridianClientAdapter. Used by screen-level component tests to
   // drive inbound events this in-memory double otherwise has no live peer to generate.
@@ -448,6 +472,49 @@ export class FakeMeridianClientAdapter implements MeridianClientAdapter {
     if (gate.kind === "warn") contact.trust = "pinned_key_changed";
     else if (gate.kind === "blocked") contact.trust = "blocked";
     else contact.trust = "pinned";
+  }
+
+  /**
+   * Simulates an incoming `mrd.file/1` offer that reached the `AskUser` policy verdict (this
+   * in-memory double has no live peer/transport to generate one for real — see
+   * {@link MeridianClientAdapter.acceptTransfer}'s doc comment for the real gap this stands in
+   * for). Pushes a `state: "offered"` transfer that `listTransfers()`/{@link acceptTransfer}/
+   * {@link rejectTransfer} can then act on, and returns its `streamId` — mirrors
+   * `simulateIncomingRequest`'s existing shape for chat message requests.
+   */
+  simulateIncomingTransferOffer(peer: MeridianId, fileName: string, totalBytes: number): StreamHandle {
+    this.requireContact(peer);
+    const streamId = this.nextId("stream");
+    this.transfers.push({
+      streamId,
+      peer,
+      direction: "in",
+      fileName,
+      totalBytes,
+      transferredBytes: 0,
+      state: "offered",
+    });
+    return streamId;
+  }
+
+  /**
+   * Directly mutates an existing transfer's progress and (optionally) state — this double's
+   * {@link sendFile} completes a send instantly (see its own doc comment) and has no real chunked
+   * transport to drive incremental progress on either side, so screen tests that need to exercise a
+   * progress UI drive it directly via this helper instead, mirroring {@link simulateSendGate}'s
+   * "drive the underlying state directly, never a separately-tracked shadow field" shape.
+   */
+  simulateTransferProgress(
+    streamId: StreamHandle,
+    transferredBytes: number,
+    state?: FileTransferSummary["state"],
+  ): void {
+    const transfer = this.transfers.find((t) => t.streamId === streamId);
+    if (!transfer) {
+      throw new MeridianAdapterError("unknown", `no transfer with id ${streamId}`);
+    }
+    transfer.transferredBytes = transferredBytes;
+    if (state) transfer.state = state;
   }
 
   private pushHistory(peer: MeridianId, msg: ChatMessage): void {

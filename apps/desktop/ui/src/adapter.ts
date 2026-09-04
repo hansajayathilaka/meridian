@@ -894,6 +894,39 @@ export class TauriMeridianClientAdapter implements MeridianClientAdapter {
   async listTransfers(): Promise<FileTransferSummary[]> {
     return [...this.transfers];
   }
+
+  /**
+   * GAP (structural, pre-existing — task 12.9 surfaces it, does not introduce it): `acceptTransfer`/
+   * `rejectTransfer` are the receive-side counterpart `shared-ui`'s file-transfer screen needs, but
+   * 12.3's real `mrd.file/1` policy hook (`FileStream::with_ask_user`, `apps/streams/src/file.rs`)
+   * is a *synchronous* closure consulted inside `on_open` itself, and 12.3's own `handleFileIncoming`
+   * above always records an incoming transfer as `state: "in_progress"`, never `"offered"` — there
+   * is no live round trip anywhere in 12.3's command/event surface that could pause on this desktop
+   * shell for a human decision, let alone resolve one sent back here. `acceptTransfer`/
+   * `rejectTransfer` can therefore never legitimately find an `"offered"` transfer to act on against
+   * this adapter today; both fail closed rather than silently pretending to succeed. Wiring this for
+   * real needs a new Tauri command/event pair backing an async `ask_user` round trip — a
+   * command/event-surface change to 12.3, out of this task's scope, exactly like every other GAP in
+   * this file.
+   */
+  async acceptTransfer(streamId: StreamHandle): Promise<void> {
+    void streamId;
+    throw new MeridianAdapterError(
+      "unavailable",
+      "acceptTransfer: no Tauri command/event round trip exists for a pending file-transfer " +
+        "decision yet — see this adapter's acceptTransfer() doc comment for the full gap report",
+    );
+  }
+
+  /** See {@link acceptTransfer}'s doc comment — the same gap applies symmetrically. */
+  async rejectTransfer(streamId: StreamHandle): Promise<void> {
+    void streamId;
+    throw new MeridianAdapterError(
+      "unavailable",
+      "rejectTransfer: no Tauri command/event round trip exists for a pending file-transfer " +
+        "decision yet — see this adapter's acceptTransfer() doc comment for the full gap report",
+    );
+  }
 }
 
 function isFilePathParams(params: unknown): params is { path: string } {
