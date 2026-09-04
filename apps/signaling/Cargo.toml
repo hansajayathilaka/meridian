@@ -21,14 +21,22 @@ test-support = []
 meridian-proto = { path = "../proto" }
 meridian-identity = { path = "../identity" }
 meridian-store = { path = "../store" }
-tokio = { workspace = true }
-tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
 x25519-dalek = { workspace = true }
 getrandom = { workspace = true }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
+
+# Target-conditional split (task 12.4, T11 browser substrate): the native path keeps
+# `tokio`/`tokio-tungstenite`/`rustls` byte-for-byte unchanged from before this split (same
+# handshake, same wire bytes); `wasm32-unknown-unknown` has no story for any of the three
+# (`tokio-tungstenite`/`mio` need real TCP sockets; `rustls` TLS is meaningless when the browser's
+# own `WebSocket` object owns the `wss://` handshake instead — see `src/ws_transport.rs`) so that
+# target drops them entirely and adds the browser-facing bindings instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
 # rustls 0.23 requires an explicit process-wide crypto backend selection before any `wss://` TLS
 # handshake (`install_crypto_provider`, called at the top of `SignalingClient::connect`) — no
 # longer left to `apps/cli/src/main.rs` to remember (T3.13/F13). `default-features = false` +
@@ -40,6 +48,28 @@ thiserror = { workspace = true }
 # in the build graph to supply it — this crate already requires `tokio` (std-only), so there is no
 # no_std purity to preserve here.
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "ring"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# `sync` only: this target never touches `tokio::net`/`tokio::time`/the multi-thread runtime (all
+# native-only, see the `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]` entry above) —
+# `handshake_owned`'s `tokio::task::spawn_blocking` off-thread signing call is itself native-only
+# (`src/client.rs`'s `sign_off_thread` seam): a browser has no OS thread pool for tokio to dispatch
+# blocking work onto, and single-threaded wasm32 has nothing to gain from trying.
+tokio = { version = "1", default-features = false, features = ["sync"] }
+# `wasm-bindgen` for the `Closure`s bridging `web_sys::WebSocket`'s callback-based event model
+# (`onmessage`/`onerror`/`onclose`) into `futures-channel::mpsc`; no `wasm-bindgen-futures` (its
+# `JsFuture`/`spawn_local` helpers aren't needed here — this module exposes plain async fns for its
+# caller's own executor to drive, it never awaits a JS `Promise` or spawns a detached task itself).
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+futures-channel = "0.3"
+web-sys = { version = "0.3", features = [
+  "WebSocket",
+  "MessageEvent",
+  "BinaryType",
+  "CloseEvent",
+  "ErrorEvent",
+] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }

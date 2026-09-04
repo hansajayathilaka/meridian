@@ -14,6 +14,7 @@ members = [
   "apps/streams",
   "apps/cli",
   "apps/tui",
+  "apps/desktop",
   "apps/rendezvous",
   "apps/admin",
   "tools/xtask",

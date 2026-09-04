@@ -25,3 +25,20 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# wasm32-unknown-unknown only (task 12.1, T11 browser substrate — no browser Transport/SecretStore
+# impl lands here yet, this only makes the crate itself *compile* for the target).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# getrandom 0.3 (above) has no default wasm backend; its `wasm_js` Cargo feature (+ the matching
+# `--cfg getrandom_backend="wasm_js"` rustflag in .cargo/config.toml) opts into a wasm-bindgen-backed
+# source of OS randomness. See https://docs.rs/getrandom/#webassembly-support.
+getrandom = { workspace = true, features = ["wasm_js"] }
+# `age` (above) pulls in `rand 0.8`, which transitively needs a *second*, older getrandom (0.2.x,
+# via rand_core 0.6) — a separate crate instance from the 0.3 one directly above, with its own,
+# unrelated wasm activation switch (Cargo feature "js", not a `--cfg` rustflag). This surfaced only
+# by actually running the wasm32 `cargo check` this task requires (its own "verify, don't assume"
+# instruction), not from anything enumerated up front. This edge exists purely to turn that feature
+# on for the whole build graph — Cargo unifies features per resolved dependency version across every
+# crate that uses it, so this alone is enough without touching `age`/`x25519-dalek`'s own manifests;
+# nothing in this crate calls the 0.2 copy directly, hence the local rename.
+getrandom-0-2-js = { package = "getrandom", version = "0.2", features = ["js"] }

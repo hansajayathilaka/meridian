@@ -1,5 +1,7 @@
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
-# Targets added as clients land (see docs/architecture/stack.md §4):
-# targets = ["wasm32-unknown-unknown", "aarch64-apple-ios", "aarch64-linux-android"]
+# Targets added as clients land (see docs/architecture/stack.md §4). wasm32-unknown-unknown added
+# by task 12.1 (browser/T11 substrate completion); the remaining two ("aarch64-apple-ios",
+# "aarch64-linux-android") land with mobile (T12).
+targets = ["wasm32-unknown-unknown"]

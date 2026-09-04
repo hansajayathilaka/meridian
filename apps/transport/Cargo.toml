@@ -12,12 +12,32 @@ publish = false
 # Public API contract: docs/api/core-api-contracts.md ("Traits the platform MUST implement").
 [dependencies]
 async-trait = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time"] }
 thiserror = { workspace = true }
 # webrtc-rs itself + the `Bytes` type its data-channel API speaks. Both optional, pulled in only by
 # the `webrtc` feature below.
 webrtc = { version = "0.17", optional = true }
 bytes = { version = "1", optional = true }
+
+# tokio is split per-target (task 12.1) rather than left as a single `[dependencies]` entry: the
+# workspace's shared spec (root Cargo.toml) is `["rt-multi-thread","macros","net","sync","time",
+# "io-util"]`, and a member crate's own `features = [...]` list *unions* onto that via
+# `workspace = true` rather than narrowing it — so the `["sync", "time"]` this crate used to write
+# here was never actually restricting anything; it silently pulled in the full workspace set
+# (including `net`/`rt-multi-thread`, hence `mio`'s TCP/UDP socket sources) on every target,
+# native included. That's harmless on native (where mio's socket code builds fine) but fatal on
+# wasm32-unknown-unknown, which has no epoll/real threads/TCP stack for `mio` to bind to —
+# confirmed by actually running this task's wasm32 `cargo check`, not assumed up front, per the
+# task's own "verify, don't assume" instruction. The default (non-`webrtc`) build only ever touches
+# `tokio::sync` (`loopback.rs`) — `tokio::time`/`tokio::spawn` live entirely in `webrtc_backend.rs`,
+# already gated behind the off-by-default `webrtc` feature — so wasm32 gets its own, non-workspace,
+# minimally-featured tokio dependency instead of the (accidentally) unrestricted workspace one.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Unchanged from before this split: still the full workspace feature set via the same
+# `workspace = true` union behavior described above — this preserves native behavior exactly.
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 [features]
 default = []

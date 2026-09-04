@@ -1,5 +1,9 @@
 packages:
   - "apps/web"
+  - "apps/desktop/ui"
+  - "shared-ui"
   # future UI packages (see docs/architecture/stack.md):
   # - "clients/*"
-  # - "shared-ui"
+allowBuilds:
+  esbuild: true
+  svelte-preprocess: true

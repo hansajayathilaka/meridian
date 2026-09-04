@@ -13,6 +13,7 @@
 mod bundle;
 mod client;
 mod error;
+mod ws_transport;
 
 pub use bundle::{generate_bundle, verify_bundle, GeneratedBundle};
 pub use client::{install_crypto_provider, RouteOutcome, SignalingClient};
