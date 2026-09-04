@@ -21,7 +21,6 @@ ciborium = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 getrandom = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
 # Zeroizes superseded prekey-generation secrets (task 1.31), matching meridian-crypto's convention.
 zeroize = { workspace = true }
 # account.rs (task 4.13): the account-descriptor JSON + `$MERIDIAN_HOME` layout helpers, relocated
@@ -37,6 +36,30 @@ default = []
 # (real ICE/SCTP/DTLS backend, 1.15). Off by default for the same reason as the underlying crate:
 # heavy dependency tree, needs real UDP/ICE.
 webrtc = ["meridian-transport/webrtc"]
+
+# tokio, split per-target (task 12.4 — same additive-union discovery task 12.1 made for
+# `apps/transport/Cargo.toml`, applied here): a bare `tokio = { workspace = true, features =
+# ["sync"] }` does not *restrict* the workspace's shared tokio spec down to `sync` — a member's own
+# `features = [...]` list unions onto the workspace default (`["rt-multi-thread","macros","net",
+# "sync","time","io-util"]`) rather than narrowing it, so this crate was silently linking the full
+# set, `net`/`rt-multi-thread` (hence `mio`) included, on every target — harmless on native, fatal
+# on wasm32-unknown-unknown (no epoll/real threads/TCP for `mio` to bind to). Confirmed by actually
+# running this task's `cargo check -p meridian-core --target wasm32-unknown-unknown` once
+# `meridian-signaling` (the other wasm32 blocker) was fixed, not assumed — `session.rs`/the rest of
+# this crate only ever touches `tokio::sync` (`mpsc`, `session.rs`) and, via the `time_compat` seam
+# below, `tokio::time` (native only — wasm32 substitutes `wasmtimer`), so a minimal `sync`-only
+# wasm32 dependency is sufficient.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["sync"] }
+
+# wasm32-unknown-unknown only (task 12.1, T11 browser substrate): `session.rs`'s `time_compat` seam
+# needs a `tokio::time`-shaped `timeout`/`Instant` substitute for this target (`tokio::time`'s own
+# driver has no story for wasm32 — see `apps/transport/Cargo.toml`'s own `mio` discovery from this
+# same task). Build-verified for the first time by task 12.4, which closed the remaining
+# `meridian-signaling` blocker — see `time_compat`'s own doc comment in `src/session.rs`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasmtimer = "0.2"
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 # `test-util` is needed for `#[tokio::test(start_paused = true)]` (task 1.33's answer-timeout test:

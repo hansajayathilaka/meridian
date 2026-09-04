@@ -3,19 +3,16 @@
 
 use std::collections::VecDeque;
 
-use futures_util::{SinkExt, StreamExt};
 use meridian_identity::{sign, KeyHandle, SecretStore};
 use meridian_proto::{
     Auth, AuthOk, Bundle, Challenge, Deliver, Fetch, Frame, MailboxAck, MailboxAckOk, Op,
     OpaqueBlob, PrekeyBundle, Publish, PublishOk, RouteBody, RouteOk, TurnGrant, TurnReq,
 };
 use serde::Serialize;
-use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 use crate::bundle::{generate_bundle, verify_bundle, GeneratedBundle};
 use crate::error::{Result, SignalError};
+use crate::ws_transport::{WsConnection, WsEvent, WsStream};
 
 /// Install `ring` as the process-wide default `rustls` crypto provider, once. rustls 0.23 no
 /// longer auto-selects a backend — `rustls::ClientConfig::builder()` (and `ServerConfig::builder()`)
@@ -32,8 +29,54 @@ use crate::error::{Result, SignalError};
 /// Idempotent: a second (or concurrent) call observes "already installed" and is silently
 /// ignored — this crate links exactly one provider (`ring`, this crate's `Cargo.toml`), so there is
 /// never a genuine choice to make here.
+///
+/// **wasm32 only:** a no-op. `rustls` is a native-only dependency of this crate (task 12.4's
+/// target-conditional split, `Cargo.toml`) — a browser build's `wss://` handshake is performed by
+/// the browser's own `WebSocket` implementation, which owns its own TLS stack entirely outside this
+/// process; there is no `rustls::ClientConfig` for this process to install a crypto provider into.
+/// Kept as a callable no-op (rather than `cfg`-removed) so every caller of [`Self::connect`] can
+/// call this unconditionally regardless of target, matching this task's "public API unchanged" rule.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// wasm32 counterpart of the native [`install_crypto_provider`] above — see its doc comment.
+#[cfg(target_arch = "wasm32")]
+pub fn install_crypto_provider() {}
+
+/// Run `f` off the calling task, for [`SignalingClient::handshake_owned`]'s one synchronous
+/// `sign()` call — same purpose [`Self::connect_owned`]'s own doc comment already documents
+/// (avoid freezing every other task on a single-threaded runtime for the ~1.3 s a file-backed
+/// store's unwrap can take), just factored out into a target-conditional seam (task 12.4) instead
+/// of a direct `tokio::task::spawn_blocking` call site.
+///
+/// Native: [`tokio::task::spawn_blocking`], byte-for-byte the pre-seam behavior — same thread-pool
+/// dispatch, same `JoinError` mapping.
+#[cfg(not(target_arch = "wasm32"))]
+async fn sign_off_thread<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| SignalError::Ws(format!("signing task panicked: {e}")))?
+}
+
+/// wasm32 counterpart of the native [`sign_off_thread`] above: awaits `f` inline. There is no
+/// OS thread pool to dispatch onto in a browser (`tokio`'s wasm32 build links only its `sync`
+/// feature — `Cargo.toml`), and single-threaded wasm32 has no other task to protect from blocking
+/// the way a native multi-threaded runtime does — running `f` synchronously here is not a
+/// behavior change relative to the native path's *intent* (get the signature), only its
+/// scheduling, which the browser's own single JS event loop already governs regardless of what
+/// this function does.
+#[cfg(target_arch = "wasm32")]
+async fn sign_off_thread<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    f()
 }
 
 /// The full outcome of a [`SignalingClient::route_with_hint_detailed`] call — mirrors
@@ -53,7 +96,7 @@ pub struct RouteOutcome {
 
 /// An authenticated client session to a rendezvous server.
 pub struct SignalingClient {
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ws: WsStream,
     next_id: u64,
     account_pub: [u8; 32],
     server_domain: String,
@@ -81,10 +124,25 @@ impl SignalingClient {
         max_bundle_v: u16,
     ) -> Result<Self> {
         install_crypto_provider();
-        let (ws, _resp) = connect_async(url)
+        let ws = Self::open(url).await?;
+        Self::handshake(ws, store, handle, account_pub, invite, max_bundle_v).await
+    }
+
+    /// Open the underlying [`WsStream`] to `url` — the one call site every connect variant
+    /// (`connect`, `connect_owned`) funnels through, so the native-vs-wasm branch lives in exactly
+    /// one place rather than being duplicated at each caller.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn open(url: &str) -> Result<WsStream> {
+        let (ws, _resp) = tokio_tungstenite::connect_async(url)
             .await
             .map_err(|e| SignalError::Ws(e.to_string()))?;
-        Self::handshake(ws, store, handle, account_pub, invite, max_bundle_v).await
+        Ok(crate::ws_transport::NativeWsConnection::new(ws))
+    }
+
+    /// wasm32 counterpart of the native [`Self::open`] above — see its doc comment.
+    #[cfg(target_arch = "wasm32")]
+    async fn open(url: &str) -> Result<WsStream> {
+        crate::ws_transport::WasmWsConnection::connect(url).await
     }
 
     /// Like [`Self::connect`], but takes an owned, cheaply-`clone()`-able `Arc<dyn SecretStore>`
@@ -118,9 +176,7 @@ impl SignalingClient {
         max_bundle_v: u16,
     ) -> Result<Self> {
         install_crypto_provider();
-        let (ws, _resp) = connect_async(url)
-            .await
-            .map_err(|e| SignalError::Ws(e.to_string()))?;
+        let ws = Self::open(url).await?;
         Self::handshake_owned(ws, store, handle, account_pub, invite, max_bundle_v).await
     }
 
@@ -148,7 +204,13 @@ impl SignalingClient {
     /// end-to-end, just not that one specific line in isolation. See the task file's Outcome for
     /// the full investigation (an attempt to force genuine ambiguity via rustls's
     /// `custom-provider` feature broke an unrelated `dtls`/`webrtc` code path and was reverted).
-    #[cfg(feature = "test-support")]
+    ///
+    /// Native-only (`not(target_arch = "wasm32")`): it builds a `rustls::ClientConfig` and drives
+    /// `tokio_tungstenite::connect_async_tls_with_config` directly, neither of which this crate
+    /// links on `wasm32` (task 12.4's target-conditional dependency split — a browser build's
+    /// `wss://` TLS is the browser's own, entirely outside this process). `apps/cli/tests/wss_tls.rs`,
+    /// this function's only caller, is itself a native integration test.
+    #[cfg(all(feature = "test-support", not(target_arch = "wasm32")))]
     pub async fn connect_with_test_ca_pem(
         url: &str,
         ca_cert_pem: &[u8],
@@ -182,15 +244,16 @@ impl SignalingClient {
             tokio_tungstenite::connect_async_tls_with_config(url, None, false, Some(connector))
                 .await
                 .map_err(|e| SignalError::Ws(e.to_string()))?;
+        let ws = crate::ws_transport::NativeWsConnection::new(ws);
         Self::handshake(ws, store, handle, account_pub, invite, max_bundle_v).await
     }
 
     /// Shared post-connect handshake: the server speaks first with a single-use challenge; sign
     /// `nonce ‖ server_domain` and register the account. Used by both [`Self::connect`] and (with
     /// `test-support`) [`Self::connect_with_test_ca_pem`] — the two differ only in how the
-    /// underlying `WebSocketStream` was obtained.
+    /// underlying [`WsStream`] was obtained.
     async fn handshake(
-        ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        ws: WsStream,
         store: &dyn SecretStore,
         handle: &KeyHandle,
         account_pub: [u8; 32],
@@ -236,11 +299,13 @@ impl SignalingClient {
     }
 
     /// The [`Self::connect_owned`]-only counterpart of [`Self::handshake`] — identical wire
-    /// behavior and framing, differing only in running the one `sign()` call inside
-    /// [`tokio::task::spawn_blocking`] against an owned `Arc<dyn SecretStore>` instead of
-    /// synchronously against a borrow. See [`Self::connect_owned`]'s own doc comment for why.
+    /// behavior and framing, differing only in running the one `sign()` call through
+    /// [`sign_off_thread`] (native: [`tokio::task::spawn_blocking`], unchanged; wasm32: awaited
+    /// inline — see that function's own doc comment) against an owned `Arc<dyn SecretStore>`
+    /// instead of synchronously against a borrow. See [`Self::connect_owned`]'s own doc comment for
+    /// why.
     async fn handshake_owned(
-        ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        ws: WsStream,
         store: std::sync::Arc<dyn SecretStore>,
         handle: KeyHandle,
         account_pub: [u8; 32],
@@ -271,9 +336,10 @@ impl SignalingClient {
         // off the calling task; see this method's own doc comment.
         let mut to_sign = challenge.nonce.to_vec();
         to_sign.extend_from_slice(challenge.server_domain.as_bytes());
-        let sig = tokio::task::spawn_blocking(move || sign(store.as_ref(), &handle, &to_sign))
-            .await
-            .map_err(|e| SignalError::Ws(format!("signing task panicked: {e}")))??;
+        let sig = sign_off_thread(move || {
+            sign(store.as_ref(), &handle, &to_sign).map_err(SignalError::from)
+        })
+        .await?;
 
         let auth = Auth {
             account_pub,
@@ -550,10 +616,7 @@ impl SignalingClient {
 
     /// Close the WebSocket cleanly.
     pub async fn close(mut self) -> Result<()> {
-        self.ws
-            .close(None)
-            .await
-            .map_err(|e| SignalError::Ws(e.to_string()))
+        self.ws.close().await
     }
 
     // -- internals -----------------------------------------------------------
@@ -563,10 +626,7 @@ impl SignalingClient {
         self.next_id += 1;
         let frame = Frame::new(op, id, body)?;
         let bytes = frame.to_bytes()?;
-        self.ws
-            .send(Message::Binary(bytes))
-            .await
-            .map_err(|e| SignalError::Ws(e.to_string()))?;
+        self.ws.send_binary(bytes).await?;
         Ok(id)
     }
 
@@ -596,14 +656,13 @@ impl SignalingClient {
     }
 
     async fn recv_frame(&mut self) -> Result<Frame> {
-        while let Some(msg) = self.ws.next().await {
-            let msg = msg.map_err(|e| SignalError::Ws(e.to_string()))?;
-            match msg {
-                Message::Binary(bytes) => return Ok(Frame::from_bytes(&bytes)?),
-                Message::Ping(_) | Message::Pong(_) => continue,
-                Message::Close(_) => return Err(SignalError::ClosedEarly("frame")),
-                Message::Text(_) => return Err(SignalError::Ws("unexpected text frame".into())),
-                _ => continue,
+        while let Some(event) = self.ws.next_event().await {
+            let event = event?;
+            match event {
+                WsEvent::Binary(bytes) => return Ok(Frame::from_bytes(&bytes)?),
+                WsEvent::Ping | WsEvent::Pong | WsEvent::Other => continue,
+                WsEvent::Close => return Err(SignalError::ClosedEarly("frame")),
+                WsEvent::Text => return Err(SignalError::Ws("unexpected text frame".into())),
             }
         }
         Err(SignalError::ClosedEarly("frame"))
