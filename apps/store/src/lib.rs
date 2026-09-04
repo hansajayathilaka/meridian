@@ -16,11 +16,15 @@ mod error;
 mod file;
 mod mem;
 mod os;
+#[cfg(target_arch = "wasm32")]
+mod webcrypto;
 
 pub use error::{Result, StoreError};
 pub use file::FileSecretStore;
 pub use mem::MemorySecretStore;
 pub use os::{install_mock_keystore, platform_keystore_available, OsSecretStore};
+#[cfg(target_arch = "wasm32")]
+pub use webcrypto::WebCryptoSecretStore;
 
 use zeroize::Zeroizing;
 

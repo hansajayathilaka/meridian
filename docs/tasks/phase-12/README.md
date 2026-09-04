@@ -4,7 +4,7 @@
 
 # Phase 12 — Browser & Desktop Clients
 
-**Kind:** build · **Status:** open — 6/20 tasks done · **Reviews phase(s):** n/a (pending a future `/start-review-phase`)
+**Kind:** build · **Status:** open — 7/20 tasks done · **Reviews phase(s):** n/a (pending a future `/start-review-phase`)
 
 ## Goal
 Ship **[T11 — Browser & Desktop Clients](../../architecture/features/11-browser-desktop-clients.md)**:
@@ -141,14 +141,14 @@ Full breakdown: [Tasks (todo)](#tasks-todo) below.
 
 **Wave 2 — depends on Wave 1**
 - [x] **12.4** `meridian-signaling` WebSocket transport seam (depends on 12.1) — [file](./12.4-signaling-ws-transport-seam.md)
-- [~] **12.5** `WebCryptoSecretStore` in `apps/store`, wasm32-gated (depends on 12.1) — [file](./12.5-webcrypto-secret-store.md)
+- [x] **12.5** `WebCryptoSecretStore` in `apps/store`, wasm32-gated (depends on 12.1) — [file](./12.5-webcrypto-secret-store.md)
 - [x] **12.6** Desktop TS adapter (depends on 12.2, 12.3) — [file](./12.6-desktop-ts-adapter.md)
 - [x] **12.7** Core messaging screens: chat + contacts + message-requests (depends on 12.2) — [file](./12.7-core-messaging-screens.md)
-- [ ] **12.8** Verification screen: QR camera-scan safety-number compare (depends on 12.2, 12.7) — [file](./12.8-verification-screen.md)
+- [~] **12.8** Verification screen: QR camera-scan safety-number compare (depends on 12.2, 12.7) — [file](./12.8-verification-screen.md)
 - [ ] **12.9** File transfer screen (depends on 12.2, 12.7) — [file](./12.9-file-transfer-screen.md)
 
 **Wave 3 — depends on Wave 2**
-- [ ] **12.10** `meridian-wasm` crate scaffold + smoke build + bundle-size report (depends on 12.4) — [file](./12.10-meridian-wasm-crate-scaffold.md)
+- [~] **12.10** `meridian-wasm` crate scaffold + smoke build + bundle-size report (depends on 12.4) — [file](./12.10-meridian-wasm-crate-scaffold.md)
 
 **Wave 4 — depends on Wave 3**
 - [ ] **12.11** Browser `Transport` shim (depends on 12.10) — [file](./12.11-browser-transport-shim.md)

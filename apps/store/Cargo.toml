@@ -42,3 +42,27 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 # crate that uses it, so this alone is enough without touching `age`/`x25519-dalek`'s own manifests;
 # nothing in this crate calls the 0.2 copy directly, hence the local rename.
 getrandom-0-2-js = { package = "getrandom", version = "0.2", features = ["js"] }
+# Task 12.5 (ADR 0026 binding condition 1): `WebCryptoSecretStore`, the browser-only `SecretStore`
+# impl backed by non-extractable `crypto.subtle` `CryptoKey`s. Both `getrandom`s above are already
+# pulled transitively through `wasm-bindgen`/`js-sys` (see Cargo.lock), so these add no new
+# ecosystem surface, only direct, explicit deps on what `webcrypto.rs` calls.
+wasm-bindgen = "0.2"
+# `Crypto`/`SubtleCrypto`/`CryptoKey` (key import/sign/deriveBits); `HkdfParams`/
+# `EcdhKeyDeriveParams` (algorithm-identifier objects for HKDF-Expand and X25519 `deriveBits`
+# respectively — Ed25519 sign/import pass their algorithm identifier as a plain string, per spec).
+web-sys = { version = "0.3", features = [
+    "Crypto",
+    "SubtleCrypto",
+    "CryptoKey",
+    "HkdfParams",
+    "EcdhKeyDeriveParams",
+] }
+js-sys = "0.3"
+# Bridges a `crypto.subtle` call's returned `Promise` to a Rust `Future` (`JsFuture`). Every
+# `crypto.subtle` method is Promise-based by spec (implementations may dispatch to hardware/HSMs),
+# so this crate's WebCrypto calls are genuinely async — see `webcrypto.rs`'s module doc for how
+# that interacts with `SecretStore`'s synchronous trait signature.
+wasm-bindgen-futures = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"

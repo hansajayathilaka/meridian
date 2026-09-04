@@ -23,10 +23,13 @@ pub enum StoreError {
     #[error("could not unwrap keyfile (wrong passphrase or corrupt data)")]
     Unwrap,
 
-    /// The underlying OS keystore is unavailable or failed. `os` stores need a platform
-    /// credential store installed (Keychain / DPAPI / Secret Service); headless CI installs the
-    /// mock store via [`crate::install_mock_keystore`].
-    #[error("os keystore backend error: {0}")]
+    /// A backend error not covered by the other variants: either the underlying OS keystore is
+    /// unavailable or failed (`os` stores need a platform credential store installed — Keychain /
+    /// DPAPI / Secret Service; headless CI installs the mock store via
+    /// [`crate::install_mock_keystore`]), or — on the `wasm32` WebCrypto backend — the synchronous
+    /// `SecretStore` trait was called instead of `WebCryptoSecretStore`'s async inherent methods
+    /// (see that module's `sync_bridge_unavailable`).
+    #[error("backend error (OS keystore, or WebCrypto sync-bridge unavailable): {0}")]
     Backend(String),
 
     /// Encrypting / persisting the wrapped keyfile failed.
