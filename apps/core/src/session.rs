@@ -39,7 +39,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use zeroize::Zeroize;
 
@@ -57,6 +57,81 @@ use crate::signaling::RouteOutcome;
 use crate::chat::{ChatError, ChatState};
 use crate::streams::{CapabilityError, StreamId, StreamRegistry};
 use crate::trust::TrustStore;
+
+/// (12.1, T11 browser substrate) A tiny native/`wasm32` seam over the two `tokio::time`
+/// primitives this module needs (`timeout`, `Instant`). `tokio::time`'s own driver needs a real
+/// OS-backed reactor that `wasm32-unknown-unknown` has no story for at all (no epoll, no real
+/// threads — the same `mio` incompatibility this task's own `apps/transport/Cargo.toml` change
+/// hit and documents in full). Native path: a plain re-export of `tokio::time` — genuinely
+/// unchanged behavior, not merely "compiles the same" — so every existing native test below stays
+/// exercising the real thing. `wasm32` path: [`wasmtimer`](https://docs.rs/wasmtimer), a drop-in,
+/// `tokio::time`-shaped crate backed by the browser's own `setTimeout`/`performance.now()` (via
+/// `wasm-bindgen`) instead of a bespoke reimplementation here.
+///
+/// TODO: confirm — the `wasmtimer` crate is this task's own pin; none of T11's design docs name a
+/// specific wasm timer substitute.
+///
+/// Build-verified for the first time by task 12.4 (`cargo check -p meridian-core --target
+/// wasm32-unknown-unknown`, once `meridian-signaling`'s own wasm32 blocker was closed), which
+/// found `wasmtimer::tokio` re-exports no `Instant` at all (only `timeout`/`sleep`/`interval`) —
+/// the right type is `wasmtimer::std::Instant`, but that type has no `saturating_duration_since`
+/// (`tokio::time::Instant`'s own non-panicking "clamp to zero if `earlier` is actually later"
+/// behavior, depended on by this module's ICE-restart deadline loop below) — its plain `Sub`
+/// operator instead **panics** if the left side is earlier, a real behavior difference a naive
+/// re-export would have silently shipped with a panic-shaped landmine the six-crate check in task
+/// 12.1 had no way to catch (`meridian-core` wasn't in that check's package list). The
+/// `wasm32`-only [`Instant`] newtype below exists solely to restore that one non-panicking method;
+/// everything else is a thin pass-through.
+#[cfg(not(target_arch = "wasm32"))]
+mod time_compat {
+    pub use tokio::time::{timeout, Instant};
+}
+
+#[cfg(target_arch = "wasm32")]
+mod time_compat {
+    pub use wasmtimer::tokio::timeout;
+
+    /// Thin newtype over [`wasmtimer::std::Instant`] restoring the one
+    /// `tokio::time::Instant` method this module actually calls
+    /// ([`saturating_duration_since`](Instant::saturating_duration_since)) that `wasmtimer`
+    /// itself doesn't provide — see this module's own doc comment above for why a direct
+    /// re-export was wrong.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct Instant(wasmtimer::std::Instant);
+
+    impl Instant {
+        pub fn now() -> Self {
+            Instant(wasmtimer::std::Instant::now())
+        }
+
+        /// Same contract as `tokio::time::Instant::saturating_duration_since`: `Duration::ZERO`
+        /// if `earlier` is actually at or after `self`, never a panic (unlike
+        /// `wasmtimer::std::Instant`'s own `Sub`/`duration_since`, which assert the difference is
+        /// non-negative).
+        pub fn saturating_duration_since(&self, earlier: Instant) -> std::time::Duration {
+            if self.0 <= earlier.0 {
+                std::time::Duration::ZERO
+            } else {
+                self.0.duration_since(earlier.0)
+            }
+        }
+
+        /// Same contract as `tokio::time::Instant::elapsed`: time since `self`, saturating to
+        /// `Duration::ZERO` (never panicking) via [`saturating_duration_since`](Self::saturating_duration_since)
+        /// rather than `wasmtimer::std::Instant`'s own panicking `Sub`/`duration_since` — see this
+        /// module's doc comment above for why that distinction matters here.
+        pub fn elapsed(&self) -> std::time::Duration {
+            Instant::now().saturating_duration_since(*self)
+        }
+    }
+
+    impl std::ops::Add<std::time::Duration> for Instant {
+        type Output = Instant;
+        fn add(self, rhs: std::time::Duration) -> Instant {
+            Instant(self.0 + rhs)
+        }
+    }
+}
 
 /// Channel-0 label — always opened first, reliable/ordered (§5.3).
 pub const CTRL_LABEL: &str = "mrd.ctrl/1";
@@ -993,7 +1068,7 @@ impl<T: Transport> P2pSession<T> {
             // `set_remote_offer_and_answer`'s genuine offer application would fail outright with a
             // real signaling-state error. Restarting our own local ICE state is only correct once
             // we know we're the one sending a fresh offer (the fallback branch below).
-            match tokio::time::timeout(
+            match time_compat::timeout(
                 glare_window,
                 recv_restart_signal(relay, store, handle, &self.our_ik, &self.peer_ik, chat),
             )
@@ -1070,13 +1145,13 @@ impl<T: Transport> P2pSession<T> {
         // failure is an `Err` here, unlike the original handshake's hard-fail `send`.
         relay.send_tolerant(&self.peer_ik, blob).await?;
 
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = time_compat::Instant::now() + timeout;
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(time_compat::Instant::now());
             if remaining.is_zero() {
                 return Err(SessionError::AnswerTimeout(timeout));
             }
-            let signal = match tokio::time::timeout(
+            let signal = match time_compat::timeout(
                 remaining,
                 recv_restart_signal(relay, store, handle, &self.our_ik, &self.peer_ik, chat),
             )
@@ -1379,7 +1454,7 @@ impl<T: Transport> P2pSession<T> {
         chat: &mut ChatState,
     ) -> Result<f64, SessionError> {
         let t = self.keepalive(store, handle, chat).await?;
-        let start = std::time::Instant::now();
+        let start = time_compat::Instant::now();
         loop {
             match self.pump(store, handle, chat).await? {
                 Some(SessionEvent::KeepaliveEcho(echo)) if echo == t => {
@@ -1650,7 +1725,7 @@ pub async fn dial_with_config<T: Transport>(
     registry: Arc<StreamRegistry>,
     cfg: IceConfig,
 ) -> Result<P2pSession<T>, SessionError> {
-    let attempt_start = Instant::now();
+    let attempt_start = time_compat::Instant::now();
     let policy = cfg.policy;
     let conn = transport.new_session(cfg.clone()).await?;
     // Every path below is fallible after the session exists; close it on any of them rather than
@@ -1763,7 +1838,7 @@ async fn dial_established<T: Transport>(
     // answer, must not hang `dial` forever. On timeout the connection is closed by our caller
     // (`dial_with_config`'s catch-all `Err(e)` arm), the same cleanup path every other failure here
     // already goes through — no session leaks, and this is never a degraded session, just no session.
-    let (answer_sdp, asserted_fp, answer_ice) = match tokio::time::timeout(
+    let (answer_sdp, asserted_fp, answer_ice) = match time_compat::timeout(
         ANSWER_TIMEOUT,
         recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, false),
     )
@@ -1871,7 +1946,7 @@ pub async fn answer_with_config<T: Transport>(
     registry: Arc<StreamRegistry>,
     cfg: IceConfig,
 ) -> Result<P2pSession<T>, SessionError> {
-    let attempt_start = Instant::now();
+    let attempt_start = time_compat::Instant::now();
     let policy = cfg.policy;
     // (task 2.14) Snapshot *before* the first `recv_sdp` below, whose `chat.open_bytes` call
     // installs the responder session as a side effect on a genuine first-ever offer (X3DH) — same
@@ -1885,7 +1960,7 @@ pub async fn answer_with_config<T: Transport>(
     // why this is a distinct constant/variant from the dialer-side `ANSWER_TIMEOUT`/`AnswerTimeout`):
     // a dialer that never offers — offline, a hostile relay that drops it, or (federation) a route
     // rejected server-side before any offer reaches us — must not hang `answer` forever.
-    let (offer_sdp, asserted_fp, offer_ice) = match tokio::time::timeout(
+    let (offer_sdp, asserted_fp, offer_ice) = match time_compat::timeout(
         OFFER_TIMEOUT,
         recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, true),
     )
@@ -1925,7 +2000,7 @@ pub async fn answer_with_config<T: Transport>(
             // Same bound as the initial wait above (2.17): the dialer's own retry is expected
             // quickly (it independently detected the same `NoPath`), but nothing guarantees it
             // arrives at all, so this second wait must not be able to hang forever either.
-            let (offer_sdp2, asserted_fp2, offer_ice2) = match tokio::time::timeout(
+            let (offer_sdp2, asserted_fp2, offer_ice2) = match time_compat::timeout(
                 OFFER_TIMEOUT,
                 recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, true),
             )
