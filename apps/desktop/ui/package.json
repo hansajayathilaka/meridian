@@ -1,0 +1,27 @@
+{
+  "name": "meridian-desktop-ui",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Concrete MeridianClientAdapter (shared-ui, task 12.2) implementation for the Tauri desktop shell (ADR 0010) — invoke/listen marshaling only over task 12.3's Tauri commands/events. No window UI here (12.15 owns that).",
+  "main": "./src/adapter.ts",
+  "types": "./src/adapter.ts",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "tsc --noEmit",
+    "lint": "echo 'TODO: eslint'"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "shared-ui": "workspace:*"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^3.1.2",
+    "jsdom": "^25.0.1",
+    "svelte": "^4.2.19",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.4"
+  }
+}
