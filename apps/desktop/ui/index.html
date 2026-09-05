@@ -1,0 +1,20 @@
+<!doctype html>
+<!--
+  Task 12.15 — the real frontend entry Tauri's WebView loads (`../tauri.conf.json`'s
+  `build.frontendDist`, resolved from this package's `vite build` output). Deliberately not a
+  SvelteKit app (unlike `apps/web`, task 12.14): this shell has no server, no URL-addressable
+  routes to prerender, and no SSR concern of any kind — the whole app is one always-in-process
+  Svelte component tree over the Tauri IPC boundary (see `src/App.svelte`'s own doc comment).
+  `vite.config.ts` builds this file + `src/main.ts` into `../dist` for `tauri.conf.json` to embed.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Meridian</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
