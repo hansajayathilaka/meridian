@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pump-once"
+description = "Enables the pump_once command without any pre-configured scope."
+commands.allow = ["pump_once"]
+
+[[permission]]
+identifier = "deny-pump-once"
+description = "Denies the pump_once command without any pre-configured scope."
+commands.deny = ["pump_once"]

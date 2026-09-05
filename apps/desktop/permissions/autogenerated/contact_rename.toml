@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-contact-rename"
+description = "Enables the contact_rename command without any pre-configured scope."
+commands.allow = ["contact_rename"]
+
+[[permission]]
+identifier = "deny-contact-rename"
+description = "Denies the contact_rename command without any pre-configured scope."
+commands.deny = ["contact_rename"]

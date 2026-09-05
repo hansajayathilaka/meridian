@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-contact-mark-verified"
+description = "Enables the contact_mark_verified command without any pre-configured scope."
+commands.allow = ["contact_mark_verified"]
+
+[[permission]]
+identifier = "deny-contact-mark-verified"
+description = "Denies the contact_mark_verified command without any pre-configured scope."
+commands.deny = ["contact_mark_verified"]

@@ -4,11 +4,23 @@
   "version": "0.0.0",
   "identifier": "org.meridian.desktop",
   "build": {
-    "frontendDist": "dist"
+    "frontendDist": "dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "pnpm run dev",
+    "beforeBuildCommand": "pnpm run build"
   },
   "app": {
     "withGlobalTauri": false,
-    "windows": [],
+    "windows": [
+      {
+        "label": "main",
+        "title": "Meridian",
+        "width": 1100,
+        "height": 760,
+        "minWidth": 760,
+        "minHeight": 480
+      }
+    ],
     "security": {
       "csp": null
     }

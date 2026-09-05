@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-contact-answer-request"
+description = "Enables the contact_answer_request command without any pre-configured scope."
+commands.allow = ["contact_answer_request"]
+
+[[permission]]
+identifier = "deny-contact-answer-request"
+description = "Denies the contact_answer_request command without any pre-configured scope."
+commands.deny = ["contact_answer_request"]

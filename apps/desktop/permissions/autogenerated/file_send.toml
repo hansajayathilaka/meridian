@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-file-send"
+description = "Enables the file_send command without any pre-configured scope."
+commands.allow = ["file_send"]
+
+[[permission]]
+identifier = "deny-file-send"
+description = "Denies the file_send command without any pre-configured scope."
+commands.deny = ["file_send"]
