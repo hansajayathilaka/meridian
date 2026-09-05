@@ -71,6 +71,23 @@
     {/if}
   </header>
 
+  {#if $store.error}
+    <!--
+      Task 12.14 finding: `chatStore.ts`'s own `open()` already computes `$store.error` when
+      `openConversation`/`loadHistory`/`sendGateState` fails (e.g. this task's real, fail-closed
+      `WasmMeridianClientAdapter`, `apps/web/src/lib/adapter.ts` — "no session/chat orchestration
+      binding exists yet") but this screen never rendered it, so a failed open looked identical to a
+      genuinely empty, freshly-opened conversation ("No messages yet.", below) — exactly the
+      "silently do nothing" failure mode 12.14's own Deliverable 1 requires routes to avoid.
+      Minimal, additive fix: render it, matching the identical `role="alert"` pattern
+      `MessageRequests.svelte`/`Verification.svelte`/`FileTransfer.svelte` already use for their own
+      top-level `$store.error`.
+    -->
+    <p class="load-error" role="alert" data-testid="chat-error">{$store.error}</p>
+  {:else if $store.loading}
+    <p class="loading" data-testid="chat-loading">Loading…</p>
+  {/if}
+
   <MessageList messages={$store.messages} emptyLabel="No messages yet." />
 
   {#if sendError}
@@ -120,8 +137,13 @@
     background: var(--meridian-warn-bg, #fef3c7);
     color: var(--meridian-warn-fg, #92400e);
   }
-  .send-error {
+  .send-error,
+  .load-error {
     color: var(--meridian-error-fg, #b91c1c);
+    padding: 0 0.75rem;
+  }
+  .loading {
+    color: var(--meridian-muted-fg, #666);
     padding: 0 0.75rem;
   }
   .composer {

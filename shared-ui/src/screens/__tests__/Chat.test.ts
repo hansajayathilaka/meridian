@@ -1,8 +1,20 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { MeridianAdapterError } from "../../lib/adapter";
 import { FakeMeridianClientAdapter } from "../../lib/fake-adapter";
 import Chat from "../Chat.svelte";
+
+/** Task 12.14 regression fixture — an `openConversation()` that always fails closed, the same
+ * shape `apps/web/src/lib/adapter.ts`'s real `WasmMeridianClientAdapter` returns today (no
+ * session/chat orchestration binding exists yet). Confirms this screen surfaces `$store.error`
+ * rather than rendering an indistinguishable "No messages yet." for a failed open (the bug 12.14
+ * found and fixed in `Chat.svelte` itself). */
+class FailingOpenAdapter extends FakeMeridianClientAdapter {
+  async openConversation(): ReturnType<FakeMeridianClientAdapter["openConversation"]> {
+    throw new MeridianAdapterError("unavailable", "openConversation: no session orchestration exists");
+  }
+}
 
 afterEach(() => cleanup());
 
@@ -65,6 +77,17 @@ describe("Chat screen — send/receive", () => {
     expect((screen.getByRole("button", { name: /^send$/i }) as HTMLButtonElement).disabled).toBe(
       true,
     );
+  });
+});
+
+describe("Chat screen — fail-closed adapter errors (task 12.14)", () => {
+  it("a failed openConversation renders the adapter's error, not a silent empty transcript", async () => {
+    const adapter = new FailingOpenAdapter();
+    await adapter.generateAccount("me.example");
+    render(Chat, { props: { adapter, peer } });
+
+    const alert = await screen.findByTestId("chat-error");
+    expect(alert.textContent).toMatch(/no session orchestration/i);
   });
 });
 

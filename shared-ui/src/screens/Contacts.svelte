@@ -52,9 +52,25 @@
   {#if $store.addError}
     <p class="error" role="alert">{$store.addError}</p>
   {/if}
+  {#if $store.error}
+    <!--
+      Task 12.14 finding: `contactsStore.ts`'s own `refresh()` already computes `$store.error` on a
+      failed `listConversations()` (e.g. this task's real, fail-closed `WasmMeridianClientAdapter`,
+      `apps/web/src/lib/adapter.ts` — "no trust-store binding exists yet") but this screen never
+      rendered it, so a failed refresh looked identical to a genuinely empty contact list ("No
+      contacts yet.") — exactly the "silently do nothing" failure mode 12.14's own Deliverable 1
+      requires routes to avoid. Minimal, additive fix: render it, matching the identical
+      `role="alert"` pattern `MessageRequests.svelte`/`Verification.svelte`/`FileTransfer.svelte`
+      already use for their own top-level `$store.error`.
+    -->
+    <p class="error" role="alert" data-testid="contacts-error">{$store.error}</p>
+  {/if}
 
   {#if $store.loading}
     <p class="loading">Loading…</p>
+  {:else if $store.error}
+    <!-- Already rendered above — avoid also claiming "No contacts yet.", which would misrepresent
+         a failed refresh as a genuinely empty, successfully-loaded list. -->
   {:else if $store.conversations.length === 0}
     <p class="empty">No contacts yet.</p>
   {:else}
