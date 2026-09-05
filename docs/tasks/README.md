@@ -783,6 +783,22 @@ evaporate:
   of task 12.11's own file scope (`apps/transport/src/webrtc_backend.rs`). Flagged in task 12.17's own
   Risks/notes (the interop-matrix task most likely to hit this live) — pick up via a future `/plan-phase`
   or as a fix-task spun off when 12.17's own run surfaces it, whichever comes first.
+- **NEW (found by task 12.13's own review): `BrowserTransport::local_description()` can return
+  SDP not yet committed via `setLocalDescription()`, with commit deferred to `local_candidates()`.**
+  `apps/wasm/src/transport.rs`'s `local_description()` may return the pending offer before
+  `ensure_committed()` runs — that commit is instead lazily triggered inside `local_candidates()`.
+  If a caller reads and sends the offer, then applies the peer's real answer *before* ever calling
+  `local_candidates()`, `set_remote_description` misclassifies the answer as a fresh offer and
+  silently scrambles the negotiation — no error at any individual call site, confirmed empirically
+  (the data channel simply never opens). The real native production path,
+  `apps/core/src/session.rs::dial_with_config`, avoids this by calling `local_description()` then
+  `local_candidates()` (which commits) before ever transmitting the offer — confirmed this ordering
+  is genuinely safe. But nothing in `Transport`'s trait doc states this call-order precondition, and
+  `apps/wasm/tests/browser_transport.rs` (task 12.11's own suite) doesn't exercise data-channel-open
+  so never caught it. A future `Transport` consumer that doesn't happen to replicate
+  `dial_with_config`'s exact call order will silently reintroduce this. No open task owns fixing this
+  (either documenting the precondition on the trait, or making `local_description()` itself commit) —
+  pick up via a future `/plan-phase`.
 > live in each task file's **Outcome** section (and the phase README) — not here. This block carries
 > only what is *currently actionable* plus obligations no open task owns.
 
