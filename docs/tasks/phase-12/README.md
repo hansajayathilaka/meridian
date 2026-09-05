@@ -4,7 +4,7 @@
 
 # Phase 12 — Browser & Desktop Clients
 
-**Kind:** build · **Status:** open — 15/20 tasks done · **Reviews phase(s):** n/a (pending a future `/start-review-phase`)
+**Kind:** build · **Status:** open — 16/20 tasks done · **Reviews phase(s):** n/a (pending a future `/start-review-phase`)
 
 ## Goal
 Ship **[T11 — Browser & Desktop Clients](../../architecture/features/11-browser-desktop-clients.md)**:
@@ -162,10 +162,10 @@ Full breakdown: [Tasks (todo)](#tasks-todo) below.
 - [x] **12.15** `apps/desktop` app shell (depends on 12.6, 12.7, 12.8, 12.9) — [file](./12.15-desktop-app-shell.md)
 
 **Wave 7**
-- [~] **12.16** Desktop signed release + updater pipeline, ADR 0027 (depends on 12.15, 12.3) — [file](./12.16-desktop-signed-updater-pipeline.md)
+- [x] **12.16** Desktop signed release + updater pipeline, ADR 0027 (depends on 12.15, 12.3) — [file](./12.16-desktop-signed-updater-pipeline.md)
 
 **Wave 8 — cross-cutting verification**
-- [ ] **12.17** {CLI, browser, desktop}² interop matrix CI job (depends on 12.14, 12.15) — [file](./12.17-interop-matrix-ci.md)
+- [~] **12.17** {CLI, browser, desktop}² interop matrix CI job (depends on 12.14, 12.15) — [file](./12.17-interop-matrix-ci.md)
 - [ ] **12.18** T01/T08 conformance-vector byte-identity check across CLI/browser/desktop (depends on 12.13, 12.15) — [file](./12.18-cross-client-conformance-vectors.md)
 
 **Wave 9 — docs + phase exit**

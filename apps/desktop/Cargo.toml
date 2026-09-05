@@ -39,6 +39,11 @@ meridian-core = { path = "../core" }
 # `P2pSession` — orchestration only, mirrors `apps/cli/src/send.rs`'s identical reuse.
 meridian-streams = { path = "../streams" }
 tauri = { version = "2", features = [] }
+# Task 12.16 / ADR 0027: Tauri's own Ed25519/minisign-style updater-signature scheme — a bundled
+# public key (`tauri.conf.json`'s `plugins.updater.pubkey`) verified client-side before an update is
+# applied. This is the ONLY signing this crate wires up; OS-trusted Authenticode/notarization signing
+# stays deferred (ADR 0027 R1, same residual class as ADR 0022/0023's own).
+tauri-plugin-updater = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
@@ -54,3 +59,18 @@ keyring = "4.1.4"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Task 12.16's acceptance test (`tests/updater_rejects_tampered.rs`) drives the real
+# `tauri-plugin-updater` check/download path end to end against a local mock update server, so it
+# needs: a full (mock) Tauri app to host the plugin (`tauri`'s own `test` feature,
+# `tauri::test::mock_app`/`MockRuntime`); an HTTP server to serve a `latest.json` manifest + artifact
+# bytes (`axum`, already a workspace dependency for the rendezvous server); `url::Url` (the exact type
+# `UpdaterBuilder::endpoints` takes); and `minisign`/`base64` to sign test fixtures with a LOCAL,
+# TEST-ONLY keypair (never the real `TAURI_SIGNING_PRIVATE_KEY` CI secret) using the identical
+# minisign format `tauri-plugin-updater`'s own `verify_signature` expects. `tokio`'s `net` feature
+# (TcpListener) is dev-only — resolver "2" keeps it out of the production binary's feature set.
+tauri = { version = "2", features = ["test"] }
+tokio = { workspace = true, features = ["net"] }
+axum = { workspace = true }
+url = "2"
+minisign = "0.9"
+base64 = "0.22"

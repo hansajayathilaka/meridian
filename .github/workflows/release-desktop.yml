@@ -1,0 +1,257 @@
+# Builds the `meridian-desktop` (Tauri v2 shell, ADR 0010) binary for Linux and Windows, signs each
+# packaged artifact with Tauri's own updater-plugin signature scheme (ADR 0027 — NOT OS-trusted
+# Authenticode/notarization signing, which stays deferred, same residual class as ADR 0022/0023's own
+# R1), and publishes both to a rolling `desktop-latest` GitHub Release alongside a `latest.json`
+# static-JSON update manifest that `apps/desktop/tauri.conf.json`'s bundled `plugins.updater.pubkey`
+# verifies against before any update is applied. See docs/adr/0027-desktop-signed-updates.md and
+# docs/operations/release-binaries.md.
+#
+# Deliberately a NEW workflow file, not an extension of release-binaries.yml: that pipeline builds
+# `meridian-cli` (a different binary, different feature flags, different release channel — `cli-latest`
+# vs. this file's `desktop-latest`) on an independent trigger scoped to its own dependency graph
+# (ADR 0023). Mirrors release-binaries.yml's structure (matrix, nasm setup, packaging, sha256, rolling
+# release) wherever that reasoning still applies; the only materially new step this file adds beyond
+# that precedent is signing.
+#
+# What this does NOT do (out of this task's scope, ADR 0027's own "Out"): build a real platform
+# installer (MSI/NSIS/AppImage/dmg via `cargo tauri build`) — `apps/desktop/tauri.conf.json`'s
+# `bundle.active` stays `false` (deferred since task 12.3); this workflow packages the plain
+# `meridian-desktop` binary the same way release-binaries.yml packages `meridian`, and signs that
+# archive. Once real installer bundling lands, this signing step carries over unchanged — it operates
+# on "whatever artifact this pipeline publishes," not on installer internals.
+name: release-desktop
+
+on:
+  push:
+    branches: [main]
+    # meridian-desktop's own dependency graph plus this workflow file itself. Independent of
+    # release-binaries.yml's trigger (ADR 0023 precedent: different binary, no shared inputs worth
+    # coupling on).
+    paths:
+      - "apps/desktop/**"
+      - "apps/core/**"
+      - "apps/streams/**"
+      - "apps/store/**"
+      - "apps/transport/**"
+      - "apps/identity/**"
+      - "apps/crypto/**"
+      - "apps/signaling/**"
+      - "apps/proto/**"
+      - "apps/envelope/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/release-desktop.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: release-desktop-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_os: linux
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_os: windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Linux-only native deps `wry`/`tao` (Tauri's WebView/windowing crates) need to even compile
+      # `meridian-desktop`, matching what a Tauri Linux build always requires — not new to this
+      # workflow, just not previously exercised in CI since no desktop release pipeline existed
+      # before this task.
+      - name: Install Tauri Linux build dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libgtk-3-dev
+
+      # ring (pulled in transitively, same reasoning as release-binaries.yml) compiles x86_64
+      # assembly on Windows via nasm; windows-latest does not carry nasm preinstalled.
+      - name: Install nasm (Windows only, ring's asm build step)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-desktop-${{ matrix.target }}
+
+      - name: Compute short sha
+        id: sha
+        shell: bash
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      # `--features webrtc` — the real ICE/SCTP/DTLS transport (task 12.16 ships a release build,
+      # not the loopback-only default this crate's own dev/CI signal build uses; see
+      # apps/desktop/Cargo.toml's `webrtc` feature doc comment for why the default stays off).
+      - name: cargo build --release
+        run: cargo build --release -p meridian-desktop --features webrtc --target ${{ matrix.target }}
+
+      - name: Package (Linux)
+        if: matrix.asset_os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="stage/meridian-desktop-${{ matrix.asset_os }}-x86_64"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/meridian-desktop" "$stage/"
+          name="meridian-desktop-${{ matrix.asset_os }}-x86_64-${{ steps.sha.outputs.short }}.tar.gz"
+          tar -C stage -czf "$name" "$(basename "$stage")"
+          echo "asset=$name" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: matrix.asset_os == 'windows'
+        shell: pwsh
+        run: |
+          $stageName = "meridian-desktop-${{ matrix.asset_os }}-x86_64"
+          $stage = "stage/$stageName"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/meridian-desktop.exe" -Destination $stage
+          $name = "meridian-desktop-${{ matrix.asset_os }}-x86_64-${{ steps.sha.outputs.short }}.zip"
+          Compress-Archive -Path $stage -DestinationPath $name
+          echo "asset=$name" >> $env:GITHUB_ENV
+
+      - name: sha256sum
+        shell: bash
+        run: sha256sum "${{ env.asset }}" > "${{ env.asset }}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meridian-desktop-${{ matrix.asset_os }}
+          path: |
+            ${{ env.asset }}
+            ${{ env.asset }}.sha256
+          if-no-files-found: error
+
+  sign-and-release:
+    name: Sign artifacts + publish rolling GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # `cargo tauri signer sign` (tauri-cli) is the same tool `docs/adr/0027-desktop-signed-updates.md`
+      # names for the one-time `tauri signer generate` step; reused here to sign each release
+      # artifact. Cached like any other cargo-installed CI tool so this compile cost is paid once.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-desktop-tauri-cli
+          cache-directories: |
+            ~/.cargo/bin
+
+      - name: Install cargo-tauri (tauri-cli)
+        run: |
+          if ! command -v cargo-tauri >/dev/null 2>&1; then
+            cargo install tauri-cli --version "^2" --locked
+          fi
+
+      # SECURITY: `TAURI_SIGNING_PRIVATE_KEY`/`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` are read ONLY via
+      # GitHub Actions' `${{ secrets.* }}` interpolation into this step's environment — GitHub redacts
+      # any literal occurrence of a secret's value from all workflow logs automatically. Nothing here
+      # echoes, `cat`s, or writes either value to a file that gets uploaded as an artifact; `cargo
+      # tauri signer sign`'s own stdout (checked locally against this exact command) only ever prints
+      # the resulting PUBLIC signature blob, never the private key. A human operator with real
+      # repo-admin access must have already run `tauri signer generate` for real and set both secrets
+      # before this step can sign anything — see docs/operations/release-binaries.md. Until that
+      # happens, this step fails closed (empty/unset secrets are not a valid signing key), which is
+      # the correct failure mode: no accidentally-unsigned "latest" release ships silently.
+      - name: Sign each artifact
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for asset in dist/meridian-desktop-linux-x86_64-*.tar.gz dist/meridian-desktop-windows-x86_64-*.zip; do
+            [ -e "$asset" ] || continue
+            cargo tauri signer sign -k "$TAURI_SIGNING_PRIVATE_KEY" -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "$asset"
+          done
+
+      # Static-JSON updater manifest (Tauri's self-hosted update-server-free format): one file naming
+      # every platform's download URL + the matching `.sig` file's content, verified client-side
+      # against `apps/desktop/tauri.conf.json`'s bundled `plugins.updater.pubkey` before an update is
+      # ever applied. Platform keys (`linux-x86_64`, `windows-x86_64`) match exactly what
+      # `tauri-plugin-updater`'s own default target resolution looks up (`{os}-{arch}` from
+      # `std::env::consts` on the *running* app, not the build matrix's `asset_os` string — they
+      # happen to coincide here for `linux`/`windows`).
+      - name: Generate latest.json update manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA:0:7}"
+          repo="${GITHUB_REPOSITORY}"
+          linux_asset=$(basename dist/meridian-desktop-linux-x86_64-*.tar.gz)
+          windows_asset=$(basename dist/meridian-desktop-windows-x86_64-*.zip)
+          linux_sig=$(cat "dist/${linux_asset}.sig")
+          windows_sig=$(cat "dist/${windows_asset}.sig")
+          python3 - "$repo" "$short" "$linux_asset" "$linux_sig" "$windows_asset" "$windows_sig" <<'PY'
+          import json, sys
+          repo, short, linux_asset, linux_sig, windows_asset, windows_sig = sys.argv[1:]
+          base = f"https://github.com/{repo}/releases/download/desktop-latest"
+          manifest = {
+              "version": f"0.0.0+{short}",
+              "notes": f"Automatically built from commit {short} by the release-desktop workflow.",
+              "pub_date": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+              "platforms": {
+                  "linux-x86_64": {"signature": linux_sig, "url": f"{base}/{linux_asset}"},
+                  "windows-x86_64": {"signature": windows_sig, "url": f"{base}/{windows_asset}"},
+              },
+          }
+          with open("dist/latest.json", "w") as f:
+              json.dump(manifest, f, indent=2)
+          PY
+
+      # Rolling release, same policy as release-binaries.yml's `cli-latest` (ADR 0022/0023
+      # precedent): `desktop-latest` always points at the assets from the most recent qualifying push
+      # to main. The short-sha baked into each asset's filename (and now `latest.json`'s `version`)
+      # gives a specific download commit-level traceability.
+      - name: Create/update desktop-latest release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: desktop-latest
+          name: meridian desktop (latest)
+          body: |
+            Automatically built from commit `${{ github.sha }}` by the `release-desktop` workflow.
+            This release is rolling — its assets are replaced on every qualifying push to `main`.
+            Contains the `meridian-desktop` binary (Linux + Windows), each signed with Tauri's
+            updater-plugin signature scheme (ADR 0027) — `latest.json` is what
+            `apps/desktop/tauri.conf.json`'s bundled public key verifies an update against. Still NOT
+            an OS-trusted-signed installer (ADR 0027 R1, deferred) and NOT a real installer bundle
+            (MSI/AppImage — deferred, task 12.3). Verify a download against its `.sha256` file before
+            trusting it (see `docs/operations/release-binaries.md`).
+          prerelease: true
+          make_latest: false
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.tar.gz.sig
+            dist/*.zip
+            dist/*.zip.sha256
+            dist/*.zip.sig
+            dist/latest.json

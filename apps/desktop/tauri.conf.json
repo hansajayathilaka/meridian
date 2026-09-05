@@ -29,5 +29,14 @@
     "active": false,
     "targets": [],
     "icon": ["icons/icon.png"]
+  },
+  "plugins": {
+    "updater": {
+      "//": "Task 12.16 / ADR 0027: Tauri's built-in updater-plugin signature scheme (Ed25519/minisign-style) — NOT OS-trusted Authenticode/notarization signing (deliberately deferred, ADR 0027 R1). `pubkey` is the PUBLIC half of the keypair `tauri signer generate` produces; it is meant to be bundled/committed (only the PRIVATE half is the sensitive secret, held solely as the CI `TAURI_SIGNING_PRIVATE_KEY` repo secret per ADR 0027's decision, never committed here).",
+      "pubkey": "TODO_CONFIRM__REPLACE_WITH_REAL_PRODUCTION_PUBLIC_KEY__a human operator with real repo-admin access must run `tauri signer generate` for real and paste the resulting PUBLIC key here (see docs/operations/release-binaries.md, desktop updater signing section) before this pipeline can sign a real release; this placeholder is intentionally NOT a valid minisign public key so an accidental real update-check fails closed instead of silently trusting nothing",
+      "endpoints": [
+        "https://github.com/hansajayathilaka/meridian/releases/download/desktop-latest/latest.json"
+      ]
+    }
   }
 }

@@ -163,6 +163,15 @@ fn main() {
     let downloads = download_dir();
 
     tauri::Builder::default()
+        // Task 12.16 / ADR 0027: registers the updater plugin so its bundled public key
+        // (`tauri.conf.json`'s `plugins.updater.pubkey`) and endpoint are wired up — this alone does
+        // not add any auto-update-checking behavior (no code here ever calls
+        // `tauri_plugin_updater::UpdaterExt::updater()`/`.check()`); it only makes the mechanism
+        // available for a future "check for updates" affordance to call into. Registering the plugin
+        // grants it no WebView-facing surface (`capabilities/default.json` grants no
+        // `updater:allow-*` permission) — consistent with this task's own "no in-app behavior for a
+        // client to render" scope note.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(move |app| {
             let events = Arc::new(TauriEventSink(app.handle().clone()));
             let state: DesktopState<AppTransport> =
