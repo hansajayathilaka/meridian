@@ -67,7 +67,8 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{CryptoKey, EcdhKeyDeriveParams, HkdfParams, SubtleCrypto};
 
 use crate::{
-    KeyHandle, Result, SecretStore, SignOrDh, StoreError, DERIVE_KEY_SALT, ED25519_SEED_LEN,
+    AsyncSecretStore, KeyHandle, Result, SecretStore, SignOrDh, StoreError, DERIVE_KEY_SALT,
+    ED25519_SEED_LEN,
 };
 
 /// The three non-extractable `CryptoKey`s imported from one account seed at `store()` time — one
@@ -224,6 +225,29 @@ impl SecretStore for WebCryptoSecretStore {
 
     fn derive_key(&self, _h: &KeyHandle, _info: &[u8]) -> Result<[u8; 32]> {
         Err(sync_bridge_unavailable())
+    }
+}
+
+/// ADR 0028: the real, working async view of this store. Each method here delegates straight to
+/// the inherent `async fn` of the same name above — Rust resolves the `self.store(...)` etc. calls
+/// below to those inherent methods (inherent methods take priority over trait methods in
+/// method-call syntax), so this impl is deliberately a one-line-per-method forwarder, never a
+/// second implementation of the WebCrypto logic itself.
+impl AsyncSecretStore for WebCryptoSecretStore {
+    async fn store(&self, label: &str, secret: &[u8]) -> Result<KeyHandle> {
+        self.store(label, secret).await
+    }
+
+    async fn use_key(&self, h: &KeyHandle, op: SignOrDh, input: &[u8]) -> Result<Vec<u8>> {
+        self.use_key(h, op, input).await
+    }
+
+    fn nonextractable(&self) -> bool {
+        self.nonextractable()
+    }
+
+    async fn derive_key(&self, h: &KeyHandle, info: &[u8]) -> Result<[u8; 32]> {
+        self.derive_key(h, info).await
     }
 }
 
