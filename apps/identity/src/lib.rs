@@ -45,6 +45,8 @@ pub use keys::{
     generate_account, pubkey_from_seed, sign, verify, AccountId, GenerateError, PublicKey,
     Signature,
 };
+#[cfg(target_arch = "wasm32")]
+pub use keys::{generate_account_async, sign_async};
 pub use qr::{decode_luma, render_luma, render_terminal, QrError};
 
 // Re-export the store surface so a single `meridian_identity::` import (and the core facade) can
@@ -53,3 +55,7 @@ pub use meridian_store::{
     install_mock_keystore, platform_keystore_available, FileSecretStore, KeyHandle,
     MemorySecretStore, OsSecretStore, SecretStore, SignOrDh, StoreError,
 };
+// ADR 0028: the async `SecretStore` companion trait, `wasm32`-only (see `meridian_store`'s own
+// gate) — implemented today only by `WebCryptoSecretStore` (re-exported below).
+#[cfg(target_arch = "wasm32")]
+pub use meridian_store::{AsyncSecretStore, WebCryptoSecretStore};

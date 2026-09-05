@@ -84,11 +84,14 @@ impl AccountId {
     }
 }
 
-/// Generate a new Ed25519 account key, store the private seed in `store`, and return the account.
-///
-/// The seed is generated with the OS CSPRNG, handed to the store, and zeroized locally. The
-/// private key never leaves the store after this call — [`sign`] operates through it.
-pub fn generate_account(store: &dyn SecretStore, hint: &str) -> Result<AccountId, GenerateError> {
+/// Shared, store-independent orchestration for [`generate_account`]/`generate_account_async`
+/// (ADR 0028): hint validation, CSPRNG seed generation, public-key derivation, and this account's
+/// storage label. The only step either caller still needs to perform is the actual store call
+/// (sync or async) — kept out of this helper so both callers stay a single source of truth for
+/// everything except that one call.
+fn prepare_account(
+    hint: &str,
+) -> Result<(Zeroizing<[u8; ED25519_SEED_LEN]>, PublicKey, String), GenerateError> {
     // Fail fast on a bad hint before touching any RNG or store.
     crate::id::validate_hint(hint)?;
 
@@ -101,7 +104,37 @@ pub fn generate_account(store: &dyn SecretStore, hint: &str) -> Result<AccountId
 
     // Label the entry by the public key: stable, unique, and not secret.
     let label = hex_lower(public_key.as_bytes());
+
+    Ok((seed, public_key, label))
+}
+
+/// Generate a new Ed25519 account key, store the private seed in `store`, and return the account.
+///
+/// The seed is generated with the OS CSPRNG, handed to the store, and zeroized locally. The
+/// private key never leaves the store after this call — [`sign`] operates through it.
+pub fn generate_account(store: &dyn SecretStore, hint: &str) -> Result<AccountId, GenerateError> {
+    let (seed, public_key, label) = prepare_account(hint)?;
     let handle = store.store(&label, seed.as_slice())?;
+
+    Ok(AccountId {
+        public_key,
+        hint: hint.to_string(),
+        handle,
+    })
+}
+
+/// Async twin of [`generate_account`] (ADR 0028), for targets whose only real `SecretStore`
+/// backend is async-only (today: wasm32's `WebCryptoSecretStore`). Reuses every
+/// non-store-touching line from [`generate_account`] via the shared [`prepare_account`] helper —
+/// only the store call itself differs (`.await`ed, against `S: AsyncSecretStore` instead of
+/// `&dyn SecretStore`).
+#[cfg(target_arch = "wasm32")]
+pub async fn generate_account_async<S: meridian_store::AsyncSecretStore>(
+    store: &S,
+    hint: &str,
+) -> Result<AccountId, GenerateError> {
+    let (seed, public_key, label) = prepare_account(hint)?;
+    let handle = store.store(&label, seed.as_slice()).await?;
 
     Ok(AccountId {
         public_key,
@@ -126,6 +159,21 @@ pub fn sign(
     msg: &[u8],
 ) -> Result<Signature, meridian_store::StoreError> {
     let bytes = store.use_key(handle, SignOrDh::Sign, msg)?;
+    Signature::from_slice(&bytes).map_err(|_| {
+        meridian_store::StoreError::Backend("store returned a malformed signature".into())
+    })
+}
+
+/// Async twin of [`sign`] (ADR 0028), for targets whose only real `SecretStore` backend is
+/// async-only (today: wasm32's `WebCryptoSecretStore`). Identical construction, only the store
+/// call is `.await`ed against `S: AsyncSecretStore` instead of `&dyn SecretStore`.
+#[cfg(target_arch = "wasm32")]
+pub async fn sign_async<S: meridian_store::AsyncSecretStore>(
+    store: &S,
+    handle: &KeyHandle,
+    msg: &[u8],
+) -> Result<Signature, meridian_store::StoreError> {
+    let bytes = store.use_key(handle, SignOrDh::Sign, msg).await?;
     Signature::from_slice(&bytes).map_err(|_| {
         meridian_store::StoreError::Backend("store returned a malformed signature".into())
     })

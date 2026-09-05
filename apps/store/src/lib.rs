@@ -147,6 +147,43 @@ pub(crate) fn ed25519_seed_to_x25519_dh(seed: &[u8], peer_pub: &[u8]) -> Result<
     Ok(shared.to_bytes().to_vec())
 }
 
+/// Async twin of [`SecretStore`] (`docs/api/core-api-contracts.md`'s frozen sync trait), for
+/// targets where the platform key-store API is only reachable via `Future`s (today: wasm32's
+/// `crypto.subtle`) — ADR 0028. Not object-safe by design — unlike [`crate`]-external `Transport`,
+/// wasm32 has exactly one async-only backend ([`crate::WebCryptoSecretStore`]), so a generic bound
+/// is enough; this deliberately skips `async_trait`'s boxing/`Send`-bound machinery (see
+/// `apps/wasm/src/transport.rs`'s `AssertSend` for why `Transport` needed that and this doesn't).
+/// Same three operation names, same inputs/outputs as [`SecretStore`] — an async view of the same
+/// surface, not a new capability. `nonextractable` stays synchronous: it reports a static fact
+/// about the store, never touches `crypto.subtle`.
+///
+/// `wasm32`-gated: implemented only where a real async backend exists
+/// ([`crate::WebCryptoSecretStore`] today) — additive, and does not replace or widen
+/// [`SecretStore`] itself. No other `SecretStore` impl (`OsSecretStore`, `FileSecretStore`,
+/// `MemorySecretStore`) implements it.
+// `async_fn_in_trait`'s default lint exists because a public trait's `async fn` normally can't
+// pin down auto trait bounds like `Send` on its returned future, which matters for a trait
+// consumed behind `dyn`/across real thread boundaries. Neither applies here: this trait is
+// deliberately not object-safe (ADR 0028), consumed only via a generic `S: AsyncSecretStore`
+// bound, and its sole `wasm32` implementer (`WebCryptoSecretStore`) can never actually cross a
+// real OS thread (`wasm32-unknown-unknown` has no thread-spawning capability at all — see that
+// type's own `unsafe impl Send`/`Sync` doc comment for the identical, already-reviewed argument).
+#[cfg(target_arch = "wasm32")]
+#[allow(async_fn_in_trait)]
+pub trait AsyncSecretStore {
+    /// Async twin of [`SecretStore::store`].
+    async fn store(&self, label: &str, secret: &[u8]) -> Result<KeyHandle>;
+
+    /// Async twin of [`SecretStore::use_key`].
+    async fn use_key(&self, h: &KeyHandle, op: SignOrDh, input: &[u8]) -> Result<Vec<u8>>;
+
+    /// Same as [`SecretStore::nonextractable`] — synchronous, no `crypto.subtle` call involved.
+    fn nonextractable(&self) -> bool;
+
+    /// Async twin of [`SecretStore::derive_key`].
+    async fn derive_key(&self, h: &KeyHandle, info: &[u8]) -> Result<[u8; 32]>;
+}
+
 /// Dispatch a [`SignOrDh`] op against raw seed bytes. Central so every software store applies the
 /// same rules and conversions.
 pub(crate) fn perform_op(seed: &[u8], op: SignOrDh, input: &[u8]) -> Result<Vec<u8>> {
