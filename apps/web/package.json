@@ -2,11 +2,38 @@
   "name": "meridian-web",
   "version": "0.0.0",
   "private": true,
-  "description": "Meridian browser client (SvelteKit + WASM core) — scaffold placeholder.",
   "type": "module",
+  "description": "Meridian browser client (SvelteKit + WASM core). `src/lib/adapter.ts` (task 12.13) is the concrete MeridianClientAdapter implementation over meridian-wasm's compiled bindings + the real BrowserTransport (12.11); this task (12.14) wires the real SvelteKit route tree (`src/routes/**`) around it plus the shared screens (12.7-12.9) into a servable static bundle, and adds the CSP baseline.",
   "scripts": {
-    "dev": "echo 'TODO: vite dev (SvelteKit + meridian-wasm)'",
-    "build": "echo 'TODO: vite build'",
-    "lint": "echo 'TODO: eslint'"
+    "build:wasm": "wasm-pack build ../wasm --target web --out-dir pkg --out-name meridian_wasm",
+    "dev": "pnpm run build:wasm && vite dev",
+    "build": "pnpm run build:wasm && vite build",
+    "preview": "vite preview",
+    "test": "pnpm run build:wasm && vitest run",
+    "test:watch": "vitest",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "meridian-wasm": "file:../wasm/pkg",
+    "shared-ui": "workspace:*"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@sveltejs/adapter-static": "^3.0.10",
+    "@sveltejs/kit": "^2.70.3",
+    "@sveltejs/vite-plugin-svelte": "^3.1.2",
+    "@vitest/browser": "^2.1.4",
+    "eslint": "^9.39.5",
+    "eslint-plugin-import": "^2.32.0",
+    "eslint-plugin-svelte": "^3.23.0",
+    "globals": "^17.12.0",
+    "playwright": "^1.48.2",
+    "svelte": "^4.2.19",
+    "svelte-check": "^3.8.6",
+    "typescript": "^5.6.3",
+    "typescript-eslint": "^8.69.0",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.4"
   }
 }

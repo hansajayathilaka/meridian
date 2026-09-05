@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Meridian</title>
+    <!--
+      No hand-written CSP <meta> tag here — `svelte.config.js`'s `kit.csp` (mode "hash") computes
+      and injects the real one at build time, over the actual emitted inline bootstrap script's own
+      sha256 hash (see that file's own doc comment for why "hash", not "nonce" or "unsafe-inline",
+      is the only mode a fully static `adapter-static` build can use correctly). Do not add a
+      second, hand-written CSP meta tag here — two CSP policies on one page are the *intersection*
+      of both, and a hand-written one would silently drift from the real inline-script hash on every
+      rebuild.
+    -->
+    %sveltekit.head%
+  </head>
+  <body data-sveltekit-preload-data="hover">
+    <div style="display: contents">%sveltekit.body%</div>
+  </body>
+</html>
