@@ -4,7 +4,7 @@
 
 # Phase 12 — Browser & Desktop Clients
 
-**Kind:** build · **Status:** open — 12/20 tasks done · **Reviews phase(s):** n/a (pending a future `/start-review-phase`)
+**Kind:** build · **Status:** open — 15/20 tasks done · **Reviews phase(s):** n/a (pending a future `/start-review-phase`)
 
 ## Goal
 Ship **[T11 — Browser & Desktop Clients](../../architecture/features/11-browser-desktop-clients.md)**:
@@ -124,7 +124,7 @@ the signaling WebSocket transport seam (12.4) is its own task, separate from the
 timer task (12.1) — the former is a new internal trait/seam inside one crate, the latter is cross-cutting
 build configuration touching several leaf crates, and bundling them would violate "one focused change
 per task"; and the new `WebCryptoSecretStore` trait impl lives in `apps/store` (mirrors `os.rs`/`file.rs`/
-`mem.rs`) while the IndexedDB record-sealing/schema module (ADR 0026 conditions 2-5) lives in the new
+`mem.rs`) while the IndexedDB record-sealing/schema module (ADR 0026 conditions 2–5) lives in the new
 `apps/wasm` crate, because `meridian-crypto` (needed for sealing) already depends on `meridian-store`
 (`stack.md`'s acyclic graph) — putting the sealing code inside `apps/store` alongside the trait impl
 would create a cycle. ADR 0026 itself leaves this split open, so this isn't re-litigating the ADR.
@@ -155,14 +155,14 @@ Full breakdown: [Tasks (todo)](#tasks-todo) below.
 - [x] **12.12** Browser IndexedDB sealed store, `apps/wasm` (depends on 12.10, 12.5) — [file](./12.12-browser-indexeddb-sealed-store.md)
 
 **Wave 5 — depends on Wave 4**
-- [~] **12.13** Browser wasm adapter (depends on 12.2, 12.11, 12.12) — [file](./12.13-browser-wasm-adapter.md)
+- [x] **12.13** Browser wasm adapter (depends on 12.2, 12.11, 12.12) — [file](./12.13-browser-wasm-adapter.md)
 
 **Wave 6 — app shells**
-- [ ] **12.14** `apps/web` app shell (depends on 12.13, 12.7, 12.8, 12.9) — [file](./12.14-web-app-shell.md)
-- [ ] **12.15** `apps/desktop` app shell (depends on 12.6, 12.7, 12.8, 12.9) — [file](./12.15-desktop-app-shell.md)
+- [x] **12.14** `apps/web` app shell (depends on 12.13, 12.7, 12.8, 12.9) — [file](./12.14-web-app-shell.md)
+- [x] **12.15** `apps/desktop` app shell (depends on 12.6, 12.7, 12.8, 12.9) — [file](./12.15-desktop-app-shell.md)
 
 **Wave 7**
-- [ ] **12.16** Desktop signed release + updater pipeline, ADR 0027 (depends on 12.15, 12.3) — [file](./12.16-desktop-signed-updater-pipeline.md)
+- [~] **12.16** Desktop signed release + updater pipeline, ADR 0027 (depends on 12.15, 12.3) — [file](./12.16-desktop-signed-updater-pipeline.md)
 
 **Wave 8 — cross-cutting verification**
 - [ ] **12.17** {CLI, browser, desktop}² interop matrix CI job (depends on 12.14, 12.15) — [file](./12.17-interop-matrix-ci.md)
