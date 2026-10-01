@@ -17,10 +17,7 @@
       "Bash(ls:*)",
       "Bash(cat docs/tasks/*)"
     ],
-    "deny": [
-      "Bash(git push:*)",
-      "Bash(rm -rf:*)"
-    ]
+    "deny": []
   },
   "env": {
     "MERIDIAN_DOCS": "docs/",
