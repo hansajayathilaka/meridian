@@ -15,11 +15,12 @@ build:
 lint: fmt-check lint-invariants check-wasm32
     cargo clippy --workspace --all-targets -- -D warnings
 
-# 12.1: the browser-client substrate must keep compiling for `wasm32-unknown-unknown`. These are the
-# leaf crates only — `meridian-signaling`/`meridian-core` join this list when 12.4 closes the
-# signaling half. getrandom's browser backend is wired in apps/store/Cargo.toml + .cargo/config.toml.
+# 12.1/12.4: the browser-client substrate must keep compiling for `wasm32-unknown-unknown` — the leaf
+# crates (12.1) plus `meridian-signaling` (browser WebSocket seam, apps/signaling/src/ws_transport.rs)
+# and `meridian-core` (12.4). getrandom's browser backend is wired in apps/store/Cargo.toml +
+# .cargo/config.toml. `cargo check` only: no headless-browser runtime test exists yet (12.4 Outcome).
 check-wasm32:
-    cargo check -p meridian-store -p meridian-identity -p meridian-crypto -p meridian-proto -p meridian-envelope -p meridian-transport --target wasm32-unknown-unknown
+    cargo check -p meridian-store -p meridian-identity -p meridian-crypto -p meridian-proto -p meridian-envelope -p meridian-transport -p meridian-signaling -p meridian-core --target wasm32-unknown-unknown
 
 fmt-check:
     cargo fmt --all -- --check

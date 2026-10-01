@@ -39,7 +39,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use zeroize::Zeroize;
 
@@ -1379,7 +1379,7 @@ impl<T: Transport> P2pSession<T> {
         chat: &mut ChatState,
     ) -> Result<f64, SessionError> {
         let t = self.keepalive(store, handle, chat).await?;
-        let start = std::time::Instant::now();
+        let start = crate::timer::WallInstant::now();
         loop {
             match self.pump(store, handle, chat).await? {
                 Some(SessionEvent::KeepaliveEcho(echo)) if echo == t => {
@@ -1650,7 +1650,7 @@ pub async fn dial_with_config<T: Transport>(
     registry: Arc<StreamRegistry>,
     cfg: IceConfig,
 ) -> Result<P2pSession<T>, SessionError> {
-    let attempt_start = Instant::now();
+    let attempt_start = crate::timer::WallInstant::now();
     let policy = cfg.policy;
     let conn = transport.new_session(cfg.clone()).await?;
     // Every path below is fallible after the session exists; close it on any of them rather than
@@ -1871,7 +1871,7 @@ pub async fn answer_with_config<T: Transport>(
     registry: Arc<StreamRegistry>,
     cfg: IceConfig,
 ) -> Result<P2pSession<T>, SessionError> {
-    let attempt_start = Instant::now();
+    let attempt_start = crate::timer::WallInstant::now();
     let policy = cfg.policy;
     // (task 2.14) Snapshot *before* the first `recv_sdp` below, whose `chat.open_bytes` call
     // installs the responder session as a side effect on a genuine first-ever offer (X3DH) — same

@@ -1225,7 +1225,7 @@ today); and two new ADRs ([0026](../adr/0026-browser-client-local-store.md) brow
 - [ ] **12.3** `apps/desktop` Tauri crate scaffold (Rust side) — [file](./phase-12/12.3-desktop-tauri-crate-scaffold.md)
 
 **Wave 2 — depends on Wave 1**
-- [ ] **12.4** `meridian-signaling` WebSocket transport seam (depends on 12.1) — [file](./phase-12/12.4-signaling-ws-transport-seam.md)
+- [x] **12.4** `meridian-signaling` WebSocket transport seam (depends on 12.1) — [file](./phase-12/12.4-signaling-ws-transport-seam.md)
 - [ ] **12.5** `WebCryptoSecretStore` in `apps/store`, wasm32-gated (depends on 12.1) — [file](./phase-12/12.5-webcrypto-secret-store.md)
 - [ ] **12.6** Desktop TS adapter (depends on 12.2, 12.3) — [file](./phase-12/12.6-desktop-ts-adapter.md)
 - [ ] **12.7** Core messaging screens: chat + contacts + message-requests (depends on 12.2) — [file](./phase-12/12.7-core-messaging-screens.md)

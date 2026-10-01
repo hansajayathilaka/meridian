@@ -2882,14 +2882,18 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "hex",
+ "js-sys",
  "meridian-identity",
  "meridian-proto",
  "meridian-store",
  "rustls",
+ "send_wrapper",
  "serde",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
+ "wasm-bindgen",
+ "web-sys",
  "x25519-dalek",
  "zeroize",
 ]
@@ -4463,6 +4467,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
+name = "send_wrapper"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd0b0ec5f1c1ca621c432a25813d8d60c88abe6d3e08a3eb9cf37d97a0fe3d73"
+
+[[package]]
 name = "serde"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5701,6 +5711,16 @@ dependencies = [
  "js-sys",
  "parking_lot",
  "pin-utils",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "web-sys"
+version = "0.3.103"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8622dcb61c0bcc9fffa6938bed81210af2da9a7e4a1a834b2e37a59b6dfb6141"
+dependencies = [
+ "js-sys",
  "wasm-bindgen",
 ]
 

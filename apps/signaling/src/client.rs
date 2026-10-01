@@ -3,19 +3,16 @@
 
 use std::collections::VecDeque;
 
-use futures_util::{SinkExt, StreamExt};
 use meridian_identity::{sign, KeyHandle, SecretStore};
 use meridian_proto::{
     Auth, AuthOk, Bundle, Challenge, Deliver, Fetch, Frame, MailboxAck, MailboxAckOk, Op,
     OpaqueBlob, PrekeyBundle, Publish, PublishOk, RouteBody, RouteOk, TurnGrant, TurnReq,
 };
 use serde::Serialize;
-use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 use crate::bundle::{generate_bundle, verify_bundle, GeneratedBundle};
 use crate::error::{Result, SignalError};
+use crate::ws_transport::{Incoming, PlatformWs, WsConnection};
 
 /// Install `ring` as the process-wide default `rustls` crypto provider, once. rustls 0.23 no
 /// longer auto-selects a backend — `rustls::ClientConfig::builder()` (and `ServerConfig::builder()`)
@@ -32,8 +29,15 @@ use crate::error::{Result, SignalError};
 /// Idempotent: a second (or concurrent) call observes "already installed" and is silently
 /// ignored — this crate links exactly one provider (`ring`, this crate's `Cargo.toml`), so there is
 /// never a genuine choice to make here.
+///
+/// **wasm32 (task 12.4):** a no-op — the browser's own `WebSocket` does TLS, so no `rustls` is linked
+/// there. Kept (rather than `cfg`-removed) so the `meridian-signaling` public API is identical on
+/// every target.
 pub fn install_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
 }
 
 /// The full outcome of a [`SignalingClient::route_with_hint_detailed`] call — mirrors
@@ -53,7 +57,7 @@ pub struct RouteOutcome {
 
 /// An authenticated client session to a rendezvous server.
 pub struct SignalingClient {
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ws: PlatformWs,
     next_id: u64,
     account_pub: [u8; 32],
     server_domain: String,
@@ -81,9 +85,7 @@ impl SignalingClient {
         max_bundle_v: u16,
     ) -> Result<Self> {
         install_crypto_provider();
-        let (ws, _resp) = connect_async(url)
-            .await
-            .map_err(|e| SignalError::Ws(e.to_string()))?;
+        let ws = PlatformWs::connect(url).await?;
         Self::handshake(ws, store, handle, account_pub, invite, max_bundle_v).await
     }
 
@@ -118,9 +120,7 @@ impl SignalingClient {
         max_bundle_v: u16,
     ) -> Result<Self> {
         install_crypto_provider();
-        let (ws, _resp) = connect_async(url)
-            .await
-            .map_err(|e| SignalError::Ws(e.to_string()))?;
+        let ws = PlatformWs::connect(url).await?;
         Self::handshake_owned(ws, store, handle, account_pub, invite, max_bundle_v).await
     }
 
@@ -148,7 +148,10 @@ impl SignalingClient {
     /// end-to-end, just not that one specific line in isolation. See the task file's Outcome for
     /// the full investigation (an attempt to force genuine ambiguity via rustls's
     /// `custom-provider` feature broke an unrelated `dtls`/`webrtc` code path and was reverted).
-    #[cfg(feature = "test-support")]
+    #[cfg(all(
+        feature = "test-support",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     pub async fn connect_with_test_ca_pem(
         url: &str,
         ca_cert_pem: &[u8],
@@ -182,6 +185,7 @@ impl SignalingClient {
             tokio_tungstenite::connect_async_tls_with_config(url, None, false, Some(connector))
                 .await
                 .map_err(|e| SignalError::Ws(e.to_string()))?;
+        let ws = PlatformWs::from_stream(ws);
         Self::handshake(ws, store, handle, account_pub, invite, max_bundle_v).await
     }
 
@@ -190,7 +194,7 @@ impl SignalingClient {
     /// `test-support`) [`Self::connect_with_test_ca_pem`] — the two differ only in how the
     /// underlying `WebSocketStream` was obtained.
     async fn handshake(
-        ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        ws: PlatformWs,
         store: &dyn SecretStore,
         handle: &KeyHandle,
         account_pub: [u8; 32],
@@ -240,7 +244,7 @@ impl SignalingClient {
     /// [`tokio::task::spawn_blocking`] against an owned `Arc<dyn SecretStore>` instead of
     /// synchronously against a borrow. See [`Self::connect_owned`]'s own doc comment for why.
     async fn handshake_owned(
-        ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        ws: PlatformWs,
         store: std::sync::Arc<dyn SecretStore>,
         handle: KeyHandle,
         account_pub: [u8; 32],
@@ -271,9 +275,7 @@ impl SignalingClient {
         // off the calling task; see this method's own doc comment.
         let mut to_sign = challenge.nonce.to_vec();
         to_sign.extend_from_slice(challenge.server_domain.as_bytes());
-        let sig = tokio::task::spawn_blocking(move || sign(store.as_ref(), &handle, &to_sign))
-            .await
-            .map_err(|e| SignalError::Ws(format!("signing task panicked: {e}")))??;
+        let sig = sign_off_task(store, handle, to_sign).await?;
 
         let auth = Auth {
             account_pub,
@@ -550,10 +552,7 @@ impl SignalingClient {
 
     /// Close the WebSocket cleanly.
     pub async fn close(mut self) -> Result<()> {
-        self.ws
-            .close(None)
-            .await
-            .map_err(|e| SignalError::Ws(e.to_string()))
+        self.ws.close().await
     }
 
     // -- internals -----------------------------------------------------------
@@ -563,10 +562,7 @@ impl SignalingClient {
         self.next_id += 1;
         let frame = Frame::new(op, id, body)?;
         let bytes = frame.to_bytes()?;
-        self.ws
-            .send(Message::Binary(bytes))
-            .await
-            .map_err(|e| SignalError::Ws(e.to_string()))?;
+        self.ws.send_binary(bytes).await?;
         Ok(id)
     }
 
@@ -596,18 +592,41 @@ impl SignalingClient {
     }
 
     async fn recv_frame(&mut self) -> Result<Frame> {
-        while let Some(msg) = self.ws.next().await {
-            let msg = msg.map_err(|e| SignalError::Ws(e.to_string()))?;
-            match msg {
-                Message::Binary(bytes) => return Ok(Frame::from_bytes(&bytes)?),
-                Message::Ping(_) | Message::Pong(_) => continue,
-                Message::Close(_) => return Err(SignalError::ClosedEarly("frame")),
-                Message::Text(_) => return Err(SignalError::Ws("unexpected text frame".into())),
-                _ => continue,
-            }
+        match self.ws.recv().await? {
+            Some(Incoming::Binary(bytes)) => Ok(Frame::from_bytes(&bytes)?),
+            Some(Incoming::Close) | None => Err(SignalError::ClosedEarly("frame")),
+            Some(Incoming::Text) => Err(SignalError::Ws("unexpected text frame".into())),
         }
-        Err(SignalError::ClosedEarly("frame"))
     }
+}
+
+/// Run the handshake's one `sign()` call off the calling task (see [`SignalingClient::connect_owned`]).
+///
+/// Native: inside [`tokio::task::spawn_blocking`], unchanged from before the 12.4 seam. wasm32: the
+/// browser has no blocking pool (and this crate's wasm32 `tokio` build has no `rt`), so the call runs
+/// inline on the calling task — the same single `sign()`, same store, same count, but it does occupy
+/// the (only) thread for its duration. A browser `SecretStore` is expected to be cheap or itself async
+/// at the JS boundary (12.5/12.12); `TODO: confirm` that the browser store never needs the
+/// native-store-style multi-second KDF unwrap this offload exists to avoid.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+async fn sign_off_task(
+    store: std::sync::Arc<dyn SecretStore>,
+    handle: KeyHandle,
+    to_sign: Vec<u8>,
+) -> Result<meridian_identity::Signature> {
+    tokio::task::spawn_blocking(move || sign(store.as_ref(), &handle, &to_sign))
+        .await
+        .map_err(|e| SignalError::Ws(format!("signing task panicked: {e}")))?
+        .map_err(Into::into)
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+async fn sign_off_task(
+    store: std::sync::Arc<dyn SecretStore>,
+    handle: KeyHandle,
+    to_sign: Vec<u8>,
+) -> Result<meridian_identity::Signature> {
+    sign(store.as_ref(), &handle, &to_sign).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -622,6 +641,8 @@ mod tests {
     /// itself calls this (the stronger, `test-support`-gated integration test in
     /// `apps/cli/tests/wss_tls.rs` does that, over a real self-signed TLS handshake), but it does
     /// prove the extracted function actually installs a usable default provider.
+    // rustls is not linked on wasm32 (the browser does TLS); `install_crypto_provider` is a no-op there.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     #[test]
     fn install_crypto_provider_installs_a_default() {
         install_crypto_provider();

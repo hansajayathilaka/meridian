@@ -28,10 +28,10 @@ jobs:
           targets: wasm32-unknown-unknown
       - name: rustfmt
         run: cargo fmt --all -- --check
-      # 12.1: browser-client substrate — the leaf crates must keep compiling for wasm32 (mirrors
-      # `just check-wasm32`; signaling/core join when 12.4 lands).
-      - name: wasm32 build check (leaf crates)
-        run: cargo check -p meridian-store -p meridian-identity -p meridian-crypto -p meridian-proto -p meridian-envelope -p meridian-transport --target wasm32-unknown-unknown
+      # 12.1/12.4: browser-client substrate — the leaf crates plus meridian-signaling and meridian-core
+      # must keep compiling for wasm32 (mirrors `just check-wasm32`).
+      - name: wasm32 build check (leaf crates, signaling, core)
+        run: cargo check -p meridian-store -p meridian-identity -p meridian-crypto -p meridian-proto -p meridian-envelope -p meridian-transport -p meridian-signaling -p meridian-core --target wasm32-unknown-unknown
       - name: Repo invariants (server-no-core, no-serde-on-blob, metrics-allowlist, no-raw-id-logging)
         run: |
           bash tools/lint-server-no-core.sh
