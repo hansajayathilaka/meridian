@@ -1221,7 +1221,7 @@ today); and two new ADRs ([0026](../adr/0026-browser-client-local-store.md) brow
 
 **Wave 1 — independent**
 - [x] **12.1** `wasm32` substrate: toolchain + `getrandom` backend + timer seam — [file](./phase-12/12.1-wasm32-substrate-toolchain-getrandom-timer.md)
-- [ ] **12.2** `shared-ui` package + `MeridianClientAdapter` TS interface — [file](./phase-12/12.2-shared-ui-client-adapter-interface.md)
+- [x] **12.2** `shared-ui` package + `MeridianClientAdapter` TS interface — [file](./phase-12/12.2-shared-ui-client-adapter-interface.md)
 - [ ] **12.3** `apps/desktop` Tauri crate scaffold (Rust side) — [file](./phase-12/12.3-desktop-tauri-crate-scaffold.md)
 
 **Wave 2 — depends on Wave 1**
