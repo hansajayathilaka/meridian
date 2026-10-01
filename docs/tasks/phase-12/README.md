@@ -4,7 +4,7 @@
 
 # Phase 12 — Browser & Desktop Clients
 
-**Kind:** build · **Status:** open — 0/20 tasks done · **Reviews phase(s):** n/a (pending a future `/start-review-phase`)
+**Kind:** build · **Status:** open — 1/20 tasks done · **Reviews phase(s):** n/a (pending a future `/start-review-phase`)
 
 ## Goal
 Ship **[T11 — Browser & Desktop Clients](../../architecture/features/11-browser-desktop-clients.md)**:
@@ -135,7 +135,7 @@ Full breakdown: [Tasks (todo)](#tasks-todo) below.
 <!-- Filled by /plan-phase. Status marks: [ ] pending [~] in progress [x] done [!] blocked -->
 
 **Wave 1 — independent**
-- [ ] **12.1** `wasm32` substrate: toolchain + `getrandom` backend + timer seam — [file](./12.1-wasm32-substrate-toolchain-getrandom-timer.md)
+- [x] **12.1** `wasm32` substrate: toolchain + `getrandom` backend + timer seam — [file](./12.1-wasm32-substrate-toolchain-getrandom-timer.md)
 - [ ] **12.2** `shared-ui` package + `MeridianClientAdapter` TS interface — [file](./12.2-shared-ui-client-adapter-interface.md)
 - [ ] **12.3** `apps/desktop` Tauri crate scaffold (Rust side) — [file](./12.3-desktop-tauri-crate-scaffold.md)
 

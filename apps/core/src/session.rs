@@ -993,7 +993,7 @@ impl<T: Transport> P2pSession<T> {
             // `set_remote_offer_and_answer`'s genuine offer application would fail outright with a
             // real signaling-state error. Restarting our own local ICE state is only correct once
             // we know we're the one sending a fresh offer (the fallback branch below).
-            match tokio::time::timeout(
+            match crate::timer::timeout(
                 glare_window,
                 recv_restart_signal(relay, store, handle, &self.our_ik, &self.peer_ik, chat),
             )
@@ -1070,13 +1070,13 @@ impl<T: Transport> P2pSession<T> {
         // failure is an `Err` here, unlike the original handshake's hard-fail `send`.
         relay.send_tolerant(&self.peer_ik, blob).await?;
 
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = crate::timer::Instant::now() + timeout;
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(crate::timer::Instant::now());
             if remaining.is_zero() {
                 return Err(SessionError::AnswerTimeout(timeout));
             }
-            let signal = match tokio::time::timeout(
+            let signal = match crate::timer::timeout(
                 remaining,
                 recv_restart_signal(relay, store, handle, &self.our_ik, &self.peer_ik, chat),
             )
@@ -1763,7 +1763,7 @@ async fn dial_established<T: Transport>(
     // answer, must not hang `dial` forever. On timeout the connection is closed by our caller
     // (`dial_with_config`'s catch-all `Err(e)` arm), the same cleanup path every other failure here
     // already goes through — no session leaks, and this is never a degraded session, just no session.
-    let (answer_sdp, asserted_fp, answer_ice) = match tokio::time::timeout(
+    let (answer_sdp, asserted_fp, answer_ice) = match crate::timer::timeout(
         ANSWER_TIMEOUT,
         recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, false),
     )
@@ -1885,7 +1885,7 @@ pub async fn answer_with_config<T: Transport>(
     // why this is a distinct constant/variant from the dialer-side `ANSWER_TIMEOUT`/`AnswerTimeout`):
     // a dialer that never offers — offline, a hostile relay that drops it, or (federation) a route
     // rejected server-side before any offer reaches us — must not hang `answer` forever.
-    let (offer_sdp, asserted_fp, offer_ice) = match tokio::time::timeout(
+    let (offer_sdp, asserted_fp, offer_ice) = match crate::timer::timeout(
         OFFER_TIMEOUT,
         recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, true),
     )
@@ -1925,7 +1925,7 @@ pub async fn answer_with_config<T: Transport>(
             // Same bound as the initial wait above (2.17): the dialer's own retry is expected
             // quickly (it independently detected the same `NoPath`), but nothing guarantees it
             // arrives at all, so this second wait must not be able to hang forever either.
-            let (offer_sdp2, asserted_fp2, offer_ice2) = match tokio::time::timeout(
+            let (offer_sdp2, asserted_fp2, offer_ice2) = match crate::timer::timeout(
                 OFFER_TIMEOUT,
                 recv_sdp(relay, store, handle, &our_ik, &peer_ik, chat, true),
             )

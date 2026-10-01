@@ -1,0 +1,8 @@
+# 12.1: the upstream-documented opt-in for getrandom 0.3's browser backend (alongside its `wasm_js`
+# Cargo feature, see apps/store/Cargo.toml). The pinned 0.3.4 also selects the backend from the
+# feature alone; the cfg is kept as the documented, explicit form so a future bump can't silently
+# regress. Scoped to wasm32-unknown-unknown — native targets are unaffected.
+# NOTE: setting the RUSTFLAGS env var replaces (does not extend) this; use CARGO_ENCODED_RUSTFLAGS
+# or keep the cfg if overriding.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]

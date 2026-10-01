@@ -21,7 +21,7 @@ test-support = []
 meridian-proto = { path = "../proto" }
 meridian-identity = { path = "../identity" }
 meridian-store = { path = "../store" }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }

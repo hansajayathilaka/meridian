@@ -24,7 +24,7 @@ path = "src/main.rs"
 meridian-rendezvous = { path = "../rendezvous", features = ["sqlite"] }
 clap = { workspace = true }
 hex = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

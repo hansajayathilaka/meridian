@@ -72,7 +72,12 @@ hmac = "0.12.1"
 chacha20poly1305 = "0.10.1"
 subtle = "2.6.1"
 # Server + async client (rendezvous WSS; stack.md §3 — axum + tokio).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+# 12.1: deliberately NO features here. `workspace = true` inheritance is additive-only, so any feature
+# listed at the root is force-enabled for every member — including the wasm32 leaf crates, where
+# `net` (mio) and `rt-multi-thread` do not compile. Each member now lists exactly the features it
+# needs (the server/native crates list the former root set verbatim, so their native builds are
+# unchanged).
+tokio = "1"
 # rustls-tls-native-roots: wss:// support for the client side (meridian-signaling/meridian-cli
 # connecting to a real rendezvous deployment), trusting the OS's own CA store rather than a
 # vendored-at-build-time snapshot (webpki-roots) that can go stale relative to a CA's current

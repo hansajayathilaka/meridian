@@ -52,6 +52,9 @@ pub mod desync;
 /// (§4.6), the `mrd.ctrl/1` control channel, and keepalive/ICE-restart.
 pub mod session;
 
+/// Timer seam (12.1): `tokio::time` natively, `wasmtimer` on `wasm32` — see the module docs.
+mod timer;
+
 /// A [`session::SignalRelay`] adapter over the real rendezvous [`signaling::SignalingClient`]
 /// (1.24) — the counterpart to [`session::MemRelay`] for cross-process P2P session establishment.
 pub mod signal_relay;
