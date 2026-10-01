@@ -34,3 +34,10 @@ export {
   type QrScanner,
   type QrScanSession
 } from './qr-scanner';
+// File-transfer screen (task 12.9): `mrd.file/1` send / progress / receive, purely via the adapter.
+export { default as FileTransfer } from './screens/FileTransfer.svelte';
+export {
+  FileTransferViewModel,
+  type OfferDecision,
+  type PendingOfferDecision
+} from './screens/file-transfer.svelte';

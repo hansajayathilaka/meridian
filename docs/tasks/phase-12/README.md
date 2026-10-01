@@ -4,7 +4,7 @@
 
 # Phase 12 — Browser & Desktop Clients
 
-**Kind:** build · **Status:** open — 5/20 tasks done · **Reviews phase(s):** n/a (pending a future `/start-review-phase`)
+**Kind:** build · **Status:** open — 6/20 tasks done · **Reviews phase(s):** n/a (pending a future `/start-review-phase`)
 
 ## Goal
 Ship **[T11 — Browser & Desktop Clients](../../architecture/features/11-browser-desktop-clients.md)**:
@@ -145,7 +145,7 @@ Full breakdown: [Tasks (todo)](#tasks-todo) below.
 - [ ] **12.6** Desktop TS adapter (depends on 12.2, 12.3) — [file](./12.6-desktop-ts-adapter.md)
 - [x] **12.7** Core messaging screens: chat + contacts + message-requests (depends on 12.2) — [file](./12.7-core-messaging-screens.md)
 - [x] **12.8** Verification screen: QR camera-scan safety-number compare (depends on 12.2, 12.7) — [file](./12.8-verification-screen.md)
-- [ ] **12.9** File transfer screen (depends on 12.2, 12.7) — [file](./12.9-file-transfer-screen.md)
+- [x] **12.9** File transfer screen (depends on 12.2, 12.7) — [file](./12.9-file-transfer-screen.md)
 
 **Wave 3 — depends on Wave 2**
 - [ ] **12.10** `meridian-wasm` crate scaffold + smoke build + bundle-size report (depends on 12.4) — [file](./12.10-meridian-wasm-crate-scaffold.md)

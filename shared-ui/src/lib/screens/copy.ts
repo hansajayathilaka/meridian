@@ -16,7 +16,9 @@ export type ErrorContext =
   | 'request'
   | 'verify'
   | 'acknowledge'
-  | 'block';
+  | 'block'
+  | 'file-send'
+  | 'file-answer';
 
 export function adapterErrorCode(error: unknown): AdapterErrorCode | null {
   return error instanceof MeridianAdapterError ? error.code : null;
@@ -30,7 +32,9 @@ const GENERIC: Record<ErrorContext, string> = {
   request: 'Could not complete that action. Please try again.',
   verify: 'Could not mark this contact as verified. Nothing was changed. Please try again.',
   acknowledge: 'Could not acknowledge the key change. Nothing was changed. Please try again.',
-  block: 'Could not update the block. Nothing was changed. Please try again.'
+  block: 'Could not update the block. Nothing was changed. Please try again.',
+  'file-send': 'The file was not sent. Please try again.',
+  'file-answer': 'Could not answer the file offer. Please try again.'
 };
 
 export function describeError(error: unknown, context: ErrorContext): string {
@@ -38,9 +42,13 @@ export function describeError(error: unknown, context: ErrorContext): string {
     case 'invalid-id':
       return 'That is not a valid Meridian ID. Check it and try again.';
     case 'send-blocked':
-      return 'Message not sent: sending to this contact is blocked.';
+      return context === 'file-send'
+        ? 'File not sent: sending to this contact is blocked.'
+        : 'Message not sent: sending to this contact is blocked.';
     case 'not-found':
-      return 'That request is no longer pending.';
+      return context === 'file-answer'
+        ? 'That file offer is no longer available.'
+        : 'That request is no longer pending.';
     case 'unknown-contact':
       return 'That contact no longer exists.';
     case 'not-acknowledgeable':
@@ -98,4 +106,43 @@ export const VERIFY_COPY = {
     'no-camera': 'No camera was found. You can still compare the digits by reading them aloud.',
     unavailable: 'The camera is not available. You can still compare the digits by reading them aloud.'
   }
+} as const;
+
+/**
+ * Fixed copy for the file-transfer screen (task 12.9). Mirrors the terminal client's transfers pane
+ * semantics (apps/tui/src/streams/file.rs, task 10.11) minus the resume affordance, which dispatches
+ * nothing and has no adapter operation. Deliberately claims no more than the adapter reports: there
+ * is no "verified"/"intact"/"secure" wording, and progress is a byte count, not an integrity check
+ * (stream-types-v1.md "Known gap" on per-chunk merkle proof delivery; task 11.8's residual).
+ */
+export const FILE_COPY = {
+  heading: 'File transfers',
+  /** Always shown with the list: the honest scope of what the numbers mean. */
+  progressNote:
+    'Progress counts the bytes the transport has handled so far. It is not an integrity check. ' +
+    'A transfer can still fail after all bytes have arrived: today the whole file is checked only ' +
+    'once, at the end. A transfer is shown as complete only when the transport reports it complete.',
+  busy:
+    'Files were not added while another batch is sending; drop them again after it finishes.',
+  dropHint: 'Drop files here, or choose files to send.',
+  dropZoneLabel: 'Send files',
+  chooseFilesLabel: 'Choose files to send',
+  chooseNative: 'Choose files…',
+  gatePending: 'Checking whether sending is allowed…',
+  gateUnavailable: 'Could not check whether sending is allowed. Sending is paused.',
+  gateUnconfirmed: 'Could not confirm that sending is allowed. Please try again.',
+  gateBlockedHeading: 'Sending is blocked',
+  gatePausedHeading: 'Sending is paused',
+  notSentSuffix: (count: number): string =>
+    count > 1 ? ` ${count} files were not sent.` : '',
+  offersHeading: 'Incoming file offers',
+  offerNameNote: 'The file name and size are supplied by the sender and are not verified.',
+  noTransfers: 'No transfers yet.',
+  loadingTransfers: 'Loading…',
+  acceptPrompt:
+    'Accept this file? Accepting starts the transfer. The name and size come from the sender and ' +
+    'are not verified.',
+  rejectPrompt: 'Reject this file? The offer is declined and no transfer starts.',
+  unknownSize: 'unknown size',
+  noResume: 'Resuming or cancelling a transfer is not available yet.'
 } as const;
