@@ -25,7 +25,7 @@ default = []
 # `WebRtcTransport`. Off by default: it is a heavy dependency tree and needs real UDP/ICE, so it is
 # exercised explicitly (`--features webrtc`) by the netns rig and desktop/CLI builds, not unit CI.
 # See docs/adr/0014-media-stack.md and the `/spike libwebrtc-packaging` note.
-webrtc = ["dep:webrtc", "dep:bytes"]
+webrtc = ["dep:webrtc", "dep:bytes", "tokio/rt"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }

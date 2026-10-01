@@ -23,5 +23,16 @@ hkdf = { workspace = true }
 getrandom = { workspace = true }
 thiserror = { workspace = true }
 
+# 12.1: `wasm32-unknown-unknown` has no OS entropy source, so both getrandom lines in the tree need
+# an explicit browser backend opt-in. Target-gated: native builds are unchanged. `getrandom 0.3`
+# (used directly) takes the `wasm_js` feature plus the upstream-documented
+# `--cfg getrandom_backend="wasm_js"` rustflag set in `.cargo/config.toml`; `getrandom 0.2` (pulled transitively by rand_core 0.6 via
+# x25519-dalek / age / the AEAD stack — including `meridian-crypto`, which depends on this crate)
+# takes its `js` feature. Declaring them here, rather than in `meridian-crypto`, keeps that crate's
+# manifest untouched; cargo feature unification applies them to every dependent.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }

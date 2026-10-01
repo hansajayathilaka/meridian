@@ -231,6 +231,9 @@ async fn send_one<T: Transport>(
     progress: Option<&ProgressSender>,
 ) -> Result<(), SenderError> {
     let total = file.data.len() as u64;
+    // 12.4: deliberately still `std::time::Instant` — `meridian-streams` is outside `meridian-core`'s
+    // wasm32 dependency tree (it depends on core, not vice versa); this panics at runtime on
+    // `wasm32-unknown-unknown`, so route it via a wall-clock shim when streams is brought to wasm32.
     let start = Instant::now();
     let mut sent: u64 = 0;
 

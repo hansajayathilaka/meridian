@@ -1840,8 +1840,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "wasi",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1851,9 +1853,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2767,6 +2771,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "wasmtimer",
  "zeroize",
 ]
 
@@ -2877,14 +2882,18 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "hex",
+ "js-sys",
  "meridian-identity",
  "meridian-proto",
  "meridian-store",
  "rustls",
+ "send_wrapper",
  "serde",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
+ "wasm-bindgen",
+ "web-sys",
  "x25519-dalek",
  "zeroize",
 ]
@@ -2895,6 +2904,7 @@ version = "0.0.0"
 dependencies = [
  "age",
  "ed25519-dalek",
+ "getrandom 0.2.17",
  "getrandom 0.3.4",
  "hkdf",
  "keyring-core",
@@ -4457,6 +4467,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
+name = "send_wrapper"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd0b0ec5f1c1ca621c432a25813d8d60c88abe6d3e08a3eb9cf37d97a0fe3d73"
+
+[[package]]
 name = "serde"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5686,6 +5702,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmtimer"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c598d6b99ea013e35844697fc4670d08339d5cda15588f193c6beedd12f644b"
+dependencies = [
+ "futures",
+ "js-sys",
+ "parking_lot",
+ "pin-utils",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "web-sys"
+version = "0.3.103"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8622dcb61c0bcc9fffa6938bed81210af2da9a7e4a1a834b2e37a59b6dfb6141"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "webrtc"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6184,11 +6223,13 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "hex",
+ "meridian-core",
  "meridian-crypto",
  "meridian-envelope",
  "meridian-identity",
  "meridian-proto",
  "meridian-store",
+ "meridian-streams",
  "serde",
  "serde_json",
  "x25519-dalek",

@@ -31,6 +31,16 @@ hex = { workspace = true }
 # Matches apps/cli/Cargo.toml's figment pin exactly (not a workspace dependency there either).
 figment = { version = "0.10.19", features = ["json", "env"] }
 
+# `time` is native-only: `session.rs` reaches timers through the `crate::timer` seam (12.1), which is
+# `tokio::time` natively and `wasmtimer` on wasm32 (tokio's timer has no browser driver).
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+tokio = { workspace = true, features = ["time"] }
+# TODO: confirm — the design names no wasm32 timer crate. `wasmtimer` is a drop-in mirror of
+# `tokio::time::timeout` / `std::time::Instant` backed by the browser event loop (setTimeout/performance.now).
+# Reviewed 12.1: MIT, within deny.toml's allow-list, private seam (`crate::timer`), trivially swappable.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+wasmtimer = { version = "0.4", default-features = false, features = ["tokio"] }
+
 [features]
 default = []
 # Forwards to meridian-transport/webrtc so `meridian_core::transport::WebRtcTransport` is available

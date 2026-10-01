@@ -451,8 +451,26 @@ Numbering is `P.N` (phase.task). These *execution* phases differ from the *desig
   adapter), both app shells (12.14, 12.15), the signed-updater pipeline (12.16), cross-cutting
   verification (12.17 interop matrix, 12.18 conformance-vector cross-check), docs (12.19), and the
   phase-exit demo (12.20). Full breakdown: [phase-12/README.md](./phase-12/README.md#tasks-todo).
-- **NEXT:** `/next-task` — Wave 1 (12.1, 12.2, 12.3) has no intra-phase dependencies and can start
-  immediately.
+- **NOW:** **6/20 Phase 12 tasks done** (12.1, 12.2, 12.4, 12.7, 12.8, 12.9), one `/next-task all` batch,
+  one commit per task, each reviewed and green. **12.1 + 12.4** closed the wasm32 substrate arc:
+  `meridian-core` and all its leaf crates now build for `wasm32-unknown-unknown` (`just check-wasm32`, CI
+  lint step); 12.4's review caught an unbounded browser receive queue (fixed: bounded, fail-closed). **12.2**
+  landed `shared-ui` with the `MeridianClientAdapter` interface and a reusable contract suite
+  (`shared-ui/contract-tests`) that 12.6/12.13 adapters must pass. **12.7/12.8/12.9** built the chat,
+  contacts, message-request, verification and file-transfer screens against it; 12.7's and 12.8's
+  security reviews drove fixes so a superseded async result can never authorise a send, and
+  `markVerified` has one call site reachable only from an exact match + explicit confirm. Batch stopped at
+  **12.3** (Tauri scaffold): unblocked by dependencies but environment-gated — this container lacks the
+  webkit2gtk/GTK libs Tauri v2 needs on Linux, so it (and 12.6, 12.15, 12.16 behind it) needs the dev
+  container or a CI runner. 12.5/12.10 also need a headless-browser runner + `wasm-pack`/`wasm-bindgen`
+  CLI. Known carry-forwards: `BrowserWs` has never run in a browser (no harness yet — first covered by
+  12.13); a core-level `mark_verified(peer, expected_digits)` would close the UI's check-then-mark window
+  (architect follow-up, see [12.8's Outcome](./phase-12/12.8-verification-screen.md#outcome)); the local QR
+  is text-only (`renderQrText`). Draft PR not yet opened — `git push` was denied in this session.
+- **NEXT:** `/next-task` — remaining Phase 12 tasks are all environment-gated here: **12.3** (Tauri
+  scaffold; unlocks 12.6, 12.15, 12.16), **12.5** (WebCrypto store, needs a headless-browser runner),
+  **12.10** (`meridian-wasm`, needs `wasm-pack`/`wasm-bindgen`; unlocks 12.11–12.14). Run them in the dev
+  container or on a CI runner.
 
 
 ### Live carry-forwards (not owned by any open task)
@@ -1220,17 +1238,17 @@ today); and two new ADRs ([0026](../adr/0026-browser-client-local-store.md) brow
 [phase-12/README.md](./phase-12/README.md#tasks-todo).
 
 **Wave 1 — independent**
-- [ ] **12.1** `wasm32` substrate: toolchain + `getrandom` backend + timer seam — [file](./phase-12/12.1-wasm32-substrate-toolchain-getrandom-timer.md)
-- [ ] **12.2** `shared-ui` package + `MeridianClientAdapter` TS interface — [file](./phase-12/12.2-shared-ui-client-adapter-interface.md)
+- [x] **12.1** `wasm32` substrate: toolchain + `getrandom` backend + timer seam — [file](./phase-12/12.1-wasm32-substrate-toolchain-getrandom-timer.md)
+- [x] **12.2** `shared-ui` package + `MeridianClientAdapter` TS interface — [file](./phase-12/12.2-shared-ui-client-adapter-interface.md)
 - [ ] **12.3** `apps/desktop` Tauri crate scaffold (Rust side) — [file](./phase-12/12.3-desktop-tauri-crate-scaffold.md)
 
 **Wave 2 — depends on Wave 1**
-- [ ] **12.4** `meridian-signaling` WebSocket transport seam (depends on 12.1) — [file](./phase-12/12.4-signaling-ws-transport-seam.md)
+- [x] **12.4** `meridian-signaling` WebSocket transport seam (depends on 12.1) — [file](./phase-12/12.4-signaling-ws-transport-seam.md)
 - [ ] **12.5** `WebCryptoSecretStore` in `apps/store`, wasm32-gated (depends on 12.1) — [file](./phase-12/12.5-webcrypto-secret-store.md)
 - [ ] **12.6** Desktop TS adapter (depends on 12.2, 12.3) — [file](./phase-12/12.6-desktop-ts-adapter.md)
-- [ ] **12.7** Core messaging screens: chat + contacts + message-requests (depends on 12.2) — [file](./phase-12/12.7-core-messaging-screens.md)
-- [ ] **12.8** Verification screen: QR camera-scan safety-number compare (depends on 12.2, 12.7) — [file](./phase-12/12.8-verification-screen.md)
-- [ ] **12.9** File transfer screen (depends on 12.2, 12.7) — [file](./phase-12/12.9-file-transfer-screen.md)
+- [x] **12.7** Core messaging screens: chat + contacts + message-requests (depends on 12.2) — [file](./phase-12/12.7-core-messaging-screens.md)
+- [x] **12.8** Verification screen: QR camera-scan safety-number compare (depends on 12.2, 12.7) — [file](./phase-12/12.8-verification-screen.md)
+- [x] **12.9** File transfer screen (depends on 12.2, 12.7) — [file](./phase-12/12.9-file-transfer-screen.md)
 
 **Wave 3 — depends on Wave 2**
 - [ ] **12.10** `meridian-wasm` crate scaffold + smoke build + bundle-size report (depends on 12.4) — [file](./phase-12/12.10-meridian-wasm-crate-scaffold.md)

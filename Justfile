@@ -3,16 +3,24 @@
 
 # Install toolchains (targets/tools). Scaffold: documents the intent.
 setup:
-    @echo "TODO: rustup targets (wasm32, aarch64-*); pnpm; cargo-nextest/-ndk/-deny; just"
+    rustup target add wasm32-unknown-unknown
+    @echo "TODO: rustup targets (aarch64-*); pnpm; cargo-nextest/-ndk/-deny; just"
     @echo "coverage (just coverage): rustup component add llvm-tools-preview && cargo install cargo-llvm-cov"
 
 # Build the whole workspace.
 build:
     cargo build --workspace
 
-# Format + clippy + repo invariants.
-lint: fmt-check lint-invariants
+# Format + clippy + repo invariants + wasm32 build check.
+lint: fmt-check lint-invariants check-wasm32
     cargo clippy --workspace --all-targets -- -D warnings
+
+# 12.1/12.4: the browser-client substrate must keep compiling for `wasm32-unknown-unknown` — the leaf
+# crates (12.1) plus `meridian-signaling` (browser WebSocket seam, apps/signaling/src/ws_transport.rs)
+# and `meridian-core` (12.4). getrandom's browser backend is wired in apps/store/Cargo.toml +
+# .cargo/config.toml. `cargo check` only: no headless-browser runtime test exists yet (12.4 Outcome).
+check-wasm32:
+    cargo check -p meridian-store -p meridian-identity -p meridian-crypto -p meridian-proto -p meridian-envelope -p meridian-transport -p meridian-signaling -p meridian-core --target wasm32-unknown-unknown
 
 fmt-check:
     cargo fmt --all -- --check

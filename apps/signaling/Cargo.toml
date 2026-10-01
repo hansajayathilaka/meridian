@@ -21,14 +21,22 @@ test-support = []
 meridian-proto = { path = "../proto" }
 meridian-identity = { path = "../identity" }
 meridian-store = { path = "../store" }
-tokio = { workspace = true }
-tokio-tungstenite = { workspace = true }
-futures-util = { workspace = true }
+# `sync` only here: the browser WebSocket impl (ws_transport.rs) feeds an `tokio::sync::mpsc`
+# channel, which needs no runtime/driver. The native-only features are in the target table below.
+tokio = { workspace = true, features = ["sync"] }
 serde = { workspace = true }
 x25519-dalek = { workspace = true }
 getrandom = { workspace = true }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
+# 12.4 (WebSocket transport seam, `src/ws_transport.rs`): the native stack — tokio's runtime/net
+# features, `tokio-tungstenite`, `rustls` — is gated off `wasm32-unknown-unknown`, where `net` (mio)
+# and real threads do not exist and the browser's own `WebSocket` is used instead. The feature list
+# is the former unconditional set verbatim, so the native build is unchanged.
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 # rustls 0.23 requires an explicit process-wide crypto backend selection before any `wss://` TLS
 # handshake (`install_crypto_provider`, called at the top of `SignalingClient::connect`) — no
 # longer left to `apps/cli/src/main.rs` to remember (T3.13/F13). `default-features = false` +
@@ -40,6 +48,16 @@ thiserror = { workspace = true }
 # in the build graph to supply it — this crate already requires `tokio` (std-only), so there is no
 # no_std purity to preserve here.
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "ring"] }
+
+# 12.4: the browser `WebSocket` implementation. wasm32-only; no `rustls`/`ring` there (the browser
+# owns TLS). `wasm-bindgen`/`js-sys`/`web-sys` are MIT OR Apache-2.0 (within deny.toml's allow-list).
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+# `send_wrapper` (MIT OR Apache-2.0): makes the `!Send` JS handles `Send` with a runtime thread check,
+# so core's `SignalRelay: Send` holds without relaxing it on wasm32 — see `BrowserWs`'s docs.
+send_wrapper = "0.6"
+web-sys = { version = "0.3", features = ["WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "Event"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
