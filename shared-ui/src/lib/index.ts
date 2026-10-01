@@ -6,3 +6,16 @@ export { contactDisplayLabel, trustLabel, messageStateLabel, connectionLabel } f
 export { default as AppShell } from './components/AppShell.svelte';
 export { default as ContactRow } from './components/ContactRow.svelte';
 export { default as MessageList } from './components/MessageList.svelte';
+// Core messaging screens (task 12.7) + their view-model stores. Screens talk to the adapter only.
+export { default as AccountCreate } from './screens/AccountCreate.svelte';
+export { default as Contacts } from './screens/Contacts.svelte';
+export { default as Chat } from './screens/Chat.svelte';
+export { default as MessageRequests } from './screens/MessageRequests.svelte';
+export { AccountCreateViewModel, type ProtectionChoice } from './screens/account-create.svelte';
+export { ContactsViewModel } from './screens/contacts.svelte';
+export { ChatViewModel, type SendNotice } from './screens/chat.svelte';
+export {
+  MessageRequestsViewModel,
+  type Decision,
+  type PendingDecision
+} from './screens/message-requests.svelte';
