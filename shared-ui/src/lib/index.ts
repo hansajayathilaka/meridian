@@ -19,3 +19,18 @@ export {
   type Decision,
   type PendingDecision
 } from './screens/message-requests.svelte';
+// Verification screen (task 12.8): camera capture is an injectable seam the shell implements.
+export { default as Verification } from './screens/Verification.svelte';
+export {
+  VerificationViewModel,
+  type ActionPrompt,
+  type CheckState,
+  type VerifyNotice
+} from './screens/verification.svelte';
+export {
+  QrScannerError,
+  type QrScanFailure,
+  type QrScanHandlers,
+  type QrScanner,
+  type QrScanSession
+} from './qr-scanner';

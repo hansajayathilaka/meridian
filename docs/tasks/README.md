@@ -1229,7 +1229,7 @@ today); and two new ADRs ([0026](../adr/0026-browser-client-local-store.md) brow
 - [ ] **12.5** `WebCryptoSecretStore` in `apps/store`, wasm32-gated (depends on 12.1) — [file](./phase-12/12.5-webcrypto-secret-store.md)
 - [ ] **12.6** Desktop TS adapter (depends on 12.2, 12.3) — [file](./phase-12/12.6-desktop-ts-adapter.md)
 - [x] **12.7** Core messaging screens: chat + contacts + message-requests (depends on 12.2) — [file](./phase-12/12.7-core-messaging-screens.md)
-- [ ] **12.8** Verification screen: QR camera-scan safety-number compare (depends on 12.2, 12.7) — [file](./phase-12/12.8-verification-screen.md)
+- [x] **12.8** Verification screen: QR camera-scan safety-number compare (depends on 12.2, 12.7) — [file](./phase-12/12.8-verification-screen.md)
 - [ ] **12.9** File transfer screen (depends on 12.2, 12.7) — [file](./phase-12/12.9-file-transfer-screen.md)
 
 **Wave 3 — depends on Wave 2**
